@@ -23,8 +23,8 @@
 ## 1. P-only镜像
 
 本轮镜像包含 integrations/glm53flash/experiments/prefill-only.patch，
-同时修改 config/vllm.py、KDA、Mooncake connector 和 scheduler。
-DP只放行覆盖所有合法批量、固定为0的P-only proposal，其他动态schedule仍沿用原生DP保护。
+同时修改 config/vllm.py、KDA、Mooncake connector、scheduler 和 GPU model runner。
+DP只放行覆盖所有合法批量、固定为0的P-only proposal，其他动态schedule仍沿用原生DP保护。空闲DP的dummy路径同样使用0 proposal，保留draft-prefill并对齐EP collective。
 
 ~~~bash
 python3 integrations/glm53flash/prepare_sources.py sources-p --prefill-only-experiment
@@ -34,14 +34,15 @@ COPY sources-p/vllm/vllm/config/vllm.py /usr/local/lib/python3.12/dist-packages/
 COPY sources-p/vllm/vllm/models/glm5next/common/kda.py /usr/local/lib/python3.12/dist-packages/vllm/models/glm5next/common/kda.py
 COPY sources-p/vllm/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
 COPY sources-p/vllm/vllm/v1/core/sched/scheduler.py /usr/local/lib/python3.12/dist-packages/vllm/v1/core/sched/scheduler.py
+COPY sources-p/vllm/vllm/v1/worker/gpu/model_runner.py /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_runner.py
 EOF
-docker build -f /tmp/Dockerfile.glm-p-only -t yyf-glm53flash:prefill-dp-v2 .
+docker build -f /tmp/Dockerfile.glm-p-only -t yyf-glm53flash:prefill-dp-v3 .
 ~~~
 
 各模型主机设置：
 
 ~~~bash
-export IMAGE=yyf-glm53flash:prefill-dp-v2
+export IMAGE=yyf-glm53flash:prefill-dp-v3
 export ROUTER_IMAGE=local/glm53flash-router:pd-reservation-candidate-20261027
 export MODEL_DIR=/data/models/GLM-5.3-Flash-NVFP4
 export WORK=/data/bench/eng-yangyufei/glm53flash-pd-828384-20261027/integration-20261028/ep4p-ep4ep8d-c256-20261029

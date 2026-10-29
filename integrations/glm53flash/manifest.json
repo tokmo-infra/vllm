@@ -345,7 +345,7 @@
   },
   "optional_P_only_experiment": {
     "path": "experiments/prefill-only.patch",
-    "sha256": "9388e3ca14002070852aa23804ceb0fc1dd70ba88702d41849556a9ac34a7ca5",
+    "sha256": "05d077f58f5d58202b2817addbf3b14f5737853c3344ab855e5840ff17e4e223",
     "files": [
       {
         "path": "vllm/config/vllm.py",
@@ -362,6 +362,10 @@
       {
         "path": "vllm/v1/core/sched/scheduler.py",
         "sha256": "61e5be5939f120138297baddf2465af59c0e95d5e4588ceda4a2f065feb7b3ea"
+      },
+      {
+        "path": "vllm/v1/worker/gpu/model_runner.py",
+        "sha256": "30623c04d77ce11664239e533e950415d3ee10cca46ca69ba7edff92c9b43252"
       }
     ]
   },
@@ -383,7 +387,7 @@
     44344
   ],
   "experiment_default_enabled": false,
-  "services": "P and D stopped by human instruction; Router/Store retained; glm-c512 monitor deleted",
+  "services": "Runtime topology and launch commands are documented in root DEPLOYMENT.md.",
   "documented_deployment": {
     "case": "C230/U345/N345",
     "topology": "P82 two TP1DP4EP4; D83 and D84 one TP1DP8EP8 each",
@@ -407,6 +411,7 @@
     "Store_GiB": 3000,
     "P_only_DP_fixed_zero_proposals": true,
     "P_load_recv_threads": 4,
-    "D_max_num_seqs": 24
+    "D_max_num_seqs": 24,
+    "P_image_tag": "yyf-glm53flash:prefill-dp-v3"
   }
 }

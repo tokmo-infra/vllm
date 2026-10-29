@@ -48,7 +48,8 @@ CUDA-event hooks or temporary load generators are included.
 - config/vllm.py preserves the P-only fixed-zero proposal schedule under DP when one interval covers every legal batch size.
 - Nonconstant schedules, D roles, incomplete intervals and MTP5 keep the native DP disable guard.
 - The KDA check accepts an all-zero interval covering max_num_seqs rather than requiring exactly 1–64.
-- Nine CPU cases execute the actual DP config method and cover allowed and rejected configurations.
+- Idle-DP dummy proposal uses budget0 for the same P-only role instead of the global default3, aligning draft-prefill/collective count with active P ranks.
+- Nine CPU cases execute the actual DP config method; four more exercise the actual role predicate and dummy budget expression.
 
 ## P admission and transfer findings
 

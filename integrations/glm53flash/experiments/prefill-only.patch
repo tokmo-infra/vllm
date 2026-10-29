@@ -201,3 +201,34 @@ diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
  
      def _free_blocks(self, request: Request):
          assert request.is_finished()
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -201,6 +201,15 @@
+         self.parallel_config = vllm_config.parallel_config
+         self.scheduler_config = vllm_config.scheduler_config
+         self.speculative_config = vllm_config.speculative_config
++        transfer = vllm_config.kv_transfer_config
++        self._glm_prefill_only_target_state = transfer is not None and any(
++            child.get("kv_connector") == "MooncakeConnector"
++            and child.get("kv_role") == "kv_producer"
++            and child.get("kv_connector_extra_config", {}).get(
++                "prefill_only_target_state", False
++            ) is True
++            for child in transfer.kv_connector_extra_config.get("connectors", ())
++        )
+         self._draft_workspace_lane = int(
+             self.speculative_config is not None and self.speculative_config.use_dspark()
+         )
+@@ -957,6 +966,11 @@
+                     temperature=self.sampler.sampling_states.temperature.gpu,
+                     seeds=self.sampler.sampling_states.seeds.gpu,
+                     dp_sync_state=dp_sync_state,
++                    # Idle DP ranks must execute the same draft-prefill-only
++                    # collective sequence as active P ranks (proposal budget0).
++                    num_speculative_tokens=(
++                        0 if self._glm_prefill_only_target_state else None
++                    ),
+                     dummy_run=True,
+                     skip_attn_for_dummy_run=skip_attn,
+                     mm_inputs=mm_inputs,
