@@ -13,4 +13,4 @@
 
 配套 Router 源码位于 tokmo-infra/router，同名分支：vllm-0.32.0-0.1.16-glm5.3-flash。
 
-当前 C256：81 双 EP4 P、82 EP4 P + EP4 D、83/84 各 EP8 D，完整启动命令见 [DEPLOYMENT.md](DEPLOYMENT.md)。
+当前 C288：81 双 EP4 P、82 EP4 P + EP4 D、83/84 各 EP8 D，完整启动命令见 [DEPLOYMENT.md](DEPLOYMENT.md)。

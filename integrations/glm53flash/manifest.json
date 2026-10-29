@@ -401,11 +401,12 @@
   },
   "current_deployment": {
     "document": "DEPLOYMENT.md",
-    "case": "C256/U384/N384",
+    "case": "C288/U432/N432",
     "topology": "P81 2xEP4; P82 EP4; D82 EP4; D83/D84 EP8 each",
     "start_percent": 55,
     "Store_GiB": 3000,
     "P_only_DP_fixed_zero_proposals": true,
-    "P_load_recv_threads": 4
+    "P_load_recv_threads": 4,
+    "D_max_num_seqs": 24
   }
 }

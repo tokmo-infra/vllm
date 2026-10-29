@@ -1,4 +1,4 @@
-# EP4 P / EP4+EP8 D · C256
+# EP4 P / EP4+EP8 D · C288
 
 ## 拓扑与参数
 
@@ -7,16 +7,16 @@
 | 81 | P0：TP1/DP4/EP4 | GPU0—3 / mlx5_0—3 | 24 / 2048 | NONE |
 | 81 | P1：TP1/DP4/EP4 | GPU4—7 / mlx5_4—7 | 24 / 2048 | NONE |
 | 82 | P0：TP1/DP4/EP4 | GPU0—3 / mlx5_0—3 | 24 / 2048 | NONE |
-| 82 | D1：TP1/DP4/EP4 | GPU4—7 / mlx5_4—7 | 32 / 1024 | FULL_DECODE_ONLY，128 |
-| 83 | D0：TP1/DP8/EP8 | GPU0—7 / mlx5_0—7 | 32 / 1024 | FULL_DECODE_ONLY，128 |
-| 84 | D0：TP1/DP8/EP8 | GPU0—7 / mlx5_0—7 | 32 / 1024 | FULL_DECODE_ONLY，128 |
+| 82 | D1：TP1/DP4/EP4 | GPU4—7 / mlx5_4—7 | 24 / 1024 | FULL_DECODE_ONLY，128 |
+| 83 | D0：TP1/DP8/EP8 | GPU0—7 / mlx5_0—7 | 24 / 1024 | FULL_DECODE_ONLY，128 |
+| 84 | D0：TP1/DP8/EP8 | GPU0—7 / mlx5_0—7 | 24 / 1024 | FULL_DECODE_ONLY，128 |
 
 - 公共：GLM-5.3 Flash NVFP4，util0.95，FP8 KV，prefix256，block-size64，max-model-len auto。
 - P 保留全局MTP3/draft-prefill，proposal固定0，目标验证草稿槽0；D保持正常MTP3。
 - P接收线程4；P/D均绑定对应CX8，GID3；MoE/Attention/Linear后端自动，FlashInfer自动调优关闭。
 - 81—84各750GiB Mooncake Store，共3000GiB；水位98%，local_first。
 - Router：P/D cache_aware，负载阈值4/1.5；12路P、20路D。
-- SWE8w：C256/U384/N384，55%后完整分钟统计，持续60秒并发不足收尾，无Nsight/TTFT止损。
+- SWE8w：C288/U432/N432，55%后完整分钟统计，持续60秒并发不足收尾，无Nsight/TTFT止损。
 
 旧C230命令见 [DEPLOYMENT-C230.md](DEPLOYMENT-C230.md)，源码与历史定位见 [GLM53FLASH-TECHNICAL.md](GLM53FLASH-TECHNICAL.md)。
 
@@ -107,7 +107,7 @@ EOF
     SPEC='{"method":"mtp","num_speculative_tokens":3,"num_speculative_tokens_per_batch_size":[[1,64,0]]}'
     GRAPH='{"cudagraph_mode":"NONE"}'
   else
-    SEQ=32; BATCH=1024; RECV=1
+    SEQ=24; BATCH=1024; RECV=1
     DIRECT_ROLE=kv_consumer; STORE_ROLE=kv_consumer; DIRECT_EXTRA=''
     SPEC='{"method":"mtp","num_speculative_tokens":3}'
     GRAPH='{"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":128}'
@@ -187,14 +187,16 @@ docker run -d --name yyf-glm53flash-c256-router83 --runtime=runc --network host 
 
 ## 5. 压测与本机监控
 
-max_concurrency=256、max_active_sessions=384，SWE首384条完整自然轨迹，流式usage开启，
+模型容器和部署目录沿用创建时的c256标识；实际正式测试为C288/U432/N432。
+
+max_concurrency=288、max_active_sessions=432，SWE首432条完整自然轨迹，流式usage开启，
 reasoning_effort=xhigh、enable_thinking=true，客户端总deadline关闭。
 以总计划轮数55%为起点，同成功cohort完整分钟统计，包含命中/未命中输入。
 
 本轮自动编排入口在83；运行中不重复执行：
 
 ~~~bash
-python3 /data/bench/eng-yangyufei/glm53flash-pd-828384-20261027/integration-20261028/launch_c256.py
+python3 /data/bench/eng-yangyufei/glm53flash-pd-828384-20261027/integration-20261028/launch_ep4pd.py
 ~~~
 
 实际命令、server_info、验收与DB路径保存在83：
