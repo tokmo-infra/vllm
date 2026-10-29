@@ -87,3 +87,10 @@ The finite C512 elapsed time remained about 24.7–25.4 seconds after admission
 changes. The direct-P comparison was 23.65 seconds. Overall P queuing remains
 unresolved. These are short diagnostics, not a new maxtpm result. No GPU
 services were restarted for the source-archive commit.
+
+## 2026-10-29：索引器回滚
+
+- 同步短复现在 SM120 Prefill 融合 top-k resident 内核报 CUDA 700。
+- 撤回 FlashInfer #7085、GLM 适配与相关元数据，删除 VLLM_SM120_DSA_INDEXER 开关；Prefill / Decode 恢复原生索引器。
+- 保留 FP8 传输桥、MTP3、Mooncake 紧凑存储、异步查找和 P-only KV 准入修复。
+- C288 长测保持人工停止，不发布故障期间的性能成绩。

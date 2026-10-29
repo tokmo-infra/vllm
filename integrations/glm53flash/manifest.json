@@ -9,7 +9,7 @@
     "patches": [
       {
         "path": "patches/vllm-runtime.patch",
-        "sha256": "f02227cb019dc44d9b5f719b48043bb6f948ffd1499176aa8a713b198bd9de2d",
+        "sha256": "83e94dccb7c2e71a9ff10bd8366bf6682879ff711fe3efe9eea4138b0f109ad8",
         "files": [
           {
             "path": "vllm/_custom_ops.py",
@@ -88,18 +88,6 @@
             "sha256": "383d1ae302b3c269572c0a10bcb5af9aac99488eedbe629867c1be02a86bfaed"
           },
           {
-            "path": "vllm/models/glm5next/nvidia/sm120_dsa_adapter.py",
-            "sha256": "be8d54f780e3960bd8c806675e26ce97dece35f27f04b9ce7ed59639265b749a"
-          },
-          {
-            "path": "vllm/models/glm5next/nvidia/sm120_dsa_prefill.py",
-            "sha256": "6f1486628236868a81ab4b933368c60358a5c7648c990d3c92af0bca0b0817e7"
-          },
-          {
-            "path": "vllm/models/glm5next/nvidia/sparse_indexer.py",
-            "sha256": "43f831129bc4a16e79c8a87308afad118780a37abec46c72ed0d635999547687"
-          },
-          {
             "path": "vllm/v1/attention/backend.py",
             "sha256": "52d567d752f1e943559fad280a542f8cc77d78b4dc1a594cd8d97ea5fa007c87"
           },
@@ -130,10 +118,6 @@
           {
             "path": "vllm/v1/attention/backends/mla/index_group.py",
             "sha256": "971185354488b5c121d86a1a09685b191ede7c55203ba1e444eca605fdbc16ba"
-          },
-          {
-            "path": "vllm/v1/attention/backends/mla/indexer.py",
-            "sha256": "e06a2c14f1ba94c993cc20aee5ab169f71741c8423395f85eee67059e03c8d35"
           },
           {
             "path": "vllm/v1/attention/backends/mla/rocm_aiter_mla.py",
@@ -217,54 +201,7 @@
     "repository": "https://github.com/flashinfer-ai/flashinfer.git",
     "commit": "0b46115d238d29ea2e92c6b9b2cb077d40fbc352",
     "version": "0.7.1",
-    "patches": [
-      {
-        "path": "patches/flashinfer.patch",
-        "sha256": "052cd4ae57ef385b159a8cd51a84a3ac123e12c59f5ea53848e49b1e6f5827f0",
-        "files": [
-          {
-            "path": "flashinfer/dsa_indexer.py",
-            "sha256": "8551f22b051ff9535a3dccd16367cb8251ce817e126be794907e407082ffc9a1"
-          },
-          {
-            "path": "flashinfer/experimental/sm120_dsa_indexer/README.md",
-            "sha256": "1b11eae9c7af19f17adf6f99fb6bf83d7ec4f0102276309a82b61013d41a9906"
-          },
-          {
-            "path": "flashinfer/experimental/sm120_dsa_indexer/__init__.py",
-            "sha256": "78fbb5edae88206c6c4a7d8e64ae83bf052d7c1f65ce077f38c74b71070679fe"
-          },
-          {
-            "path": "flashinfer/experimental/sm120_dsa_indexer/_api.py",
-            "sha256": "88ce4c83342e33f1a9700549fd1850dcb9a3e130839792e5330a17f7cf65f83b"
-          },
-          {
-            "path": "flashinfer/experimental/sm120_dsa_indexer/csrc/binding.cu",
-            "sha256": "e48893029aaf4966051363a0df45098506898c4e74e11998e9e9b5846200b48e"
-          },
-          {
-            "path": "flashinfer/experimental/sm120_dsa_indexer/csrc/decode_common.cuh",
-            "sha256": "2554c3081bcc8a7e541dc57c19e8f5f6cfc5e9f2c4a52c30121ff682a57c2599"
-          },
-          {
-            "path": "flashinfer/experimental/sm120_dsa_indexer/csrc/decode_scan.cuh",
-            "sha256": "7e81007ccba35475e06ea729cdcc8dd5625ce6abda671b21acf81dfdffcda503"
-          },
-          {
-            "path": "flashinfer/experimental/sm120_dsa_indexer/csrc/decode_select_long.cuh",
-            "sha256": "eb3c02584924c34455de250d21cd4adc511504c878f76982277e8d63d72e3859"
-          },
-          {
-            "path": "flashinfer/experimental/sm120_dsa_indexer/csrc/decode_select_row.cuh",
-            "sha256": "7060aa2c0d9c8b62e244a694e3390da48372372cd6e364d3a95361030c4e71f6"
-          },
-          {
-            "path": "flashinfer/experimental/sm120_dsa_indexer/csrc/sm120_dsa_indexer.cuh",
-            "sha256": "b41850c4105321a156a280f79d7a7d4fcf4647049a7d3d53fe9b0ea510d25d1f"
-          }
-        ]
-      }
-    ]
+    "patches": []
   },
   "router": {
     "repository": "https://github.com/vllm-project/router.git",
@@ -370,7 +307,6 @@
     ]
   },
   "provenance_PRs": {
-    "flashinfer/7085": "03a71490abee5ff44b806bf5286592cd4c856d63",
     "vllm/64072": "daf15951a7deeb33ba47ce0cf436ebcb9146382f",
     "vllm/58305": "d76d076968d224e34e9452487d77a2d3a9cb11e6",
     "vllm/63142": "0eb37ba3e3bef61f4bc904e75cfbb76c51e51e2e",
@@ -412,6 +348,14 @@
     "P_only_DP_fixed_zero_proposals": true,
     "P_load_recv_threads": 4,
     "D_max_num_seqs": 24,
-    "P_image_tag": "yyf-glm53flash:prefill-dp-v3"
+    "P_image_tag": "yyf-glm53flash:native-indexer-v4",
+    "model_image_tag": "yyf-glm53flash:native-indexer-v4",
+    "experimental_sm120_indexer": false
+  },
+  "reverted_PRs": {
+    "flashinfer/7085": {
+      "commit": "03a71490abee5ff44b806bf5286592cd4c856d63",
+      "reason": "SM120 ragged Prefill fused top-k reproduced CUDA illegal memory access; restore native Prefill and Decode indexers"
+    }
   }
 }

@@ -22,6 +22,8 @@
 
 ## 1. P-only镜像
 
+当前镜像 native-indexer-v4 已移除实验性 SM120 融合索引器及共用开关；Prefill / Decode 使用原生索引器。
+
 本轮镜像包含 integrations/glm53flash/experiments/prefill-only.patch，
 同时修改 config/vllm.py、KDA、Mooncake connector、scheduler 和 GPU model runner。
 DP只放行覆盖所有合法批量、固定为0的P-only proposal，其他动态schedule仍沿用原生DP保护。空闲DP的dummy路径同样使用0 proposal，保留draft-prefill并对齐EP collective。
@@ -35,14 +37,18 @@ COPY sources-p/vllm/vllm/models/glm5next/common/kda.py /usr/local/lib/python3.12
 COPY sources-p/vllm/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
 COPY sources-p/vllm/vllm/v1/core/sched/scheduler.py /usr/local/lib/python3.12/dist-packages/vllm/v1/core/sched/scheduler.py
 COPY sources-p/vllm/vllm/v1/worker/gpu/model_runner.py /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_runner.py
+COPY sources-p/vllm/vllm/models/glm5next/nvidia/sparse_indexer.py /usr/local/lib/python3.12/dist-packages/vllm/models/glm5next/nvidia/sparse_indexer.py
+COPY sources-p/vllm/vllm/v1/attention/backends/mla/indexer.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/indexer.py
+COPY sources-p/flashinfer/flashinfer/dsa_indexer.py /usr/local/lib/python3.12/dist-packages/flashinfer/dsa_indexer.py
+RUN rm -f /usr/local/lib/python3.12/dist-packages/vllm/models/glm5next/nvidia/sm120_dsa_adapter.py /usr/local/lib/python3.12/dist-packages/vllm/models/glm5next/nvidia/sm120_dsa_prefill.py && rm -rf /usr/local/lib/python3.12/dist-packages/flashinfer/experimental/sm120_dsa_indexer /usr/local/lib/python3.12/dist-packages/vllm/models/glm5next/nvidia/__pycache__ /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/__pycache__ /usr/local/lib/python3.12/dist-packages/flashinfer/__pycache__
 EOF
-docker build -f /tmp/Dockerfile.glm-p-only -t yyf-glm53flash:prefill-dp-v3 .
+docker build -f /tmp/Dockerfile.glm-p-only -t yyf-glm53flash:native-indexer-v4 .
 ~~~
 
 各模型主机设置：
 
 ~~~bash
-export IMAGE=yyf-glm53flash:prefill-dp-v3
+export IMAGE=yyf-glm53flash:native-indexer-v4
 export ROUTER_IMAGE=local/glm53flash-router:pd-reservation-candidate-20261027
 export MODEL_DIR=/data/models/GLM-5.3-Flash-NVFP4
 export WORK=/data/bench/eng-yangyufei/glm53flash-pd-828384-20261027/integration-20261028/ep4p-ep4ep8d-c256-20261029
@@ -132,7 +138,7 @@ EOF
     -e VLLM_HOST_IP="$NODE_IP" -e NCCL_SOCKET_IFNAME=enp115s0f1np1 \
     -e GLOO_SOCKET_IFNAME=enp115s0f1np1 -e NCCL_IB_HCA="$IB_HCA" \
     -e NCCL_IB_GID_INDEX=3 -e MC_GID_INDEX=3 -e NCCL_DEBUG=INFO \
-    -e VLLM_SERVER_DEV_MODE=1 -e VLLM_USE_V2_MODEL_RUNNER=1 -e VLLM_SM120_DSA_INDEXER=1 \
+    -e VLLM_SERVER_DEV_MODE=1 -e VLLM_USE_V2_MODEL_RUNNER=1 \
     -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
     -e MOONCAKE_CONFIG_PATH=/work/mooncake.json -e WITH_NVIDIA_PEERMEM=0 \
     -e VLLM_MOONCAKE_BOOTSTRAP_PORT="$BOOT" -e MALLOC_ARENA_MAX=2 \
