@@ -39,8 +39,7 @@ COPY sources-p/vllm/vllm/v1/core/sched/scheduler.py /usr/local/lib/python3.12/di
 COPY sources-p/vllm/vllm/v1/worker/gpu/model_runner.py /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_runner.py
 COPY sources-p/vllm/vllm/models/glm5next/nvidia/sparse_indexer.py /usr/local/lib/python3.12/dist-packages/vllm/models/glm5next/nvidia/sparse_indexer.py
 COPY sources-p/vllm/vllm/v1/attention/backends/mla/indexer.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/indexer.py
-COPY sources-p/flashinfer/flashinfer/dsa_indexer.py /usr/local/lib/python3.12/dist-packages/flashinfer/dsa_indexer.py
-RUN rm -f /usr/local/lib/python3.12/dist-packages/vllm/models/glm5next/nvidia/sm120_dsa_adapter.py /usr/local/lib/python3.12/dist-packages/vllm/models/glm5next/nvidia/sm120_dsa_prefill.py && rm -rf /usr/local/lib/python3.12/dist-packages/flashinfer/experimental/sm120_dsa_indexer /usr/local/lib/python3.12/dist-packages/vllm/models/glm5next/nvidia/__pycache__ /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/__pycache__ /usr/local/lib/python3.12/dist-packages/flashinfer/__pycache__
+RUN rm -f /usr/local/lib/python3.12/dist-packages/flashinfer/dsa_indexer.py /usr/local/lib/python3.12/dist-packages/vllm/models/glm5next/nvidia/sm120_dsa_adapter.py /usr/local/lib/python3.12/dist-packages/vllm/models/glm5next/nvidia/sm120_dsa_prefill.py && rm -rf /usr/local/lib/python3.12/dist-packages/flashinfer/experimental/sm120_dsa_indexer /usr/local/lib/python3.12/dist-packages/vllm/models/glm5next/nvidia/__pycache__ /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/__pycache__ /usr/local/lib/python3.12/dist-packages/flashinfer/__pycache__
 EOF
 docker build -f /tmp/Dockerfile.glm-p-only -t yyf-glm53flash:native-indexer-v4 .
 ~~~
