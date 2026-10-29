@@ -743,6 +743,18 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         self.counter_num_preempted_reqs = create_metric_per_engine(
             counter_num_preempted_reqs, per_engine_labelvalues
         )
+        phase_unavailable = self._counter_cls(
+            name="vllm:request_phase_metrics_unavailable",
+            documentation="Request phase samples without observed ordered milestones.",
+            labelnames=labelnames + ["phase"],
+        )
+        self.counter_phase_metrics_unavailable = {
+            phase: {
+                idx: phase_unavailable.labels(*labels, phase)
+                for idx, labels in per_engine_labelvalues.items()
+            }
+            for phase in ("queue", "prefill", "inference", "decode", "tpot")
+        }
 
         counter_prompt_tokens = self._counter_cls(
             name="vllm:prompt_tokens",
@@ -1293,18 +1305,37 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.histogram_e2e_time_request[engine_idx].observe(
                 finished_request.e2e_latency
             )
-            self.histogram_queue_time_request[engine_idx].observe(
-                finished_request.queued_time
-            )
-            self.histogram_prefill_time_request[engine_idx].observe(
-                finished_request.prefill_time
-            )
-            self.histogram_inference_time_request[engine_idx].observe(
-                finished_request.inference_time
-            )
-            self.histogram_decode_time_request[engine_idx].observe(
-                finished_request.decode_time
-            )
+            for phase, value, histogram in (
+                (
+                    "queue",
+                    finished_request.queued_time,
+                    self.histogram_queue_time_request,
+                ),
+                (
+                    "prefill",
+                    finished_request.prefill_time,
+                    self.histogram_prefill_time_request,
+                ),
+                (
+                    "inference",
+                    finished_request.inference_time,
+                    self.histogram_inference_time_request,
+                ),
+                (
+                    "decode",
+                    finished_request.decode_time,
+                    self.histogram_decode_time_request,
+                ),
+                (
+                    "tpot",
+                    finished_request.mean_time_per_output_token,
+                    self.histogram_request_time_per_output_token,
+                ),
+            ):
+                if value is None:
+                    self.counter_phase_metrics_unavailable[phase][engine_idx].inc()
+                else:
+                    histogram[engine_idx].observe(value)
             self.histogram_request_num_preemptions[engine_idx].observe(
                 finished_request.num_preemptions
             )
@@ -1320,9 +1351,6 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             )
             self.histogram_num_generation_tokens_request[engine_idx].observe(
                 finished_request.num_generation_tokens
-            )
-            self.histogram_request_time_per_output_token[engine_idx].observe(
-                finished_request.mean_time_per_output_token
             )
             if finished_request.max_tokens_param:
                 self.histogram_max_tokens_request[engine_idx].observe(
