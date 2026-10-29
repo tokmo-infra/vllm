@@ -9,6 +9,8 @@
 - **MLA / MTP**：合入 528 字节紧凑 KV 布局和能力检查下的 MTP 元数据复用。
 - **Router**：修复 D 请求预占负载计数，覆盖流式结束与取消；补充历史前缀及 usage 处理。
 - **源码与构建**：在 integrations/glm53flash 保存固定版本补丁、依赖清单和镜像构建方法。
-- **启动配置**：C230 三机 P、D、Router、Mooncake 的 CX8 命令统一整理在 integrations/glm53flash/DEPLOYMENT.md。
+- **启动配置**：C230 三机 P、D、Router、Mooncake 的 CX8 命令统一整理在 DEPLOYMENT-C230.md。
 
 配套 Router 源码位于 tokmo-infra/router，同名分支：vllm-0.32.0-0.1.16-glm5.3-flash。
+
+当前 C256：81 双 EP4 P、82 EP4 P + EP4 D、83/84 各 EP8 D，完整启动命令见 [DEPLOYMENT.md](DEPLOYMENT.md)。

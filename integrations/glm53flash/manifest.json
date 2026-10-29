@@ -345,15 +345,19 @@
   },
   "optional_P_only_experiment": {
     "path": "experiments/prefill-only.patch",
-    "sha256": "d8d8aa41fbe8920330456fd9935da82922abe44f25a9071d3c3215d6d551c909",
+    "sha256": "9388e3ca14002070852aa23804ceb0fc1dd70ba88702d41849556a9ac34a7ca5",
     "files": [
+      {
+        "path": "vllm/config/vllm.py",
+        "sha256": "771e695ce3da501112b05278db6caf733c6b18863fc56f230a9842b9fceaae5f"
+      },
       {
         "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py",
         "sha256": "edfbedb91fb6b536cc474e694c5f07e4c608aadec94257bbd93d532ac4b13f0e"
       },
       {
         "path": "vllm/models/glm5next/common/kda.py",
-        "sha256": "d78a6daf9ea12487f66e2f5dd24a78518ba30bc22f464dba48c2b9ff55f959df"
+        "sha256": "862ba2a0e5e2f8b6b2c14e18a67ac40dc4066abbff6dfacda031582536c9ece0"
       },
       {
         "path": "vllm/v1/core/sched/scheduler.py",
@@ -387,11 +391,21 @@
     "model_image": "sha256:33333ac91514dba29a27edc90a654b225231dd5b730bc68459e077fe2f9a2e57",
     "start_percent": 55,
     "complete_minutes": 12,
-    "Store_GiB": 2250
+    "Store_GiB": 2250,
+    "document": "DEPLOYMENT-C230.md"
   },
   "release_repositories": {
     "vllm": "https://github.com/tokmo-infra/vllm",
     "router": "https://github.com/tokmo-infra/router",
     "branch": "vllm-0.32.0-0.1.16-glm5.3-flash"
+  },
+  "current_deployment": {
+    "document": "DEPLOYMENT.md",
+    "case": "C256/U384/N384",
+    "topology": "P81 2xEP4; P82 EP4; D82 EP4; D83/D84 EP8 each",
+    "start_percent": 55,
+    "Store_GiB": 3000,
+    "P_only_DP_fixed_zero_proposals": true,
+    "P_load_recv_threads": 4
   }
 }

@@ -1,3 +1,38 @@
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -1064,6 +1064,31 @@
+         ):
+             return
+ 
++        # Constant-zero P-only proposals cannot diverge across DP ranks.
++        # Keep the native DP guard for every other speculative schedule.
++        schedule = speculative_config.num_speculative_tokens_per_batch_size
++        transfer = self.kv_transfer_config
++        fixed_zero_prefill = (
++            speculative_config.num_speculative_tokens == 3
++            and schedule is not None
++            and len(schedule) == 1
++            and schedule[0][0] == 1
++            and schedule[0][1] >= self.scheduler_config.max_num_seqs
++            and schedule[0][2] == 0
++            and transfer is not None
++            and any(
++                child.get("kv_connector") == "MooncakeConnector"
++                and child.get("kv_role") == "kv_producer"
++                and child.get("kv_connector_extra_config", {}).get(
++                    "prefill_only_target_state", False
++                ) is True
++                for child in transfer.kv_connector_extra_config.get("connectors", ())
++            )
++        )
++        if fixed_zero_prefill:
++            logger.info_once("GLM_P_DP_FIXED_ZERO_PROPOSALS enabled")
++            return
++
+         logger.warning_once(
+             "Dynamic speculative decoding is not supported with data "
+             "parallelism because data-parallel ranks can select different "
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
@@ -69,7 +104,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_conn
 diff --git a/vllm/models/glm5next/common/kda.py b/vllm/models/glm5next/common/kda.py
 --- a/vllm/models/glm5next/common/kda.py
 +++ b/vllm/models/glm5next/common/kda.py
-@@ -168,6 +168,29 @@
+@@ -168,6 +168,34 @@
      def get_kv_cache_spec(self, vllm_config: VllmConfig) -> MambaSpec:
          spec = super().get_kv_cache_spec(vllm_config)
          assert isinstance(spec, MambaSpec)
@@ -84,10 +119,15 @@ diff --git a/vllm/models/glm5next/common/kda.py b/vllm/models/glm5next/common/kd
 +        )
 +        if prefill_only:
 +            sd = vllm_config.speculative_config
-+            if (sd is None or sd.num_speculative_tokens != 3
-+                or sd.num_speculative_tokens_per_batch_size != [(1, 64, 0)]
-+                and sd.num_speculative_tokens_per_batch_size != [[1, 64, 0]]):
-+                raise ValueError("P target-state-only needs MTP3 with proposal budget0")
++            schedule = None if sd is None else sd.num_speculative_tokens_per_batch_size
++            if (
++                sd is None or sd.num_speculative_tokens != 3
++                or schedule is None or len(schedule) != 1
++                or schedule[0][0] != 1
++                or schedule[0][1] < vllm_config.scheduler_config.max_num_seqs
++                or schedule[0][2] != 0
++            ):
++                raise ValueError("P target-state-only needs MTP3 and fixed-zero proposals covering max_num_seqs")
 +            # Only target verification slots disappear. The MTP layer still
 +            # runs its full prefill; state shapes and precision do not change.
 +            spec = replace(spec, num_speculative_blocks=0)
