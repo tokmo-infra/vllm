@@ -7,6 +7,7 @@
 - **Mooncake 缓存**：增加分组紧凑存储、异步查找、混合前缀复用及编码隔离命名空间；匹配粒度 256，淘汰水位 98%。
 - **SM120 索引器**：回滚实验性融合 top-k 接入，Prefill / Decode 恢复原生路径。
 - **阶段计时**：取消请求缺少调度或首输出事件时，不再产生负排队时间及异常 prefill 时间；缺失阶段单独计数。
+- **Store 读租约**：仅对租约过期的 GET 项重新查询副本并读取一次；保留原始失败和重试指标，不调整租约时长。
 - **MLA / MTP**：合入 528 字节紧凑 KV 布局和能力检查下的 MTP 元数据复用。
 - **Router**：修复 D 请求预占负载计数，覆盖流式结束与取消；补充历史前缀及 usage 处理。
 - **源码与构建**：在 integrations/glm53flash 保存固定版本补丁、依赖清单和镜像构建方法。
@@ -14,4 +15,4 @@
 
 配套 Router 源码位于 tokmo-infra/router，同名分支：vllm-0.32.0-0.1.16-glm5.3-flash。
 
-当前 C288：81 双 EP4 P、82 EP4 P + EP4 D、83/84 各 EP8 D，完整启动命令见 [DEPLOYMENT.md](DEPLOYMENT.md)。
+当前 C230 对照：82 双 EP4 P、83/84 各 EP8 D，沿用 [DEPLOYMENT-C230.md](DEPLOYMENT-C230.md) 的模型参数，P 使用 API4、接收线程4，各端异步 lookup；使用原 SWE8w 轨迹。

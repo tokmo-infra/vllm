@@ -57,6 +57,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
     TailKeyBoundary,
     TPShardedStoreLayout,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.lease import (  # noqa: E501
+    LEASE_EXPIRED,
+    retry_expired_get_once,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.protocol import (  # noqa: E501
     LOOKUP_MSG,
     RESET_MSG,
@@ -1243,6 +1247,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         current_batch_keys: list[str] = key_list_c
         current_batch_block_ids: list[int] = block_id_list_c
         batch_bytes = 0
+        load_get_recorded = False
         try:
             for (
                 batch_keys,
@@ -1252,6 +1257,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             ) in load_batches:
                 current_batch_keys = batch_keys
                 current_batch_block_ids = batch_block_ids
+                load_get_recorded = False
                 batch_bytes = _sum_batch_bytes(batch_sizes)
                 tiers_by_key: dict[str, str] | None = None
                 if envs.VLLM_MOONCAKE_STORE_TIER_LOG:
@@ -1280,6 +1286,48 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     status="partial_failure" if failed else "ok",
                     num_failed_keys=len(failed),
                 )
+                load_get_recorded = True
+                expired = [i for i, value in enumerate(res) if value == LEASE_EXPIRED]
+                if expired:
+                    logger.warning(
+                        "Refreshing expired Mooncake read leases once for "
+                        "%d/%d keys of request %s",
+                        len(expired),
+                        len(batch_keys),
+                        req_id,
+                    )
+                    retry_start = time.perf_counter()
+                    retry_bytes = _sum_batch_bytes([batch_sizes[i] for i in expired])
+                    try:
+                        res = retry_expired_get_once(
+                            self.store, batch_keys, batch_addrs, batch_sizes, res
+                        )
+                    except Exception:
+                        self._record_operation(
+                            "load_get_retry",
+                            retry_start,
+                            len(expired),
+                            num_bytes=retry_bytes,
+                            status="error",
+                            num_failed_keys=len(expired),
+                        )
+                        raise
+                    remaining = sum(res[i] < 0 for i in expired)
+                    self._record_operation(
+                        "load_get_retry",
+                        retry_start,
+                        len(expired),
+                        num_bytes=retry_bytes,
+                        status="partial_failure" if remaining else "ok",
+                        num_failed_keys=remaining,
+                    )
+                    failed = [
+                        (key, value, block_id)
+                        for key, value, block_id in zip(
+                            batch_keys, res, batch_block_ids, strict=True
+                        )
+                        if value < 0
+                    ]
                 if failed:
                     self._report_load_error(
                         req_id, [block_id for _, _, block_id in failed]
@@ -1294,14 +1342,15 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     break
         except Exception as e:
             self._report_load_error(req_id, current_batch_block_ids)
-            self._record_operation(
-                "load_get",
-                load_get_start,
-                len(current_batch_keys),
-                num_bytes=batch_bytes,
-                status="error",
-                num_failed_keys=len(current_batch_keys),
-            )
+            if not load_get_recorded:
+                self._record_operation(
+                    "load_get",
+                    load_get_start,
+                    len(current_batch_keys),
+                    num_bytes=batch_bytes,
+                    status="error",
+                    num_failed_keys=len(current_batch_keys),
+                )
             logger.warning(
                 "Failed to get Mooncake sub-batch %s, error: %s",
                 current_batch_keys[:3],
