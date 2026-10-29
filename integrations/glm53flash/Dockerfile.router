@@ -1,0 +1,3 @@
+ARG ROUTER_BASE_IMAGE
+FROM ${ROUTER_BASE_IMAGE}
+COPY sources/router/target/release/libvllm_router_rs.so /opt/qwen38-router/vllm_router_rs.abi3.so

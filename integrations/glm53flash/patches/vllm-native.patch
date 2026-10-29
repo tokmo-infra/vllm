@@ -1,0 +1,435 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -497,6 +497,9 @@
+       )
+     endif()
+     FetchContent_MakeAvailable(cutlass)
++    # The image ships the complete headers but no CUTLASS CMake project.
++    set(CUTLASS_DIR "${VLLM_CUTLASS_SRC_DIR}")
++    include_directories("${CUTLASS_DIR}/include" "${CUTLASS_DIR}/tools/util/include")
+ 
+     list(APPEND VLLM_STABLE_EXT_SRC
+       "csrc/quantization/w8a8/cutlass/scaled_mm_entry.cu"
+@@ -1200,6 +1203,19 @@
+     endif()
+   endif()
+ 
++  # Preserve two original fat-binary schemas without changing SM120 dispatch.
++  if(VLLM_GPU_LANG STREQUAL "CUDA")
++    set(PRESERVED_FATBIN_SRCS
++      "csrc/kimi_k3/attn_res_kernel.cu"
++      "csrc/quantization/fp4/mxfp4_experts_quant.cu")
++    set_gencode_flags_for_srcs(SRCS "${PRESERVED_FATBIN_SRCS}" CUDA_ARCHS "10.0f")
++    set_property(SOURCE ${PRESERVED_FATBIN_SRCS} APPEND PROPERTY
++      COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--expt-extended-lambda;--use_fast_math>")
++    list(APPEND VLLM_STABLE_EXT_SRC ${PRESERVED_FATBIN_SRCS})
++    set_property(SOURCE "csrc/torch_bindings.cpp" APPEND PROPERTY
++      COMPILE_DEFINITIONS VLLM_ENABLE_KIMI_K3_ATTN_RES=1)
++  endif()
++
+   message(STATUS "Enabling C_stable extension.")
+   list(REMOVE_DUPLICATES VLLM_STABLE_EXT_SRC)
+   define_extension_target(
+@@ -1275,6 +1291,8 @@
+ endif()
+ 
+ #
++# Standalone rebuild: retain existing MoE and external extensions from image.
++return()
+ # _moe_C_stable_libtorch extension
+ #
+ 
+diff --git a/csrc/attention/mla/cutlass_sm100_mla/kernel/gather_tensor.hpp b/csrc/attention/mla/cutlass_sm100_mla/kernel/gather_tensor.hpp
+new file mode 100644
+--- /dev/null
++++ b/csrc/attention/mla/cutlass_sm100_mla/kernel/gather_tensor.hpp
+@@ -0,0 +1,215 @@
++/***************************************************************************************************
++ * Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ * SPDX-License-Identifier: BSD-3-Clause
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright notice, this
++ * list of conditions and the following disclaimer.
++ *
++ * 2. Redistributions in binary form must reproduce the above copyright notice,
++ * this list of conditions and the following disclaimer in the documentation
++ * and/or other materials provided with the distribution.
++ *
++ * 3. Neither the name of the copyright holder nor the names of its
++ * contributors may be used to endorse or promote products derived from
++ * this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
++ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
++ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ **************************************************************************************************/
++#pragma once
++
++#include "cute/layout.hpp"
++#include "cute/tensor.hpp"
++#include "cute/util/print.hpp"
++
++namespace example {
++
++using namespace cute;
++
++// Empty type used to disable gather/scatter for a GEMM argument
++struct NoGather
++{
++  template<class... Ts>
++  NoGather(Ts...) {};
++};
++
++/// Function object that applies an index to its argument
++template <class Index>
++struct IndexedGather
++{
++  CUTE_HOST_DEVICE constexpr
++  IndexedGather(Index const *indices = {}): indices_(indices) {}
++
++  template <typename I>
++  CUTE_HOST_DEVICE constexpr
++  Index
++  operator()(I i) const { return indices_[i]; }
++
++  CUTE_HOST_DEVICE friend
++  void
++  print(IndexedGather const &s) {
++    cute::print("Indexed");
++  }
++
++  Index const *indices_;
++};
++
++/// Function object that applies a stride to its argument
++/// Example: StridedFunc<int,_2> gathers every other row/column
++template <class Stride>
++struct StridedGather
++{
++  CUTE_HOST_DEVICE constexpr
++  StridedGather(Stride stride = {}): stride_(stride) {}
++
++  template <class I>
++  CUTE_HOST_DEVICE constexpr
++  auto
++  operator()(I i) const { return i * stride_; }
++
++  CUTE_HOST_DEVICE friend
++  void
++  print(StridedGather const &s) {
++    cute::print("Strided{");
++    print(s.stride_);
++    cute::print("}");
++  }
++
++  Stride stride_;
++};
++
++/// Custom stride object that applies a function followed by a stride
++template <class Func, class Stride>
++struct CustomStride
++{
++  CUTE_HOST_DEVICE constexpr
++  CustomStride(Func const &func, Stride const &stride): func_(func), stride_(stride) {}
++
++  template <class I>
++  CUTE_HOST_DEVICE constexpr friend
++  auto
++  operator*(I i, CustomStride const &s) { return s.func_(i) * s.stride_; }
++
++  template <class I>
++  CUTE_HOST_DEVICE constexpr friend
++  auto
++  operator*(CustomStride const &s, I i) { return s.func_(i) * s.stride_; }
++
++  CUTE_HOST_DEVICE friend
++  void
++  print(CustomStride const & s) {
++    cute::print("Custom{");
++    print(s.func_);
++    cute::print(",");
++    print(s.stride_);
++    cute::print("}");
++  }
++
++  template<class Div>
++  CUTE_HOST_DEVICE constexpr friend
++  auto
++  safe_div(CustomStride const &s, Div const &div)
++  {
++    return CustomStride<Func, decltype(safe_div(s.stride_, div))>(s.func_, safe_div(s.stride_, div));
++  }
++
++  // Circumvent the requirement on make_layout that shape and stride are integral
++  template <class Shape>
++  CUTE_HOST_DEVICE constexpr friend
++  auto
++  make_layout(Shape const &shape, CustomStride const &stride)
++  {
++    return Layout<Shape, CustomStride>(shape, stride);
++  }
++
++  Func func_;
++  Stride stride_;
++};
++
++template<class Stride, class Func>
++CUTLASS_HOST_DEVICE
++auto
++make_custom_stride_layout(Stride const &stride, Func&& func)
++{
++  // Use a dummy shape and replace the first non-unit stride with a custom gather stride
++  auto idx = find_if(stride, [](auto x){ return not is_constant<1, decltype(x)>{}; });
++  constexpr int I = decltype(idx)::value;
++  return make_layout(repeat_like(stride, _1{}),
++                     replace<I>(stride, CustomStride{static_cast<Func&&>(func), get<I>(stride)}));
++}
++
++/// Helper function to optionally create a gather tensor
++template<class Iterator, class Shape, class Stride, class Func>
++CUTLASS_HOST_DEVICE
++auto
++make_gather_tensor(Iterator iter, Shape const &shape, Stride const &stride, Func &&func)
++{
++  if constexpr (not cutlass::platform::is_same<remove_cvref_t<Func>, NoGather>::value) {
++    Layout matrix_layout = make_identity_layout(shape);
++    auto offset = as_arithmetic_tuple(repeat_like(shape, _0{}));
++    Layout gather_layout = make_custom_stride_layout(stride, static_cast<Func&&>(func));
++    return make_tensor(iter, ComposedLayout{gather_layout, offset, matrix_layout});
++  } else {
++    return make_tensor(iter, shape, stride);
++  }
++}
++
++} // namespace example
++
++namespace cute
++{
++
++template<int N, int I, class Shape, class Stride>
++CUTE_HOST_DEVICE constexpr
++auto
++upcast(Shape const& shape, Stride const& stride)
++{
++  if constexpr (is_tuple<Shape>::value) {
++    return transform_layout(shape, stride, [](auto const& s, auto const& d) { return upcast<N,I>(s,d); });
++  } else if constexpr (is_scaled_basis<Stride>::value) {
++    if constexpr (Stride::mode() == I) {
++      return make_layout(ceil_div(shape, Int<N>{}), ceil_div(stride, Int<N>{}));
++    } else {
++      return make_layout(shape, stride);
++    }
++  } else {
++    return upcast<N>(shape, stride);
++  }
++
++  CUTE_GCC_UNREACHABLE;
++}
++
++template <int N, class OuterShape, class OuterStride, class Offset, class Shape, class Stride>
++CUTE_HOST_DEVICE constexpr
++auto
++upcast(ComposedLayout<Layout<OuterShape,OuterStride>,Offset,Layout<Shape,Stride>> const& layout)
++{
++  // Find index of the stride-1 mode - that is the only one that requires updating inner shape and offset
++  auto idx = find_if(layout.layout_a().stride(), [](auto x){ return is_constant<1, decltype(x)>{}; });
++  constexpr int I = decltype(idx)::value;
++
++  // Upcast the outer layout (works as expected)
++  auto outer = upcast<N>(layout.layout_a());
++
++  // Upcast the accumulated offset along stride-1 mode
++  auto offset = as_arithmetic_tuple(replace<I>(layout.offset(), upcast<N>(get<I>(layout.offset()))));
++
++  // Upcast the inner layout's shape along stride-1 mode
++  auto inner = upcast<N,I>(layout.layout_b().shape(), layout.layout_b().stride());
++
++  return composition(outer, offset, inner);
++}
++
++} // namespace example
+diff --git a/csrc/cache_kernels.cu b/csrc/cache_kernels.cu
+--- a/csrc/cache_kernels.cu
++++ b/csrc/cache_kernels.cu
+@@ -410,7 +410,8 @@
+   }
+ }
+ 
+-template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
++template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt,
++          bool skip_scale>
+ __global__ void concat_and_cache_mla_kernel(
+     const scalar_t* __restrict__ kv_c,  // [num_tokens, kv_lora_rank]
+     const scalar_t* __restrict__ k_pe,  // [num_tokens, pe_dim]
+@@ -443,6 +444,9 @@
+           block_idx * block_stride + block_offset * entry_stride + i + offset;
+       if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
+         dst[dst_idx] = src[src_idx];
++      } else if constexpr (skip_scale) {
++        dst[dst_idx] =
++            fp8::scaled_convert<cache_t, scalar_t, kv_dt>(src[src_idx], 1.0f);
+       } else {
+         dst[dst_idx] =
+             fp8::scaled_convert<cache_t, scalar_t, kv_dt>(src[src_idx], *scale);
+@@ -526,6 +530,7 @@
+     const int kv_lora_rank,                    //
+     const int pe_dim,                          //
+     const int block_size,                      //
++    const bool has_rope_tail,                  //
+     const float* scale                         //
+ ) {
+   const int64_t token_idx = blockIdx.x;
+@@ -542,15 +547,15 @@
+   // For the NoPE part, each tile of 128 elements is handled by half of one warp
+   // (16 threads). There are 4 total tiles, so 2 warps (64 threads).
+   // Lanes 0 and 16 of each warp write the scale values for that warp's tiles.
+-  // The RoPE part (last 64 elements) is handled by another 1 warp (32 threads).
++  // The optional RoPE tail is handled by another 1 warp (32 threads).
+   // So in total, we use 3 warps (96 threads) per block.
+ 
+-  // Cast kv_cache to 16_bit for RoPE values
+-  scalar_t* kv_cache_16bit =
+-      reinterpret_cast<scalar_t*>(&kv_cache[dst_idx_start]);
+-
+-  // Zero the reserved RoPE tail for NoPE rows.
+   if (threadIdx.x >= 64) {
++    if (!has_rope_tail) {
++      return;
++    }
++    scalar_t* kv_cache_16bit =
++        reinterpret_cast<scalar_t*>(&kv_cache[dst_idx_start]);
+     // Each thread handles two elements of RoPE
+     const int8_t pe_idx_start = (threadIdx.x - 64) * 2;
+     // RoPE values start after the packed 8-bit NoPE values and the
+@@ -891,8 +896,8 @@
+ // KV_T is the data type of key and value tensors.
+ // CACHE_T is the stored data type of kv-cache.
+ // KV_DTYPE is the real data type of kv-cache.
+-#define CALL_CONCAT_AND_CACHE_MLA(KV_T, CACHE_T, KV_DTYPE)                    \
+-  vllm::concat_and_cache_mla_kernel<KV_T, CACHE_T, KV_DTYPE>                  \
++#define LAUNCH_CONCAT_AND_CACHE_MLA(KV_T, CACHE_T, KV_DTYPE, SKIP_SCALE)      \
++  vllm::concat_and_cache_mla_kernel<KV_T, CACHE_T, KV_DTYPE, SKIP_SCALE>      \
+       <<<grid, block, 0, stream>>>(                                           \
+           reinterpret_cast<KV_T*>(kv_c.data_ptr()),                           \
+           reinterpret_cast<KV_T*>(k_pe.data_ptr()),                           \
+@@ -900,6 +905,13 @@
+           slot_mapping.const_data_ptr<int64_t>(), block_stride, entry_stride, \
+           kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size,         \
+           reinterpret_cast<const float*>(scale.data_ptr()));
++
++#define CALL_CONCAT_AND_CACHE_MLA(KV_T, CACHE_T, KV_DTYPE)      \
++  if (skip_scale) {                                             \
++    LAUNCH_CONCAT_AND_CACHE_MLA(KV_T, CACHE_T, KV_DTYPE, true)  \
++  } else {                                                      \
++    LAUNCH_CONCAT_AND_CACHE_MLA(KV_T, CACHE_T, KV_DTYPE, false) \
++  }
+ 
+ // KV_T is the data type of key and value tensors.
+ // CACHE_T is the stored data type of kv-cache.
+@@ -911,7 +923,7 @@
+           reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),                    \
+           slot_mapping.const_data_ptr<int64_t>(), block_stride, entry_stride, \
+           kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size,         \
+-          reinterpret_cast<const float*>(scale.data_ptr()));
++          has_rope_tail, reinterpret_cast<const float*>(scale.data_ptr()));
+ 
+ void concat_and_cache_mla(
+     torch::stable::Tensor& kv_c,      // [num_tokens, kv_lora_rank]
+@@ -919,7 +931,8 @@
+     torch::stable::Tensor& kv_cache,  // [num_blocks, block_size, (kv_lora_rank
+                                       // + pe_dim)]
+     torch::stable::Tensor& slot_mapping,  // [num_tokens] or [num_actual_tokens]
+-    const std::string& kv_cache_dtype, torch::stable::Tensor& scale) {
++    const std::string& kv_cache_dtype, torch::stable::Tensor& scale,
++    bool skip_scale) {
+   // NOTE(woosuk): In vLLM V1, key.size(0) can be different from
+   // slot_mapping.size(0) because of padding for CUDA graphs.
+   // In vLLM V0, key.size(0) is always equal to slot_mapping.size(0) because
+@@ -934,6 +947,8 @@
+   int kv_lora_rank = kv_c.size(1);
+   int pe_dim = k_pe.size(1);
+   int block_size = kv_cache.size(1);
++  const int64_t row_bytes = kv_cache.size(2) * kv_cache.element_size();
++  const bool has_rope_tail = row_bytes == 656;
+ 
+   const bool is_nvfp4_ds_mla = kv_cache_dtype == "nvfp4_ds_mla";
+   if (kv_cache_dtype == "fp8_ds_mla") {
+@@ -941,8 +956,9 @@
+                     "kv_lora_rank must be 512 for fp8_ds_mla");
+     STD_TORCH_CHECK(pe_dim == 64 || pe_dim == 0,
+                     "pe_dim must be 64 or 0 for fp8_ds_mla");
+-    STD_TORCH_CHECK(kv_cache.size(2) == 656 / kv_cache.element_size(),
+-                    "kv_cache.size(2) must be 656 bytes for fp8_ds_mla");
++    STD_TORCH_CHECK(has_rope_tail || (pe_dim == 0 && row_bytes == 528),
++                    "fp8_ds_mla requires 656-byte rows, or 528-byte rows with "
++                    "pe_dim == 0");
+     STD_TORCH_CHECK(kv_c.element_size() == 2,
+                     "kv_c.element_size() must be 2 for fp8_ds_mla");
+     STD_TORCH_CHECK(k_pe.element_size() == 2,
+@@ -980,8 +996,8 @@
+     // For the NoPE part, each tile of 128 elements is handled by half of one
+     // warp (16 threads). There are 4 total tiles, so 2 warps (64 threads).
+     // Lanes 0 and 16 of each warp write the scale values for that warp's tiles.
+-    // The RoPE part (last 64 elements) is handled by another 1 warp (32
+-    // threads). So in total, we use 3 warps (96 threads) per block.
++    // The optional RoPE tail is handled by another 1 warp (32 threads).
++    // So in total, we use 3 warps (96 threads) per block.
+     dim3 block(96);
+     DISPATCH_BY_KV_CACHE_DTYPE(kv_c.scalar_type(), kv_cache_dtype,
+                                CALL_CONCAT_AND_CACHE_DS_MLA);
+@@ -1011,6 +1027,9 @@
+   }
+ }
+ 
++#undef CALL_CONCAT_AND_CACHE_MLA
++#undef LAUNCH_CONCAT_AND_CACHE_MLA
++
+ void concat_and_cache_mla_grouped(
+     torch::stable::Tensor& kv_c,  // [num_layers, num_tokens, kv_lora_rank]
+     torch::stable::Tensor& k_pe,  // [num_layers, num_tokens, pe_dim]
+@@ -1803,6 +1822,8 @@
+   STD_TORCH_CHECK(dst.scalar_type() == torch::headeronly::ScalarType::BFloat16,
+                   "dst must be bfloat16");
+   STD_TORCH_CHECK(head_dim == 576, "head_dim must be 576 for MLA");
++  STD_TORCH_CHECK(src_cache.size(2) * src_cache.element_size() >= 656,
++                  "src_cache rows must contain at least 656 bytes for MLA");
+ 
+   int64_t block_table_stride = block_table.stride(0);
+   int64_t cache_block_stride = src_cache.stride(0);
+diff --git a/csrc/ops.h b/csrc/ops.h
+--- a/csrc/ops.h
++++ b/csrc/ops.h
+@@ -663,7 +663,7 @@
+                           torch::stable::Tensor& kv_cache,
+                           torch::stable::Tensor& slot_mapping,
+                           const std::string& kv_cache_dtype,
+-                          torch::stable::Tensor& scale);
++                          torch::stable::Tensor& scale, bool skip_scale);
+ 
+ void concat_and_cache_mla_grouped(
+     torch::stable::Tensor& kv_c, torch::stable::Tensor& k_pe,
+diff --git a/csrc/torch_bindings.cpp b/csrc/torch_bindings.cpp
+--- a/csrc/torch_bindings.cpp
++++ b/csrc/torch_bindings.cpp
+@@ -972,7 +972,8 @@
+       "                     Tensor! kv_cache,"
+       "                     Tensor slot_mapping,"
+       "                     str kv_cache_dtype,"
+-      "                     Tensor scale) -> ()");
++      "                     Tensor scale,"
++      "                     bool skip_scale=False) -> ()");
+ 
+   // Grouped concat_and_cache_mla across all layers. Each layer's cache base
+   // pointer and optional plain-FP8 scale are read from device tensors.

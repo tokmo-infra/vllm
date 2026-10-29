@@ -1,0 +1,3245 @@
+diff --git a/vllm/_custom_ops.py b/vllm/_custom_ops.py
+--- a/vllm/_custom_ops.py
++++ b/vllm/_custom_ops.py
+@@ -2747,9 +2747,10 @@
+     slot_mapping: torch.Tensor,
+     kv_cache_dtype: str,
+     scale: torch.Tensor,
++    skip_scale: bool = False,
+ ) -> None:
+     torch.ops._C_cache_ops.concat_and_cache_mla(
+-        kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
++        kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale, skip_scale
+     )
+ 
+ 
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -1828,7 +1828,7 @@
+                     "--no-scheduler-reserve-full-isl."
+                 )
+             if self.model_config is not None and not hasattr(
+-                self.model_config.hf_config, "index_topk"
++                self.model_config.hf_text_config, "index_topk"
+             ):
+                 raise ValueError(
+                     "HiSparse is only supported for DSA models with index_topk."
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/base.py b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/base.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+@@ -532,6 +532,14 @@
+         """
+         pass
+ 
++    def get_divergent_matched_tokens(
++        self, request: "Request", num_computed_tokens: int
++    ) -> tuple[int | None, bool]:
++        """Look up a hit that can restore state at a divergent local boundary."""
++        if not self.supports_divergent_local_hybrid_hits:
++            return 0, False
++        return self.get_num_new_matched_tokens(request, num_computed_tokens)
++
+     def get_external_cache_hit_sources(
+         self,
+         request: "Request",
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/hisparse/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/hisparse/worker.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/hisparse/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/hisparse/worker.py
+@@ -302,6 +302,7 @@
+         )
+         self._dma_submitted = False
+         self._per_layer_mirrored: set[int] = set()
++        self._in_step = False
+         self._submitted_mirror_layers: set[int] = set()
+         self._layer_ready_events = tuple(torch.Event() for _ in cache_handles)
+         self._forward_ready_event = torch.Event()
+@@ -427,6 +428,7 @@
+             self._slot_mapping_staging.candidates = mirrors
+         self._set_row_mirrors(mirrors)
+         self._clear_forward_mirror_state()
++        self._in_step = True
+         for handle in self.cache_handles:
+             handle.all_context_pages_resident = metadata.all_context_pages_resident
+         self._copy_host_blocks(metadata.host_block_copies, previous_host_write_event)
+@@ -712,7 +714,7 @@
+ 
+     def _enqueue_layer_mirror(self, layer_index: int) -> None:
+         handle = self.cache_handles[layer_index]
+-        if not handle.host_mirror_required:
++        if not self._in_step or not handle.host_mirror_required:
+             return
+         if layer_index in self._per_layer_mirrored:
+             raise RuntimeError(f"HiSparse layer {layer_index} mirrored twice.")
+@@ -916,6 +918,7 @@
+         compute_stream = current_stream()
+         self._forward_ready_event.record()
+         self._finish_mirror_phase(self._forward_ready_event)
++        self._in_step = False
+         if self.is_host_writer:
+             if self._dma_submitted:
+                 compute_stream.wait_event(self.host_write_event)
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/fp8_wire.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/fp8_wire.py
+new file mode 100644
+--- /dev/null
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/fp8_wire.py
+@@ -0,0 +1,35 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Lossless FP8 NoPE512 wire -> GLM packed-MLA import.
++
++The source contains static-scale E4M3 bytes. GLM's packed reader accepts four
++arbitrary FP32 dequantization scales per row. Preserve the 512 bytes and repeat
++the producer's actual scale; do not requantize or assume scale == 1.
++"""
++import math
++import torch
++
++
++def import_fp8_nope512_blocks(cache, block_ids, scale, scratch=None):
++    if cache.ndim == 4 and cache.shape[1] == 1:
++        cache = cache[:, 0]
++    if cache.dtype != torch.uint8 or cache.ndim != 3 or cache.shape[-1] != 528:
++        raise ValueError('FP8 wire bridge requires uint8 [block,row,528]')
++    if cache.stride(1) != 528 or cache.stride(2) != 1:
++        raise ValueError('FP8 wire bridge requires contiguous rows inside each page')
++    if not math.isfinite(scale) or scale <= 0:
++        raise ValueError('invalid producer FP8 dequantization scale')
++    rows = cache.shape[1]
++    if scratch is None:
++        scratch = torch.empty((rows, 512), dtype=torch.uint8, device=cache.device)
++    if scratch.shape != (rows, 512) or scratch.device != cache.device:
++        raise ValueError('wire scratch shape/device mismatch')
++    for block in sorted(set(block_ids)):
++        if not 0 <= block < cache.shape[0]:
++            raise ValueError('wire destination block out of range')
++        page = cache[block]
++        # RDMA wrote a contiguous rows*512-byte source payload at this address.
++        # Stage BEFORE expanding, otherwise later input rows would be clobbered.
++        scratch.copy_(page.view(-1)[:rows * 512].view(rows, 512))
++        page[:, :512].copy_(scratch)
++        page[:, 512:].view(torch.float32).fill_(scale)
++    return scratch
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
+@@ -35,13 +35,19 @@
+     KVConnectorTransferResults,
+     SupportsHMA,
+ )
+-from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
++from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
++    KVConnectorPromMetrics,
++    KVConnectorStats,
++    PromMetric,
++    PromMetricT,
++)
+ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
+     MooncakeBootstrapServer,
+     RegisterWorkerPayload,
+ )
+ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
+     MooncakeKVConnectorStats,
++    MooncakePromMetrics,
+ )
+ from vllm.distributed.parallel_state import (
+     get_pp_group,
+@@ -137,6 +143,19 @@
+         "Transfer region references a missing KV group."
+     )
+     return list(block_ids_by_group[group_index])
++
++
++def _contiguous_runs(
++    src_ids: np.ndarray, dst_ids: np.ndarray
++) -> tuple[np.ndarray, np.ndarray]:
++    """Start index and length of each run that steps by +1 on both sides."""
++    assert len(src_ids) == len(dst_ids), "Source and destination ids must pair up."
++    if len(src_ids) == 0:
++        empty = np.empty(0, dtype=np.int64)
++        return empty, empty
++    breaks = np.flatnonzero((np.diff(src_ids) != 1) | (np.diff(dst_ids) != 1)) + 1
++    starts = np.concatenate(([0], breaks))
++    return starts, np.diff(np.append(starts, len(src_ids)))
+ 
+ 
+ def _get_tp_ratio(local_tp_size: int, remote_tp_size: int) -> int:
+@@ -622,6 +641,7 @@
+     # peer did not send the field, so the run must not be promoted.
+     registered_row_offsets: list[int] = msgspec.field(default_factory=list)
+     remote_pp_size: int = 1
++    mla_wire_format: str = ""
+ 
+ 
+ class MooncakeXferResponseStatus(IntEnum):
+@@ -641,6 +661,7 @@
+     ok_reqs: list[ReqId] | None = None
+     err_reqs: list[ReqId] | None = None
+     err_msg: str | None = None
++    mla_source_scales: dict[str, float] | None = None
+ 
+ 
+ @dataclass
+@@ -703,6 +724,14 @@
+ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
+     _cache_hit_source = CacheHitSource.P2P
+ 
++    @property
++    def supports_divergent_local_hybrid_hits(self) -> bool:
++        # A decode pulls the unhashed blocks of every transfer group, so the
++        # recurrent-state slot arrives even when the attention prefix is local.
++        # Roles that prefill locally keep the lookup that finds the shared
++        # prefix boundary.
++        return self._pulls_mamba_state
++
+     def __init__(
+         self,
+         vllm_config: VllmConfig,
+@@ -714,6 +743,13 @@
+         assert vllm_config.kv_transfer_config is not None
+         assert vllm_config.kv_transfer_config.engine_id is not None
+         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
++        self._pulls_mamba_state = (
++            vllm_config.kv_transfer_config.kv_role == "kv_consumer"
++            and any(
++                isinstance(group.kv_cache_spec, MambaSpec)
++                for group in kv_cache_config.transfer_groups
++            )
++        )
+ 
+         if role == KVConnectorRole.SCHEDULER:
+             assert kv_cache_config is not None, (
+@@ -863,6 +899,18 @@
+         cls, data: dict[str, Any] | None = None
+     ) -> KVConnectorStats | None:
+         return MooncakeKVConnectorStats(data=data or {})
++
++    @classmethod
++    def build_prom_metrics(
++        cls,
++        vllm_config: VllmConfig,
++        metric_types: dict[type[PromMetric], type[PromMetricT]],
++        labelnames: list[str],
++        per_engine_labelvalues: dict[int, list[object]],
++    ) -> KVConnectorPromMetrics:
++        return MooncakePromMetrics(
++            vllm_config, metric_types, labelnames, per_engine_labelvalues
++        )
+ 
+ 
+ class MooncakeConnectorScheduler:
+@@ -1181,6 +1229,12 @@
+         logger.info("Initializing Mooncake Transfer Engine worker %s", engine_id)
+ 
+         self.vllm_config = vllm_config
++        self._fp8_wire_bridge = (
++            vllm_config.kv_transfer_config.kv_connector_extra_config.get(
++                "fp8_nope512_pd_bridge", False) is True
++        )
++        self._mla_wire_scales: dict[str, float] = {}
++        self._mla_pending_import: dict[str, tuple[list[list[int]], dict[str, float]]] = {}
+         # Capture device BEFORE TransferEngine init — MNNVL's NVLink allocator
+         # may change the current CUDA device during engine.initialize().
+         self.device_id = torch.accelerator.current_device_index()
+@@ -1561,6 +1615,11 @@
+             )
+             await sock.send_multipart((identity, self._encoder.encode(response)))
+             return
++        if meta.mla_wire_format:
++            if (meta.mla_wire_format != "static_fp8_nope512_v1"
++                    or not self._fp8_wire_bridge or not self._mla_wire_scales
++                    or self.tp_size != 1 or self.pp_size != 1):
++                raise ValueError("Unsupported Mooncake FP8 wire encoding/topology")
+         for d_req_id, (transfer_id, _) in meta.req_blocks.items():
+             if transfer_id not in self.reqs_need_send:
+                 # This req is not enqueued in P side yet, create it here.
+@@ -1689,6 +1748,7 @@
+ 
+             response = MooncakeXferResponse(
+                 status=response_status,
++                mla_source_scales=(self._mla_wire_scales if meta.mla_wire_format else None),
+                 ok_reqs=[d_req_id for d_req_id, _ in ok_ready_reqs] or None,
+                 err_reqs=err_reqs or None,
+                 err_msg=err_msg,
+@@ -1833,6 +1893,17 @@
+             if not any(local_block_ids_by_group):
+                 continue
+ 
++            # Normalize before kernel expansion so _contiguous_runs can
++            # coalesce the resulting ascending kernel runs.
++            for group_index, (local_group, remote_group) in enumerate(
++                zip(local_block_ids_by_group, remote_block_ids_by_group)
++            ):
++                if local_group:
++                    (
++                        local_block_ids_by_group[group_index],
++                        remote_block_ids_by_group[group_index],
++                    ) = _normalize_paired_block_order(local_group, remote_group)
++
+             local_block_ids_by_group = self._logical_to_kernel_block_ids(
+                 local_block_ids_by_group
+             )
+@@ -1840,28 +1911,40 @@
+                 remote_block_ids_by_group
+             )
+ 
++            # Regions of the same KV group share block ids; group them once.
++            block_runs: dict[tuple[int, tuple[int, ...]], tuple[np.ndarray, ...]] = {}
+             for local_region, remote_region in zip(local_regions, remote_regions):
+                 assert local_region.group_index == remote_region.group_index, (
+                     "Aligned Mooncake transfer regions must belong to the same "
+                     "KV group."
+                 )
+-                local_block_ids = _block_ids_for_region(
+-                    local_block_ids_by_group,
+-                    local_region.group_index,
+-                    local_region.shared_group_ids,
+-                )
+-                remote_block_ids = _block_ids_for_region(
+-                    remote_block_ids_by_group,
+-                    remote_region.group_index,
+-                    local_region.shared_group_ids,
+-                )
+-                if not local_block_ids:
++                group_key = (local_region.group_index, local_region.shared_group_ids)
++                if group_key not in block_runs:
++                    local_ids = np.asarray(
++                        _block_ids_for_region(
++                            local_block_ids_by_group,
++                            local_region.group_index,
++                            local_region.shared_group_ids,
++                        ),
++                        dtype=np.int64,
++                    )
++                    remote_ids = np.asarray(
++                        _block_ids_for_region(
++                            remote_block_ids_by_group,
++                            remote_region.group_index,
++                            local_region.shared_group_ids,
++                        ),
++                        dtype=np.int64,
++                    )
++                    block_runs[group_key] = (
++                        local_ids,
++                        remote_ids,
++                        *_contiguous_runs(local_ids, remote_ids),
++                    )
++                local_ids, remote_ids, run_starts, run_lens = block_runs[group_key]
++                if len(local_ids) == 0:
+                     continue
+ 
+-                # Group by indices within this region's KV-cache group only.
+-                group_local_block_ids, group_remote_block_ids = (
+-                    group_concurrent_contiguous(local_block_ids, remote_block_ids)
+-                )
+                 (
+                     should_transfer,
+                     src_region_offset,
+@@ -1897,36 +1980,24 @@
+                     transfer_len=transfer_len,
+                 )
+ 
+-                for group_local_block_id, group_remote_block_id in zip(
+-                    group_local_block_ids, group_remote_block_ids
+-                ):
+-                    if can_coalesce:
+-                        src_ptrs.append(
+-                            local_region.base_addr
+-                            + group_local_block_id[0] * local_region.block_len
+-                            + src_region_offset
+-                        )
+-                        dst_ptrs.append(
+-                            remote_region.base_addr
+-                            + group_remote_block_id[0] * remote_region.block_len
+-                            + dst_region_offset
+-                        )
+-                        lengths.append(transfer_len * len(group_local_block_id))
+-                    else:
+-                        for local_block_id, remote_block_id in zip(
+-                            group_local_block_id, group_remote_block_id
+-                        ):
+-                            src_ptrs.append(
+-                                local_region.base_addr
+-                                + local_block_id * local_region.block_len
+-                                + src_region_offset
+-                            )
+-                            dst_ptrs.append(
+-                                remote_region.base_addr
+-                                + remote_block_id * remote_region.block_len
+-                                + dst_region_offset
+-                            )
+-                            lengths.append(transfer_len)
++                if can_coalesce:
++                    local_ids = local_ids[run_starts]
++                    remote_ids = remote_ids[run_starts]
++                    lengths.extend((run_lens * transfer_len).tolist())
++                else:
++                    lengths.extend([transfer_len] * len(local_ids))
++                src_ptrs.extend(
++                    (
++                        local_ids * local_region.block_len
++                        + (local_region.base_addr + src_region_offset)
++                    ).tolist()
++                )
++                dst_ptrs.extend(
++                    (
++                        remote_ids * remote_region.block_len
++                        + (remote_region.base_addr + dst_region_offset)
++                    ).tolist()
++                )
+ 
+             logger.debug(
+                 "Sending kv_caches for request %s (%d blocks) to %s",
+@@ -2177,6 +2248,8 @@
+             raise RuntimeError("Mooncake batch memory registration failed.")
+ 
+         self.device_kv_caches = kv_caches
++        if self._fp8_wire_bridge:
++            self._register_fp8_wire_bridge(kv_caches)
+         logger.debug(
+             "registered block_lens=%s kv_block_lens=%s",
+             self.block_len_per_layer,
+@@ -2210,6 +2283,63 @@
+                     "Mooncake sender listener did not become ready within "
+                     f"{ready_timeout:.0f}s."
+                 )
++
++    def _register_fp8_wire_bridge(self, kv_caches):
++        if self.tp_size != 1 or self.pp_size != 1:
++            raise ValueError("FP8 wire bridge currently supports TP1/PP1 only")
++        hf = self.model_config.hf_text_config
++        if hf.kv_lora_rank != 512 or hf.qk_rope_head_dim != 0:
++            raise ValueError("FP8 wire bridge only supports GLM NoPE512")
++        context = self.vllm_config.compilation_config.static_forward_context
++        for name, cache in kv_caches.items():
++            spec = self._layer_specs.get(name)
++            if (not isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
++                    or spec.head_size != 512):
++                continue  # Indexer also has an MLA spec, but head_size=128.
++            if cache.ndim == 4 and cache.shape[1] == 1:
++                cache = cache[:, 0]  # Registered MLA tensors retain a singleton KV head.
++            if cache.ndim != 3 or not cache[0].is_contiguous():
++                raise ValueError(f"Unsupported FP8 wire cache view: {name} {cache.shape}")
++            if self.is_kv_producer:
++                if cache.shape[-1] != 512 or spec.cache_dtype_str not in ("fp8", "fp8_e4m3"):
++                    raise ValueError(f"Producer is not standard NoPE512 FP8: {name}")
++                self._mla_wire_scales[name] = float(context[name]._k_scale_float)
++            elif self.is_kv_consumer:
++                if cache.dtype != torch.uint8 or cache.shape[-1] != 528 or spec.cache_dtype_str != "fp8_ds_mla":
++                    raise ValueError(f"Consumer is not GLM packed NoPE528 FP8: {name}")
++                indices = [i for i, n in enumerate(self.registered_layer_names) if n == name]
++                if len(indices) != 1:
++                    raise ValueError(f"FP8 wire bridge needs named per-layer regions: {name}")
++                i = indices[0]
++                if self.registered_group_indices[i] < 0:
++                    raise ValueError("FP8 wire bridge cannot use opaque shared-group regions")
++                self.kv_block_len_per_layer[i] = cache.shape[1] * 512
++        if not any(isinstance(x, MLAAttentionSpec) for x in self._layer_specs.values()):
++            raise ValueError("FP8 wire bridge found no MLA cache")
++        logger.info("FP8 NoPE512 wire bridge registered: role=%s producer_scales=%s",
++                    "producer" if self.is_kv_producer else "consumer", self._mla_wire_scales)
++
++    def _import_finished_fp8_wire(self, req_ids):
++        from .fp8_wire import import_fp8_nope512_blocks
++        scratch = None
++        converted = 0
++        for req_id in req_ids:
++            pending = self._mla_pending_import.pop(req_id, None)
++            if pending is None:  # Failed receives have no successful import pending.
++                continue
++            blocks, scales = pending
++            for name, scale in scales.items():
++                group = self.kv_cache_config.transfer_group_index_by_layer[name]
++                ids = blocks[group]
++                if ids:
++                    scratch = import_fp8_nope512_blocks(
++                        self.device_kv_caches[name], ids, scale, scratch)
++                    converted += len(ids)
++        if converted:
++            # This runs in the worker thread, after RDMA completion and before
++            # reporting readiness. GPU work must finish before scheduler reuse.
++            torch.cuda.current_stream(self.device_id).synchronize()
++            logger.debug("FP8 wire import completed: %s layer-pages", converted)
+ 
+     async def fetch_finished_recving_reqs(self) -> set[ReqId]:
+         finished_recving_reqs = self.finished_recving_reqs
+@@ -2264,6 +2394,8 @@
+ 
+         finished_recving_reqs = recv_fut.result() if recv_fut else set()
+         finished_sending_reqs = send_fut.result() if send_fut else set()
++        if self._fp8_wire_bridge and self.is_kv_consumer and finished_recving_reqs:
++            self._import_finished_fp8_wire(finished_recving_reqs)
+ 
+         if finished_sending_reqs or finished_recving_reqs:
+             logger.debug(
+@@ -2331,6 +2463,8 @@
+                 list(groups) for groups in self.region_shared_groups
+             ],
+             registered_row_offsets=self.region_row_offsets,
++            mla_wire_format=("static_fp8_nope512_v1"
++                             if self._fp8_wire_bridge and self.is_kv_consumer else ""),
+         )
+ 
+         encoded_data = self._encoder.encode(metadata)
+@@ -2430,6 +2564,16 @@
+             # Empty pulls only release the producer's blocks; the consumer
+             # did not enter WAITING_FOR_REMOTE_KVS.
+             if pull_meta.pull_tasks_count == 0 and any(pull_meta.local_block_ids):
++                if self._fp8_wire_bridge and self.is_kv_consumer:
++                    expected = {n for n, spec in self._layer_specs.items()
++                                if isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
++                                and spec.head_size == 512}
++                    if not response.mla_source_scales or set(response.mla_source_scales) != expected:
++                        self._handle_failed_recv(pull_metas, [req_id], "missing/incompatible FP8 producer scale metadata")
++                        continue
++                    self._mla_pending_import[pull_meta.d_req_id] = (
++                        self._logical_to_kernel_block_ids(pull_meta.local_block_ids),
++                        response.mla_source_scales)
+                 self.finished_recving_reqs.add(pull_meta.d_req_id)
+ 
+         if ok_reqs:
+@@ -2624,6 +2768,7 @@
+             tuple(meta.registered_group_indices),
+             tuple(tuple(groups) for groups in meta.registered_shared_group_ids),
+             tuple(meta.registered_row_offsets),
++            meta.mla_wire_format,
+         )
+         cached = self._prepared_transfer_regions.get(cache_key)
+         if cached is not None:
+@@ -2705,7 +2850,9 @@
+         # gating on use_mla alone would promote and then fail the length check
+         # for a non-replicated MLA rank with tp_ratio != 1.
+         tp_ratio = _get_tp_ratio(self.tp_size, meta.remote_tp_size)
+-        if tp_ratio == 1 or self._producer_cache_is_replicated():
++        # Different per-layer offsets/strides must not be hidden by copying a
++        # whole HMA allocation: even same-sized pages may encode different bytes.
++        if not meta.mla_wire_format and (tp_ratio == 1 or self._producer_cache_is_replicated()):
+             covered_both_sides = len(local_regions) == len(pre_align_local) and len(
+                 remote_regions
+             ) == len(pre_align_remote)
+@@ -2819,21 +2966,28 @@
+         )
+ 
+ 
+-def group_concurrent_contiguous(
+-    src_indices: list[int], dst_indices: list[int]
+-) -> tuple[list[list[int]], list[list[int]]]:
+-    """Vectorised NumPy implementation."""
+-    if len(src_indices) == 0:
+-        return [], []
+-
+-    brk = np.where((np.diff(src_indices) != 1) | (np.diff(dst_indices) != 1))[0] + 1
+-    src_groups = np.split(src_indices, brk)
+-    dst_groups = np.split(dst_indices, brk)
+-
+-    src_groups = [g.tolist() for g in src_groups]
+-    dst_groups = [g.tolist() for g in dst_groups]
+-
+-    return src_groups, dst_groups
++def _normalize_paired_block_order(
++    src_ids: list[int], dst_ids: list[int]
++) -> tuple[list[int], list[int]]:
++    """Reverse jointly descending consecutive runs without changing block pairs."""
++    if len(src_ids) < 2:
++        return src_ids, dst_ids
++
++    descending = (np.diff(np.asarray(src_ids, dtype=np.int64)) == -1) & (
++        np.diff(np.asarray(dst_ids, dtype=np.int64)) == -1
++    )
++    if not descending.any():
++        return src_ids, dst_ids
++    if descending.all():
++        return src_ids[::-1], dst_ids[::-1]
++
++    boundaries = np.flatnonzero(np.diff(descending, prepend=False, append=False))
++    src_ids, dst_ids = src_ids.copy(), dst_ids.copy()
++    for start, stop in boundaries.reshape(-1, 2):
++        # A run of descending edges covers one more block than edges.
++        src_ids[start : stop + 1] = src_ids[start : stop + 1][::-1]
++        dst_ids[start : stop + 1] = dst_ids[start : stop + 1][::-1]
++    return src_ids, dst_ids
+ 
+ 
+ def get_mooncake_side_channel_port(vllm_config: VllmConfig) -> int:
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/stats.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/stats.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/stats.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/stats.py
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Stats container for the Mooncake connector."""
++"""Stats and Prometheus metrics for the Mooncake connector."""
+ 
+ import threading
+ from dataclasses import dataclass
+@@ -8,12 +8,50 @@
+ 
+ import numpy as np
+ 
++from vllm.config import VllmConfig
+ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
++    KVConnectorPromMetrics,
+     KVConnectorStats,
++    PromMetric,
++    PromMetricT,
+ )
+-
+-# TODO(mooncake-stats): add MooncakePromMetrics (mirror NixlPromMetrics)
+-# and wire it via MooncakeConnector.build_prom_metrics in a follow-up PR.
++from vllm.v1.metrics.utils import create_metric_per_engine
++
++# Bucket edges for the per-transfer series, named after the series each feeds.
++# Timing covers 5ms to 5s; post time is not measured, so there is no
++# sub-millisecond edge. Payload sizes run 2KiB to 8GiB, doubling every other
++# power of two, and descriptor counts run 10 to 50k.
++_XFER_TIME_BUCKETS = (
++    0.005,
++    0.01,
++    0.025,
++    0.05,
++    0.075,
++    0.1,
++    0.2,
++    0.3,
++    0.5,
++    0.75,
++    1.0,
++    5.0,
++)
++_BYTES_BUCKETS = tuple(2 ** (10 + i) for i in range(1, 25, 2))
++_DESCRIPTOR_BUCKETS = (
++    10,
++    20,
++    30,
++    50,
++    75,
++    100,
++    200,
++    400,
++    1000,
++    2000,
++    4000,
++    10000,
++    20000,
++    50000,
++)
+ 
+ 
+ @dataclass
+@@ -58,8 +96,8 @@
+             self.data["bytes_transferred"].append(total_bytes)
+             self.data["num_descriptors"].append(num_descs)
+ 
+-    # Failure counters store a list of 1s so a future Prom counter can iterate
+-    # with .inc(list_item), mirroring NIXL's NixlPromMetrics.observe.
++    # Each failure appends a single unit, which MooncakePromMetrics sums into
++    # one counter increment.
+     def record_failed_transfer(self):
+         with self._lock:
+             self.data["num_failed_transfers"].append(1)
+@@ -144,3 +182,99 @@
+     @property
+     def num_successful_transfers(self) -> int:
+         return len(self.data["transfer_duration"])
++
++
++class MooncakePromMetrics(KVConnectorPromMetrics):
++    """Prometheus metrics for Mooncake KV Cache transfers.
++
++    Mooncake is push-based, so the histograms are only populated on the
++    prefiller (P) instance; the counters are bumped wherever the failure was
++    detected.
++    """
++
++    def __init__(
++        self,
++        vllm_config: VllmConfig,
++        metric_types: dict[type[PromMetric], type[PromMetricT]],
++        labelnames: list[str],
++        per_engine_labelvalues: dict[int, list[object]],
++    ):
++        super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
++
++        mooncake_histogram_xfer_time = self._histogram_cls(
++            name="vllm:mooncake_xfer_time_seconds",
++            documentation="Histogram of transfer duration for Mooncake"
++            " KV Cache transfers.",
++            buckets=_XFER_TIME_BUCKETS,
++            labelnames=labelnames,
++        )
++        self.mooncake_histogram_xfer_time = create_metric_per_engine(
++            mooncake_histogram_xfer_time, self.per_engine_labelvalues
++        )
++        mooncake_histogram_bytes_transferred = self._histogram_cls(
++            name="vllm:mooncake_bytes_transferred",
++            documentation="Histogram of bytes transferred per Mooncake"
++            " KV Cache transfer.",
++            buckets=_BYTES_BUCKETS,
++            labelnames=labelnames,
++        )
++        self.mooncake_histogram_bytes_transferred = create_metric_per_engine(
++            mooncake_histogram_bytes_transferred, self.per_engine_labelvalues
++        )
++        mooncake_histogram_num_descriptors = self._histogram_cls(
++            name="vllm:mooncake_num_descriptors",
++            documentation="Histogram of number of descriptors per Mooncake"
++            " KV Cache transfer.",
++            buckets=_DESCRIPTOR_BUCKETS,
++            labelnames=labelnames,
++        )
++        self.mooncake_histogram_num_descriptors = create_metric_per_engine(
++            mooncake_histogram_num_descriptors, self.per_engine_labelvalues
++        )
++        counter_mooncake_num_failed_transfers = self._counter_cls(
++            name="vllm:mooncake_num_failed_transfers",
++            documentation="Number of failed Mooncake KV Cache transfers.",
++            labelnames=labelnames,
++        )
++        self.counter_mooncake_num_failed_transfers = create_metric_per_engine(
++            counter_mooncake_num_failed_transfers, self.per_engine_labelvalues
++        )
++        counter_mooncake_num_failed_recvs = self._counter_cls(
++            name="vllm:mooncake_num_failed_recvs",
++            documentation="Number of failed Mooncake KV Cache receives.",
++            labelnames=labelnames,
++        )
++        self.counter_mooncake_num_failed_recvs = create_metric_per_engine(
++            counter_mooncake_num_failed_recvs, self.per_engine_labelvalues
++        )
++        counter_mooncake_num_kv_expired_reqs = self._counter_cls(
++            name="vllm:mooncake_num_kv_expired_reqs",
++            documentation="Number of requests that had their KV expire. "
++            "NOTE: This metric is tracked on the P instance.",
++            labelnames=labelnames,
++        )
++        self.counter_mooncake_num_kv_expired_reqs = create_metric_per_engine(
++            counter_mooncake_num_kv_expired_reqs, self.per_engine_labelvalues
++        )
++
++    def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0) -> None:
++        # A snapshot always carries every declared key, so a miss here is a
++        # connector bug and should surface rather than silently drop samples.
++        for per_engine_metrics, stats_key in (
++            (self.mooncake_histogram_xfer_time, "transfer_duration"),
++            (self.mooncake_histogram_bytes_transferred, "bytes_transferred"),
++            (self.mooncake_histogram_num_descriptors, "num_descriptors"),
++        ):
++            for value in transfer_stats_data[stats_key]:
++                per_engine_metrics[engine_idx].observe(value)
++
++        # Each failure appends a single unit, so incrementing by the sum costs
++        # one Prometheus client call per series instead of one per event.
++        for per_engine_metrics, stats_key in (
++            (self.counter_mooncake_num_failed_transfers, "num_failed_transfers"),
++            (self.counter_mooncake_num_failed_recvs, "num_failed_recvs"),
++            (self.counter_mooncake_num_kv_expired_reqs, "num_kv_expired_reqs"),
++        ):
++            num_events = sum(transfer_stats_data[stats_key])
++            if num_events:
++                per_engine_metrics[engine_idx].inc(num_events)
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
+@@ -7,6 +7,7 @@
+ 
+ from collections.abc import Iterable, Sequence
+ from dataclasses import dataclass, field
++from itertools import product
+ from typing import NamedTuple, cast
+ 
+ import numpy as np
+@@ -348,6 +349,282 @@
+         )
+ 
+ 
++class CompactGroupStoreLayout(RankLocalStoreLayout):
++    """Opt-in logical-view payload for one KV-cache group.
++
++    Unlike the historical layout, this stores only the tensors registered for
++    this group and serializes their logical elements in C order. Stride gaps
++    and padded page tails are omitted. ``tail_shape`` is supplied only for a
++    verified MLA page shaped logically as ``(heads, states, content_bytes)``;
++    when that shape matches every registered view, partial final blocks can
++    omit unused token states. Other cache kinds (notably Mamba/KDA) retain the
++    complete logical state.
++    """
++
++    def __init__(
++        self,
++        metadata: KeyMetadata,
++        block_size: int,
++        hash_block_size: int,
++        *,
++        tail_shape: tuple[int, int, int] | None = None,
++    ) -> None:
++        super().__init__(metadata, block_size, hash_block_size)
++        self.tail_shape = tail_shape
++        self._views: list[
++            tuple[
++                int,
++                int,
++                tuple[int, ...],
++                tuple[int, ...],
++                int,
++                tuple[tuple[int, int], ...],
++            ]
++        ] = []
++        self._num_blocks = 0
++        # Keep a complete logical page until the runtime MLA (including
++        # quantized/indexer) view-to-token mapping has been verified. Group and
++        # stride-gap compaction is independent of tail trimming.
++        self.tail_trim_supported = False
++        self.tail_trim_reason = "disabled; retain full logical pages"
++        self.compact_block_bytes = 0
++        self.compact_segment_count = 0
++
++    @staticmethod
++    def _logical_runs(
++        shape: tuple[int, ...],
++        strides_bytes: tuple[int, ...],
++        element_size: int,
++    ) -> list[tuple[int, int]]:
++        """Return active byte runs in logical row-major order.
++
++        Non-contiguous inner dimensions are enumerated element-by-element (and
++        adjacent addresses are coalesced), so stride gaps are never serialized
++        as values.
++        """
++        if not shape or any(size <= 0 for size in shape):
++            return []
++        suffix_start = len(shape)
++        run_size = element_size
++        for axis in range(len(shape) - 1, -1, -1):
++            if shape[axis] != 1 and strides_bytes[axis] != run_size:
++                break
++            run_size *= shape[axis]
++            suffix_start = axis
++
++        outer_ranges = [range(size) for size in shape[:suffix_start]]
++        runs: list[tuple[int, int]] = []
++
++        def append_run(offset: int) -> None:
++            if runs and runs[-1][0] + runs[-1][1] == offset:
++                previous_offset, previous_size = runs[-1]
++                runs[-1] = (previous_offset, previous_size + run_size)
++            else:
++                runs.append((offset, run_size))
++
++        for index in product(*outer_ranges):
++            offset = sum(
++                coordinate * strides_bytes[axis]
++                for axis, coordinate in enumerate(index)
++            )
++            append_run(offset)
++        return runs
++
++    @staticmethod
++    def _has_proven_non_overlapping_layout(
++        shape: tuple[int, ...], strides_bytes: tuple[int, ...], element_size: int
++    ) -> bool:
++        """Conservatively prove a positive-stride view has no aliases.
++
++        Sorting dimensions by stride accepts ordinary permuted/interleaved
++        layouts (including a head stride that crosses block-stride boundaries)
++        while rejecting layouts whose non-overlap cannot be established.
++        """
++        span = element_size
++        dimensions = (
++            (size, stride)
++            for size, stride in zip(shape, strides_bytes, strict=True)
++            if size > 1
++        )
++        for size, stride in sorted(dimensions, key=lambda item: item[1]):
++            if stride < span:
++                return False
++            span += (size - 1) * stride
++        return True
++
++    def register_kv_caches(
++        self,
++        kv_caches: Sequence[torch.Tensor],
++        num_blocks: int,
++    ) -> None:
++        if not kv_caches:
++            raise ValueError("Compact Store group has no KV-cache views")
++        self._num_blocks = num_blocks
++        self._views = []
++        self.compact_block_bytes = 0
++        self.compact_segment_count = 0
++        tail_shape_matches = self.tail_shape is not None
++
++        for cache in kv_caches:
++            if cache.ndim < 2 or cache.shape[0] != num_blocks:
++                raise ValueError(
++                    "Compact Store views must have manager blocks on dimension 0; "
++                    f"got shape={tuple(cache.shape)}, num_blocks={num_blocks}"
++                )
++            element_size = cache.element_size()
++            block_stride = cache.stride(0) * element_size
++            inner_shape = tuple(cache.shape[1:])
++            inner_strides = tuple(
++                stride * element_size for stride in cache.stride()[1:]
++            )
++            if block_stride <= 0 or any(stride <= 0 for stride in inner_strides):
++                raise ValueError(
++                    "Compact Store does not support zero or negative cache strides: "
++                    f"shape={tuple(cache.shape)}, strides={tuple(cache.stride())}"
++                )
++            runs = self._logical_runs(inner_shape, inner_strides, element_size)
++            if not runs:
++                raise ValueError("Compact Store view has no active elements")
++            max_end = max(offset + length for offset, length in runs)
++            if not self._has_proven_non_overlapping_layout(
++                tuple(cache.shape),
++                tuple(stride * element_size for stride in cache.stride()),
++                element_size,
++            ):
++                raise ValueError(
++                    "Compact Store cannot prove cache view is non-overlapping: "
++                    f"shape={tuple(cache.shape)}, strides={tuple(cache.stride())}"
++                )
++            storage = cache.untyped_storage()
++            storage_offset = cache.data_ptr() - storage.data_ptr()
++            last_block_end = (num_blocks - 1) * block_stride + max_end
++            if storage_offset < 0 or (
++                storage_offset + last_block_end > storage.nbytes()
++            ):
++                raise ValueError(
++                    "Compact Store view exceeds its backing storage: "
++                    f"segments (shape={tuple(cache.shape)}, "
++                    f"strides={tuple(cache.stride())}, block_stride={block_stride}, "
++                    f"active_end={max_end}, storage_bytes={storage.nbytes()})"
++                )
++
++            cache_tail_shape = None
++            if cache.ndim == 4:
++                cache_tail_shape = (
++                    cache.shape[1],
++                    cache.shape[2],
++                    cache.shape[3] * element_size,
++                )
++            if cache_tail_shape != self.tail_shape:
++                tail_shape_matches = False
++
++            self._views.append(
++                (
++                    cache.data_ptr(),
++                    block_stride,
++                    inner_shape,
++                    inner_strides,
++                    element_size,
++                    tuple(runs),
++                )
++            )
++            self.compact_block_bytes += sum(length for _, length in runs)
++            self.compact_segment_count += len(runs)
++
++        self.tail_trim_supported = False
++        self.tail_trim_reason = (
++            "disabled; retain full logical pages"
++            if tail_shape_matches
++            else "disabled; retain full logical pages (MLA shape unverified)"
++        )
++
++    def _runs_for_tokens(
++        self,
++        view: tuple[
++            int,
++            int,
++            tuple[int, ...],
++            tuple[int, ...],
++            int,
++            tuple[tuple[int, int], ...],
++        ],
++        valid_tokens: int,
++    ) -> list[tuple[int, int]]:
++        _, _, inner_shape, inner_strides, element_size, full_runs = view
++        shape = inner_shape
++        if (
++            valid_tokens < self.block_size
++            and self.tail_trim_supported
++            and self.tail_shape is not None
++        ):
++            heads, full_states, content_bytes = self.tail_shape
++            state_numerator = valid_tokens * full_states
++            if state_numerator % self.block_size == 0:
++                valid_states = state_numerator // self.block_size
++                if valid_states > 0:
++                    shape = (heads, valid_states, content_bytes // element_size)
++                    return self._logical_runs(shape, inner_strides, element_size)
++        # MLA tail trimming is disabled until a runtime tensor-to-token mapping
++        # is verified. Reuse registered runs so large KDA views are not
++        # re-enumerated for every stored or received chunk.
++        return list(full_runs)
++
++    def _block_values(
++        self, block_id: int, valid_tokens: int
++    ) -> tuple[list[int], list[int]]:
++        addrs: list[int] = []
++        sizes: list[int] = []
++        for view in self._views:
++            base_addr, block_stride, _, _, _, _ = view
++            for offset, length in self._runs_for_tokens(view, valid_tokens):
++                addrs.append(base_addr + block_id * block_stride + offset)
++                sizes.append(length)
++        return addrs, sizes
++
++    def prepare_values(
++        self,
++        chunks: Sequence[tuple[int, int]],
++        block_ids: list[int],
++        shard_ids: Sequence[StoreShardId],
++    ) -> tuple[list[list[int]], list[list[int]], list[int]]:
++        if not chunks:
++            return [], [], []
++        if len(chunks) != len(shard_ids) or any(shard_id != 0 for shard_id in shard_ids):
++            raise ValueError("Compact rank-local Store chunks require shard 0")
++
++        all_addrs: list[list[int]] = []
++        all_sizes: list[list[int]] = []
++        selected_block_ids: list[int] = []
++        for start, end in chunks:
++            if start < 0 or end <= start or start % self.block_size != 0:
++                raise ValueError(
++                    f"Compact Store chunks must start on a block boundary: {(start, end)}"
++                )
++            first_block = start // self.block_size
++            last_block = (end - 1) // self.block_size
++            if last_block >= len(block_ids):
++                raise IndexError("Compact Store chunk exceeds block ID table")
++
++            chunk_addrs: list[int] = []
++            chunk_sizes: list[int] = []
++            for chunk_block in range(first_block, last_block + 1):
++                page_start = chunk_block * self.block_size
++                valid_tokens = min(end, page_start + self.block_size) - page_start
++                block_addrs, block_sizes = self._block_values(
++                    block_ids[chunk_block], valid_tokens
++                )
++                chunk_addrs.extend(block_addrs)
++                chunk_sizes.extend(block_sizes)
++            all_addrs.append(chunk_addrs)
++            all_sizes.append(chunk_sizes)
++            selected_block_ids.append(block_ids[first_block])
++
++        return all_addrs, all_sizes, selected_block_ids
++
++    def prepare_value_for_block(self, block_id: int) -> tuple[list[int], list[int]]:
++        return self._block_values(block_id, self.block_size)
++
++
+ class TPShardedStoreLayout(StoreLayout):
+     """Store layout shared by divisible TP sizes."""
+ 
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/staged_lookup.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/staged_lookup.py
+new file mode 100644
+--- /dev/null
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/staged_lookup.py
+@@ -0,0 +1,100 @@
++"""CPU-only lookup ordering for staged Mamba boundary existence checks."""
++
++from __future__ import annotations
++
++from collections.abc import Callable, Collection, Sequence
++from dataclasses import dataclass
++
++
++@dataclass(frozen=True, slots=True)
++class LookupCandidate:
++    """One logical (group, hash) candidate and all namespaces needed to load it."""
++
++    group_id: int
++    block_hash: bytes
++    namespace_keys: tuple[str, ...]
++    boundary_tokens: int | None = None
++
++
++def staged_lookup_exists(
++    candidates: Sequence[LookupCandidate],
++    *,
++    token_len: int,
++    mamba_group_ids: Collection[int] | None,
++    batch_is_exist: Callable[[Sequence[str]], Sequence[int]],
++    find_hit_length: Callable[[set[tuple[int, bytes]], int], int],
++    boundaries_per_batch: int = 8,
++) -> set[tuple[int, bytes]]:
++    """Return loadable candidates, lazily probing older Mamba boundaries.
++
++    Non-Mamba keys are checked together first. Mamba keys are checked in
++    descending token-boundary batches; all groups and TP namespaces for a
++    boundary stay together. After each batch the coordinator callback evaluates
++    the accumulated exists set at the original token length. Once its hit
++    reaches this batch's oldest boundary, still older checkpoints cannot
++    extend the hit and are left untouched.
++
++    Unknown Mamba groups/boundaries fall back to one all-candidate lookup.
++    Namespace keys are deduplicated for Store calls, but every candidate still
++    requires all its namespace keys to exist.
++    """
++    if boundaries_per_batch <= 0:
++        raise ValueError("boundaries_per_batch must be positive")
++    if not candidates:
++        return set()
++
++    mamba_ids = set(mamba_group_ids or ())
++    mamba = [candidate for candidate in candidates if candidate.group_id in mamba_ids]
++    staged = bool(mamba_ids and mamba) and all(
++        candidate.boundary_tokens is not None
++        and 0 < candidate.boundary_tokens <= token_len
++        for candidate in mamba
++    )
++
++    exists: set[tuple[int, bytes]] = set()
++    checked_keys: dict[str, bool] = {}
++
++    def check(batch: Sequence[LookupCandidate]) -> None:
++        keys = list(
++            dict.fromkeys(
++                key
++                for candidate in batch
++                for key in candidate.namespace_keys
++                if key not in checked_keys
++            )
++        )
++        if keys:
++            values = batch_is_exist(keys)
++            if len(values) != len(keys):
++                raise ValueError("batch_is_exist returned the wrong number of results")
++            checked_keys.update(
++                (key, value == 1) for key, value in zip(keys, values, strict=True)
++            )
++
++        for candidate in batch:
++            if candidate.namespace_keys and all(checked_keys[key] for key in candidate.namespace_keys):
++                exists.add((candidate.group_id, bytes(candidate.block_hash)))
++
++    if not staged:
++        check(candidates)
++        return exists
++
++    non_mamba = [candidate for candidate in candidates if candidate.group_id not in mamba_ids]
++    check(non_mamba)
++
++    by_boundary: dict[int, list[LookupCandidate]] = {}
++    for candidate in mamba:
++        # The staged predicate above guarantees a concrete boundary.
++        boundary = candidate.boundary_tokens
++        assert boundary is not None
++        by_boundary.setdefault(boundary, []).append(candidate)
++    boundaries = sorted(by_boundary, reverse=True)
++    for offset in range(0, len(boundaries), boundaries_per_batch):
++        batch_boundaries = boundaries[offset : offset + boundaries_per_batch]
++        batch = [candidate for boundary in batch_boundaries for candidate in by_boundary[boundary]]
++        check(batch)
++        hit_length = find_hit_length(exists, token_len)
++        if hit_length >= min(batch_boundaries):
++            break
++
++    return exists
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+@@ -45,6 +45,7 @@
+ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  # noqa: E501
+     BlobBlockHashes,
+     ChunkedTokenDatabase,
++    CompactGroupStoreLayout,
+     KeyMetadata,
+     LBHNCStoreLayout,
+     LBNHCStoreLayout,
+@@ -89,6 +90,7 @@
+ from vllm.v1.kv_cache_layout import KVCacheLayout
+ 
+ from .metrics import MooncakeStoreConnectorStats
++from .staged_lookup import LookupCandidate, staged_lookup_exists
+ 
+ logger = init_logger(__name__)
+ 
+@@ -110,6 +112,33 @@
+ 
+     store_tp_size = extra_config.get("store_tp_size")
+     return store_tp_size if type(store_tp_size) is int and store_tp_size > 0 else None
++
++
++def _compact_group_cache_tensors(
++    group: Any,
++    kv_caches: dict[str, torch.Tensor | Sequence[torch.Tensor]],
++    num_blocks: int,
++) -> list[torch.Tensor]:
++    """Return every registered state view for exactly one KV-cache group."""
++    missing_layers = [name for name in group.layer_names if name not in kv_caches]
++    if missing_layers:
++        raise ValueError(
++            f"Missing transferable KV caches for layers: {missing_layers}"
++        )
++
++    result: list[torch.Tensor] = []
++    for layer_name in group.layer_names:
++        value = kv_caches[layer_name]
++        states = (value,) if isinstance(value, torch.Tensor) else value
++        if not isinstance(states, Sequence) or not states or not all(
++            isinstance(state, torch.Tensor) for state in states
++        ):
++            raise TypeError(
++                f"KV cache for {layer_name} must be a tensor or a non-empty "
++                "sequence of state tensors"
++            )
++        result.extend(group_kernel_blocks(state, num_blocks) for state in states)
++    return result
+ 
+ 
+ def _rotate_list(values: list[_T], offset: int) -> list[_T]:
+@@ -1391,6 +1420,10 @@
+         assert kv_role is not None
+         self.kv_role = kv_role
+         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
++        compact_payload_option = extra_config.get("store_compact_group_payloads", False)
++        if type(compact_payload_option) is not bool:
++            raise ValueError("store_compact_group_payloads must be a boolean")
++        self._store_compact_group_payloads = compact_payload_option
+         self.can_put = self.kv_role in ("kv_producer", "kv_both") or (
+             extra_config.get("save_decode_cache", False)
+         )
+@@ -1558,12 +1591,20 @@
+         self, extra_config: dict[str, Any]
+     ) -> tuple[int | None, str, type[TPShardedStoreLayout] | None]:
+         """Select the opt-in TP layout and its Store namespace."""
++        compact_payloads = extra_config.get("store_compact_group_payloads", False)
++
++        def compact_namespace(namespace: str) -> str:
++            if not compact_payloads:
++                return namespace
++            marker = "@store_format:compact_group_views_v1"
++            return f"{namespace}@payload:compact_group_views_v1" if namespace else marker
++
+         lcm_store_tp_enabled = extra_config.get("enable_store_tp_lcm") is True
+         store_tp_requested = (
+             lcm_store_tp_enabled or extra_config.get("store_tp_size") is not None
+         )
+         if not store_tp_requested:
+-            return None, "", None
++            return None, compact_namespace(""), None
+ 
+         requested_store_tp_size = resolve_store_tp_size(extra_config)
+         cache_layout = self.cache_config.get_resolved_kv_cache_layout()
+@@ -1589,7 +1630,11 @@
+                     )
+                 return (
+                     requested_store_tp_size,
+-                    layout_cls.shared_namespace(requested_store_tp_size, self.pp_size),
++                    compact_namespace(
++                        layout_cls.shared_namespace(
++                            requested_store_tp_size, self.pp_size
++                        )
++                    ),
+                     layout_cls,
+                 )
+             if self.num_kv_head == 1:
+@@ -1600,11 +1645,13 @@
+                 )
+                 return (
+                     None,
+-                    f"@store_pp:{self.pp_size}@store_format:tp_shared_mqa",
++                    compact_namespace(
++                        f"@store_pp:{self.pp_size}@store_format:tp_shared_mqa"
++                    ),
+                     None,
+                 )
+ 
+-        store_namespace = (
++        store_namespace = compact_namespace(
+             f"@store_pp:{self.pp_size}@store_format:"
+             f"rank_local_tp{self.tp_size}_layout_{cache_layout.name}"
+         )
+@@ -1644,7 +1691,35 @@
+                 tp_rank=group_tp_rank,
+             )
+             store_layout: TPShardedStoreLayout | None = None
+-            if layout_cls is not None:
++            if (
++                getattr(self, "_store_compact_group_payloads", False)
++                and layout_cls is None
++            ):
++                inner_specs = (
++                    tuple(group.kv_cache_spec.kv_cache_specs.values())
++                    if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
++                    else (group.kv_cache_spec,)
++                )
++                tail_shape = None
++                if inner_specs and all(
++                    isinstance(
++                        inner_spec, (MLAAttentionSpec, SlidingWindowMLASpec)
++                    )
++                    for inner_spec in inner_specs
++                ):
++                    spec = inner_specs[0]
++                    tail_shape = (
++                        spec.num_heads,
++                        spec.num_states,
++                        spec.state_content_size_bytes,
++                    )
++                store_layout = CompactGroupStoreLayout(
++                    group_metadata,
++                    group.kv_cache_spec.block_size,
++                    hash_block_size,
++                    tail_shape=tail_shape,
++                )
++            elif layout_cls is not None:
+                 assert self.store_tp_size is not None
+                 store_layout = layout_cls(
+                     group_metadata,
+@@ -1728,7 +1803,7 @@
+ 
+     def register_kv_caches(
+         self,
+-        kv_caches: dict[str, torch.Tensor],
++        kv_caches: dict[str, torch.Tensor | Sequence[torch.Tensor]],
+     ) -> None:
+         """Register KV cache tensors and start transfer threads."""
+         if self._capacity_only:
+@@ -1748,8 +1823,54 @@
+         assert self.cache_config.num_gpu_blocks is not None
+         self.num_blocks = self.cache_config.num_gpu_blocks
+         use_group_regions = self._kv_cache_config.hisparse_host_num_blocks is not None
+-
+-        if not use_group_regions:
++        compact_payloads = getattr(self, "_store_compact_group_payloads", False)
++        if compact_payloads and use_group_regions:
++            raise ValueError(
++                "store_compact_group_payloads currently requires the standard "
++                "non-HiSparse cache registration path"
++            )
++
++        if compact_payloads:
++            registered_buffers: dict[int, int] = {}
++            for group_idx, (group, db) in enumerate(
++                zip(self._kv_cache_groups, self.token_dbs, strict=True)
++            ):
++                group_tensors = _compact_group_cache_tensors(
++                    group, kv_caches, self.num_blocks
++                )
++                for cache in group_tensors:
++                    storage = cache.untyped_storage()
++                    base_addr = storage.data_ptr()
++                    region_len = storage.nbytes()
++                    registered_len = registered_buffers.get(base_addr)
++                    if registered_len is None:
++                        ret = self.store.register_buffer(base_addr, region_len)
++                        if ret != 0:
++                            raise RuntimeError(
++                                "Mooncake register_buffer failed for addr "
++                                f"{base_addr:#x} len {region_len}: {ret}"
++                            )
++                        registered_buffers[base_addr] = region_len
++                    elif registered_len != region_len:
++                        raise ValueError(
++                            f"KV cache views at {base_addr:#x} expose inconsistent "
++                            f"region sizes: {registered_len} and {region_len}."
++                        )
++                db.store_layout.register_kv_caches(group_tensors, self.num_blocks)
++                if isinstance(db.store_layout, CompactGroupStoreLayout):
++                    logger.info(
++                        "Compact Store group %d: layers=%d state_views=%d "
++                        "active_bytes_per_block=%d segments_per_block=%d "
++                        "mla_tail_trim=%s (%s)",
++                        group_idx,
++                        len(group.layer_names),
++                        len(group_tensors),
++                        db.store_layout.compact_block_bytes,
++                        db.store_layout.compact_segment_count,
++                        db.store_layout.tail_trim_supported,
++                        db.store_layout.tail_trim_reason,
++                    )
++        elif not use_group_regions:
+             store_layer_names = {
+                 layer_name
+                 for group in self._kv_cache_groups
+@@ -2112,6 +2233,7 @@
+         # candidate_meta stores the (group, hash_bytes) for key slice.
+         candidate_keys: list[str] = []
+         candidate_meta: list[tuple[int, bytes]] = []
++        candidate_boundaries: list[int] = []
+         fine_grained = self.coord.enable_partial_hash_hits
+         lookup_masks = None if fine_grained else self.coord.lookup_mask(token_len)
+         for g_idx, db in enumerate(self.token_dbs):
+@@ -2147,39 +2269,79 @@
+                         PoolKey.build_key_string(key_prefix, hash_hex)
+                     )
+                 candidate_meta.append((g_idx, bytes(h)))
++                candidate_boundaries.append(
++                    (chunk_id + 1) * (self.hash_block_size if fine_grained else spec_block_size)
++                )
+ 
+         if not candidate_keys:
+             return MooncakeLookupResult(0)
+ 
+         lookup_start = time.perf_counter()
++        checked_key_count = 0
+         try:
+-            res = self.store.batch_is_exist(candidate_keys)
++            if (
++                getattr(self, "_store_compact_group_payloads", False)
++                and fine_grained
++                and self.coord.mamba_group_ids
++            ):
++                candidates = []
++                pos = 0
++                for (g_idx, hash_bytes), boundary in zip(
++                    candidate_meta, candidate_boundaries, strict=True
++                ):
++                    count = len(self._lookup_key_prefixes[g_idx])
++                    candidates.append(LookupCandidate(
++                        g_idx, hash_bytes, tuple(candidate_keys[pos:pos+count]), boundary
++                    ))
++                    pos += count
++
++                def check_keys(keys):
++                    nonlocal checked_key_count
++                    checked_key_count += len(keys)
++                    return self.store.batch_is_exist(keys)
++
++                def usable_hit(exists, length):
++                    pool = ExternalCachedBlockPool(self.hash_block_size, exists)
++                    _, hit = self.coord.find_longest_cache_hit(block_hashes, length, pool)
++                    # Preserve the existing sampling-token recomputation: an
++                    # all-hit lookup may need the preceding KDA checkpoint.
++                    if hit >= num_tokens:
++                        bound = self.coord.align_lookup_length(num_tokens - 1)
++                        if bound <= 0:
++                            return 0
++                        _, hit = self.coord.find_longest_cache_hit(block_hashes, bound, pool)
++                    return hit
++
++                exists_set = staged_lookup_exists(
++                    candidates, token_len=token_len,
++                    mamba_group_ids=self.coord.mamba_group_ids,
++                    batch_is_exist=check_keys, find_hit_length=usable_hit,
++                )
++            else:
++                checked_key_count = len(candidate_keys)
++                res = self.store.batch_is_exist(candidate_keys)
++                exists_set = set()
++                pos = 0
++                for g_idx, hash_bytes in candidate_meta:
++                    count = len(self._lookup_key_prefixes[g_idx])
++                    if all(res[pos + j] == 1 for j in range(count)):
++                        exists_set.add((g_idx, hash_bytes))
++                    pos += count
+             self._record_kv_connector_operation(
+                 "lookup_exists",
+                 time.perf_counter() - lookup_start,
+-                len(candidate_keys),
++                checked_key_count,
+             )
+         except Exception as e:
+             self._record_kv_connector_operation(
+                 "lookup_exists",
+                 time.perf_counter() - lookup_start,
+-                len(candidate_keys),
++                checked_key_count,
+                 status="error",
+-                num_failed_keys=len(candidate_keys),
++                num_failed_keys=checked_key_count,
+             )
+             logger.error("Remote connection failed in lookup: %s", e)
+             return MooncakeLookupResult(0)
+-
+-        # A (group, hash) is "present" only when every namespace that will be
+-        # loaded has it (per-group count: sharded groups need every rank's
+-        # shard, replicated groups one namespace per unique KV head).
+-        exists_set = set()
+-        pos = 0
+-        for g_idx, hash_bytes in candidate_meta:
+-            count = len(self._lookup_key_prefixes[g_idx])
+-            if all(res[pos + j] == 1 for j in range(count)):
+-                exists_set.add((g_idx, hash_bytes))
+-            pos += count
+ 
+         cached_block_pool = ExternalCachedBlockPool(
+             self.hash_block_size,
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
+@@ -214,9 +214,7 @@
+ 
+     @property
+     def supports_divergent_local_hybrid_hits(self) -> bool:
+-        return bool(self._connectors) and all(
+-            c.supports_divergent_local_hybrid_hits for c in self._connectors
+-        )
++        return any(c.supports_divergent_local_hybrid_hits for c in self._connectors)
+ 
+     @property
+     def requires_kv_delivery(self) -> bool:
+@@ -436,11 +434,28 @@
+         request: "Request",
+         num_computed_tokens: int,
+     ) -> tuple[int | None, bool]:
++        return self._get_num_new_matched_tokens(request, num_computed_tokens, False)
++
++    def get_divergent_matched_tokens(
++        self, request: "Request", num_computed_tokens: int
++    ) -> tuple[int | None, bool]:
++        return self._get_num_new_matched_tokens(request, num_computed_tokens, True)
++
++    def _get_num_new_matched_tokens(
++        self, request: "Request", num_computed_tokens: int, hit_diverged: bool
++    ) -> tuple[int | None, bool]:
+         to_return = (0, False)
+         for i, c in enumerate(self._connectors):
+-            toks, load_async = c.get_num_new_matched_tokens(
+-                request, num_computed_tokens
+-            )
++            if hit_diverged:
++                if not c.supports_divergent_local_hybrid_hits:
++                    continue
++                toks, load_async = c.get_divergent_matched_tokens(
++                    request, num_computed_tokens
++                )
++            else:
++                toks, load_async = c.get_num_new_matched_tokens(
++                    request, num_computed_tokens
++                )
+             # If there is a connector still looking up the matches,
+             # we return None to indicate that we are not done yet.
+             if toks is None:
+diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
+--- a/vllm/model_executor/layers/attention/mla_attention.py
++++ b/vllm/model_executor/layers/attention/mla_attention.py
+@@ -563,6 +563,9 @@
+ 
+         # Sparse MLA reads top-k indices from a shared buffer. Pass it
+         # explicitly so backbone "skip" layers (indexer=None) still find it.
++        self.topk_buffer_width = (
++            topk_indices_buffer.shape[-1] if topk_indices_buffer is not None else None
++        )
+         if use_sparse:
+             extra_impl_args["topk_indices_buffer"] = topk_indices_buffer
+             if index_group_builder is not None:
+@@ -801,6 +804,8 @@
+             slot_mapping,
+             kv_cache_dtype,
+             k_scale,
++            kv_cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2")
++            and self._k_scale_float == 1.0,
+         )
+ 
+     def prepare_kv_cache_update(
+@@ -1361,9 +1366,10 @@
+             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+             # ds_mla layouts pack NoPE + RoPE + scales into one opaque per-token
+             # blob, so the size is not derivable from head_size.
+-            # See flashmla_sparse.py.
+-            state_content_bytes={"fp8_ds_mla": 656, "nvfp4_ds_mla": 352}.get(
+-                self.kv_cache_dtype
++            state_content_bytes=(
++                cast(MLAAttentionImpl, self.impl).get_fp8_ds_mla_row_bytes()
++                if self.kv_cache_dtype == "fp8_ds_mla"
++                else {"nvfp4_ds_mla": 352}.get(self.kv_cache_dtype)
+             ),
+         )
+         if self.sliding_window is not None:
+@@ -1373,6 +1379,7 @@
+             )
+         spec = MLAAttentionSpec(
+             **common_kwargs,
++            topk_buffer_width=self.topk_buffer_width,
+             is_index_group_leader=self.indexer is not None,
+             non_causal_multi_token_decode=self.non_causal_multi_token_decode,
+         )
+diff --git a/vllm/model_executor/layers/attention/sparse_mla_attention.py b/vllm/model_executor/layers/attention/sparse_mla_attention.py
+--- a/vllm/model_executor/layers/attention/sparse_mla_attention.py
++++ b/vllm/model_executor/layers/attention/sparse_mla_attention.py
+@@ -358,7 +358,12 @@
+ 
+         prefill_max_seq_len = 0
+         prefill: SparseMLAPrefillMetadata | None = None
+-        if num_prefills > 0 and self._prefill_backend is not None:
++        # HiSparse stages host rows for sparse-MQA-only backends too (SM120).
++        # Those backends deliberately do not create an MHA prefill backend.
++        if num_prefills > 0 and (
++            self._prefill_backend is not None
++            or self.vllm_config.attention_config.hisparse_config is not None
++        ):
+             seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+             assert seq_lens_cpu is not None
+             prefill_max_seq_len = int(
+@@ -409,7 +414,8 @@
+                 topk_mask_workspace=self.topk_mask_workspace,
+                 host_staging_plan=staging_plan,
+             )
+-            self._prefill_backend.prepare_metadata(prefill)
++            if self._prefill_backend is not None:
++                self._prefill_backend.prepare_metadata(prefill)
+ 
+         return self.metadata_cls(  # type: ignore[call-arg]
+             num_reqs=common_attn_metadata.num_reqs,
+@@ -680,7 +686,11 @@
+                 index_group_builder.register_layer(
+                     indexer is not None,
+                     vllm_config,
+-                    head_size=head_size,
++                    row_width=(
++                        self.get_fp8_ds_mla_row_bytes()
++                        if kv_cache_dtype == "fp8_ds_mla"
++                        else head_size
++                    ),
+                     kv_cache_dtype=kv_cache_dtype,
+                 )
+             )
+diff --git a/vllm/models/deepseek_v32/amd/rocm.py b/vllm/models/deepseek_v32/amd/rocm.py
+--- a/vllm/models/deepseek_v32/amd/rocm.py
++++ b/vllm/models/deepseek_v32/amd/rocm.py
+@@ -244,6 +244,7 @@
+             mla_kv_cache=mla_kv_cache,
+             mla_kv_cache_dtype=self.kv_cache_dtype,
+             mla_k_scale=mla_k_scale,
++            skip_scale=self._k_scale_float == 1.0,
+             has_indexer=has_indexer,
+             index_rope_interleave=self._index_rope_interleave,
+             kv_c_out=kv_c_out,
+diff --git a/vllm/models/deepseek_v32/attention.py b/vllm/models/deepseek_v32/attention.py
+--- a/vllm/models/deepseek_v32/attention.py
++++ b/vllm/models/deepseek_v32/attention.py
+@@ -398,6 +398,7 @@
+             mla_kv_cache=mla_kv_cache,
+             mla_kv_cache_dtype=self.kv_cache_dtype,
+             mla_k_scale=mla_k_scale,
++            skip_scale=self._k_scale_float == 1.0,
+             has_indexer=has_indexer,
+             index_rope_interleave=self._index_rope_interleave,
+             kv_c_out=kv_c_out,
+@@ -546,6 +547,8 @@
+                 cache_slot_mapping,
+                 self.kv_cache_dtype,
+                 self._k_scale,
++                self._k_scale_float == 1.0
++                and self.kv_cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2"),
+             )
+ 
+         num_actual = attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
+diff --git a/vllm/models/deepseek_v32/common/kernels.py b/vllm/models/deepseek_v32/common/kernels.py
+--- a/vllm/models/deepseek_v32/common/kernels.py
++++ b/vllm/models/deepseek_v32/common/kernels.py
+@@ -173,6 +173,7 @@
+     mla_cache_entry_stride,
+     MLA_CACHE_BLOCK_SIZE: tl.constexpr,
+     MLA_CACHE_FP8: tl.constexpr,
++    SKIP_MLA_SCALE: tl.constexpr,
+     mla_cache_scale_ptr,
+     # fp8_ds_mla cache views (block-scaled fp8 NoPE + unquantized bf16 RoPE).
+     # mla_cache_ptr is the fp8 (1-byte) view, so the block/entry strides above
+@@ -383,18 +384,19 @@
+             )
+             # kv_c_normed (KV_DIM elements)
+             if MLA_CACHE_FP8:
+-                scale = tl.load(mla_cache_scale_ptr)
+-                kv_c_fp8 = (kv_c.to(tl.float32) / scale).to(fp8_dtype)
++                scale = 1.0
++                if not SKIP_MLA_SCALE:
++                    scale = tl.load(mla_cache_scale_ptr)
++                    kv_c_fp8 = (kv_c.to(tl.float32) / scale).to(fp8_dtype)
++                else:
++                    kv_c_fp8 = kv_c.to(tl.float32).to(fp8_dtype)
+                 tl.store(dst + kv_block, kv_c_fp8)
+             else:
+                 tl.store(dst + kv_block, kv_c)
+             # k_pe_roped (from registers, interleaved layout)
+             if MLA_CACHE_FP8:
+                 tl.store(dst + KV_DIM + dim_off * 2, (r1 / scale).to(fp8_dtype))
+-                tl.store(
+-                    dst + KV_DIM + dim_off * 2 + 1,
+-                    (r2 / scale).to(fp8_dtype),
+-                )
++                tl.store(dst + KV_DIM + dim_off * 2 + 1, (r2 / scale).to(fp8_dtype))
+             else:
+                 tl.store(dst + KV_DIM + dim_off * 2, r1)
+                 tl.store(dst + KV_DIM + dim_off * 2 + 1, r2)
+@@ -536,6 +538,7 @@
+     kv_c_out: torch.Tensor | None = None,
+     k_pe_out: torch.Tensor | None = None,
+     index_k_out: torch.Tensor | None = None,
++    skip_scale: bool = False,
+ ) -> torch.Tensor:
+     assert positions.ndim == 1
+     assert q_c.ndim == 2
+@@ -707,6 +710,7 @@
+         mla_entry_stride,
+         mla_block_size,
+         mla_cache_fp8,
++        mla_cache_fp8 and skip_scale,
+         mla_k_scale,
+         mla_ds_scale_view,
+         mla_ds_rope_view,
+diff --git a/vllm/models/dots3_note/nvidia/attention.py b/vllm/models/dots3_note/nvidia/attention.py
+--- a/vllm/models/dots3_note/nvidia/attention.py
++++ b/vllm/models/dots3_note/nvidia/attention.py
+@@ -724,6 +724,7 @@
+         slot_mapping: torch.Tensor,
+         kv_cache_dtype: str,
+         k_scale: torch.Tensor,
++        skip_scale: bool = False,
+     ) -> None:
+         super().do_kv_cache_update(
+             kv_c_normed,
+@@ -732,6 +733,7 @@
+             slot_mapping,
+             kv_cache_dtype,
+             k_scale,
++            skip_scale=skip_scale,
+         )
+ 
+     def forward_mha(  # type: ignore[override]
+diff --git a/vllm/models/glm5next/common/model.py b/vllm/models/glm5next/common/model.py
+--- a/vllm/models/glm5next/common/model.py
++++ b/vllm/models/glm5next/common/model.py
+@@ -90,6 +90,7 @@
+ from vllm.multimodal import MULTIMODAL_REGISTRY
+ from vllm.platforms import current_platform
+ from vllm.sequence import IntermediateTensors
++from vllm.utils.math_utils import round_up
+ 
+ from .attention import Glm5NextMLAAttention
+ from .kda import Glm5NextLinearAttention
+@@ -100,6 +101,16 @@
+ )
+ 
+ logger = init_logger(__name__)
++
++
++def get_sparse_topk_buffer_width(config: Glm5NextTextConfig) -> int:
++    """Reserve the incomplete pool tail and align sparse MLA tiles."""
++    topk = config.index_topk
++    assert topk is not None
++    kpool = config.index_kpool
++    assert kpool is not None
++    return round_up(topk + kpool - 1, 128)
++
+ 
+ _MHC_TAU = 0.05
+ """mHC routing temperature. A GLM-5.3-Flash trained value that neither the
+@@ -700,20 +711,9 @@
+ 
+         self.is_v32 = config.index_topk is not None
+         if self.is_v32:
+-            topk_tokens = config.index_topk
+-            assert topk_tokens is not None
+-            # Reserve room for the incomplete pool tail.
+-            kpool = config.index_kpool
+-            assert kpool is not None
+-            buffer_width = topk_tokens + (kpool - 1 if kpool > 1 else 0)
+-            # Sparse MLA tiles top-k in 128 columns; padded slots remain masked.
+-            sparse_topk_block_n = 128
+-            buffer_width = (
+-                (buffer_width + sparse_topk_block_n - 1) // sparse_topk_block_n
+-            ) * sparse_topk_block_n
+             topk_indices_buffer = torch.empty(
+                 vllm_config.scheduler_config.max_num_batched_tokens,
+-                buffer_width,
++                get_sparse_topk_buffer_width(config),
+                 dtype=torch.int32,
+                 device=self.device,
+             )
+diff --git a/vllm/models/glm5next/common/mtp.py b/vllm/models/glm5next/common/mtp.py
+--- a/vllm/models/glm5next/common/mtp.py
++++ b/vllm/models/glm5next/common/mtp.py
+@@ -23,7 +23,10 @@
+     maybe_remap_kv_scale_name,
+ )
+ from vllm.model_executor.models.deepseek_mtp import SharedHead
+-from vllm.model_executor.models.deepseek_v2 import DeepseekV2MixtureOfExperts
++from vllm.model_executor.models.deepseek_v2 import (
++    DeepseekV2MixtureOfExperts,
++    DeepseekV32IndexerCache,
++)
+ from vllm.model_executor.models.utils import maybe_prefix
+ from vllm.models.glm5next.nvidia.ops.fused_eh_norm import fused_eh_norm
+ from vllm.platforms import current_platform
+@@ -37,6 +40,7 @@
+     _num_fused_shared_experts,
+     _try_load_fp8_attn_proj,
+     _try_load_fp8_indexer_wk,
++    get_sparse_topk_buffer_width,
+     get_spec_layer_idx_from_weight_name,
+ )
+ 
+@@ -52,20 +56,9 @@
+         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+         self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+ 
+-        # Reserve room for the incomplete pool tail and align the sparse MLA
+-        # buffer width to BLOCK_N=128.
+-        topk_tokens = config.index_topk
+-        assert topk_tokens is not None
+-        kpool = config.index_kpool
+-        assert kpool is not None
+-        buffer_width = topk_tokens + (kpool - 1 if kpool > 1 else 0)
+-        sparse_topk_block_n = 128
+-        buffer_width = (
+-            (buffer_width + sparse_topk_block_n - 1) // sparse_topk_block_n
+-        ) * sparse_topk_block_n
+         topk_indices_buffer = torch.empty(
+             vllm_config.scheduler_config.max_num_batched_tokens,
+-            buffer_width,
++            get_sparse_topk_buffer_width(config),
+             dtype=torch.int32,
+             device=current_platform.device_type,
+         )
+@@ -152,6 +145,16 @@
+         # index_share_for_mtp_iteration: step 0 computes top-k, steps 1+ reuse.
+         for mla_attn in self._mtp_mla_attns:
+             mla_attn.skip_topk = skip
++
++    def topk_cache_layers(self) -> set[str]:
++        """Indexer cache layers, which no step that reuses the top-k reads."""
++        return {
++            module.prefix
++            for mla_attn in self._mtp_mla_attns
++            if mla_attn.indexer is not None
++            for module in mla_attn.indexer.modules()
++            if isinstance(module, DeepseekV32IndexerCache)
++        }
+ 
+     def compact_topk_indices(self, slot_ids: torch.Tensor):
+         """Gather the top-k index rows at ``slot_ids`` to the front of the buffer."""
+diff --git a/vllm/models/glm5next/nvidia/sm120_dsa_adapter.py b/vllm/models/glm5next/nvidia/sm120_dsa_adapter.py
+new file mode 100644
+--- /dev/null
++++ b/vllm/models/glm5next/nvidia/sm120_dsa_adapter.py
+@@ -0,0 +1,66 @@
++"""Opt-in FlashInfer #7085 paged indexer; GLM k-pool expansion stays native."""
++from functools import cache
++import os
++import torch
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++_reported = False
++
++def enabled():
++    return os.getenv('VLLM_SM120_DSA_INDEXER', '0') == '1'
++
++@cache
++def prewarm(device_index: int, max_rows: int, max_context: int):
++    if not enabled():
++        return
++    from flashinfer.experimental.sm120_dsa_indexer import _api
++    dev = torch.device('cuda',device_index)
++    # JIT and persistent scratch are initialized before CUDA graph capture.
++    _api._module()
++    _api._decode_logits(dev,max_rows,max_context)
++    if max_context > _api._row_sel_keys():
++        _api._decode_long_ws(dev,max_rows)
++
++def eligible(q, q_scale, dcp_world_size, top_k, sparse_indices):
++    return (enabled() and dcp_world_size == 1 and q_scale is None
++        and q.dtype == torch.float8_e4m3fn
++        and q.shape[-2] in (32,64) and q.shape[-1] == 128
++        and 1 <= q.shape[1] <= 16 and 1 <= top_k <= 4096)
++
++def paged_topk(q, kv_cache, weights, context_lens, block_table, top_k, max_context):
++    global _reported
++    from flashinfer.experimental.sm120_dsa_indexer import dsa_indexer_topk_paged
++    result,_ = dsa_indexer_topk_paged(q,kv_cache,weights,context_lens,block_table,
++        top_k=top_k,max_context_len=min(max_context,block_table.shape[1]*kv_cache.shape[1]),
++        return_scores=False)
++    if not _reported:
++        logger.info('GLM SM120 DSA indexer: FlashInfer PR7085 paged decode selected; kpool expansion unchanged')
++        _reported = True
++    return result
++
++
++_prefill_reported = False
++
++
++def prefill_eligible(q, k, q_scale, dcp_world_size, row_shard, chunk):
++    return (enabled() and dcp_world_size == 1 and row_shard is None
++            and q_scale is None and q.dtype == torch.float8_e4m3fn
++            and k.dtype == torch.float8_e4m3fn
++            and q.shape[-2] in (32, 64) and q.shape[-1] == 128
++            and chunk.sm120_query_start_loc is not None)
++
++
++def prefill_topk(q, k, k_scale, weights, chunk, top_k, ratio):
++    global _prefill_reported
++    from flashinfer.experimental.sm120_dsa_indexer import dsa_indexer_topk
++    result, _ = dsa_indexer_topk(
++        q, k, weights, chunk.sm120_query_start_loc, chunk.cu_seq_lens,
++        k_scale=k_scale, top_k=top_k,
++        q_causal_offsets=chunk.sm120_query_causal_offsets, ratio=ratio,
++        max_seqlen_k=chunk.sm120_max_seq_len, return_scores=False,
++    )
++    if not _prefill_reported:
++        logger.info('GLM SM120 DSA indexer: FlashInfer PR7085 ragged prefill selected; native causal ranges and kpool expansion unchanged')
++        _prefill_reported = True
++    return result
+diff --git a/vllm/models/glm5next/nvidia/sm120_dsa_prefill.py b/vllm/models/glm5next/nvidia/sm120_dsa_prefill.py
+new file mode 100644
+--- /dev/null
++++ b/vllm/models/glm5next/nvidia/sm120_dsa_prefill.py
+@@ -0,0 +1,121 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Exact-range SM120 prefill adapter for GLM5Next compressed index K cache.
++
++The generic ragged DSA API expresses visibility as a segment plus a causal
++ratio/offset. GLM metadata instead provides an exact [ks, ke) for every query
++row (not necessarily a 1:1 query/key mapping). This eager-only adapter packs
++each row's exact key interval as its own one-query segment, then maps returned
++segment-local IDs back to original packed-K coordinates.
++
++Bounded first-stage path: FP8 CUDA eager prefill and at most max_packed_keys
++duplicated keys. Catch UnsupportedPrefillShape to use DeepGEMM instead. JIT,
++build, and runtime errors are deliberately not caught or silently downgraded.
++"""
++
++from __future__ import annotations
++
++from typing import Sequence
++
++import torch
++
++
++class UnsupportedPrefillShape(RuntimeError):
++    """The exact-range prefill case is outside this helper's limited path."""
++
++
++def dsa_indexer_topk_prefill_ranges(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    k_scale: torch.Tensor,
++    weights: torch.Tensor,
++    cu_seqlen_ks: torch.Tensor,
++    cu_seqlen_ke: torch.Tensor,
++    *,
++    top_k: int,
++    max_packed_keys: int = 262_144,
++    out: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Run SM120 top-k for exact per-query key ranges.
++
++    q is FP8 [num_rows, H, 128]; k is gathered FP8 [num_keys, 128]. k_scale
++    is FP32 [num_keys] or raw uint8 [num_keys, 4]. weights is [num_rows, H].
++    cu_seqlen_ks/ke are exact local key bounds for each query; device tensors
++    are read to host to construct variable-length segments. Returned indices
++    are restored to the original local packed-K coordinate, with -1 padding.
++
++    Not CUDA-graph capturable: variable-size segment packing is prefill-only.
++    """
++    if q.device.type != "cuda":
++        raise UnsupportedPrefillShape("SM120 prefill helper requires CUDA")
++    if torch.cuda.is_current_stream_capturing():
++        raise UnsupportedPrefillShape("exact-range prefill adapter is eager-only")
++    if q.dtype != torch.float8_e4m3fn or k.dtype != torch.float8_e4m3fn:
++        raise UnsupportedPrefillShape("exact-range prefill currently supports FP8 only")
++    if q.ndim != 3 or q.shape[-1] != 128 or q.shape[1] not in (32, 64):
++        raise UnsupportedPrefillShape("expected q=[rows, H32|H64, 128]")
++    if k.ndim != 2 or k.shape[-1] != 128:
++        raise UnsupportedPrefillShape("expected gathered k=[keys, 128]")
++    nrows = q.shape[0]
++    if weights.shape != q.shape[:2]:
++        raise ValueError(f"weights must have shape {tuple(q.shape[:2])}")
++    if cu_seqlen_ks.numel() != nrows or cu_seqlen_ke.numel() != nrows:
++        raise ValueError("row ks/ke tensors must contain one bound per query")
++    if out is not None and (out.shape != (nrows, top_k) or out.dtype != torch.int32):
++        raise ValueError("out must be int32 [num_rows, top_k]")
++
++    # Eager prefill sync is intentional: exact row ranges take precedence over
++    # inferring a potentially wrong causal offset for compressed GLM rows.
++    starts: Sequence[int] = cu_seqlen_ks.detach().to(device="cpu", dtype=torch.int64).tolist()
++    ends: Sequence[int] = cu_seqlen_ke.detach().to(device="cpu", dtype=torch.int64).tolist()
++    spans = [end - start for start, end in zip(starts, ends, strict=True)]
++    if any(start < 0 or end < start or end > k.shape[0] for start, end in zip(starts, ends, strict=True)):
++        raise ValueError("row key range is outside the gathered packed-K buffer")
++    total = sum(spans)
++    if total > max_packed_keys:
++        raise UnsupportedPrefillShape(
++            f"exact-range packing needs {total} keys, limit is {max_packed_keys}"
++        )
++
++    dev = q.device
++    # One query per segment, ratio=1 and no causal offset: every row sees the
++    # complete exact [ks, ke) interval, regardless of q/k compression ratio.
++    q_cu = torch.arange(nrows + 1, device=dev, dtype=torch.int32)
++    k_prefix = [0]
++    key_ids: list[int] = []
++    for start, end in zip(starts, ends, strict=True):
++        key_ids.extend(range(start, end))
++        k_prefix.append(k_prefix[-1] + end - start)
++    k_cu = torch.tensor(k_prefix, device=dev, dtype=torch.int32)
++
++    if k_scale.dtype == torch.uint8:
++        scales = k_scale.contiguous().view(torch.float32).reshape(-1)
++    elif k_scale.dtype == torch.float32:
++        scales = k_scale.contiguous().reshape(-1)
++    else:
++        raise UnsupportedPrefillShape("k_scale must be float32 or raw uint8 FP32 bytes")
++    if scales.numel() != k.shape[0]:
++        raise ValueError("k_scale must contain one FP32 scale per gathered key")
++    if key_ids:
++        gather_ids = torch.tensor(key_ids, device=dev, dtype=torch.int64)
++        packed_k = k.index_select(0, gather_ids).contiguous()
++        packed_scale = scales.index_select(0, gather_ids).contiguous()
++    else:
++        packed_k = k[:0].contiguous()
++        packed_scale = scales[:0].contiguous()
++
++    from flashinfer.experimental.sm120_dsa_indexer import dsa_indexer_topk
++
++    ids, _ = dsa_indexer_topk(
++        q.contiguous(), packed_k, weights.contiguous(), q_cu, k_cu,
++        k_scale=packed_scale, top_k=top_k, ratio=1,
++        max_seqlen_k=max(spans, default=0), indices=out, return_scores=False,
++    )
++
++    # Kernel IDs address the concatenated buffer; restore local source IDs for
++    # the existing DCP merge and kpool-to-token expansion downstream.
++    packed_base = k_cu[:-1].to(torch.int64)[:, None]
++    original_base = torch.tensor(starts, device=dev, dtype=torch.int64)[:, None]
++    valid = ids >= 0
++    mapped = ids.to(torch.int64) - packed_base + original_base
++    ids.copy_(torch.where(valid, mapped, -1).to(torch.int32))
++    return ids
+diff --git a/vllm/models/glm5next/nvidia/sparse_indexer.py b/vllm/models/glm5next/nvidia/sparse_indexer.py
+--- a/vllm/models/glm5next/nvidia/sparse_indexer.py
++++ b/vllm/models/glm5next/nvidia/sparse_indexer.py
+@@ -347,7 +347,18 @@
+             from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
+ 
+             num_rows = q_slice.shape[0]
+-            if chunk.local_total_seq_lens == 0:
++            from vllm.models.glm5next.nvidia import sm120_dsa_adapter as sm120_dsa
++            prefill_fused_topk = None
++            if chunk.local_total_seq_lens > 0 and sm120_dsa.prefill_eligible(
++                q_slice_cast, k_quant_cast, q_scale_slice, dcp_world_size, row_shard, chunk
++            ):
++                prefill_fused_topk = sm120_dsa.prefill_topk(
++                    q_slice_cast, k_quant_cast, k_scale_cast,
++                    weights[row_start:row_end], chunk,
++                    topk_tokens // index_kpool if index_kpool > 1 else topk_tokens,
++                    index_kpool,
++                )
++            if prefill_fused_topk is not None or chunk.local_total_seq_lens == 0:
+                 logits = q_slice.new_empty((num_rows, 0), dtype=torch.float32)
+             else:
+                 logits = fp8_fp4_mqa_logits(
+@@ -371,7 +382,9 @@
+             else:
+                 topk_dst = topk_indices_buffer[row_start:row_end, :topk_tokens]
+ 
+-            if logits.shape[1] == 0:
++            if prefill_fused_topk is not None:
++                topk_dst.copy_(prefill_fused_topk)
++            elif logits.shape[1] == 0:
+                 topk_dst.fill_(-1)
+             else:
+                 torch.ops._C.top_k_per_row_prefill(
+@@ -596,17 +609,25 @@
+         )
+         from vllm.utils.deep_gemm import fp8_fp4_paged_mqa_logits
+ 
+-        logits = fp8_fp4_paged_mqa_logits(
+-            (padded_q_quant_cast, padded_q_scale),
+-            kv_cache,
+-            padded_weights[:num_padded_tokens],
+-            seq_lens,
+-            decode_metadata.block_table,
+-            decode_metadata.schedule_metadata,
+-            max_model_len=max_pool_len,
+-            clean_logits=False,
+-            indices=decode_metadata.indices,
+-        )
++        from vllm.models.glm5next.nvidia import sm120_dsa_adapter as sm120_dsa
++        select_k = topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
++        fused_topk = None
++        if sm120_dsa.eligible(padded_q_quant_cast, padded_q_scale, dcp_world_size,
++                              select_k, decode_metadata.indices):
++            fused_topk = sm120_dsa.paged_topk(
++                padded_q_quant_cast, kv_cache, padded_weights[:num_padded_tokens],
++                seq_lens, decode_metadata.block_table, select_k, max_pool_len)
++            # The single-rank merge below does not consume logits.
++            logits = torch.empty((num_padded_tokens, 0), dtype=torch.float32,
++                                 device=padded_q_quant_cast.device)
++        else:
++            logits = fp8_fp4_paged_mqa_logits(
++                (padded_q_quant_cast, padded_q_scale), kv_cache,
++                padded_weights[:num_padded_tokens], seq_lens,
++                decode_metadata.block_table, decode_metadata.schedule_metadata,
++                max_model_len=max_pool_len, clean_logits=False,
++                indices=decode_metadata.indices)
++
+         num_rows = logits.shape[0]
+         # kpool: logits are pool-granular -> select topk_tokens//kpool pools,
+         # then expand each pool back to its kpool tokens.
+@@ -623,14 +644,17 @@
+         # honors kernel_config.sparse_indexer_topk_backend and picks between
+         # cooperative/persistent by batch size instead of always taking the
+         # same kernel.
+-        get_indexer_topk(topk_backend)(
+-            logits,
+-            seq_lens,
+-            next_n,
+-            topk_dst,
+-            select_k,
+-            attn_metadata_narrowed.max_seq_len,
+-        )
++        if fused_topk is not None:
++            topk_dst.copy_(fused_topk)
++        else:
++            get_indexer_topk(topk_backend)(
++                logits,
++                seq_lens,
++                next_n,
++                topk_dst,
++                select_k,
++                attn_metadata_narrowed.max_seq_len,
++            )
+         _merge_dcp_topk_global(
+             logits,
+             topk_dst,
+@@ -728,6 +752,12 @@
+         self._cp_kv_cache_interleave_size: int | None = None
+         self.dcp_world_size = 1
+         self.dcp_rank = 0
++        from vllm.models.glm5next.nvidia import sm120_dsa_adapter as sm120_dsa
++        if sm120_dsa.enabled() and _cfg is not None:
++            num_spec = (_cfg.speculative_config.num_speculative_tokens
++                        if _cfg.speculative_config is not None else 0)
++            max_rows = _cfg.scheduler_config.max_num_seqs * (num_spec + 1)
++            sm120_dsa.prewarm(torch.cuda.current_device(), max_rows, self.max_pool_len)
+         if _parallel is not None and _parallel.decode_context_parallel_size > 1:
+             if _parallel.prefill_context_parallel_size > 1:
+                 raise NotImplementedError(
+diff --git a/vllm/v1/attention/backend.py b/vllm/v1/attention/backend.py
+--- a/vllm/v1/attention/backend.py
++++ b/vllm/v1/attention/backend.py
+@@ -209,6 +209,10 @@
+     @classmethod
+     def supports_kv_connector(cls) -> bool:
+         return True
++
++    @classmethod
++    def supports_hisparse(cls) -> bool:
++        return False
+ 
+     @classmethod
+     def supports_device_cpu_query_lens_mismatch(cls) -> bool:
+@@ -294,6 +298,7 @@
+         use_adaptive_verification: bool = False,
+         use_dcp: bool = False,
+         use_rswa: bool = False,
++        use_hisparse: bool = False,
+     ) -> list[str]:
+         invalid_reasons = []
+         if not cls.supports_head_size(head_size):
+@@ -338,6 +343,8 @@
+             invalid_reasons.append("batch invariance not supported")
+         if use_kv_connector and not cls.supports_kv_connector():
+             invalid_reasons.append("KV connector not supported")
++        if use_hisparse and not cls.supports_hisparse():
++            invalid_reasons.append("HiSparse not supported")
+         if use_pcp and not cls.supports_pcp():
+             invalid_reasons.append("PCP not supported")
+         if use_dcp and not cls.supports_dcp():
+@@ -1024,6 +1031,9 @@
+     hisparse_cache: "HiSparseCacheHandle | None" = None
+     supports_pcp: bool = True
+ 
++    def get_fp8_ds_mla_row_bytes(self) -> int:
++        return 656
++
+     @abstractmethod
+     def __init__(
+         self,
+@@ -1095,6 +1105,7 @@
+         slot_mapping: torch.Tensor,
+         kv_cache_dtype: str,
+         k_scale: torch.Tensor,
++        skip_scale: bool = False,
+     ) -> None:
+         if kv_cache.numel() == 0:
+             return
+@@ -1107,6 +1118,7 @@
+             slot_mapping.flatten(),
+             kv_cache_dtype=kv_cache_dtype,
+             scale=k_scale,
++            skip_scale=skip_scale,
+         )
+ 
+ 
+diff --git a/vllm/v1/attention/backends/mla/amx_mla.py b/vllm/v1/attention/backends/mla/amx_mla.py
+--- a/vllm/v1/attention/backends/mla/amx_mla.py
++++ b/vllm/v1/attention/backends/mla/amx_mla.py
+@@ -311,6 +311,7 @@
+         slot_mapping: torch.Tensor,
+         kv_cache_dtype: str,
+         k_scale: torch.Tensor,
++        skip_scale: bool = False,
+     ) -> None:
+         # Overrides the default (CUDA-only concat_and_cache_mla).
+         if kv_cache.numel() == 0:
+diff --git a/vllm/v1/attention/backends/mla/cpu_mla.py b/vllm/v1/attention/backends/mla/cpu_mla.py
+--- a/vllm/v1/attention/backends/mla/cpu_mla.py
++++ b/vllm/v1/attention/backends/mla/cpu_mla.py
+@@ -200,6 +200,7 @@
+         slot_mapping: torch.Tensor,
+         kv_cache_dtype: str,
+         k_scale: torch.Tensor,
++        skip_scale: bool = False,
+     ) -> None:
+         if kv_cache.numel() == 0:
+             return
+diff --git a/vllm/v1/attention/backends/mla/flashattn_mla_sparse.py b/vllm/v1/attention/backends/mla/flashattn_mla_sparse.py
+--- a/vllm/v1/attention/backends/mla/flashattn_mla_sparse.py
++++ b/vllm/v1/attention/backends/mla/flashattn_mla_sparse.py
+@@ -41,6 +41,10 @@
+         "bfloat16",
+     ]
+ 
++    @classmethod
++    def supports_hisparse(cls) -> bool:
++        return True
++
+     @staticmethod
+     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+         return [MultipleOf(64)]
+diff --git a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
+--- a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
++++ b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
+@@ -48,6 +48,10 @@
+ class _FlashInferMLASparseBackendBase(AttentionBackend):
+     """Common metadata for concrete FlashInfer sparse MLA backends."""
+ 
++    @classmethod
++    def supports_hisparse(cls) -> bool:
++        return True
++
+     @staticmethod
+     def get_name() -> str:
+         return "FLASHINFER_MLA_SPARSE"
+diff --git a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
+--- a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
++++ b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
+@@ -6,6 +6,7 @@
+ 
+ import torch
+ 
++from vllm.config import get_current_vllm_config
+ from vllm.model_executor.layers.attention.sparse_mla_attention import (
+     SparseMLACommonImpl,
+ )
+@@ -35,6 +36,11 @@
+ 
+     is_sparse = True
+     supports_dense_mha_prefill = False
++
++    def get_fp8_ds_mla_row_bytes(self) -> int:
++        if self.kv_lora_rank == 512 and self.qk_rope_head_dim == 0:
++            return 528
++        return super().get_fp8_ds_mla_row_bytes()
+ 
+     def __init__(
+         self,
+@@ -83,8 +89,6 @@
+             topk_indices_buffer=topk_indices_buffer,
+             **mla_args,
+         )
+-        from vllm.config import get_current_vllm_config
+-
+         vllm_config = get_current_vllm_config()
+         model_type = None
+         if vllm_config.model_config is not None:
+@@ -122,6 +126,26 @@
+         index_group = self.index_group
+         if isinstance(index_group, HiSparseMLAIndexGroup):
+             num_decode_tokens = attn_metadata.num_decode_tokens
++            physical_kv_cache = index_group.physical_kv_cache(self.index_group_index)
++            if (
++                num_decode_tokens == num_actual_toks
++                or index_group.cache(self.index_group_index).all_context_pages_resident
++            ):
++                topk_indices_physical = cast(
++                    torch.Tensor,
++                    index_group.convert_logical_to_physical_topk(
++                        self.index_group_index,
++                        topk_indices,
++                        attn_metadata,
++                        block_stride_rows=None,
++                        return_valid_counts=False,
++                    ),
++                )
++                return (
++                    self._run_mqa_kernel(q, physical_kv_cache, topk_indices_physical),
++                    None,
++                )
++
+             outputs = []
+             if num_decode_tokens:
+                 topk_indices_physical = cast(
+@@ -137,51 +161,32 @@
+                 outputs.append(
+                     self._run_mqa_kernel(
+                         q[:num_decode_tokens],
+-                        index_group.physical_kv_cache(self.index_group_index),
++                        physical_kv_cache,
+                         topk_indices_physical,
+                     )
+                 )
+-            if num_decode_tokens < num_actual_toks:
+-                cache = index_group.cache(self.index_group_index)
+-                if num_decode_tokens == 0 and cache.all_context_pages_resident:
+-                    topk_indices_physical = cast(
+-                        torch.Tensor,
+-                        index_group.convert_logical_to_physical_topk(
+-                            self.index_group_index,
+-                            topk_indices,
+-                            attn_metadata,
+-                            block_stride_rows=None,
+-                            return_valid_counts=False,
+-                        ),
+-                    )
+-                    prefill_cache = index_group.physical_kv_cache(
+-                        self.index_group_index
+-                    )
+-                else:
+-                    prefill_cache, block_table, req_ids = (
+-                        index_group.stage_prefill_rows(
+-                            self.index_group_index,
+-                            kv_c_and_k_pe_cache,
+-                            attn_metadata,
+-                        )
+-                    )
+-                    topk_indices_physical = cast(
+-                        torch.Tensor,
+-                        triton_convert_req_index_to_global_index(
+-                            req_ids,
+-                            block_table,
+-                            topk_indices[num_decode_tokens:],
+-                            BLOCK_SIZE=attn_metadata.block_size,
+-                            NUM_TOPK_TOKENS=topk_indices.shape[1],
+-                        ),
+-                    )
+-                outputs.append(
+-                    self._run_mqa_kernel(
+-                        q[num_decode_tokens:],
+-                        prefill_cache,
+-                        topk_indices_physical,
+-                    )
+-                )
++            prefill_cache, block_table, req_ids = index_group.stage_prefill_rows(
++                self.index_group_index,
++                kv_c_and_k_pe_cache,
++                attn_metadata,
++            )
++            topk_indices_physical = cast(
++                torch.Tensor,
++                triton_convert_req_index_to_global_index(
++                    req_ids,
++                    block_table,
++                    topk_indices[num_decode_tokens:],
++                    BLOCK_SIZE=attn_metadata.block_size,
++                    NUM_TOPK_TOKENS=topk_indices.shape[1],
++                ),
++            )
++            outputs.append(
++                self._run_mqa_kernel(
++                    q[num_decode_tokens:],
++                    prefill_cache,
++                    topk_indices_physical,
++                )
++            )
+             output = torch.cat(outputs) if len(outputs) > 1 else outputs[0]
+             return output, None
+ 
+diff --git a/vllm/v1/attention/backends/mla/flashmla_sparse.py b/vllm/v1/attention/backends/mla/flashmla_sparse.py
+--- a/vllm/v1/attention/backends/mla/flashmla_sparse.py
++++ b/vllm/v1/attention/backends/mla/flashmla_sparse.py
+@@ -154,6 +154,10 @@
+         "nvfp4_ds_mla",  # NVFP4 NoPE + FP8 RoPE (SM100 only)
+     ]
+ 
++    @classmethod
++    def supports_hisparse(cls) -> bool:
++        return True
++
+     @staticmethod
+     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+         if (
+@@ -858,6 +862,21 @@
+         if cache is not None:
+             assert isinstance(index_group, HiSparseMLAIndexGroup)
+             num_decode_tokens = attn_metadata.num_decode_tokens
++            if num_decode_tokens < q.shape[0] and cache.all_context_pages_resident:
++                physical_topk, lengths = index_group.convert_logical_to_physical_topk(
++                    self.index_group_index,
++                    topk_indices,
++                    attn_metadata,
++                    block_stride_rows=None,
++                    return_valid_counts=True,
++                )
++                return self._bf16_flash_mla_kernel(
++                    q,
++                    index_group.physical_kv_cache(self.index_group_index),
++                    physical_topk,
++                    lengths,
++                    actual_num_heads,
++                )
+             if num_decode_tokens > 0:
+                 decode_topk, decode_lengths = (
+                     index_group.convert_logical_to_physical_topk(
+diff --git a/vllm/v1/attention/backends/mla/index_group.py b/vllm/v1/attention/backends/mla/index_group.py
+--- a/vllm/v1/attention/backends/mla/index_group.py
++++ b/vllm/v1/attention/backends/mla/index_group.py
+@@ -17,7 +17,6 @@
+     triton_convert_req_index_to_global_index,
+ )
+ from vllm.v1.hisparse.runtime import (
+-    FP8_DS_MLA_ROW_BYTES,
+     HiSparseCacheHandle,
+     HiSparsePrefillStagingPlan,
+     create_hisparse_cache_handle,
+@@ -49,7 +48,7 @@
+         self,
+         vllm_config: VllmConfig | None = None,
+         *,
+-        head_size: int | None = None,
++        row_width: int | None = None,
+         kv_cache_dtype: str | None = None,
+     ) -> int:
+         layer_index = self.num_layers
+@@ -121,6 +120,7 @@
+         *,
+         block_stride_rows: int | None,
+         return_valid_counts: bool,
++        idx_mapping: torch.Tensor | None = None,
+     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+         num_tokens = logical_topk_indices.shape[0]
+         if num_tokens > self.physical_topk_indices.shape[0]:
+@@ -132,6 +132,7 @@
+                 BLOCK_STRIDE_ROWS=block_stride_rows,
+                 NUM_TOPK_TOKENS=logical_topk_indices.shape[1],
+                 return_valid_counts=return_valid_counts,
++                idx_mapping=idx_mapping,
+             )
+ 
+         physical_topk_indices = self.physical_topk_indices[:num_tokens]
+@@ -155,6 +156,7 @@
+                     valid_counts_out=(
+                         valid_topk_counts if return_valid_counts else None
+                     ),
++                    idx_mapping=idx_mapping,
+                 )
+                 self.physical_topk_ready.record(self.side_stream)
+         compute_stream.wait_event(self.physical_topk_ready)
+@@ -177,22 +179,20 @@
+         self,
+         vllm_config: VllmConfig | None = None,
+         *,
+-        head_size: int | None = None,
++        row_width: int | None = None,
+         kv_cache_dtype: str | None = None,
+     ) -> int:
+         assert vllm_config is not None
+-        assert head_size is not None
++        assert row_width is not None
+         assert kv_cache_dtype is not None
+         layer_index = super().register_layer()
+         if self.prefill_stream is None:
+             self.prefill_stream = _create_side_stream(self.logical_topk_indices.device)
+         if kv_cache_dtype == "fp8_ds_mla":
+-            row_width = FP8_DS_MLA_ROW_BYTES
+             kv_dtype = torch.uint8
+         else:
+             from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+ 
+-            row_width = head_size
+             kv_dtype = kv_cache_dtype_str_to_dtype(
+                 kv_cache_dtype, vllm_config.model_config
+             )
+@@ -233,7 +233,10 @@
+         cache = self.cache(layer_index)
+         num_tokens = logical_topk_indices.shape[0]
+         req_id_per_token = attn_metadata.req_id_per_token[:num_tokens]
+-        if num_tokens > cache.runtime.max_swap_rows:
++        if num_tokens > cache.runtime.max_swap_rows or (
++            cache.all_context_pages_resident
++            and cache.num_decode_tokens < cache.num_actual_tokens
++        ):
+             # Prefill-sized batches do not fit the decode residency workspace.
+             # Non-resident prefills are staged before reaching this path.
+             assert cache.all_context_pages_resident
+@@ -243,10 +246,11 @@
+                 layer_index,
+                 logical_topk_indices,
+                 req_id_per_token,
+-                leader.batch_block_table(),
++                leader.block_table,
+                 leader.view.block_size,
+                 block_stride_rows=leader.view.attention_block_stride,
+                 return_valid_counts=return_valid_counts,
++                idx_mapping=leader.runtime.request_state_indices,
+             )
+         source_block_table = cache.source_block_table
+         assert source_block_table is not None
+@@ -358,7 +362,7 @@
+         is_index_producing_layer: bool,
+         vllm_config: VllmConfig | None = None,
+         *,
+-        head_size: int | None = None,
++        row_width: int | None = None,
+         kv_cache_dtype: str | None = None,
+     ) -> tuple[SparseMLAIndexGroup, int]:
+         if is_index_producing_layer or self.current_group is None:
+@@ -390,7 +394,7 @@
+         group = self.current_group
+         group_index = group.register_layer(
+             vllm_config,
+-            head_size=head_size,
++            row_width=row_width,
+             kv_cache_dtype=kv_cache_dtype,
+         )
+         return group, group_index
+diff --git a/vllm/v1/attention/backends/mla/indexer.py b/vllm/v1/attention/backends/mla/indexer.py
+--- a/vllm/v1/attention/backends/mla/indexer.py
++++ b/vllm/v1/attention/backends/mla/indexer.py
+@@ -476,6 +476,9 @@
+     max_local_total_seq_lens: int = 0
+ 
+     pcp_deinterleave_idx: torch.Tensor | None = None
++    sm120_query_start_loc: torch.Tensor | None = None
++    sm120_query_causal_offsets: torch.Tensor | None = None
++    sm120_max_seq_len: int = 0
+ 
+ 
+ class BuildPrefillChunkMetadataKernel(
+@@ -1950,7 +1953,24 @@
+     else:
+         token_end = query_start_loc_cpu[end_idx].item()
+ 
++    sm120_q_cu = sm120_offsets = None
++    sm120_max_k = 0
++    if pcp_plan is None and dcp_world_size == 1:
++        # Build once per batch, not once per attention layer. Keep the
++        # exact native compression and sliced-query visibility boundary.
++        sm120_q_cu = (query_start_loc - qs_start).clamp(0, output_query_len)
++        query_lens = query_start_loc[1:] - query_start_loc[:-1]
++        sm120_offsets = (
++            uncompressed_seq_lens[start_idx:end_idx].to(torch.int64)
++            - query_lens.to(torch.int64)
++            + (qs_start - query_start_loc[:-1]).clamp_min(0).to(torch.int64)
++        )
++        sm120_max_k = int(compressed_seq_lens_cpu[start_idx:end_idx].max().item())
++
+     return DeepseekV32IndexerPrefillChunkMetadata(
++        sm120_query_start_loc=sm120_q_cu,
++        sm120_query_causal_offsets=sm120_offsets,
++        sm120_max_seq_len=sm120_max_k,
+         pcp_deinterleave_idx=pcp_deinterleave_idx,
+         cu_seqlen_ks=cu_seq_len_ks,
+         cu_seqlen_ke=cu_seq_len_ke,
+diff --git a/vllm/v1/attention/backends/mla/rocm_aiter_mla.py b/vllm/v1/attention/backends/mla/rocm_aiter_mla.py
+--- a/vllm/v1/attention/backends/mla/rocm_aiter_mla.py
++++ b/vllm/v1/attention/backends/mla/rocm_aiter_mla.py
+@@ -400,6 +400,7 @@
+         use_adaptive_verification: bool = False,
+         use_dcp: bool = False,
+         use_rswa: bool = False,
++        use_hisparse: bool = False,
+     ) -> list[str]:
+         invalid_reasons = super().validate_configuration(
+             head_size=head_size,
+@@ -421,6 +422,7 @@
+             use_adaptive_verification=use_adaptive_verification,
+             use_dcp=use_dcp,
+             use_rswa=use_rswa,
++            use_hisparse=use_hisparse,
+         )
+         # Arch/signature cannot express this: the backend still advertises
+         # fp16, so a DSpark draft with kv_cache_dtype="auto" would select
+diff --git a/vllm/v1/attention/backends/mla/sparse_utils.py b/vllm/v1/attention/backends/mla/sparse_utils.py
+--- a/vllm/v1/attention/backends/mla/sparse_utils.py
++++ b/vllm/v1/attention/backends/mla/sparse_utils.py
+@@ -81,6 +81,7 @@
+         block_stride_rows: int
+         block_n: int
+         has_prefill_workspace: bool
++        has_idx_mapping: bool
+         count_valid: bool
+         single_tile: bool
+         compact_to_front: bool
+@@ -99,6 +100,7 @@
+         token_indices_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS]
+         out_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS]
+         valid_count_ptr,  # int32 [num_tokens] - output valid count per row
++        idx_mapping_ptr,  # int32 [num_requests] - block table row per request
+         prefill_request_id_ptr,  # int32 [num_tokens], -1 for decode, >=0 for prefill
+         workspace_starts_ptr,  # int32 [num_prefill_reqs+1] or nullptr
+         workspace_rank_stride,  # rows per DCP rank of a gathered prefill workspace
+@@ -109,6 +111,7 @@
+         BLOCK_N: tl.constexpr,  # tile width along columns
+         NUM_TOPK_TOKENS: tl.constexpr,
+         HAS_PREFILL: tl.constexpr,
++        HAS_IDX_MAPPING: tl.constexpr,
+         COUNT_VALID: tl.constexpr,  # whether to count valid indices
+         # BLOCK_N >= NUM_TOPK_TOKENS: one program owns the query, so its count
+         # is an in-register reduction and needs no atomic.
+@@ -141,6 +144,8 @@
+ 
+         # Load request id for this token (no mask: grid is exact)
+         req = tl.load(req_id_ptr + token_id)
++        if HAS_IDX_MAPPING:
++            req = tl.maximum(tl.load(idx_mapping_ptr + req), 0)
+ 
+         # Load token indices for this tile
+         ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
+@@ -239,6 +244,7 @@
+         BLOCK_N: int,
+         NUM_TOPK_TOKENS: int,
+         HAS_PREFILL_WORKSPACE: bool,
++        HAS_IDX_MAPPING: bool,
+         COUNT_VALID: bool,
+         COMPACT_TO_FRONT: bool,
+         DCP_SIZE: int,
+@@ -252,6 +258,7 @@
+             block_stride_rows=BLOCK_STRIDE_ROWS,
+             block_n=tiling[1],
+             has_prefill_workspace=HAS_PREFILL_WORKSPACE,
++            has_idx_mapping=HAS_IDX_MAPPING,
+             count_valid=COUNT_VALID,
+             single_tile=tiling[0],
+             compact_to_front=COMPACT_TO_FRONT,
+@@ -279,6 +286,20 @@
+             block_size * dcp_size,
+         )
+         max_num_blocks_per_req = get_block_table_width(max_num_blocks, block_size)
++        hisparse_combos: list[dict[str, Any]] = []
++        if vllm_config.attention_config.hisparse_config is not None:
++            hisparse_combos.extend(
++                dict(
++                    HAS_PREFILL_WORKSPACE=False,
++                    HAS_IDX_MAPPING=True,
++                    COUNT_VALID=count_valid,
++                    COMPACT_TO_FRONT=count_valid,
++                    DCP_SIZE=1,
++                    DCP_RANK=0,
++                    DCP_INTERLEAVE=1,
++                )
++                for count_valid in (False, True)
++            )
+         pcp_dcp_combos = []
+         if (
+             vllm_config.parallel_config.prefill_context_parallel_size > 1
+@@ -288,6 +309,7 @@
+             pcp_dcp_combos.append(
+                 dict(
+                     HAS_PREFILL_WORKSPACE=True,
++                    HAS_IDX_MAPPING=False,
+                     COUNT_VALID=True,
+                     COMPACT_TO_FRONT=True,
+                     DCP_SIZE=dcp_size,
+@@ -299,6 +321,7 @@
+             zip_inputs(
+                 dict(
+                     HAS_PREFILL_WORKSPACE=False,
++                    HAS_IDX_MAPPING=False,
+                     COUNT_VALID=False,
+                     COMPACT_TO_FRONT=False,
+                     DCP_SIZE=1,
+@@ -307,6 +330,7 @@
+                 ),
+                 dict(
+                     HAS_PREFILL_WORKSPACE=False,
++                    HAS_IDX_MAPPING=False,
+                     COUNT_VALID=True,
+                     COMPACT_TO_FRONT=True,
+                     DCP_SIZE=1,
+@@ -315,6 +339,7 @@
+                 ),
+                 dict(
+                     HAS_PREFILL_WORKSPACE=True,
++                    HAS_IDX_MAPPING=False,
+                     COUNT_VALID=True,
+                     COMPACT_TO_FRONT=True,
+                     DCP_SIZE=1,
+@@ -323,6 +348,7 @@
+                 ),
+                 dict(
+                     HAS_PREFILL_WORKSPACE=False,
++                    HAS_IDX_MAPPING=False,
+                     COUNT_VALID=True,
+                     COMPACT_TO_FRONT=False,
+                     DCP_SIZE=dcp_size,
+@@ -331,6 +357,7 @@
+                 ),
+                 dict(
+                     HAS_PREFILL_WORKSPACE=False,
++                    HAS_IDX_MAPPING=False,
+                     COUNT_VALID=True,
+                     COMPACT_TO_FRONT=dcp_size > 1,
+                     DCP_SIZE=dcp_size,
+@@ -338,6 +365,7 @@
+                     DCP_INTERLEAVE=dcp_interleave,
+                 ),
+                 *pcp_dcp_combos,
++                *hisparse_combos,
+             ),
+             BLOCK_SIZE=block_size,
+             BLOCK_STRIDE_ROWS=block_stride_rows,
+@@ -373,6 +401,7 @@
+             prefill_workspace_starts=(
+                 int32_ptr if compile_key.has_prefill_workspace else None
+             ),
++            idx_mapping=(int32_ptr if compile_key.has_idx_mapping else None),
+             max_num_blocks_per_req=1,
+             workspace_rank_stride=1,
+             BLOCK_SIZE=compile_key.block_size,
+@@ -380,6 +409,7 @@
+             BLOCK_N=compile_key.block_n,
+             NUM_TOPK_TOKENS=compile_key.num_topk_tokens,
+             HAS_PREFILL_WORKSPACE=compile_key.has_prefill_workspace,
++            HAS_IDX_MAPPING=compile_key.has_idx_mapping,
+             COUNT_VALID=compile_key.count_valid,
+             COMPACT_TO_FRONT=compile_key.compact_to_front,
+             DCP_SIZE=compile_key.dcp_size,
+@@ -397,6 +427,7 @@
+         valid_counts: torch.Tensor | None,
+         prefill_workspace_request_ids: torch.Tensor | None,
+         prefill_workspace_starts: torch.Tensor | None,
++        idx_mapping: torch.Tensor | None,
+         *,
+         workspace_rank_stride: int,
+         max_num_blocks_per_req: int,
+@@ -405,6 +436,7 @@
+         BLOCK_N: int,
+         NUM_TOPK_TOKENS: int,
+         HAS_PREFILL_WORKSPACE: bool,
++        HAS_IDX_MAPPING: bool,
+         COUNT_VALID: bool,
+         COMPACT_TO_FRONT: bool,
+         DCP_SIZE: int,
+@@ -419,6 +451,7 @@
+             valid_count_ptr=valid_counts,
+             prefill_request_id_ptr=prefill_workspace_request_ids,
+             workspace_starts_ptr=prefill_workspace_starts,
++            idx_mapping_ptr=idx_mapping,
+             BLOCK_N=block_n,
+             HAS_PREFILL=HAS_PREFILL_WORKSPACE,
+             SINGLE_TILE=single_tile,
+@@ -475,6 +508,7 @@
+     return_valid_counts: bool = False,
+     out: torch.Tensor | None = None,
+     valid_counts_out: torch.Tensor | None = None,
++    idx_mapping: torch.Tensor | None = None,
+ ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+     """out[token_id, indice_id] =
+         block_table[req_id[token_id],
+@@ -494,11 +528,17 @@
+     prefill_workspace_starts: int32 [num_prefills], 0-indexed workspace
+         starts for each prefill request
+ 
++    When idx_mapping (int32 [num_requests]) is given, block_table is
++    indexed by idx_mapping[req_id[token_id]] instead of req_id[token_id].
++
+     When return_valid_counts is True, also returns the count of valid (non -1)
+     indices per row, computed during the same kernel pass (no extra overhead).
+     """
+     assert req_id.dtype == torch.int32
+     assert block_table.dtype == torch.int32
++    assert idx_mapping is None or (
++        idx_mapping.dtype == torch.int32 and idx_mapping.is_contiguous()
++    )
+     assert token_indices.dtype == torch.int32
+     assert req_id.shape[0] == token_indices.shape[0], (
+         f"req_id ({req_id.shape[0]}) and token_indices ({token_indices.shape[0]}) "
+@@ -572,6 +612,7 @@
+         valid_counts,
+         prefill_workspace_request_ids,
+         prefill_workspace_starts,
++        idx_mapping,
+         # shapes / constexprs
+         workspace_rank_stride=prefill_workspace_rank_stride or 0,
+         max_num_blocks_per_req=max_num_blocks_per_req,
+@@ -582,6 +623,7 @@
+         BLOCK_N=BLOCK_N,
+         NUM_TOPK_TOKENS=NUM_TOPK_TOKENS,
+         HAS_PREFILL_WORKSPACE=HAS_PREFILL_WORKSPACE,
++        HAS_IDX_MAPPING=idx_mapping is not None,
+         COUNT_VALID=return_valid_counts,
+         COMPACT_TO_FRONT=return_valid_counts,
+         DCP_SIZE=dcp_size,
+@@ -680,6 +722,7 @@
+         # No prefill workspace on the DCP decode path.
+         None,
+         None,
++        None,
+         workspace_rank_stride=0,
+         max_num_blocks_per_req=max_num_blocks_per_req,
+         BLOCK_SIZE=BLOCK_SIZE,
+@@ -689,6 +732,7 @@
+         BLOCK_N=BLOCK_N,
+         NUM_TOPK_TOKENS=NUM_TOPK_TOKENS,
+         HAS_PREFILL_WORKSPACE=False,
++        HAS_IDX_MAPPING=False,
+         COUNT_VALID=count_valid,
+         COMPACT_TO_FRONT=compact_valid_to_front,
+         DCP_SIZE=dcp_size,
+diff --git a/vllm/v1/attention/selector.py b/vllm/v1/attention/selector.py
+--- a/vllm/v1/attention/selector.py
++++ b/vllm/v1/attention/selector.py
+@@ -37,6 +37,7 @@
+     use_adaptive_verification: bool = False
+     use_dcp: bool = False
+     use_rswa: bool = False
++    use_hisparse: bool = False
+ 
+     def __repr__(self):
+         return (
+@@ -57,7 +58,8 @@
+             f"use_adaptive_verification={self.use_adaptive_verification}, "
+             f"use_pcp={self.use_pcp}, "
+             f"use_dcp={self.use_dcp}, "
+-            f"use_rswa={self.use_rswa})"
++            f"use_rswa={self.use_rswa}, "
++            f"use_hisparse={self.use_hisparse})"
+         )
+ 
+ 
+@@ -174,6 +176,9 @@
+             vllm_config.model_config is not None
+             and vllm_config.model_config.rswa_window is not None
+         ),
++        use_hisparse=(
++            use_sparse and vllm_config.attention_config.hisparse_config is not None
++        ),
+     )
+ 
+     # A per-KV-group override (keyed by KVCacheSpecKind) takes precedence over
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -975,11 +975,11 @@
+                         block_aligned_local = (
+                             num_new_local_computed_tokens - partial_tail
+                         )
+-                        ext_tokens, load_kv_async = (
+-                            self.connector.get_num_new_matched_tokens(
+-                                request, block_aligned_local
+-                            )
+-                        )
++                        if hit_diverged:
++                            lookup = self.connector.get_divergent_matched_tokens
++                        else:
++                            lookup = self.connector.get_num_new_matched_tokens
++                        ext_tokens, load_kv_async = lookup(request, block_aligned_local)
+                         if request.skip_reading_prefix_cache:
+                             ext_tokens, load_kv_async = 0, False
+ 
+diff --git a/vllm/v1/hisparse/binding.py b/vllm/v1/hisparse/binding.py
+--- a/vllm/v1/hisparse/binding.py
++++ b/vllm/v1/hisparse/binding.py
+@@ -63,18 +63,22 @@
+             "HiSparse requires a GPU block size supported by every sparse "
+             f"attention and indexer backend: {error}"
+         ) from error
+-    kv_cache_spec = kv_cache_spec | {
++    resized_specs: dict[str, KVCacheSpec] = {
+         name: spec.copy_with_new_block_size(block_size)
+         for name, spec in mla_specs.items()
+     }
+-    groups = get_hisparse_kv_cache_groups(vllm_config, kv_cache_spec)
++    groups = get_hisparse_kv_cache_groups(vllm_config, resized_specs)
+     assert groups is not None
+-    return kv_cache_spec | {
+-        layer_name: group.kv_cache_spec
+-        for group in groups
+-        if isinstance(group.kv_cache_spec, (HiSparseResidentSpec, HiSparseHotSpec))
+-        for layer_name in group.layer_names
+-    }
++    return (
++        kv_cache_spec
++        | resized_specs
++        | {
++            layer_name: group.kv_cache_spec
++            for group in groups
++            if isinstance(group.kv_cache_spec, (HiSparseResidentSpec, HiSparseHotSpec))
++            for layer_name in group.layer_names
++        }
++    )
+ 
+ 
+ def allocate_hisparse_kv_caches(
+@@ -228,7 +232,7 @@
+         assert len(table_shapes) == 1
+         max_num_reqs, max_num_pages = table_shapes.pop()
+         residency = torch.zeros(
+-            (max_num_reqs, len(resident_groups), max_num_pages),
++            (len(resident_groups), max_num_reqs, max_num_pages),
+             dtype=torch.int32,
+             device=block_tables.input_block_tables[resident_groups[0][0]].device,
+         )
+@@ -246,7 +250,7 @@
+                 block_stride=tensor_config.block_stride,
+                 num_blocks=kv_cache_config.num_blocks,
+                 block_size=group.kv_cache_spec.block_size,
+-                block_table=residency[:, resident_source_index],
++                block_table=residency[resident_source_index],
+                 slot_mapping=block_tables.slot_mappings[group_id],
+             )
+             cache_handle.residency = residency
+diff --git a/vllm/v1/hisparse/layout.py b/vllm/v1/hisparse/layout.py
+--- a/vllm/v1/hisparse/layout.py
++++ b/vllm/v1/hisparse/layout.py
+@@ -135,7 +135,12 @@
+ 
+     config = ResolvedHiSparseConfig.from_vllm_config(
+         vllm_config,
+-        vllm_config.model_config.hf_config.index_topk,
++        max(
++            spec.topk_buffer_width
++            if spec.topk_buffer_width is not None
++            else vllm_config.model_config.hf_text_config.index_topk
++            for spec in source_specs.values()
++        ),
+         gpu_block_size,
+     )
+     assert config is not None
+diff --git a/vllm/v1/hisparse/residency_chunked.py b/vllm/v1/hisparse/residency_chunked.py
+new file mode 100644
+--- /dev/null
++++ b/vllm/v1/hisparse/residency_chunked.py
+@@ -0,0 +1,90 @@
++"""Bound HiSparse resolver CTA shared memory without reducing the top-k union.
++
++Keep the complete hot buffer. Resolve the verification rows in per-request
++chunks, using the existing CUDA operator, then gather all compacted misses once.
++Prior chunks remain MRU; hot_size >= the complete union prevents their eviction.
++All row remapping is device-side and uses fixed sizes for CUDA graph replay.
++"""
++from __future__ import annotations
++
++import torch
++
++
++def required_shared_bytes(hot_size: int, union_rows: int) -> int:
++    return 4 * (2 * (union_rows + 1) + 3 * ((hot_size + 31) // 32) + 7) + 2 * hot_size
++
++
++def query_chunk_size(hot_size: int, top_k: int, max_union_rows: int, limit: int) -> int:
++    max_queries = (max_union_rows + top_k - 1) // top_k
++    for q in range(max_queries, 0, -1):
++        if required_shared_bytes(hot_size, q * top_k) <= limit:
++            return q
++    raise ValueError("Even one HiSparse query exceeds the shared-memory limit")
++
++
++def resolve_residency(*args, max_queries_per_chunk: int, original=None):
++    if original is None:
++        original = torch.ops._C_cache_ops.hisparse_resolve_residency
++    if len(args) != 25:
++        raise ValueError("Unexpected HiSparse resolver ABI")
++    values = list(args)
++    indices = values[3]
++    request_states = values[7]
++    max_union_rows = values[9]
++    request_ids = values[14]
++    if request_ids is None or request_states is None:
++        raise ValueError("Chunked HiSparse requires explicit request IDs and states")
++    n, top_k = indices.shape
++    queries = (max_union_rows + top_k - 1) // top_k
++    if queries <= max_queries_per_chunk:
++        return original(*values)
++    if n == 0:
++        return
++    if n <= max_queries_per_chunk:
++        # Small draft batches fit even if every row belongs to one request.
++        values[9] = n * top_k
++        return original(*values)
++    if values[8] < max_union_rows:
++        raise ValueError("Hot capacity must cover the complete verification union")
++    requests = request_states.numel()
++    ids = request_ids.to(torch.long)
++    valid = (ids >= 0) & (ids < requests)
++    safe_ids = torch.where(valid, ids, requests)
++    # Prefix occurrence count also handles non-contiguous request IDs safely.
++    onehot = torch.zeros((n, requests + 1), dtype=torch.int32, device=ids.device)
++    onehot.scatter_(1, safe_ids[:, None], 1)
++    ordinal = onehot.cumsum(0, dtype=torch.int32).gather(1, safe_ids[:, None])[:, 0] - 1
++    valid &= ordinal < queries
++    table_pad = requests * queries
++    keys = torch.where(valid, safe_ids * queries + ordinal, table_pad)
++    table = torch.full((table_pad + 1,), n, dtype=torch.long, device=ids.device)
++    table.scatter_(0, keys, torch.arange(n, device=ids.device))
++    table = table[:-1].view(requests, queries)
++    inputs = torch.cat((indices, indices.new_full((1, top_k), -1)), 0)
++    # Outputs 19/20/21 are compact plans: scatter their *whole query rows*,
++    # not a mask over the original union, to preserve every compacted miss.
++    output_positions = (4, 10, 12, 17, 18, 19, 20, 21)
++    zeros = {10, 18, 21}
++    merged = {}
++    for pos in output_positions:
++        out = values[pos]
++        if out is not None:
++            if out.shape[0] != n:
++                raise ValueError(f"Unexpected resolver output rows at argument {pos}")
++            merged[pos] = out.new_full((n + 1, *out.shape[1:]), 0 if pos in zeros else -1)
++    for start in range(0, queries, max_queries_per_chunk):
++        count = min(max_queries_per_chunk, queries - start)
++        rowmap = table[:, start:start + count].reshape(-1)
++        call = list(values)
++        call[3] = inputs.index_select(0, rowmap).contiguous()
++        call[9] = count * top_k
++        call[14] = torch.arange(requests, device=ids.device, dtype=request_ids.dtype).repeat_interleave(count)
++        for pos in merged:
++            out = values[pos]
++            call[pos] = out.new_full((requests * count, *out.shape[1:]), 0 if pos in zeros else -1)
++        original(*call)
++        for pos, target in merged.items():
++            # The only duplicate index is the disposable padding row n.
++            target.index_copy_(0, rowmap, call[pos])
++    for pos, target in merged.items():
++        values[pos].copy_(target[:-1])
+diff --git a/vllm/v1/hisparse/runtime.py b/vllm/v1/hisparse/runtime.py
+--- a/vllm/v1/hisparse/runtime.py
++++ b/vllm/v1/hisparse/runtime.py
+@@ -25,6 +25,7 @@
+ from vllm.utils.torch_utils import async_tensor_h2d, current_stream
+ from vllm.v1.attention.backend import max_decode_query_len
+ from vllm.v1.hisparse.types import SparseKVResidencyUpdate
++from vllm.v1.hisparse.residency_chunked import query_chunk_size, required_shared_bytes, resolve_residency
+ from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+ from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
+ 
+@@ -36,8 +37,6 @@
+     from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
+     from vllm.v1.kv_cache_interface import KVCacheConfig
+ 
+-# fp8_ds_mla KV row: 512 B quantized NoPE + 16 B scales + 128 B RoPE.
+-FP8_DS_MLA_ROW_BYTES = 656
+ HiSparseTopKResult: TypeAlias = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+ 
+ 
+@@ -164,29 +163,20 @@
+ 
+ def _check_residency_shared_memory(
+     device: torch.device, config: ResolvedHiSparseConfig
+-) -> None:
+-    """Reject a config whose residency resolver exceeds per-block shared memory."""
+-    # Mirrors hisparse_resolve_residency's layout: union hash keys and values
+-    # (plus an empty slot), per-chunk offsets, five counters, done bits, and
+-    # the int16 compacted LRU.
+-    hot_size = config.device_buffer_size
+-    num_chunks = cdiv(hot_size, 32)
+-    required = 4 * (2 * (config.max_union_rows + 1) + 3 * num_chunks + 7) + 2 * hot_size
+-    device_index = (
+-        device.index
+-        if device.index is not None
+-        else torch.accelerator.current_device_index()
+-    )
++) -> int:
++    """Select a fitting resolver chunk, preserving the complete hot capacity."""
++    device_index = device.index if device.index is not None else torch.accelerator.current_device_index()
+     available = get_max_shared_memory_bytes(device_index)
+-    if required > available:
+-        raise ValueError(
+-            "HiSparse residency resolution needs "
+-            f"{required} B of shared memory per block for "
+-            f"device_buffer_size={config.device_buffer_size} and "
+-            f"{config.max_union_rows} rows per request "
+-            "(decode query length x index_topk), but the device allows "
+-            f"{available} B. Lower device_buffer_size or num_speculative_tokens."
+-        )
++    chunk = query_chunk_size(config.device_buffer_size, config.top_k, config.max_union_rows, available)
++    full = required_shared_bytes(config.device_buffer_size, config.max_union_rows)
++    if full > available:
++        logger.warning(
++            "HiSparse resolver uses verification chunks of %d queries: %d B per CTA "
++            "instead of %d B (device limit %d B). Full top-k union %d and hot buffer %d remain unchanged.",
++            chunk, required_shared_bytes(config.device_buffer_size, chunk * config.top_k),
++            full, available, config.max_union_rows, config.device_buffer_size,
++        )
++    return chunk
+ 
+ 
+ def check_hisparse_host_memory(pool_bytes: int) -> None:
+@@ -722,8 +712,9 @@
+         # block table and need not be contiguous in the shared slab.
+         self.region_stride = config.device_buffer_size
+         self.max_union_rows = config.max_union_rows
++        self.residency_max_queries_per_chunk = math.ceil(config.max_union_rows / config.top_k)
+         if self.device.type == "cuda":
+-            _check_residency_shared_memory(self.device, config)
++            self.residency_max_queries_per_chunk = _check_residency_shared_memory(self.device, config)
+ 
+         row_bytes = row_width * kv_dtype.itemsize
+         if row_bytes % 16 != 0:
+@@ -959,7 +950,7 @@
+ 
+         # Padded rows are skipped by the kernel (request_state_indices) and must
+         # come out as -1 so the attention kernel masks them.
+-        torch.ops._C_cache_ops.hisparse_resolve_residency(
++        resolve_residency(
+             host_cache,
+             hot.cache,
+             self.hot_block_table,
+@@ -987,6 +978,7 @@
+             if resident is not None and resident.view is not None
+             else 0,
+             0,
++            max_queries_per_chunk=self.residency_max_queries_per_chunk,
+         )
+ 
+     def _swap_rows(self, shared_rows: slice) -> None:
+@@ -1123,13 +1115,13 @@
+ ) -> None:
+     """Apply scheduled requests' residency changes.
+ 
+-    ``residency`` is ``[state rows, resident groups, pages]``: the GPU block of
++    ``residency`` is ``[resident groups, state rows, pages]``: the GPU block of
+     each page, or block 0 when the page is read from the host.
+     """
+     if not updates:
+         return
+     batch_rows = {request_id: row for row, request_id in enumerate(request_ids)}
+-    num_groups = residency.shape[1]
++    num_groups = residency.shape[0]
+     rows: list[int] = []
+     pages: list[int] = []
+     block_ids: list[list[int]] = [[] for _ in range(num_groups)]
+@@ -1150,7 +1142,7 @@
+         host_values, device=request_state_indices.device, dtype=torch.int32
+     )
+     state_rows = request_state_indices[values[:, 0]]
+-    residency[state_rows, :, values[:, 1]] = values[:, 2:]
++    residency[:, state_rows, values[:, 1]] = values[:, 2:].T
+ 
+ 
+ class HiSparseCacheHandle:
+@@ -1175,7 +1167,6 @@
+         # Speculator layers write their rows after the target forward.
+         self.draft_layer = False
+         self.index_group_caches: list[HiSparseCacheHandle] = [self]
+-        self._batch_block_table: torch.Tensor | None = None
+ 
+     def prepare_group_for_batch(self, attn_metadata: Any | None) -> None:
+         assert self.runtime.is_group_leader
+@@ -1184,7 +1175,6 @@
+ 
+     def _prepare_for_batch(self, attn_metadata: Any | None) -> None:
+         self.dummy_batch = attn_metadata is None
+-        self._batch_block_table = None
+         self.runtime.begin_forward()
+         self.num_actual_tokens = (
+             attn_metadata.num_actual_tokens if attn_metadata is not None else 0
+@@ -1199,17 +1189,6 @@
+         self.host_mirror_required = attn_metadata is not None and (
+             not self.decode_batch or self.runtime.eager_host_mirror
+         )
+-
+-    def batch_block_table(self) -> torch.Tensor:
+-        """Resident rows by this step's batch row, for the prefill paths."""
+-        if self._batch_block_table is None:
+-            assert self.block_table is not None
+-            indices = self.runtime.request_state_indices
+-            assert indices is not None
+-            self._batch_block_table = self.block_table.index_select(
+-                0, indices.clamp(min=0)
+-            )
+-        return self._batch_block_table
+ 
+     def write_target(
+         self, num_input_rows: int, num_slot_rows: int
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -686,6 +686,8 @@
+ class MLAAttentionSpec(FullAttentionSpec):
+     # TODO(Lucas/Chen): less hacky way to do this
+     cache_dtype_str: str | None = None
++    topk_buffer_width: int | None = None
++    """Width of the model's sparse top-k indices buffer, including padding."""
+     # DeepseekV4 only fields. Non-DeepseekV4 MLA models leave these at defaults.
+     alignment: int | None = None  # Default to None for no padding.
+     model_version: str | None = None
+@@ -707,6 +709,7 @@
+             "All attention layers in the same KV cache group must be MLAAttentionSpec."
+         )
+         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
++        topk_buffer_width_set = {spec.topk_buffer_width for spec in specs}
+         tokens_per_state_set = set(spec.tokens_per_state for spec in specs)
+         model_version_set = set(spec.model_version for spec in specs)
+         cache_role_set = {spec.cache_role for spec in specs}
+@@ -714,6 +717,7 @@
+         block_stride_alignment_set = {spec.block_stride_alignment for spec in specs}
+         assert (
+             len(cache_dtype_str_set) == 1
++            and len(topk_buffer_width_set) == 1
+             and len(tokens_per_state_set) == 1
+             and len(model_version_set) == 1
+             and len(cache_role_set) == 1
+@@ -721,7 +725,8 @@
+             and len(block_stride_alignment_set) == 1
+         ), (
+             "All attention layers in the same KV cache group must use the same "
+-            "quantization method, tokens per state, model version, cache role, "
++            "quantization method, top-k buffer width, tokens per state, "
++            "model version, cache role, "
+             "index-sharing role, and block stride alignment."
+         )
+         merged_spec = cls(
+@@ -736,6 +741,7 @@
+             num_head_slots=specs[0].num_head_slots,
+             state_content_bytes=specs[0].state_content_bytes,
+             cache_dtype_str=cache_dtype_str_set.pop(),
++            topk_buffer_width=topk_buffer_width_set.pop(),
+             tokens_per_state=tokens_per_state_set.pop(),
+             model_version=model_version_set.pop(),
+             cache_role=cache_role_set.pop(),
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -2025,7 +2025,9 @@
+                 skip_compiled=skip_compiled,
+                 is_padding=input_batch.is_padding,
+             ):
+-                self.kv_connector.pre_forward(scheduler_output, input_batch)
++                self.kv_connector.pre_forward(
++                    scheduler_output, input_batch, attn_metadata=attn_metadata
++                )
+                 if ubatch_state is not None:
+                     assert self.ubatch_runner is not None
+                     model_output = self.ubatch_runner.run(
+diff --git a/vllm/v1/worker/gpu/spec_decode/mtp/speculator.py b/vllm/v1/worker/gpu/spec_decode/mtp/speculator.py
+--- a/vllm/v1/worker/gpu/spec_decode/mtp/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/mtp/speculator.py
+@@ -33,7 +33,19 @@
+             and hasattr(draft_model.model, "set_skip_topk")
+             and hasattr(draft_model.model, "compact_topk_indices")
+         )
++        # Steps 1+ skip the indexer, so its caches need no decode metadata.
++        self.topk_cache_layers: set[str] = set()
++        if self.share_mtp_topk_indices:
++            layers = getattr(draft_model.model, "topk_cache_layers", None)
++            self.topk_cache_layers = layers() if layers is not None else set()
++        # Draft prefill outputs are sampled only at each request's last token.
++        set_prefill_rows = getattr(draft_model.model, "set_prefill_rows", None)
++        if set_prefill_rows is not None:
++            set_prefill_rows(self.last_token_indices)
+         return draft_model
++
++    def draft_decode_reads(self, layer_names: list[str]) -> bool:
++        return not set(layer_names) <= self.topk_cache_layers
+ 
+     def on_prefill_begin(self, num_reqs: int) -> None:
+         # Step 0 computes its own top-k. Unconditional, so a step that died
+diff --git a/vllm/v1/worker/gpu/spec_decode/speculator.py b/vllm/v1/worker/gpu/spec_decode/speculator.py
+--- a/vllm/v1/worker/gpu/spec_decode/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/speculator.py
+@@ -598,4 +598,10 @@
+             )
+         for groups in self.attn_groups:
+             for group in groups:
++                if not self.draft_decode_reads(group.layer_names):
++                    continue
+                 group.update_draft_decode_metadata(attn_metadata)
++
++    def draft_decode_reads(self, layer_names: list[str]) -> bool:
++        """Whether draft decode steps read these layers' attention metadata."""
++        return True

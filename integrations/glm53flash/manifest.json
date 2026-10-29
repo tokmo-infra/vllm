@@ -1,0 +1,383 @@
+{
+  "name": "vllm-0.32.0-glm5.3-flash",
+  "archived_at": "2026-10-29",
+  "layout": "Pinned integration patch set; repository main source is not replaced by older runtime files.",
+  "vllm": {
+    "repository": "https://github.com/vllm-project/vllm.git",
+    "commit": "5df63a7203cdb9328d824a27b682e77c7b9928be",
+    "version": "0.32.0",
+    "patches": [
+      {
+        "path": "patches/vllm-runtime.patch",
+        "sha256": "f02227cb019dc44d9b5f719b48043bb6f948ffd1499176aa8a713b198bd9de2d",
+        "files": [
+          {
+            "path": "vllm/_custom_ops.py",
+            "sha256": "156baa1215c43df0cddc9e4188d767f1964fd8319f79b37ffb8a7e2ed8f19057"
+          },
+          {
+            "path": "vllm/config/vllm.py",
+            "sha256": "d30876a57fff3c7a929e584eb48c2bfa3145a612fe9a950c3072d9b7c8ee88d6"
+          },
+          {
+            "path": "vllm/distributed/kv_transfer/kv_connector/v1/base.py",
+            "sha256": "e74ae8d6966971759b21df93eb3cd9e9c2ea1e7fb03fa42b247d5fb14d86dd07"
+          },
+          {
+            "path": "vllm/distributed/kv_transfer/kv_connector/v1/hisparse/worker.py",
+            "sha256": "83cad141105497b90268ebd3db9d9ee15e0d4496ec14355d20b7b1baed28e16e"
+          },
+          {
+            "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/fp8_wire.py",
+            "sha256": "7c952f8f388300acc72c54f5b63f530ccb38e606e9f7db11ecd642d11777d9c6"
+          },
+          {
+            "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py",
+            "sha256": "170a7c46294e676af3f7ea978dc7873526a4d4aed51fb0de1d0c72d9b59b243c"
+          },
+          {
+            "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/stats.py",
+            "sha256": "29469c688af6c4bc3a1129bb4d0da28519f4e812f5e64467abb07d3dae822f7d"
+          },
+          {
+            "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py",
+            "sha256": "f48cd2134b1d62251d8c90b3182b6a762f1e19827a6f6ace1831b962f77bcd23"
+          },
+          {
+            "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/staged_lookup.py",
+            "sha256": "bebb909ff6da50f153ee789fc9422d073bb7304e79ec6aac6eae769e690dee28"
+          },
+          {
+            "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py",
+            "sha256": "c46cf389f6365926ffb8290d0a4cd8f0211f306d53139309d9bdcce893204ad4"
+          },
+          {
+            "path": "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py",
+            "sha256": "7a2ae1ee1ec286cead7f7e3f37368c9006136cc12c021b41cf1a5acd045858c3"
+          },
+          {
+            "path": "vllm/model_executor/layers/attention/mla_attention.py",
+            "sha256": "bb669c9ab9efbd63cdb8e9f01c23873397c01ad6cfd0ff1b9f293b680fd60b55"
+          },
+          {
+            "path": "vllm/model_executor/layers/attention/sparse_mla_attention.py",
+            "sha256": "798269daf18317ea9a0acc5b901f8a9a179d65f21144ef4e1bf36185efe9f2ed"
+          },
+          {
+            "path": "vllm/models/deepseek_v32/amd/rocm.py",
+            "sha256": "df4b2d1ad982a049c5c48bb68cdd24cf2eda9eb2c38993c5fb328037850a5e06"
+          },
+          {
+            "path": "vllm/models/deepseek_v32/attention.py",
+            "sha256": "21b91ff9719b687d9c7805c85f40affd045c692b179c20884eb9f97e3ad510d0"
+          },
+          {
+            "path": "vllm/models/deepseek_v32/common/kernels.py",
+            "sha256": "b7d88d348ea80010feddd2ebc56bffc5b4ad528dc1dbb48c98128e5ec2461f52"
+          },
+          {
+            "path": "vllm/models/dots3_note/nvidia/attention.py",
+            "sha256": "7420daf5338894cb56060040af457b437303fd7e118c52d2f4c6e114c6446211"
+          },
+          {
+            "path": "vllm/models/glm5next/common/model.py",
+            "sha256": "ca9617d20431548507910debdfafeab4f9381db4ab783e88478d507c79da21a4"
+          },
+          {
+            "path": "vllm/models/glm5next/common/mtp.py",
+            "sha256": "383d1ae302b3c269572c0a10bcb5af9aac99488eedbe629867c1be02a86bfaed"
+          },
+          {
+            "path": "vllm/models/glm5next/nvidia/sm120_dsa_adapter.py",
+            "sha256": "be8d54f780e3960bd8c806675e26ce97dece35f27f04b9ce7ed59639265b749a"
+          },
+          {
+            "path": "vllm/models/glm5next/nvidia/sm120_dsa_prefill.py",
+            "sha256": "6f1486628236868a81ab4b933368c60358a5c7648c990d3c92af0bca0b0817e7"
+          },
+          {
+            "path": "vllm/models/glm5next/nvidia/sparse_indexer.py",
+            "sha256": "43f831129bc4a16e79c8a87308afad118780a37abec46c72ed0d635999547687"
+          },
+          {
+            "path": "vllm/v1/attention/backend.py",
+            "sha256": "52d567d752f1e943559fad280a542f8cc77d78b4dc1a594cd8d97ea5fa007c87"
+          },
+          {
+            "path": "vllm/v1/attention/backends/mla/amx_mla.py",
+            "sha256": "4f318886bb49fe462f2087dcbf850fa78b6e2be7ea2efd18ba3f3e5a77108ded"
+          },
+          {
+            "path": "vllm/v1/attention/backends/mla/cpu_mla.py",
+            "sha256": "89a5d2587e5b8b8859e793149fc48679081738c6c2e9e0b7ed468334b846e72d"
+          },
+          {
+            "path": "vllm/v1/attention/backends/mla/flashattn_mla_sparse.py",
+            "sha256": "0c33fa718c15c7952b71f605d65da05cec6a511982eba0aefcaae70a2dfddd27"
+          },
+          {
+            "path": "vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py",
+            "sha256": "900774d965e079a5188b7dcd47e58f2c5d9e002fa52f656d6292d79fdc4b1030"
+          },
+          {
+            "path": "vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py",
+            "sha256": "775fdf8ab6ebd2007324004abe5ed2f5c818f1cf303d8b28a016a3956419abe3"
+          },
+          {
+            "path": "vllm/v1/attention/backends/mla/flashmla_sparse.py",
+            "sha256": "f9366acaffe7fbe04007a11b698bd529869673ba67481c48b069d13a32cf03e4"
+          },
+          {
+            "path": "vllm/v1/attention/backends/mla/index_group.py",
+            "sha256": "971185354488b5c121d86a1a09685b191ede7c55203ba1e444eca605fdbc16ba"
+          },
+          {
+            "path": "vllm/v1/attention/backends/mla/indexer.py",
+            "sha256": "e06a2c14f1ba94c993cc20aee5ab169f71741c8423395f85eee67059e03c8d35"
+          },
+          {
+            "path": "vllm/v1/attention/backends/mla/rocm_aiter_mla.py",
+            "sha256": "e81ac96a5fa9af05450fb7b379bfb6df90175acd3083572a188a0dcdf90e50e3"
+          },
+          {
+            "path": "vllm/v1/attention/backends/mla/sparse_utils.py",
+            "sha256": "37ac8964d9133f9c0a69659aa0838f653f4d804dd9d1d77feb239e5298bda231"
+          },
+          {
+            "path": "vllm/v1/attention/selector.py",
+            "sha256": "a9787819033a518be6649636c68b4173261ff87b872b13f0456b999615ccd673"
+          },
+          {
+            "path": "vllm/v1/core/sched/scheduler.py",
+            "sha256": "59864fe3c462f8022a48a0906bd0dd937260559d5f0eb9f51d89f744efdacf36"
+          },
+          {
+            "path": "vllm/v1/hisparse/binding.py",
+            "sha256": "2189a164c007b23e421bb3be79407286bb3cd3cee05f1b351a98e6deffd8cce0"
+          },
+          {
+            "path": "vllm/v1/hisparse/layout.py",
+            "sha256": "0799e0cac5a2cf7ab8be6595f8d4cec79366f7a06b070d33142c3aebc6b7dc22"
+          },
+          {
+            "path": "vllm/v1/hisparse/residency_chunked.py",
+            "sha256": "0d9c1be8fa008b3412a3bd17e7442cac4a48c7d349c8ca6b09f1e863e5c2364e"
+          },
+          {
+            "path": "vllm/v1/hisparse/runtime.py",
+            "sha256": "c47675d7146017c1d50eaae43e4571846d531fc9f4ffe812d962bdbccce60213"
+          },
+          {
+            "path": "vllm/v1/kv_cache_interface.py",
+            "sha256": "77319db85bbc4684705e88c639a91203eb0da95136a96d4b3a82effc775865a4"
+          },
+          {
+            "path": "vllm/v1/worker/gpu/model_runner.py",
+            "sha256": "fcf9add5cb88c27693b8dad95919d99f94101cfbc6c3e9e20af81f0c6966ca55"
+          },
+          {
+            "path": "vllm/v1/worker/gpu/spec_decode/mtp/speculator.py",
+            "sha256": "cc38bb4681ecd9e543002e708118becd3d7ce18960c8f8faf0b183cb71c0eff7"
+          },
+          {
+            "path": "vllm/v1/worker/gpu/spec_decode/speculator.py",
+            "sha256": "51619cbce2f10501128df001c18fa050d16bf580c6fd44feed461ff9397a97af"
+          }
+        ]
+      },
+      {
+        "path": "patches/vllm-native.patch",
+        "sha256": "7a8d68540a8d162b6f611cd34e33322380cdd5320df943f5a03d944a3202a9be",
+        "files": [
+          {
+            "path": "CMakeLists.txt",
+            "sha256": "711491949c2cc2cd20e08d59e07611ba1d0fd72dcc2346d356138acc30f98ba7"
+          },
+          {
+            "path": "csrc/attention/mla/cutlass_sm100_mla/kernel/gather_tensor.hpp",
+            "sha256": "af83b6b853a6abf73881c0749b44174f92f69bf6512c3604e612275afe96a2b5"
+          },
+          {
+            "path": "csrc/cache_kernels.cu",
+            "sha256": "b9506a6c1856a6ce3c408350029e28ec2e6308863a5d1092e574449e5d120349"
+          },
+          {
+            "path": "csrc/ops.h",
+            "sha256": "88b1e5ba07aeba7a39884140f08051a3509afb75f38481d65eacbb739f6f1191"
+          },
+          {
+            "path": "csrc/torch_bindings.cpp",
+            "sha256": "3accf9c572d3ce535949e97a4128329ef4fa10a92740fb6ff1ec1fbfa9b31f92"
+          }
+        ]
+      }
+    ]
+  },
+  "flashinfer": {
+    "repository": "https://github.com/flashinfer-ai/flashinfer.git",
+    "commit": "0b46115d238d29ea2e92c6b9b2cb077d40fbc352",
+    "version": "0.7.1",
+    "patches": [
+      {
+        "path": "patches/flashinfer.patch",
+        "sha256": "052cd4ae57ef385b159a8cd51a84a3ac123e12c59f5ea53848e49b1e6f5827f0",
+        "files": [
+          {
+            "path": "flashinfer/dsa_indexer.py",
+            "sha256": "8551f22b051ff9535a3dccd16367cb8251ce817e126be794907e407082ffc9a1"
+          },
+          {
+            "path": "flashinfer/experimental/sm120_dsa_indexer/README.md",
+            "sha256": "1b11eae9c7af19f17adf6f99fb6bf83d7ec4f0102276309a82b61013d41a9906"
+          },
+          {
+            "path": "flashinfer/experimental/sm120_dsa_indexer/__init__.py",
+            "sha256": "78fbb5edae88206c6c4a7d8e64ae83bf052d7c1f65ce077f38c74b71070679fe"
+          },
+          {
+            "path": "flashinfer/experimental/sm120_dsa_indexer/_api.py",
+            "sha256": "88ce4c83342e33f1a9700549fd1850dcb9a3e130839792e5330a17f7cf65f83b"
+          },
+          {
+            "path": "flashinfer/experimental/sm120_dsa_indexer/csrc/binding.cu",
+            "sha256": "e48893029aaf4966051363a0df45098506898c4e74e11998e9e9b5846200b48e"
+          },
+          {
+            "path": "flashinfer/experimental/sm120_dsa_indexer/csrc/decode_common.cuh",
+            "sha256": "2554c3081bcc8a7e541dc57c19e8f5f6cfc5e9f2c4a52c30121ff682a57c2599"
+          },
+          {
+            "path": "flashinfer/experimental/sm120_dsa_indexer/csrc/decode_scan.cuh",
+            "sha256": "7e81007ccba35475e06ea729cdcc8dd5625ce6abda671b21acf81dfdffcda503"
+          },
+          {
+            "path": "flashinfer/experimental/sm120_dsa_indexer/csrc/decode_select_long.cuh",
+            "sha256": "eb3c02584924c34455de250d21cd4adc511504c878f76982277e8d63d72e3859"
+          },
+          {
+            "path": "flashinfer/experimental/sm120_dsa_indexer/csrc/decode_select_row.cuh",
+            "sha256": "7060aa2c0d9c8b62e244a694e3390da48372372cd6e364d3a95361030c4e71f6"
+          },
+          {
+            "path": "flashinfer/experimental/sm120_dsa_indexer/csrc/sm120_dsa_indexer.cuh",
+            "sha256": "b41850c4105321a156a280f79d7a7d4fcf4647049a7d3d53fe9b0ea510d25d1f"
+          }
+        ]
+      }
+    ]
+  },
+  "router": {
+    "repository": "https://github.com/vllm-project/router.git",
+    "commit": "db02f358da401b60d4ae14eb286163763a0705cc",
+    "version": "0.1.16",
+    "patches": [
+      {
+        "path": "patches/router.patch",
+        "sha256": "f1597ced2aff6e0b3080afeb82b8b88e52554c2fee388fbe8f9f2274443c064b",
+        "files": [
+          {
+            "path": "Cargo.lock",
+            "sha256": "3f108f0cdb55f3153944403d98214712d603ffbb12b8f3ee7a325230b0170bce"
+          },
+          {
+            "path": "Cargo.toml",
+            "sha256": "40a7d347b7f172fe68b12f61cef203a581ea354720119d581a5c88563f5cfb41"
+          },
+          {
+            "path": "src/core/worker_registry.rs",
+            "sha256": "c29e668532a3cf0b8361ca411c4354d3f0f07ccf2103ef21272b46f0b2c33675"
+          },
+          {
+            "path": "src/protocols/spec.rs",
+            "sha256": "601bfb0f75577809ef8ca59230eb5d1d963e27c8526dd97b61b601fdc897bb09"
+          },
+          {
+            "path": "src/routers/http/mod.rs",
+            "sha256": "99c05e84d0ee9a265e38872ada561ae730e70c1eb406ca11ad7c303b262e4427"
+          },
+          {
+            "path": "src/routers/http/pd_usage.rs",
+            "sha256": "b59e4e11bf5e5e14bc32e7a64c9eec5da1a8b67c69375867439c325fd26c3a48"
+          },
+          {
+            "path": "src/routers/http/vllm_pd_router.rs",
+            "sha256": "bebb9a2154df9b1fc1114fe08f959d220cd6cd8459a58a559f45d3509875e1cd"
+          }
+        ]
+      }
+    ],
+    "deployed_image": "sha256:0eee14a71f7b8027f0235bfb8b99eebc8416ca7cbf07b6776577fbd944810413",
+    "deployed_extension_sha256": "7096f5d8847141dc7a49f33ba1ca25beb937c7dd76209660c1e022e6c566f6e7",
+    "source_receipt": "d_fix cargo build and candidate image build retry; resulting image 0eee14a71f7b"
+  },
+  "mooncake": {
+    "package": "mooncake-transfer-engine-cuda13",
+    "version": "0.3.13.post1",
+    "native_core_patch": null,
+    "changes": "vLLM connector/Store integration and master configuration",
+    "eviction_high_watermark_ratio": 0.98,
+    "pool_gib_per_D_host": 750
+  },
+  "build": {
+    "python": "3.12",
+    "torch": "2.13.0+cu130",
+    "triton": "3.7.1",
+    "cuda_architectures": [
+      "100",
+      "120"
+    ],
+    "family_architectures": [
+      "10.0f",
+      "12.0f"
+    ],
+    "target": "_C_stable_libtorch",
+    "base_image": "sha256:33333ac91514dba29a27edc90a654b225231dd5b730bc68459e077fe2f9a2e57",
+    "native_sha256": "5c52814f7d27f8da2523a61de8eb1282176583c8db4916cdd6c11260bd8dc3f4"
+  },
+  "optional_P_only_experiment": {
+    "path": "experiments/prefill-only.patch",
+    "sha256": "d8d8aa41fbe8920330456fd9935da82922abe44f25a9071d3c3215d6d551c909",
+    "files": [
+      {
+        "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py",
+        "sha256": "edfbedb91fb6b536cc474e694c5f07e4c608aadec94257bbd93d532ac4b13f0e"
+      },
+      {
+        "path": "vllm/models/glm5next/common/kda.py",
+        "sha256": "d78a6daf9ea12487f66e2f5dd24a78518ba30bc22f464dba48c2b9ff55f959df"
+      },
+      {
+        "path": "vllm/v1/core/sched/scheduler.py",
+        "sha256": "61e5be5939f120138297baddf2465af59c0e95d5e4588ceda4a2f065feb7b3ea"
+      }
+    ]
+  },
+  "provenance_PRs": {
+    "flashinfer/7085": "03a71490abee5ff44b806bf5286592cd4c856d63",
+    "vllm/64072": "daf15951a7deeb33ba47ce0cf436ebcb9146382f",
+    "vllm/58305": "d76d076968d224e34e9452487d77a2d3a9cb11e6",
+    "vllm/63142": "0eb37ba3e3bef61f4bc904e75cfbb76c51e51e2e",
+    "vllm/62478": "22fd7b2357556f13a216fd1edcc6173cf317a02c"
+  },
+  "additional_selected_PRs": [
+    62102,
+    63971,
+    63041
+  ],
+  "not_applied": [
+    63938,
+    63544,
+    44344
+  ],
+  "experiment_default_enabled": false,
+  "services": "P and D stopped by human instruction; Router/Store retained; glm-c512 monitor deleted",
+  "documented_deployment": {
+    "case": "C230/U345/N345",
+    "topology": "P82 two TP1DP4EP4; D83 and D84 one TP1DP8EP8 each",
+    "network": "P/D explicit CX8",
+    "model_image": "sha256:33333ac91514dba29a27edc90a654b225231dd5b730bc68459e077fe2f9a2e57",
+    "start_percent": 55,
+    "complete_minutes": 12,
+    "Store_GiB": 2250
+  }
+}
