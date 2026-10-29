@@ -88,7 +88,7 @@ docker run -d --name "glm-mooncake-store-$NODE_ID" --network host --runtime=runc
 ## 3. P/D模型启动函数
 
 P新增四个字段位于 MooncakeConnector.kv_connector_extra_config，不是MultiConnector顶层或Store内。
-decode缓存保存不覆盖，沿用原生默认false。
+decode缓存保存不覆盖，沿用原生默认false。每次启动使用新的engine_id，避免D沿用上次P进程的KV连接元数据。
 
 ~~~bash
 launch_instance() {
@@ -96,6 +96,7 @@ launch_instance() {
   HCAS=$(printf '%s' "$GPUS" | sed 's/\([0-9]\)/mlx5_\1/g')
   IB_HCA="=$(printf '%s' "$HCAS" | sed 's/,/:1,/g'):1"
   DIR="$WORK/$NAME"; mkdir -p "$DIR/cache"
+  ENGINE_ID="$NAME-$(date +%s%N)"
   cat > "$DIR/mooncake.json" <<EOF
 {"mode":"standalone-store","metadata_server":"http://192.168.17.83:61242/metadata",
  "master_server_address":"192.168.17.83:61241","protocol":"rdma","device_name":"$HCAS",
@@ -114,7 +115,7 @@ EOF
     GRAPH='{"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":128}'
   fi
   KV=$(cat <<EOF
-{"kv_connector":"MultiConnector","kv_role":"kv_both","engine_id":"$NAME",
+{"kv_connector":"MultiConnector","kv_role":"kv_both","engine_id":"$ENGINE_ID",
  "kv_load_failure_policy":"fail","kv_connector_extra_config":{"connectors":[
  {"kv_connector":"MooncakeConnector","kv_role":"$DIRECT_ROLE",
   "kv_connector_extra_config":{"mooncake_protocol":"rdma","device_name":"$HCAS"$DIRECT_EXTRA}},
