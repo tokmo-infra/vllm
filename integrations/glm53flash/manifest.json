@@ -1,5 +1,5 @@
 {
-  "name": "vllm-0.32.0-glm5.3-flash",
+  "name": "vllm-0.32.0-0.1.16-glm5.3-flash",
   "archived_at": "2026-10-29",
   "layout": "Pinned integration patch set; repository main source is not replaced by older runtime files.",
   "vllm": {
@@ -308,7 +308,16 @@
     ],
     "deployed_image": "sha256:0eee14a71f7b8027f0235bfb8b99eebc8416ca7cbf07b6776577fbd944810413",
     "deployed_extension_sha256": "7096f5d8847141dc7a49f33ba1ca25beb937c7dd76209660c1e022e6c566f6e7",
-    "source_receipt": "d_fix cargo build and candidate image build retry; resulting image 0eee14a71f7b"
+    "source_receipt": "d_fix cargo build and candidate image build retry; resulting image 0eee14a71f7b",
+    "release_repository": "https://github.com/tokmo-infra/router",
+    "release_branch": "vllm-0.32.0-0.1.16-glm5.3-flash",
+    "release_commit": "280e8ff",
+    "source_sync_validation": {
+      "reservation_tests": 5,
+      "pd_usage_tests": 12,
+      "kv_hash_tests": 6,
+      "mode": "Original Linux test binary from matching archived sources; no rebuild or GPU services"
+    }
   },
   "mooncake": {
     "package": "mooncake-transfer-engine-cuda13",
@@ -379,5 +388,10 @@
     "start_percent": 55,
     "complete_minutes": 12,
     "Store_GiB": 2250
+  },
+  "release_repositories": {
+    "vllm": "https://github.com/tokmo-infra/vllm",
+    "router": "https://github.com/tokmo-infra/router",
+    "branch": "vllm-0.32.0-0.1.16-glm5.3-flash"
   }
 }

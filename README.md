@@ -1,4 +1,4 @@
-# vLLM 0.32.0 · GLM-5.3 Flash
+# vLLM 0.32.0 / Router 0.1.16 · GLM-5.3 Flash
 
 - **SM103 / SM120 NVFP4**：补齐 B300 与 RTX PRO 6000 的原生编译路径和算子注册。
 - **FP8 KV 传输**：兼容 P 端标准 FP8 与 D 端 packed MLA 布局，恢复跨架构 PD 的 MTP 接受率。
@@ -10,3 +10,5 @@
 - **Router**：修复 D 请求预占负载计数，覆盖流式结束与取消；补充历史前缀及 usage 处理。
 - **源码与构建**：在 integrations/glm53flash 保存固定版本补丁、依赖清单和镜像构建方法。
 - **启动配置**：C230 三机 P、D、Router、Mooncake 的 CX8 命令统一整理在 integrations/glm53flash/DEPLOYMENT.md。
+
+配套 Router 源码位于 tokmo-infra/router，同名分支：vllm-0.32.0-0.1.16-glm5.3-flash。
