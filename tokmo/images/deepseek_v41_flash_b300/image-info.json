@@ -1,0 +1,41 @@
+{
+  "image": "local/vllm-openai:0.32.0-dsv41-native-token-cache-v1",
+  "image_id": "sha256:e0fdb06bdeecb93075241a839e2b943b26019a9b4bf0c1c2df0b7ba4f0717c99",
+  "base_image": "vllm/vllm-openai:v0.32.0",
+  "base_image_id": "sha256:bd8a5d7a8774800c92d714c0c226b32c1863f929150f36efd610aebcd12a335d",
+  "repo_digests": [],
+  "source_revision": "5df63a7203cdb9328d824a27b682e77c7b9928be",
+  "os": "linux",
+  "architecture": "amd64",
+  "created": "2026-10-26T08:48:56.046931865Z",
+  "source_verified_date": "2026-10-30",
+  "verification": {
+    "unchanged_upstream_package_files": 3293,
+    "modified_upstream_package_files": [
+      "vllm/renderers/base.py"
+    ],
+    "added_custom_package_files": [
+      "vllm/tokenizers/dsv41_native_cache.py",
+      "vllm/tokenizers/dsv41_segment_cache_core.py"
+    ],
+    "packaged_vendor_or_generated_files": 2131,
+    "workspace_changes": [],
+    "scope": "Compare upstream-tracked vLLM files and /vllm-workspace examples/benchmarks with the installed image. Vendored/generated files and native binaries are inherited from the base image and recorded in installed-vllm.sha256."
+  },
+  "versions": {
+    "torch": "2.13.0+cu130",
+    "transformers": "5.19.0",
+    "tokenizers": "0.23.3",
+    "mooncake-transfer-engine-cuda13": "0.3.13.post1"
+  },
+  "production_profile": {
+    "gpus": 8,
+    "instances": 4,
+    "tp": 1,
+    "dp_per_instance": 2,
+    "ep_per_instance": 2,
+    "l2_bytes": 1717986918400,
+    "l3_quota_bytes": 2199023255552,
+    "validation_status": "static configuration checked; this full-capacity L2+L3 profile has not completed a serving benchmark"
+  }
+}

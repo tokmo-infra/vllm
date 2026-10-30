@@ -1,0 +1,53 @@
+{
+  "verified_date": "2026-10-30",
+  "original_image": "local/vllm-openai:0.32.0-dsv41-native-token-cache-v1",
+  "original_image_id": "sha256:e0fdb06bdeecb93075241a839e2b943b26019a9b4bf0c1c2df0b7ba4f0717c99",
+  "source_comparison": {
+    "unchanged_upstream_package_files": 3293,
+    "modified_upstream_package_files": 1,
+    "added_custom_package_files": 2,
+    "three_custom_source_files_match_original_image": true
+  },
+  "image_rebuild": {
+    "status": "passed",
+    "dockerfile": "tokmo/images/deepseek_v41_flash_b300/Dockerfile",
+    "network": "none",
+    "installed_vllm_files_matching_original_image": 5440,
+    "checks": ["base renderer SHA256", "three source SHA256 values", "Python compilation"]
+  },
+  "tokenizer_renderer_tests": {
+    "status": "passed",
+    "passed": 9,
+    "duration_seconds": 11.38,
+    "model_assets": "/data2/models/DeepSeek-V4.1-Flash-1017",
+    "gpu_model_execution": false,
+    "cases": [
+      "added-token boundaries and Unicode",
+      "four native fallback variants including offsets and truncation",
+      "bounded LRU and namespace isolation",
+      "epoch invalidation",
+      "threaded and asynchronous tokenization",
+      "synchronous and asynchronous chat namespace propagation"
+    ]
+  },
+  "production_configuration": {
+    "status": "static checks passed",
+    "captured_containers": 14,
+    "owners": 8,
+    "l2_bytes": 1717986918400,
+    "l3_quota_bytes": 2199023255552,
+    "checks": [
+      "GPU pairs and NUMA",
+      "unique names and ports",
+      "L2 and L3 quotas without duplicate rank pools",
+      "HCA and offload/promotion settings",
+      "model parameters and router DP workers",
+      "state directory override",
+      "invalid ID rejection",
+      "image build context"
+    ],
+    "containers_started": false,
+    "full_capacity_serving_benchmark_completed": false
+  },
+  "scope": "Source archival, image rebuild and CPU tokenizer regressions; no serving deployment or new performance measurement."
+}
