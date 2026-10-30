@@ -13,9 +13,12 @@
 
 ~~~bash
 .venv/bin/python integrations/glm53flash/prepare_sources.py sources
+git clone --depth 1 --branch v0.29.0 https://github.com/vllm-project/vllm.git sources/vllm-rust-v029
+(cd sources/router && cargo build --locked --release --bin vllm-router)
 ~~~
 
 原生构建配方见integrations/glm53flash/Dockerfile。整合镜像保留CUDA、Torch和已编译扩展，以回滚后的运行时代码和调优修复更新Python层；构建记录保存镜像ID、源码与二进制哈希。
+Router镜像配方为integrations/glm53flash/Dockerfile.router，入口为/usr/local/bin/vllm-router，直接运行Rust二进制。
 
 通用1P2D、Router、Mooncake配置见 [DEPLOYMENT.md](DEPLOYMENT.md)。C16调优验证见 [FLASHINFER-AUTOTUNE.md](FLASHINFER-AUTOTUNE.md)。
 
