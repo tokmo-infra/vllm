@@ -5,11 +5,13 @@
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+from prometheus_client import generate_latest
 from tokenizers import AddedToken, Tokenizer, decoders, models, pre_tokenizers, trainers
 from transformers import TokenizersBackend
 
 from vllm.tokenizers.glm53_native_cache import NativeCache
 from vllm.tokenizers.glm53_segment_cache_core import SegmentCache
+from vllm.v1.metrics.prometheus import unregister_vllm_metrics
 
 
 @pytest.fixture
@@ -104,3 +106,19 @@ def test_epoch_discards_retained_history_before_next_encode(
     state = cache.cache.snapshot()
     assert state["reused_tokens"] == 0
     assert state["encoded_requests"] == 1
+
+
+def test_single_api_cache_metrics_survive_native_metric_cleanup(tokenizer):
+    cache = NativeCache(tokenizer, 0.001, "single-api-metrics")
+    unregister_vllm_metrics()
+    prompt = {"prompt": "<u>hello world<e>"}
+    params = {"add_special_tokens": False}
+    expected = tokenizer(prompt["prompt"], **params)["input_ids"]
+    assert cache.try_encode(prompt, params) == expected
+    assert cache.try_encode(prompt, params) == expected
+    output = generate_latest().decode()
+    assert (
+        'vllm:tokenizer_cache_enabled{api_process="single-api-metrics"} 1.0' in output
+    )
+    assert 'source="reused_tokens"' in output
+    assert cache.cache.snapshot()["reused_tokens"] > 0

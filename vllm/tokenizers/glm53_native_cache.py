@@ -10,10 +10,11 @@ import logging
 import math
 import os
 import time
+from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
 
-from prometheus_client import Counter, Gauge, Histogram
+from prometheus_client import REGISTRY, Counter, Gauge, Histogram
 from tokenizers import Tokenizer
 
 from vllm.tokenizers.glm53_segment_cache_core import SegmentCache
@@ -80,6 +81,7 @@ class NativeCache:
         self.epoch_path = os.environ.get("VLLM_GLM53_TOKENIZER_CACHE_EPOCH_FILE", "")
         self.epoch = self._epoch()
         self.last_evictions = 0
+        self.metrics_registered = False
         LIMIT.labels(self.rank).set(self.cache.max_bytes)
         SIZE.labels(self.rank).set(0)
         ENABLED.labels(self.rank).set(1)
@@ -96,6 +98,22 @@ class NativeCache:
         return Path(self.epoch_path).read_text().strip()
 
     def try_encode(self, prompt, kwargs, want_offsets=False, queued_at=None):
+        # Single-API engine startup unregisters vllm collectors after rendering
+        # initialization. Reattach these same collectors on the first request.
+        if not self.metrics_registered:
+            for metric in (
+                TOKENS,
+                REQUESTS,
+                SIZE,
+                LIMIT,
+                EVICTIONS,
+                TIMING,
+                ENABLED,
+                ACTIVE,
+            ):
+                with suppress(ValueError):  # Multi-API servers retain the registration.
+                    REGISTRY.register(metric)
+            self.metrics_registered = True
         started = time.monotonic()
         if queued_at is not None:
             TIMING.labels(self.rank, "tokenize_queue").observe(started - queued_at)

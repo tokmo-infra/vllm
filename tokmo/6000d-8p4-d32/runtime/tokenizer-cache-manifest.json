@@ -6,11 +6,11 @@
   "tokenizer_sha256": "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d",
   "files_sha256": {
     "glm53_segment_cache_core.py": "ff96fc52bba9ab3b3e9c0e4275d01b1ecbc5d202c2703170588208e791ed75b2",
-    "glm53_native_cache.py": "0f2267f7dae87bb32965935ec8d85271a815d939eb1fa3de87e20b8d505323ac",
+    "glm53_native_cache.py": "1ef5ce94fa3d30e78d55e4a385ed42ef4bf6af10579ecac58686eb57346250a6",
     "vllm_renderer_base.py": "c2d97b9cf5682fc80f1d1890402702512a96a440cae2b2293f66902400cd0809"
   },
   "scope": "Native CPU API renderer only; exact token IDs; original native encoding on cache misses and unsupported requests",
   "cache_gib_per_api": 4,
-  "core_changes": "SPDX/format/type annotations/Path.read_bytes, and regex package literal matcher per repository rules; encoding remains native. Revalidated all 421 full token-ID comparisons, 15 regressions, async/fallback/epoch checks.",
+  "core_changes": "SPDX/format/type annotations/Path.read_bytes, and regex package literal matcher per repository rules; encoding remains native. Revalidated all 421 full token-ID comparisons, 15 regressions, async/fallback/epoch checks. Single-API native metrics reattach after startup cleanup; 16 regressions passed.",
   "activation": "Opt-in VLLM_GLM53_TOKENIZER_CACHE_GIB=4 in P and D head APIs; read-only mounts; headless ranks use 0"
 }

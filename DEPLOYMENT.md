@@ -12,6 +12,25 @@
 
 P端API进程4、KV接收线程4，P/D异步查找开启。保留原生MTP3和原生后端，不启用P-only实验，不传禁用FlashInfer自动调优的参数。
 
+### 带原生分词缓存的镜像
+
+在项目根目录构建并替换同名推理镜像，Router镜像不变：
+
+~~~bash
+docker build -f integrations/glm53flash/Dockerfile.tokenizer-cache \
+  -t local/glm53flash-vllm:0.32.0 .
+~~~
+
+此构建沿用 `540155b18ee7` 的原有模型、算子和精度，补入分词缓存及 MLA 六参数接口修复。
+`VLLM_GLM53_TOKENIZER_CACHE_GIB` 是每个 API 进程的 CPU 缓存上限，按需占用，不占 GPU 显存。
+本组三机按每GPU等效4 GiB设置：两P实例各4个API进程，每进程传 `-e VLLM_GLM53_TOKENIZER_CACHE_GIB=4`；
+两D实例各1个API进程，每进程传 `-e VLLM_GLM53_TOKENIZER_CACHE_GIB=32`。每台最大合计32 GiB。
+
+当前主机没有加载 peer-memory 模块，P/D另传 `-e WITH_NVIDIA_PEERMEM=false`，
+Mooncake通过DMA-BUF注册GPU内存，仍使用RDMA传输。
+分词复用率取 `tokenizer_cache_tokens_total` 中 `reused_tokens/(reused_tokens+encoded_tokens)`，
+与 GPU KV 命中率分别统计。
+
 各主机先设置以下变量，IP、模型路径、密钥按环境填写。
 
 ~~~bash
@@ -131,6 +150,7 @@ EOF
     -e GLOO_SOCKET_IFNAME="$NET_IF" -e NCCL_IB_HCA="$IB_HCA" \
     -e NCCL_IB_GID_INDEX=3 -e MC_GID_INDEX=3 -e NCCL_DEBUG=INFO \
     -e VLLM_USE_V2_MODEL_RUNNER=1 -e VLLM_MOONCAKE_LOAD_RECV_THREADS=4 \
+    -e VLLM_GLM53_TOKENIZER_CACHE_GIB=4 -e WITH_NVIDIA_PEERMEM=false \
     -e MOONCAKE_CONFIG_PATH="/work/p$IDX-mooncake.json" \
     -e VLLM_MOONCAKE_BOOTSTRAP_PORT="$BOOTSTRAP" -e VLLM_HTTP_TIMEOUT_KEEP_ALIVE=120 \
     --entrypoint vllm "$IMAGE" serve /model \
@@ -186,6 +206,7 @@ docker run -d --name glm-D --init --memory 96g --memory-swap 96g --network host 
   -e GLOO_SOCKET_IFNAME="$NET_IF" -e NCCL_IB_HCA="$IB_HCA" \
   -e NCCL_IB_GID_INDEX=3 -e MC_GID_INDEX=3 -e NCCL_DEBUG=INFO \
   -e VLLM_USE_V2_MODEL_RUNNER=1 \
+  -e VLLM_GLM53_TOKENIZER_CACHE_GIB=32 -e WITH_NVIDIA_PEERMEM=false \
   -e MOONCAKE_CONFIG_PATH=/work/mooncake.json \
   -e VLLM_MOONCAKE_BOOTSTRAP_PORT=19083 -e VLLM_HTTP_TIMEOUT_KEEP_ALIVE=120 \
   --entrypoint vllm "$IMAGE" serve /model \
