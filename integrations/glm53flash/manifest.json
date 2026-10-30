@@ -311,7 +311,7 @@
     "start_percent": 55,
     "complete_minutes": 12,
     "Store_GiB": 2250,
-    "document": "DEPLOYMENT-C230.md"
+    "document": "DEPLOYMENT.md"
   },
   "release_repositories": {
     "vllm": "https://github.com/tokmo-infra/vllm",
@@ -320,12 +320,41 @@
   },
   "current_deployment": {
     "document": "DEPLOYMENT.md",
-    "topology": "One P role with two EP4 instances; two D roles with one EP8 instance each",
+    "topology": "P82 two TP1DP4EP4; D83 and D84 one TP1DP8EP8 each",
     "P_api_server_count": 4,
     "P_load_recv_threads": 4,
     "lookup_async": true,
     "MTP": "native3; P-only fixed-zero and scratch-release experiments removed",
-    "flashinfer_autotune": "native default; no disabling kernel-config in standard commands"
+    "flashinfer_autotune": "native default; no disabling kernel-config in standard commands",
+    "model_source_commit": "e84b737eb98418bd29aae864731fb7d7b041601f",
+    "model_images": {
+      "82": "sha256:bd6c77d709b8225ebf7b4a9a3890509a4e2df87af846fcc7230b65a7a57d16f7",
+      "83": "sha256:7491915c394c61557945b885d4f7ed7a00c51f3d04d5501e19de9e2171914de6",
+      "84": "sha256:5f9dad045b5e3f28e5abe8099834ca965809821acf8a392a5308ec9092dd8cc3"
+    },
+    "tokenizer_cpu_cache_gib_per_gpu": 2,
+    "P_tokenizer_cpu_cache_gib_per_api": 2,
+    "D_tokenizer_cpu_cache_gib_per_api": 16,
+    "D_api_server_count": 1,
+    "host_tokenizer_cpu_cache_gib": 16,
+    "benchmark": {
+      "case": "C218/U327/N327",
+      "dataset": "SWE8w-original-first327",
+      "planned_turns": 24208,
+      "metric_start_percent": 55,
+      "metric_start_turns": 13315,
+      "underfill_grace_seconds": 60,
+      "max_tokens": 4096,
+      "timeout_seconds": null,
+      "stream": true,
+      "include_usage": true,
+      "reasoning_effort": "xhigh",
+      "enable_thinking": true,
+      "temperature": 0.1,
+      "seed": 42,
+      "nsight": false,
+      "ttft_early_stop": false
+    }
   },
   "reverted_PRs": {
     "flashinfer/7085": {

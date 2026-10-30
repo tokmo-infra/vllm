@@ -9,6 +9,7 @@
 | 公共 | GLM-5.3 Flash NVFP4，KV FP8，MTP3，prefix256，max-model-len auto |
 | Mooncake | P、D1、D2 各750 GiB，共2250 GiB；水位98%；local_first |
 | Router | P/D 均 cache_aware，负载阈值4 / 1.5 |
+| Tokenizer CPU缓存 | 每GPU等效2 GiB；P每API 2 GiB，D每API 16 GiB；每台合计16 GiB |
 
 P端API进程4、KV接收线程4，P/D异步查找开启。保留原生MTP3和原生后端，不启用P-only实验，不传禁用FlashInfer自动调优的参数。
 
@@ -23,8 +24,8 @@ docker build -f integrations/glm53flash/Dockerfile.tokenizer-cache \
 
 此构建沿用 `540155b18ee7` 的原有模型、算子和精度，补入分词缓存及 MLA 六参数接口修复。
 `VLLM_GLM53_TOKENIZER_CACHE_GIB` 是每个 API 进程的 CPU 缓存上限，按需占用，不占 GPU 显存。
-本组三机按每GPU等效4 GiB设置：两P实例各4个API进程，每进程传 `-e VLLM_GLM53_TOKENIZER_CACHE_GIB=4`；
-两D实例各1个API进程，每进程传 `-e VLLM_GLM53_TOKENIZER_CACHE_GIB=32`。每台最大合计32 GiB。
+本组三机按每GPU等效2 GiB设置：两P实例各4个API进程，每进程传 `-e VLLM_GLM53_TOKENIZER_CACHE_GIB=2`；
+两D实例各1个API进程，每进程传 `-e VLLM_GLM53_TOKENIZER_CACHE_GIB=16`。每台最大合计16 GiB。
 
 当前主机没有加载 peer-memory 模块，P/D另传 `-e WITH_NVIDIA_PEERMEM=false`，
 Mooncake通过DMA-BUF注册GPU内存，仍使用RDMA传输。
@@ -37,7 +38,7 @@ Mooncake通过DMA-BUF注册GPU内存，仍使用RDMA传输。
 | --- | --- | --- |
 | P API 进程数 | 1 | 4 |
 | P KV 接收线程 | 原生默认1 | 4 |
-| CPU 分词缓存 | 未启用 | P每API 4 GiB，D每API 32 GiB |
+| CPU 分词缓存 | 未启用 | P每API 2 GiB，D每API 16 GiB |
 | FlashInfer 自动调优 | 显式关闭 | 使用原生自动调优 |
 | WITH_NVIDIA_PEERMEM | 0 | false，含义相同 |
 
@@ -49,14 +50,14 @@ P seq24/batch2048、D seq16/batch1024/graph64、MTP3、FP8、prefix256、util0.9
 ~~~bash
 export IMAGE=local/glm53flash-vllm:0.32.0
 export ROUTER_IMAGE=local/glm53flash-router:0.1.16
-export MODEL_DIR=/path/to/GLM-5.3-Flash-NVFP4
-export WORK=/path/to/glm-pd
+export MODEL_DIR=/data/models/GLM-5.3-Flash-NVFP4
+export WORK=/data/bench/glm53flash-pd
 export CACHE_DIR="$WORK/cache"
-export CACHE_NAMESPACE=glm53flash-prefix256-v1
+export CACHE_NAMESPACE=glm53flash-c218-token-cache2g-20261030-prefix256
 export API_KEY='replace-at-runtime'
-export MASTER_IP='<master-ip>'
-export P_IP='<prefill-rdma-ip>'
-export D1_IP='<decode-1-rdma-ip>' D2_IP='<decode-2-rdma-ip>'
+export MASTER_IP=11.8.0.83
+export P_IP=11.8.0.82
+export D1_IP=11.8.0.83 D2_IP=11.8.0.84
 export ROUTER_IP="$D1_IP"
 mkdir -p "$WORK" "$CACHE_DIR"
 ~~~
@@ -64,7 +65,8 @@ mkdir -p "$WORK" "$CACHE_DIR"
 ## 2. Mooncake master
 
 ~~~bash
-docker run -d --name glm-mooncake-master --network host --ipc host \
+docker run -d --name glm-mooncake-master --network host --ipc private \
+  --memory 4g --memory-swap 8g \
   --runtime=runc -e NVIDIA_VISIBLE_DEVICES=void \
   --entrypoint mooncake_master "$IMAGE" \
   --rpc_port=61241 --enable_http_metadata_server=true \
@@ -78,11 +80,12 @@ docker run -d --name glm-mooncake-master --network host --ipc host \
 NODE_IP 取对应主机RDMA IP。三台Store均使用 mlx5_0 至 mlx5_7；GID index为3。
 
 ~~~bash
-export LIBCUDA_PATH=/path/to/host/libcuda.so.1
+export LIBCUDA_PATH=$(readlink -f /lib/x86_64-linux-gnu/libcuda.so.1)
 export NODE_IP="$D1_IP"  # P用P_IP；D2用D2_IP
 export HCAS=mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 docker run -d --name glm-mooncake-store --network host --ipc host \
-  --runtime=runc -e NVIDIA_VISIBLE_DEVICES=void --ulimit memlock=-1:-1 \
+  --memory 832g --memory-swap 832g \
+  --runtime=runc -e NVIDIA_VISIBLE_DEVICES=void -e MC_GID_INDEX=3 --ulimit memlock=-1:-1 \
   --cap-add IPC_LOCK --cap-add SYS_NICE \
   -v "$LIBCUDA_PATH:/opt/host-driver/libcuda.so.1:ro" \
   -e LD_LIBRARY_PATH=/opt/host-driver:/usr/local/cuda/lib64 \
@@ -125,7 +128,7 @@ EOF
 P0使用GPU0—3及对应CX8 HCA，P1使用GPU4—7及对应CX8 HCA。
 
 ~~~bash
-export NET_IF='<local-CX8-network-interface>'
+export NET_IF=enp115s0f1np1
 for IDX in 0 1; do
   if [ "$IDX" = 0 ]; then
     GPU_REQUEST='"device=0,1,2,3"'
@@ -162,8 +165,9 @@ EOF
     -e VLLM_HOST_IP="$P_IP" -e NCCL_SOCKET_IFNAME="$NET_IF" \
     -e GLOO_SOCKET_IFNAME="$NET_IF" -e NCCL_IB_HCA="$IB_HCA" \
     -e NCCL_IB_GID_INDEX=3 -e MC_GID_INDEX=3 -e NCCL_DEBUG=INFO \
-    -e VLLM_USE_V2_MODEL_RUNNER=1 -e VLLM_MOONCAKE_LOAD_RECV_THREADS=4 \
-    -e VLLM_GLM53_TOKENIZER_CACHE_GIB=4 -e WITH_NVIDIA_PEERMEM=false \
+    -e VLLM_SERVER_DEV_MODE=1 -e VLLM_USE_V2_MODEL_RUNNER=1 -e VLLM_MOONCAKE_LOAD_RECV_THREADS=4 \
+    -e VLLM_GLM53_TOKENIZER_CACHE_GIB=2 -e WITH_NVIDIA_PEERMEM=false \
+    -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e MALLOC_ARENA_MAX=2 \
     -e MOONCAKE_CONFIG_PATH="/work/p$IDX-mooncake.json" \
     -e VLLM_MOONCAKE_BOOTSTRAP_PORT="$BOOTSTRAP" -e VLLM_HTTP_TIMEOUT_KEEP_ALIVE=120 \
     --entrypoint vllm "$IMAGE" serve /model \
@@ -193,7 +197,7 @@ export HCAS=mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 write_mc_config "$WORK/mooncake.json" "$HCAS"
 export ROLE_ID=D1  # 另一D角色使用D2
 export NODE_IP="$D1_IP"
-export NET_IF='<local-CX8-network-interface>'
+export NET_IF=enp115s0f1np1
 export IB_HCA='=mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1'
 ENGINE_ID="glm-D-$ROLE_ID-$(date +%s%N)"
 D_KV=$(cat <<EOF
@@ -218,8 +222,9 @@ docker run -d --name glm-D --init --memory 96g --memory-swap 96g --network host 
   -e VLLM_HOST_IP="$NODE_IP" -e NCCL_SOCKET_IFNAME="$NET_IF" \
   -e GLOO_SOCKET_IFNAME="$NET_IF" -e NCCL_IB_HCA="$IB_HCA" \
   -e NCCL_IB_GID_INDEX=3 -e MC_GID_INDEX=3 -e NCCL_DEBUG=INFO \
-  -e VLLM_USE_V2_MODEL_RUNNER=1 \
-  -e VLLM_GLM53_TOKENIZER_CACHE_GIB=32 -e WITH_NVIDIA_PEERMEM=false \
+  -e VLLM_SERVER_DEV_MODE=1 -e VLLM_USE_V2_MODEL_RUNNER=1 \
+  -e VLLM_GLM53_TOKENIZER_CACHE_GIB=16 -e WITH_NVIDIA_PEERMEM=false \
+  -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e MALLOC_ARENA_MAX=2 \
   -e MOONCAKE_CONFIG_PATH=/work/mooncake.json \
   -e VLLM_MOONCAKE_BOOTSTRAP_PORT=19083 -e VLLM_HTTP_TIMEOUT_KEEP_ALIVE=120 \
   --entrypoint vllm "$IMAGE" serve /model \
@@ -296,10 +301,30 @@ docker run -d --name glm-router --runtime=runc --network host \
 
 | 指标 | 端口 / 路径 |
 | --- | --- |
-| P / D vLLM | 18483 /metrics |
+| P0 / P1 vLLM | 18483 /metrics、18493 /metrics |
+| D1 / D2 vLLM | 18483 /metrics |
 | Router | 18301 /metrics |
 | Mooncake master | 61243 /metrics |
 | Mooncake Store HTTP | 61245 |
 
 P 速度取 local_compute token计数差，不包括缓存命中；D 速度取generation token计数差。
 多路DP按engine标签分别读取，汇总时按实际采样间隔计算。
+
+## 9. 当前测试参数
+
+| 参数 | 值 |
+| --- | --- |
+| 数据集 | SWE8w 原版首327条完整自然轨迹 |
+| max_concurrency | 218 |
+| max_active_sessions | 327 |
+| 样本数 / loader split | 327 / train[:327] |
+| 总计划轮数 | 24208 |
+| metric_start_percent / 起始完成轮数 | 55 / 13315 |
+| 统计窗口 | 55%后的完整分钟 |
+| 低于目标并发持续时间 | 60秒 |
+| stream / stream_options.include_usage | true / true |
+| timeout_seconds / max_tokens | null / 4096 |
+| reasoning_effort / enable_thinking | xhigh / true |
+| temperature / seed | 0.1 / 42 |
+| GPU / Mooncake初态 | 验收后清空 |
+| Nsight / TTFT止损 | 关闭 / 关闭 |
