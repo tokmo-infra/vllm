@@ -1,0 +1,60 @@
+# 本地压测计划；已确认使用现有 SWE 80K（8万）版本。
+# 单价：BigModel 官方人民币标准价 × 0.2；单位 CNY / 1,000,000 tokens。
+# 官方输入0.8、缓存命中0.23、输出2.8：https://bigmodel.cn/pricing
+name: glm53flash-6000d-8p4-d32-swe80k-c1024-a1536-pmem090-tokenizer-cache
+case: RTX6000D 64GPU 8xDEP4-P WideEP32-D native-MTP3 Mooncake-PD CPU-Store4TiB CUDA-Graph P-mem0.90-D-mem0.95 NativeTokenizerCache4GiB-per-API
+seed: 42
+logging:
+  level: INFO
+  progress_interval_seconds: 30
+pipeline:
+  loader:
+    plugin: hf-datasets
+    settings:
+      dataset: json
+      data_files: /data1/perf/perf-benchmark/datasets/swe/swe-maxtpm-80k-candidate.jsonl
+      split: train[:1536]
+  normalization:
+    plugin: open-swe-traces
+    settings:
+      missing_tool_call_id: empty
+  selector:
+    plugin: all
+    settings: {}
+  executor:
+    plugin: openai-chat
+    settings:
+      base_url: http://11.5.0.81:38080
+      model: glm-5.3-flash-nvfp4
+      api_keys:
+      - env: PERF_TARGET_API_KEY
+      stream: true
+      timeout_seconds: 1800
+      max_tokens: 4096
+      cache_salt_enabled: true
+      extra_body:
+        temperature: 0
+  scheduler:
+    plugin: multi-turn-closed-loop
+    settings:
+      max_active_sessions: 1536
+      max_concurrency: 1024
+  metrics:
+    plugin: standard
+    settings:
+      maxtpm: true
+      # 固定1536会话=1.5×1024；沿用本客户端对应的53%自动起点。
+      maxtpm_start_percent: 53
+      memory_limit: 4GB
+      pricing:
+        currency: CNY
+        per_tokens: 1000000
+        input_price: 0.16
+        cached_input_price: 0.046
+        output_price: 0.56
+        source: "BigModel GLM-5.3-Flash official standard CNY prices 0.8/0.23/2.8 per 1M tokens x0.2; verified 2026-10-30 https://bigmodel.cn/pricing"
+  saver:
+    plugin: sqlite
+    settings:
+      path: /data1/perf/perf-benchmark/results/eng-xinhao/glm53flash-6000d-8p4-d32/swe80k-c1024-a1536-run-003/results.db
+  exporter: {}

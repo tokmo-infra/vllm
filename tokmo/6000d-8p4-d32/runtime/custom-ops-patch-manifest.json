@@ -1,0 +1,10 @@
+{
+  "base_image": "sha256:540155b18ee763049423a616628cc1fee5e22176b3b1397775465f9067569bcf",
+  "source_path": "/usr/local/lib/python3.12/dist-packages/vllm/_custom_ops.py",
+  "original_sha256": "36428c27bad9bf5ffe5debf9e34bccbc888adb68ad3eb972f6c9ff080e7f683e",
+  "patched_sha256": "8622b1153be546ce968cb0e4cb05392652643ea7581d79fab2d0da5d127c826f",
+  "native_library_sha256": "2d933ec4c0723e8e3df1b0c6bee1b2676e5437d99451059e076366b0a8318335",
+  "native_schema": "concat_and_cache_mla(Tensor, Tensor, Tensor, Tensor, str, Tensor) -> ()",
+  "change": "Accept default skip_scale=False from native reference caller; delegate unchanged six-argument operation. Reject True explicitly.",
+  "scope": "SM120 callers use default False; no kernel/model/runner replacement"
+}

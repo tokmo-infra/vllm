@@ -1,0 +1,122 @@
+[
+  {
+    "source": "vllm/renderers/base.py",
+    "output": "vllm_renderer_base.py",
+    "original_sha256": "ec2fe84538bb30ad7ed1e10833081c8c389e6a2f8fda1dcef50005b9db75a1a7",
+    "patched_sha256": "c2d97b9cf5682fc80f1d1890402702512a96a440cae2b2293f66902400cd0809",
+    "edits": [
+      {
+        "start": 498,
+        "end": 547,
+        "old": "\nfrom vllm.exceptions import VLLMValidationError\n",
+        "new": ""
+      },
+      {
+        "start": 853,
+        "end": 889,
+        "old": "from vllm.logger import init_logger\n",
+        "new": ""
+      },
+      {
+        "start": 1474,
+        "end": 1516,
+        "old": "from vllm.tokenizers import TokenizerLike\n",
+        "new": "from vllm.tokenizers.glm53_native_cache import (\n    NativeCache,\n    make_cache,\n    timed_tokenize_async,\n    track_render,\n)\n"
+      },
+      {
+        "start": 1727,
+        "end": 1727,
+        "old": "",
+        "new": "\nfrom vllm.exceptions import VLLMValidationError\nfrom vllm.logger import init_logger\nfrom vllm.tokenizers import TokenizerLike\n"
+      },
+      {
+        "start": 2098,
+        "end": 2098,
+        "old": "",
+        "new": "\n"
+      },
+      {
+        "start": 3308,
+        "end": 3308,
+        "old": "",
+        "new": "    _glm53_native_cache: NativeCache | None = None\n\n"
+      },
+      {
+        "start": 3797,
+        "end": 3797,
+        "old": "",
+        "new": "        self._glm53_native_cache = make_cache(config, tokenizer)\n"
+      },
+      {
+        "start": 6186,
+        "end": 6186,
+        "old": "",
+        "new": "        if self._glm53_native_cache is not None:\n            self._tokenize_prompt_async = timed_tokenize_async(self, self._executor)\n"
+      },
+      {
+        "start": 25070,
+        "end": 25070,
+        "old": "",
+        "new": "        *,\n        _queued_at: float | None = None,\n"
+      },
+      {
+        "start": 25326,
+        "end": 25326,
+        "old": "",
+        "new": "        if self._glm53_native_cache is not None:\n            ids = self._glm53_native_cache.try_encode(\n                prompt, kwargs, want_offsets, _queued_at\n            )\n            if ids is not None:\n                return self._build_tokens_prompt(ids, prompt)\n"
+      },
+      {
+        "start": 31744,
+        "end": 31782,
+        "old": "        prompts: Sequence[TokPrompt],\n",
+        "new": "        prompts: Sequence[DictPrompt | TokPrompt],\n"
+      },
+      {
+        "start": 49880,
+        "end": 49880,
+        "old": "",
+        "new": "        if prompt_extras and \"cache_salt\" in prompt_extras:\n            self._apply_prompt_extras(\n                dict_prompts, {\"cache_salt\": prompt_extras[\"cache_salt\"]}\n            )\n"
+      },
+      {
+        "start": 50401,
+        "end": 50401,
+        "old": "",
+        "new": "    @track_render\n"
+      },
+      {
+        "start": 51225,
+        "end": 51225,
+        "old": "",
+        "new": "        if prompt_extras and \"cache_salt\" in prompt_extras:\n            self._apply_prompt_extras(\n                dict_prompts, {\"cache_salt\": prompt_extras[\"cache_salt\"]}\n            )\n"
+      }
+    ]
+  },
+  {
+    "source": "vllm/_custom_ops.py",
+    "output": "vllm_custom_ops.py",
+    "original_sha256": "36428c27bad9bf5ffe5debf9e34bccbc888adb68ad3eb972f6c9ff080e7f683e",
+    "patched_sha256": "8622b1153be546ce968cb0e4cb05392652643ea7581d79fab2d0da5d127c826f",
+    "edits": [
+      {
+        "start": 84459,
+        "end": 84470,
+        "old": ") -> None:\n",
+        "new": "    skip_scale: bool = False,\n) -> None:\n    # Image 540155b18ee7 exposes the six-argument native cache operator.\n    # SM120 MLA calls this with the default False; preserve that operation.\n    if skip_scale:\n        raise RuntimeError(\"This image does not support concat_and_cache_mla(skip_scale=True)\")\n"
+      }
+    ]
+  },
+  {
+    "source": "deep_ep/buffers/elastic.py",
+    "output": "deep_ep_elastic.py",
+    "original_sha256": "a20347291581dde085e1a89a5084cf6c50b34c70e897525e148c98848ee71cf1",
+    "patched_sha256": "7e5775303ba98cd1a2183456a77adc28dcfee78527c422d79ea98991fe6c6b06",
+    "edits": [
+      {
+        "start": 29208,
+        "end": 29208,
+        "old": "",
+        "new": "\n        # Deployment override for PCIe-only machines whose bandwidth probes\n        # cannot provide the NVLink/RDMA estimates required by this heuristic.\n        explicit_sms = os.environ.get('AI_INFRA_DEEPEP_V2_NUM_SMS')\n        if explicit_sms is not None:\n            requested_sms = int(explicit_sms)\n            device_sms = torch.cuda.get_device_properties('cuda').multi_processor_count\n            if requested_sms < 4 or requested_sms % 2 or requested_sms > device_sms:\n                raise ValueError(\n                    'AI_INFRA_DEEPEP_V2_NUM_SMS must be even, at least 4, '\n                    'and no greater than the device SM count'\n                )\n            return requested_sms\n"
+      }
+    ]
+  }
+]

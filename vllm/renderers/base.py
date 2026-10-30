@@ -48,6 +48,12 @@ from vllm.multimodal.processing import BaseMultiModalProcessor
 from vllm.multimodal.processing import ProcessorInputs as MMProcessorInputs
 from vllm.multimodal.registry import MultiModalTimingRegistry
 from vllm.tokenizers import TokenizerLike
+from vllm.tokenizers.glm53_native_cache import (
+    NativeCache,
+    make_cache,
+    timed_tokenize_async,
+    track_render,
+)
 from vllm.utils.async_utils import make_async
 from vllm.utils.counter import AtomicCounter
 from vllm.utils.torch_utils import set_default_torch_num_threads
@@ -104,6 +110,8 @@ class _SwappableExecutor(Executor):
 
 
 class BaseRenderer(ABC, Generic[_T]):
+    _glm53_native_cache: NativeCache | None = None
+
     def __init__(self, config: "VllmConfig", tokenizer: _T | None) -> None:
         super().__init__()
 
@@ -116,6 +124,7 @@ class BaseRenderer(ABC, Generic[_T]):
         self._finalizer = weakref.finalize(self, self._resources.close)
 
         self.tokenizer = tokenizer
+        self._glm53_native_cache = make_cache(config, tokenizer)
 
         # Background multimodal warmup task (a future returned by
         # _mm_executor) so it overlaps engine-core initialization while
@@ -156,6 +165,8 @@ class BaseRenderer(ABC, Generic[_T]):
         self._tokenize_prompt_async = make_async(
             self._tokenize_prompt, executor=self._executor
         )
+        if self._glm53_native_cache is not None:
+            self._tokenize_prompt_async = timed_tokenize_async(self, self._executor)
         self._async_tokenizer_decode = make_async(self._decode, executor=self._executor)
 
         self.mm_processor: BaseMultiModalProcessor | None = None
@@ -668,12 +679,20 @@ class BaseRenderer(ABC, Generic[_T]):
         self,
         prompt: TextPrompt,
         params: TokenizeParams,
+        *,
+        _queued_at: float | None = None,
     ) -> TokensPrompt:
         tokenizer = self.get_tokenizer()
         want_offsets = self._wants_offsets(prompt, params)
         kwargs = params.get_encode_kwargs()
         if want_offsets:
             kwargs = {**kwargs, "return_offsets_mapping": True}
+        if self._glm53_native_cache is not None:
+            ids = self._glm53_native_cache.try_encode(
+                prompt, kwargs, want_offsets, _queued_at
+            )
+            if ids is not None:
+                return self._build_tokens_prompt(ids, prompt)
         encoding = tokenizer(prompt["prompt"], **kwargs)
         return self._build_tokens_prompt(
             encoding["input_ids"],
@@ -861,7 +880,7 @@ class BaseRenderer(ABC, Generic[_T]):
     # Step 3: Add extra keys to the prompts
     def _apply_prompt_extras(
         self,
-        prompts: Sequence[TokPrompt],
+        prompts: Sequence[DictPrompt | TokPrompt],
         prompt_extras: dict[str, Any] | None,
     ):
         if not prompt_extras:
@@ -1364,6 +1383,10 @@ class BaseRenderer(ABC, Generic[_T]):
             out_conversations.append(conv)
             dict_prompts.append(prompt)
 
+        if prompt_extras and "cache_salt" in prompt_extras:
+            self._apply_prompt_extras(
+                dict_prompts, {"cache_salt": prompt_extras["cache_salt"]}
+            )
         tok_prompts = self.tokenize_prompts(dict_prompts, tok_params)
 
         prompt_extras = dict(prompt_extras or {})
@@ -1379,6 +1402,7 @@ class BaseRenderer(ABC, Generic[_T]):
 
         return out_conversations, eng_prompts
 
+    @track_render
     async def render_chat_async(
         self,
         conversations: Sequence[list["ChatCompletionMessageParam"]],
@@ -1404,6 +1428,10 @@ class BaseRenderer(ABC, Generic[_T]):
             out_conversations.append(conv)
             dict_prompts.append(prompt)
 
+        if prompt_extras and "cache_salt" in prompt_extras:
+            self._apply_prompt_extras(
+                dict_prompts, {"cache_salt": prompt_extras["cache_salt"]}
+            )
         tok_prompts = await self.tokenize_prompts_async(dict_prompts, tok_params)
 
         prompt_extras = dict(prompt_extras or {})

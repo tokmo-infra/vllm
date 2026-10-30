@@ -169,6 +169,8 @@ if TYPE_CHECKING:
     VLLM_USE_RUST_BENCH: bool = False
     VLLM_RUST_FRONTEND_PATH: str | None = "auto"
     VLLM_SERVER_DEV_MODE: bool = False
+    VLLM_GLM53_TOKENIZER_CACHE_GIB: float = 0
+    VLLM_GLM53_TOKENIZER_CACHE_EPOCH_FILE: str = ""
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_MLA_DISABLE: bool = False
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
@@ -1470,6 +1472,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # some additional endpoints for developing and debugging,
     # e.g. `/reset_prefix_cache`
     "VLLM_SERVER_DEV_MODE": lambda: bool(int(os.getenv("VLLM_SERVER_DEV_MODE", "0"))),
+    # Opt-in native GLM5.3 tokenizer segment cache, GiB per API process.
+    # Zero disables it. Only the validated GLM tokenizer fingerprint is accepted.
+    "VLLM_GLM53_TOKENIZER_CACHE_GIB": lambda: float(
+        os.getenv("VLLM_GLM53_TOKENIZER_CACHE_GIB", "0")
+    ),
+    # An optional readable file whose contents act as a tokenizer-cache epoch.
+    # Changing it clears each API cache on that process's next encoding call.
+    "VLLM_GLM53_TOKENIZER_CACHE_EPOCH_FILE": lambda: os.getenv(
+        "VLLM_GLM53_TOKENIZER_CACHE_EPOCH_FILE", ""
+    ),
     # Controls the maximum number of requests to handle in a
     # single asyncio task when processing per-token outputs in the
     # V1 AsyncLLM interface. It is applicable when handling a high

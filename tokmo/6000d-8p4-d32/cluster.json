@@ -1,0 +1,571 @@
+{
+  "name": "glm53flash-8p4-d32-xinhao",
+  "workdir": "/data/bench/eng-xinhao/vllm-pd/glm53-flash/6000d-8p4-d32",
+  "model_dir": "/data/models/GLM-5.3-Flash-NVFP4",
+  "model_image": "local/glm53flash-vllm:0.32.0",
+  "model_image_id": "sha256:540155b18ee763049423a616628cc1fee5e22176b3b1397775465f9067569bcf",
+  "router_image": "local/glm53flash-router:0.1.16",
+  "router_image_id": "sha256:21c9cfa19e348f84a99102ab02922d5cd3a1ef6d659881cac09e9d6479c4d07b",
+  "served_model_name": "glm-5.3-flash-nvfp4",
+  "prefill_nodes": [
+    81,
+    82,
+    83,
+    84
+  ],
+  "decode_nodes": [
+    85,
+    86,
+    87,
+    88
+  ],
+  "control_node": 81,
+  "model": {
+    "max_model_len": -1,
+    "mtp_tokens": 3,
+    "kv_cache_dtype": "fp8",
+    "attention_backend": "FLASHINFER_MLA_SPARSE_SM120",
+    "moe_backend": "auto (reference native selection)",
+    "mamba_cache_mode": "align",
+    "mamba_ssm_cache_dtype": "float32",
+    "kv_cache_layout": "BLHNC",
+    "prefix_match_unit": 256,
+    "pd_connector": "MooncakeConnector",
+    "enforce_eager": false,
+    "block_size": 64,
+    "language_model_only": true,
+    "flashinfer_autotune": "native default",
+    "native_tokenizer_cache": {
+      "enabled": true,
+      "gib_per_api": 4,
+      "api_processes": 40,
+      "max_total_gib": 160,
+      "headless_gib": 0,
+      "reference": "B300 native segment cache; exact official token IDs; pinned GLM tokenizer SHA",
+      "manifest": "runtime/tokenizer-cache-manifest.json"
+    }
+  },
+  "prefill": {
+    "gpu_groups": [
+      [
+        0,
+        1,
+        2,
+        3
+      ],
+      [
+        4,
+        5,
+        6,
+        7
+      ]
+    ],
+    "max_num_seqs": 64,
+    "max_num_batched_tokens": 4096,
+    "api_server_count": 4,
+    "http_ports": [
+      31010,
+      31014
+    ],
+    "dp_ports": [
+      18360,
+      18460
+    ],
+    "all2all_backend": "allgather_reducescatter",
+    "nccl_p2p_level": "PXB",
+    "bootstrap_ports": [
+      27600,
+      27700
+    ],
+    "max_cudagraph_capture_size": 256,
+    "gpu_memory_utilization": 0.9,
+    "memory_budget_reason": "Reserve 5% more GPU memory for real DP4 allgather MoE workspaces and CUDA Graph private pools; C1024 first attempt requested 2.04GiB with only 0.3-0.4GiB free."
+  },
+  "decode": {
+    "max_num_seqs": 128,
+    "max_num_batched_tokens": 2048,
+    "api_server_count": 8,
+    "http_port": 31011,
+    "dp_port": 28360,
+    "all2all_backend": "deepep_v2",
+    "max_cudagraph_capture_size": 512,
+    "nccl_p2p_level": "PIX",
+    "ep_rdma_devices": [
+      "mlx5_0:1",
+      "mlx5_2:1",
+      "mlx5_5:1",
+      "mlx5_6:1"
+    ],
+    "kv_rdma_devices": [
+      "mlx5_1:1",
+      "mlx5_3:1",
+      "mlx5_4:1",
+      "mlx5_7:1"
+    ],
+    "per_gpu_hca_binding": "library-selected within each plane; not a per-rank forced mapping",
+    "pix_gpu_pairs": [
+      [
+        0,
+        1
+      ],
+      [
+        2,
+        3
+      ],
+      [
+        4,
+        5
+      ],
+      [
+        6,
+        7
+      ]
+    ],
+    "pix_p2p_runtime_acceptance_required": true,
+    "communication_sms": 32,
+    "runtime_patch": "runtime/deep_ep_elastic.py",
+    "deepep_v2_allow_hybrid_mode": false,
+    "deepep_v2_num_sms": 32,
+    "enable_prefix_caching": true,
+    "prefix_match_unit": 256,
+    "enforce_eager": false,
+    "bootstrap_port": 28600,
+    "gpu_memory_utilization": 0.95
+  },
+  "mooncake": {
+    "master_port": 54365,
+    "master_metrics_port": 29465,
+    "master_memory_gib": 8,
+    "store_gib_per_node": 512,
+    "client_buffer_gib_per_rank": 2,
+    "cache_prefix": "glm53flash-mc-native-mtp3-h256-8p4-d32-540155-v4",
+    "lookup_async": true,
+    "load_async": true,
+    "save_decode_cache": false,
+    "with_nvidia_peermem": 0,
+    "store_instances_per_node": 2,
+    "store_gib_per_instance": 256,
+    "store_ports": [
+      54465,
+      54466
+    ],
+    "store_http_ports": [
+      29466,
+      29467
+    ],
+    "store_buffer_gib_per_instance": 4,
+    "store_container_memory_gib_per_instance": 280,
+    "store_numa_nodes": [
+      0,
+      1
+    ],
+    "store_rdma_devices_by_numa": [
+      [
+        "mlx5_1:1",
+        "mlx5_3:1"
+      ],
+      [
+        "mlx5_4:1",
+        "mlx5_7:1"
+      ]
+    ],
+    "placement": "P preferred_segment: local NUMA TE endpoint; local_first host fallback; global P/D fallback, not D-only",
+    "store_nodes": [
+      81,
+      82,
+      83,
+      84,
+      85,
+      86,
+      87,
+      88
+    ],
+    "store_total_gib": 4096,
+    "store_te_ports": [
+      15465,
+      15466
+    ],
+    "allocation_strategy": "local_first",
+    "prefill_store_rdma_devices": [
+      "mlx5_0:1",
+      "mlx5_1:1",
+      "mlx5_2:1",
+      "mlx5_3:1",
+      "mlx5_4:1",
+      "mlx5_5:1",
+      "mlx5_6:1",
+      "mlx5_7:1"
+    ],
+    "prefill_store_hca_scope": "all eight for global reachability; CPU/memory remain NUMA-bound; fallback may cross NUMA",
+    "preferred_segment_by_prefill_instance": {
+      "81-0": "11.5.0.81:15465",
+      "81-1": "11.5.0.81:15466",
+      "82-0": "11.5.0.82:15465",
+      "82-1": "11.5.0.82:15466",
+      "83-0": "11.5.0.83:15465",
+      "83-1": "11.5.0.83:15466",
+      "84-0": "11.5.0.84:15465",
+      "84-1": "11.5.0.84:15466"
+    },
+    "host_identity": "derived from local_hostname/requester 11.5.0.{node}; pinned client has no MOONCAKE_HOST_ID override",
+    "prefill_store_topology": "MC_MS_AUTO_DISC=1 + custom topology with only the Store memory NUMA; four local preferred HCAs and four remote fallback HCAs, all eight retained",
+    "store_compact_group_payloads": true
+  },
+  "router": {
+    "port": 38080,
+    "metrics_port": 38081,
+    "memory_gib": 64,
+    "prefill_policy": "cache_aware",
+    "decode_policy": "cache_aware",
+    "request_timeout_secs": 1800,
+    "session_affinity_header": "X-Session-ID",
+    "pd_token_balance": true,
+    "kv_fraction": 0.85,
+    "balance_abs_threshold": 4,
+    "balance_rel_threshold": 1.5,
+    "affinity": "prefix-aware bounded-load routing; replaces strict X-Session-ID pinning"
+  },
+  "preflight": {
+    "model_min_host_available_gib": 128,
+    "host_reserve_gib": 128,
+    "gpu_max_used_mib": 1024,
+    "numa_reserve_gib": 64
+  },
+  "nodes": {
+    "81": {
+      "ssh_alias": "6000d-81",
+      "ip": "11.5.0.81",
+      "socket_ifname": "enp3s0f0np0",
+      "rdma_devices": [
+        "mlx5_0:1",
+        "mlx5_1:1",
+        "mlx5_2:1",
+        "mlx5_3:1",
+        "mlx5_4:1",
+        "mlx5_5:1",
+        "mlx5_6:1",
+        "mlx5_7:1"
+      ],
+      "gpu_numa": [
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1
+      ],
+      "hca_numa": {
+        "mlx5_0": 0,
+        "mlx5_1": 0,
+        "mlx5_2": 0,
+        "mlx5_3": 0,
+        "mlx5_4": 1,
+        "mlx5_5": 1,
+        "mlx5_6": 1,
+        "mlx5_7": 1
+      },
+      "gid_index": null,
+      "driver_library": "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+      "numa_cpus": [
+        "0-63,128-191",
+        "64-127,192-255"
+      ]
+    },
+    "82": {
+      "ssh_alias": "6000d-82",
+      "ip": "11.5.0.82",
+      "socket_ifname": "enp3s0f0np0",
+      "rdma_devices": [
+        "mlx5_0:1",
+        "mlx5_1:1",
+        "mlx5_2:1",
+        "mlx5_3:1",
+        "mlx5_4:1",
+        "mlx5_5:1",
+        "mlx5_6:1",
+        "mlx5_7:1"
+      ],
+      "gpu_numa": [
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1
+      ],
+      "hca_numa": {
+        "mlx5_0": 0,
+        "mlx5_1": 0,
+        "mlx5_2": 0,
+        "mlx5_3": 0,
+        "mlx5_4": 1,
+        "mlx5_5": 1,
+        "mlx5_6": 1,
+        "mlx5_7": 1
+      },
+      "gid_index": null,
+      "driver_library": "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+      "numa_cpus": [
+        "0-63,128-191",
+        "64-127,192-255"
+      ]
+    },
+    "83": {
+      "ssh_alias": "6000d-83",
+      "ip": "11.5.0.83",
+      "socket_ifname": "enp3s0f0np0",
+      "rdma_devices": [
+        "mlx5_0:1",
+        "mlx5_1:1",
+        "mlx5_2:1",
+        "mlx5_3:1",
+        "mlx5_4:1",
+        "mlx5_5:1",
+        "mlx5_6:1",
+        "mlx5_7:1"
+      ],
+      "gpu_numa": [
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1
+      ],
+      "hca_numa": {
+        "mlx5_0": 0,
+        "mlx5_1": 0,
+        "mlx5_2": 0,
+        "mlx5_3": 0,
+        "mlx5_4": 1,
+        "mlx5_5": 1,
+        "mlx5_6": 1,
+        "mlx5_7": 1
+      },
+      "gid_index": null,
+      "driver_library": "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+      "numa_cpus": [
+        "0-63,128-191",
+        "64-127,192-255"
+      ]
+    },
+    "84": {
+      "ssh_alias": "6000d-84",
+      "ip": "11.5.0.84",
+      "socket_ifname": "enp3s0f0np0",
+      "rdma_devices": [
+        "mlx5_0:1",
+        "mlx5_1:1",
+        "mlx5_2:1",
+        "mlx5_3:1",
+        "mlx5_4:1",
+        "mlx5_5:1",
+        "mlx5_6:1",
+        "mlx5_7:1"
+      ],
+      "gpu_numa": [
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1
+      ],
+      "hca_numa": {
+        "mlx5_0": 0,
+        "mlx5_1": 0,
+        "mlx5_2": 0,
+        "mlx5_3": 0,
+        "mlx5_4": 1,
+        "mlx5_5": 1,
+        "mlx5_6": 1,
+        "mlx5_7": 1
+      },
+      "gid_index": null,
+      "driver_library": "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+      "numa_cpus": [
+        "0-63,128-191",
+        "64-127,192-255"
+      ]
+    },
+    "85": {
+      "ssh_alias": "6000d-85",
+      "ip": "11.5.0.85",
+      "socket_ifname": "ens50np0",
+      "rdma_devices": [
+        "mlx5_0:1",
+        "mlx5_1:1",
+        "mlx5_2:1",
+        "mlx5_3:1",
+        "mlx5_4:1",
+        "mlx5_5:1",
+        "mlx5_6:1",
+        "mlx5_7:1"
+      ],
+      "gpu_numa": [
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1
+      ],
+      "hca_numa": {
+        "mlx5_0": 0,
+        "mlx5_1": 0,
+        "mlx5_2": 0,
+        "mlx5_3": 0,
+        "mlx5_4": 1,
+        "mlx5_5": 1,
+        "mlx5_6": 1,
+        "mlx5_7": 1
+      },
+      "gid_index": null,
+      "driver_library": "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+      "numa_cpus": [
+        "0-31,64-95",
+        "32-63,96-127"
+      ]
+    },
+    "86": {
+      "ssh_alias": "6000d-86",
+      "ip": "11.5.0.86",
+      "socket_ifname": "ens50np0",
+      "rdma_devices": [
+        "mlx5_0:1",
+        "mlx5_1:1",
+        "mlx5_2:1",
+        "mlx5_3:1",
+        "mlx5_4:1",
+        "mlx5_5:1",
+        "mlx5_6:1",
+        "mlx5_7:1"
+      ],
+      "gpu_numa": [
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1
+      ],
+      "hca_numa": {
+        "mlx5_0": 0,
+        "mlx5_1": 0,
+        "mlx5_2": 0,
+        "mlx5_3": 0,
+        "mlx5_4": 1,
+        "mlx5_5": 1,
+        "mlx5_6": 1,
+        "mlx5_7": 1
+      },
+      "gid_index": null,
+      "driver_library": "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+      "numa_cpus": [
+        "0-31,64-95",
+        "32-63,96-127"
+      ]
+    },
+    "87": {
+      "ssh_alias": "6000d-87",
+      "ip": "11.5.0.87",
+      "socket_ifname": "ens50np0",
+      "rdma_devices": [
+        "mlx5_0:1",
+        "mlx5_1:1",
+        "mlx5_2:1",
+        "mlx5_3:1",
+        "mlx5_4:1",
+        "mlx5_5:1",
+        "mlx5_6:1",
+        "mlx5_7:1"
+      ],
+      "gpu_numa": [
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1
+      ],
+      "hca_numa": {
+        "mlx5_0": 0,
+        "mlx5_1": 0,
+        "mlx5_2": 0,
+        "mlx5_3": 0,
+        "mlx5_4": 1,
+        "mlx5_5": 1,
+        "mlx5_6": 1,
+        "mlx5_7": 1
+      },
+      "gid_index": null,
+      "driver_library": "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+      "numa_cpus": [
+        "0-31,64-95",
+        "32-63,96-127"
+      ]
+    },
+    "88": {
+      "ssh_alias": "6000d-88",
+      "ip": "11.5.0.88",
+      "socket_ifname": "ens50np0",
+      "rdma_devices": [
+        "mlx5_0:1",
+        "mlx5_1:1",
+        "mlx5_2:1",
+        "mlx5_3:1",
+        "mlx5_4:1",
+        "mlx5_5:1",
+        "mlx5_6:1",
+        "mlx5_7:1"
+      ],
+      "gpu_numa": [
+        0,
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
+        1
+      ],
+      "hca_numa": {
+        "mlx5_0": 0,
+        "mlx5_1": 0,
+        "mlx5_2": 0,
+        "mlx5_3": 0,
+        "mlx5_4": 1,
+        "mlx5_5": 1,
+        "mlx5_6": 1,
+        "mlx5_7": 1
+      },
+      "gid_index": null,
+      "driver_library": "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+      "numa_cpus": [
+        "0-31,64-95",
+        "32-63,96-127"
+      ]
+    }
+  },
+  "mooncake_image": "vllm/vllm-openai:v0.32.0",
+  "mooncake_image_id": "sha256:bd8a5d7a8774800c92d714c0c226b32c1863f929150f36efd610aebcd12a335d",
+  "reference": {
+    "vllm_commit": "e39fef0657b0c1582b2d2bbeb1828b40a77a71d7",
+    "router_commit": "48740d2ad97f734a8846cc5679668b744c237dc1",
+    "branch": "vllm-0.32.0-0.1.16-glm5.3-flash"
+  }
+}

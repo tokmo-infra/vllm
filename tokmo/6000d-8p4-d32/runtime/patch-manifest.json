@@ -1,0 +1,13 @@
+{
+  "base_image": "sha256:540155b18ee763049423a616628cc1fee5e22176b3b1397775465f9067569bcf",
+  "package": "deep_ep",
+  "version": "2.0.0+local",
+  "source": "/usr/local/lib/python3.12/dist-packages/deep_ep/buffers/elastic.py",
+  "original_sha256": "a20347291581dde085e1a89a5084cf6c50b34c70e897525e148c98848ee71cf1",
+  "patched_sha256": "7e5775303ba98cd1a2183456a77adc28dcfee78527c422d79ea98991fe6c6b06",
+  "change": "Optional explicit even SM count bypasses bandwidth heuristic; dispatch/combine kernels and communication topology are unchanged.",
+  "env": "AI_INFRA_DEEPEP_V2_NUM_SMS",
+  "deployment_value": 32,
+  "cpu_boundary_checks": "passed for 4/32/128 and rejected 2/31/130",
+  "image_source_original_sha256_verified": true
+}
