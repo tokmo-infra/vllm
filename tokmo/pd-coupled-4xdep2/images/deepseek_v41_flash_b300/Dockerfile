@@ -12,7 +12,7 @@ RUN echo 'ec2fe84538bb30ad7ed1e10833081c8c389e6a2f8fda1dcef50005b9db75a1a7  /usr
 
 COPY vllm/renderers/base.py /usr/local/lib/python3.12/dist-packages/vllm/renderers/base.py
 COPY vllm/tokenizers/dsv41_native_cache.py vllm/tokenizers/dsv41_segment_cache_core.py /usr/local/lib/python3.12/dist-packages/vllm/tokenizers/
-COPY tokmo/images/deepseek_v41_flash_b300/source.sha256 /opt/tokmo/source.sha256
+COPY tokmo/pd-coupled-4xdep2/images/deepseek_v41_flash_b300/source.sha256 /opt/tokmo/source.sha256
 RUN cd /usr/local/lib/python3.12/dist-packages \
     && sha256sum -c /opt/tokmo/source.sha256 \
     && uv venv --python /usr/bin/python3.12 --system-site-packages /tmp/.venv \

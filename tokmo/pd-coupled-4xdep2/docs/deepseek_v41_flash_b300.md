@@ -2,7 +2,7 @@
 
 本文维护企业自定义镜像的生产推荐配置：**单机 8×B300，4 个 TP1/DP2/EP2 的 P/D 耦合实例，1600GiB 共享 DRAM L2，2TiB SSD L3**。模型为 DeepSeek-V4.1-Flash-1017。脚本按模型、硬件和部署拓扑存放，不依赖 Git 分支名称。
 
-配置入口：[部署脚本目录](../../../deployments/deepseek_v41_flash/b300/pd-coupled-4xdep2/README.md)。本文仅保留这一套容量和拓扑。该完整容量组合已完成静态参数检查，尚未完成新的服务压测；生产推荐配置不等同于该组合已经验收上线。
+配置入口：[部署脚本目录](../deployments/deepseek_v41_flash/b300/README.md)。本文仅保留这一套容量和拓扑。该完整容量组合已完成静态参数检查，尚未完成新的服务压测；生产推荐配置不等同于该组合已经验收上线。
 
 ## 镜像与代码来源
 
@@ -20,7 +20,7 @@
 
 2026-10-30 从 B300 原镜像提取并比对源码：3293 个上游已跟踪包文件完全相同，修改 `vllm/renderers/base.py`，新增 `vllm/tokenizers/dsv41_native_cache.py` 和 `vllm/tokenizers/dsv41_segment_cache_core.py`。这三个文件在仓库中保留镜像原字节；其余基础源码保留完整上游历史。镜像的 examples/benchmarks 与对应上游文件一致。
 
-自定义部分在原生 renderer 内增加 CPU 精确分段分词缓存和前端计时；沿用原生分词结果、cache salt 与回退路径。它与 GPU KV、Mooncake L2/L3 是不同缓存。GPU kernel、模型计算和原生二进制沿用基础镜像。第三方构建依赖、生成文件及二进制的安装态清单见 [installed-vllm.sha256](../../../images/deepseek_v41_flash_b300/installed-vllm.sha256)，镜像依赖见 [image-packages.txt](../../../images/deepseek_v41_flash_b300/image-packages.txt)，来源信息见 [image-info.json](../../../images/deepseek_v41_flash_b300/image-info.json)。
+自定义部分在原生 renderer 内增加 CPU 精确分段分词缓存和前端计时；沿用原生分词结果、cache salt 与回退路径。它与 GPU KV、Mooncake L2/L3 是不同缓存。GPU kernel、模型计算和原生二进制沿用基础镜像。第三方构建依赖、生成文件及二进制的安装态清单见 [installed-vllm.sha256](../images/deepseek_v41_flash_b300/installed-vllm.sha256)，镜像依赖见 [image-packages.txt](../images/deepseek_v41_flash_b300/image-packages.txt)，来源信息见 [image-info.json](../images/deepseek_v41_flash_b300/image-info.json)。
 
 原镜像和基础镜像在 B300 上没有 `RepoDigests`。这里记录的 SHA256 是 Docker **image ID**，不可当作仓库 manifest digest 使用。将镜像推入企业 Registry 后，应另外固定该 Registry 返回的 digest。仓库中的构建配方生成代码一致的新镜像，不承诺重建出相同 image ID。
 
@@ -29,10 +29,10 @@
 已有原镜像时可直接使用。需要从仓库重建时，在 B300 的仓库根目录执行：
 
 ```bash
-bash tokmo/deployments/deepseek_v41_flash/b300/pd-coupled-4xdep2/build-image.sh
+bash tokmo/pd-coupled-4xdep2/deployments/deepseek_v41_flash/b300/build-image.sh
 ```
 
-[构建脚本](../../../deployments/deepseek_v41_flash/b300/pd-coupled-4xdep2/build-image.sh)检查本地基础镜像 ID，以 `tokmo/images/deepseek_v41_flash_b300/Dockerfile` 构建，复制仓库内三个实际源码文件，并检查 SHA256 与 Python 编译。默认禁止拉取基础镜像和构建时访问网络。基础镜像、CUDA 扩展和依赖由已验证的底座提供。
+[构建脚本](../deployments/deepseek_v41_flash/b300/build-image.sh)检查本地基础镜像 ID，以 `tokmo/pd-coupled-4xdep2/images/deepseek_v41_flash_b300/Dockerfile` 构建，复制仓库内三个实际源码文件，并检查 SHA256 与 Python 编译。默认禁止拉取基础镜像和构建时访问网络。基础镜像、CUDA 扩展和依赖由已验证的底座提供。
 
 `IMAGE` 可指定输出 tag，`BASE_IMAGE` 可指定同一基础镜像的本地名称；两者都必须已具备相应输入。只有明确升级并重新验收底座时才修改 `EXPECTED_BASE_IMAGE_ID`。Router 是独立部署依赖，不由此 Dockerfile 构建。
 
@@ -45,7 +45,7 @@ bash tokmo/deployments/deepseek_v41_flash/b300/pd-coupled-4xdep2/build-image.sh
 | 2 | 4、5 | 2 | 30024 | 16560 |
 | 3 | 6、7 | 3 | 30026 | 16660 |
 
-[coupled.sh](../../../deployments/deepseek_v41_flash/b300/pd-coupled-4xdep2/coupled.sh)保留以下设置：
+[coupled.sh](../deployments/deepseek_v41_flash/b300/coupled.sh)保留以下设置：
 
 - 每实例 TP1/DP2/EP2，EP 权重过滤、EPLB、NUMA 绑定；每 rank `max-num-seqs=512`、`max-num-batched-tokens=16384`，模型上下文由 `max-model-len=-1` 自动选择。
 - `FP8` KV、`FLASHMLA_MEGA_ATTN_DSV41` attention、`mxfp4` indexer、`deep_gemm_mega_moe`、`deep_select`；开启 GPU prefix cache。
@@ -67,9 +67,9 @@ bash tokmo/deployments/deepseek_v41_flash/b300/pd-coupled-4xdep2/build-image.sh
 | owner 容器内存上限 | 224GiB | 8 个 owner |
 | master 容器内存上限 | — | 64GiB |
 
-[mooncake.json](../../../deployments/deepseek_v41_flash/b300/pd-coupled-4xdep2/mooncake.json)设置 `mode=standalone-store`、`global_segment_size=0`。vLLM rank 只作为请求方，200GiB L2 由每个独立 owner 持有，不能再次给 8 个 vLLM rank 分配共享 segment。所有实例都可使用整个共享池，未限制到固定 owner 或 preferred segment。
+[mooncake.json](../deployments/deepseek_v41_flash/b300/mooncake.json)设置 `mode=standalone-store`、`global_segment_size=0`。vLLM rank 只作为请求方，200GiB L2 由每个独立 owner 持有，不能再次给 8 个 vLLM rank 分配共享 segment。所有实例都可使用整个共享池，未限制到固定 owner 或 preferred segment。
 
-8 个 owner 在 [mooncake-owner.sh](../../../deployments/deepseek_v41_flash/b300/pd-coupled-4xdep2/mooncake-owner.sh)中分别设置 `global_segment_size=214748364800`，L3 的逻辑、物理和容量声明上限均为 `274877906944` bytes。每个 owner 使用自己的 `owner-0` 至 `owner-7` 子目录；默认父目录为：
+8 个 owner 在 [mooncake-owner.sh](../deployments/deepseek_v41_flash/b300/mooncake-owner.sh)中分别设置 `global_segment_size=214748364800`，L3 的逻辑、物理和容量声明上限均为 `274877906944` bytes。每个 owner 使用自己的 `owner-0` 至 `owner-7` 子目录；默认父目录为：
 
 ```text
 /data1/lab/eng-xinhao/mooncake-l3/b300-pd-coupled-4xdep2-l2-200g-l3-2t-v1
@@ -110,7 +110,7 @@ Mooncake 请求端 `device_name=mlx5_6`，所有 owner 使用 `--device_names=ml
 在 B300 仓库根目录执行：
 
 ```bash
-cd tokmo/deployments/deepseek_v41_flash/b300/pd-coupled-4xdep2
+cd tokmo/pd-coupled-4xdep2/deployments/deepseek_v41_flash/b300
 uv venv --python 3.12 .venv
 
 bash mooncake-master.sh
@@ -143,7 +143,7 @@ curl --noproxy '*' -f http://127.0.0.1:18086/workers
 | owner TransferEngine | 50140–50147 |
 | owner HTTP health / metrics | 9320–9327 |
 
-[router.sh](../../../deployments/deepseek_v41_flash/b300/pd-coupled-4xdep2/router.sh)使用普通耦合路由，将四个后端展开为 8 个 DP worker，策略 `cache_aware`，内存上限 64GiB，请求超时 600 秒，worker 启动超时 7200 秒。API 地址 `http://11.5.0.55:18086/v1`，配置中的 key 为 `EMPTY`；面向企业用户的访问控制由入口层提供。
+[router.sh](../deployments/deepseek_v41_flash/b300/router.sh)使用普通耦合路由，将四个后端展开为 8 个 DP worker，策略 `cache_aware`，内存上限 64GiB，请求超时 600 秒，worker 启动超时 7200 秒。API 地址 `http://11.5.0.55:18086/v1`，配置中的 key 为 `EMPTY`；面向企业用户的访问控制由入口层提供。
 
 在独立终端执行 `.venv/bin/python monitor.py`，每 10 秒采集模型、Router、master、owner 与 NVMe 计数器，写入状态目录的 `validation/production-external-metrics.jsonl.gz`，Ctrl+C 结束。关注外部 KV 命中、SSD bytes/ops/latency、淘汰、promotion、TTFT/TPOT。外部 KV token 包含 L2 和 L3，不能全部当作 SSD 命中。
 

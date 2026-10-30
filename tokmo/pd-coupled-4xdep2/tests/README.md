@@ -10,13 +10,13 @@ docker run --rm --network none \
     -e HF_HUB_OFFLINE=1 -e VLLM_NO_USAGE_STATS=1 \
     -e PYTHONDONTWRITEBYTECODE=1 \
     -v /data2/models/DeepSeek-V4.1-Flash-1017:/model:ro \
-    -v "$PWD/tokmo/tests:/verification:ro" \
+    -v "$PWD/tokmo/pd-coupled-4xdep2/tests:/verification:ro" \
     --entrypoint /bin/bash \
     local/vllm-openai:0.32.0-dsv41-native-token-cache-v1 \
     -lc 'cd /tmp && uv venv --python /usr/bin/python3.12 --system-site-packages /tmp/.venv && /tmp/.venv/bin/python -m pytest -q -c /dev/null -p no:cacheprovider /verification/test_dsv41_native_cache.py'
 ```
 
-三份镜像源码的 SHA256 固定在 `tokmo/images/deepseek_v41_flash_b300/source.sha256`。重建 Dockerfile 会核对它们并执行 Python 编译。为保留原镜像的精确源码，这三份文件不做格式化重写；新增部署工具和验证代码按仓库风格检查。
+三份镜像源码的 SHA256 固定在 `tokmo/pd-coupled-4xdep2/images/deepseek_v41_flash_b300/source.sha256`。重建 Dockerfile 会核对它们并执行 Python 编译。为保留原镜像的精确源码，这三份文件不做格式化重写；新增部署工具和验证代码按仓库风格检查。
 
 这些验证不替代完整容量 L2/L3 配置的模型验收和性能测量。
 

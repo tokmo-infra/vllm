@@ -10,7 +10,7 @@
   },
   "image_rebuild": {
     "status": "passed",
-    "dockerfile": "tokmo/images/deepseek_v41_flash_b300/Dockerfile",
+    "dockerfile": "tokmo/pd-coupled-4xdep2/images/deepseek_v41_flash_b300/Dockerfile",
     "network": "none",
     "installed_vllm_files_matching_original_image": 5440,
     "checks": ["base renderer SHA256", "three source SHA256 values", "Python compilation"]
@@ -48,7 +48,7 @@
     ],
     "containers_started": false,
     "full_capacity_serving_benchmark_completed": false,
-    "profile": "tokmo/deployments/deepseek_v41_flash/b300/pd-coupled-4xdep2"
+    "profile": "tokmo/pd-coupled-4xdep2/deployments/deepseek_v41_flash/b300"
   },
   "scope": "Source archival, image rebuild and CPU tokenizer regressions; no serving deployment or new performance measurement."
 }

@@ -16,5 +16,5 @@ fi
 docker build --pull=false --network none \
     --build-arg "BASE_IMAGE=$BASE_IMAGE" \
     --build-arg "SOURCE_REVISION=$(git -C "$REPO_ROOT" rev-parse HEAD)" \
-    -t "$IMAGE" -f "$REPO_ROOT/tokmo/images/deepseek_v41_flash_b300/Dockerfile" \
+    -t "$IMAGE" -f "$REPO_ROOT/tokmo/pd-coupled-4xdep2/images/deepseek_v41_flash_b300/Dockerfile" \
     "$REPO_ROOT"
