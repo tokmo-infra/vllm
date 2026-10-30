@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd -- "$SCRIPT_DIR/../../../.." && pwd)
+REPO_ROOT=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)
 IMAGE=${IMAGE:-local/vllm-openai:0.32.0-dsv41-native-token-cache-v1}
 BASE_IMAGE=${BASE_IMAGE:-vllm/vllm-openai:v0.32.0}
 EXPECTED_BASE_IMAGE_ID=${EXPECTED_BASE_IMAGE_ID:-sha256:bd8a5d7a8774800c92d714c0c226b32c1863f929150f36efd610aebcd12a335d}

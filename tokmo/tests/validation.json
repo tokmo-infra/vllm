@@ -47,7 +47,8 @@
       "image build context"
     ],
     "containers_started": false,
-    "full_capacity_serving_benchmark_completed": false
+    "full_capacity_serving_benchmark_completed": false,
+    "profile": "tokmo/deployments/deepseek_v41_flash/b300/pd-coupled-4xdep2"
   },
   "scope": "Source archival, image rebuild and CPU tokenizer regressions; no serving deployment or new performance measurement."
 }
