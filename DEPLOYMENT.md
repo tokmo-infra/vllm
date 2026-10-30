@@ -241,7 +241,7 @@ docker run -d --name glm-router --runtime=runc --network host \
   -v "$MODEL_DIR:/model:ro" -v "$WORK/token-balance.json:/run/token-balance.json:ro" \
   -e VLLM_ROUTER_PD_TOKEN_BALANCE_CONFIG=/run/token-balance.json \
   -e NVIDIA_VISIBLE_DEVICES=void -e OPENAI_API_KEY="$API_KEY" \
-  --entrypoint /usr/bin/python3 "$ROUTER_IMAGE" -m vllm_router.launch_router \
+  --entrypoint /usr/local/bin/vllm-router "$ROUTER_IMAGE" \
   --vllm-pd-disaggregation --kv-connector mooncake \
   --prefill "http://$P_IP:18483" 19083 --prefill "http://$P_IP:18493" 19093 \
   --decode "http://$D1_IP:18483" --decode "http://$D2_IP:18483" \
