@@ -31,6 +31,19 @@ Mooncake通过DMA-BUF注册GPU内存，仍使用RDMA传输。
 分词复用率取 `tokenizer_cache_tokens_total` 中 `reused_tokens/(reused_tokens+encoded_tokens)`，
 与 GPU KV 命中率分别统计。
 
+### 与原 C230 显式 CX8 启动记录的差异
+
+| 项目 | 原 C230 | 本轮 |
+| --- | --- | --- |
+| P API 进程数 | 1 | 4 |
+| P KV 接收线程 | 原生默认1 | 4 |
+| CPU 分词缓存 | 未启用 | P每API 4 GiB，D每API 32 GiB |
+| FlashInfer 自动调优 | 显式关闭 | 使用原生自动调优 |
+| WITH_NVIDIA_PEERMEM | 0 | false，含义相同 |
+
+P seq24/batch2048、D seq16/batch1024/graph64、MTP3、FP8、prefix256、util0.95和CX8绑定均沿用原配置。
+原记录使用镜像 `33333ac91514`；本轮基于用户指定的 `540155b18ee7` 补入分词缓存和接口修复。
+
 各主机先设置以下变量，IP、模型路径、密钥按环境填写。
 
 ~~~bash
