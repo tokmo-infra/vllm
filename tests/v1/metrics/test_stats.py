@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
+
 from vllm.v1.core.sched.output import ScheduledEncoderInputStats, SchedulerOutput
-from vllm.v1.engine import EngineCoreOutputs, FinishReason
+from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.metrics.stats import (
     IterationStats,
+    LoRARequestStates,
     PrefillStats,
     PrefixCacheStats,
     PromptTokenStats,
@@ -20,6 +23,49 @@ from vllm.v1.utils import compute_iteration_details
 def test_iteration_stats_repr():
     iteration_stats = IterationStats()
     assert repr(iteration_stats).startswith("IterationStats(")
+
+
+@pytest.mark.parametrize(
+    "scheduled,first,last,tokens,expected",
+    [
+        (0.0, 0.0, 0.0, 0, (None, None, None, None, None)),
+        (11.0, 0.0, 0.0, 0, (1.0, None, None, None, None)),
+        (11.0, 12.0, 14.0, 3, (1.0, 1.0, 3.0, 2.0, 1.0)),
+        (11.0, 12.0, 12.0, 1, (1.0, 1.0, 1.0, 0.0, None)),
+        (9.0, 12.0, 14.0, 3, (None, 3.0, 5.0, 2.0, 1.0)),
+    ],
+)
+def test_request_phase_metrics_require_observed_ordered_milestones(
+    scheduled, first, last, tokens, expected
+):
+    """An abort before scheduling must not subtract zero from host uptime."""
+    stats = IterationStats()
+    request = RequestStateStats(
+        arrival_time=1.0,
+        queued_ts=10.0,
+        scheduled_ts=scheduled,
+        first_token_ts=first,
+        last_token_ts=last,
+        num_generation_tokens=tokens,
+    )
+    stats.update_from_finished_request(
+        FinishReason.ABORT if tokens == 0 else FinishReason.STOP,
+        "phase-milestones",
+        128,
+        16,
+        request,
+    )
+    result = stats.finished_requests[0]
+    assert (
+        result.queued_time,
+        result.prefill_time,
+        result.inference_time,
+        result.decode_time,
+        result.mean_time_per_output_token,
+    ) == expected
+    assert result.finish_reason == (
+        FinishReason.ABORT if tokens == 0 else FinishReason.STOP
+    )
 
 
 def test_scheduler_iteration_details_serialization():
@@ -149,6 +195,26 @@ def test_compute_iteration_details_includes_encoder_stats():
 
     assert iteration_details.num_encoder_inputs == 2
     assert iteration_details.num_encoder_output_tokens == 392
+
+
+def test_aborted_empty_output_does_not_create_first_token_milestone():
+    stats = IterationStats()
+    request = RequestStateStats(arrival_time=1.0, queued_ts=10.0)
+    stats.update_from_output(
+        EngineCoreOutput(
+            request_id="aborted-before-output",
+            new_token_ids=[],
+            finish_reason=FinishReason.ABORT,
+        ),
+        engine_core_timestamp=15.0,
+        is_prefilling=True,
+        req_stats=request,
+        lora_states=LoRARequestStates(),
+        lora_name=None,
+    )
+    assert request.first_token_ts == request.last_token_ts == 0.0
+    assert stats.time_to_first_tokens_iter == []
+    assert stats.inter_token_latencies_iter == []
 
 
 def test_prefill_kv_computed_with_cache():

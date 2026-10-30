@@ -1,0 +1,5 @@
+# Preserve the upstream CUDA key-end variable in the archived source diff.
+[default.extend-words]
+kend = "kend"
+arange = "arange"
+ue = "ue"

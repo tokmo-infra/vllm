@@ -1,0 +1,353 @@
+{
+  "name": "vllm-0.32.0-0.1.16-glm5.3-flash",
+  "archived_at": "2026-10-30",
+  "layout": "Pinned integration patch set; repository main source is not replaced by older runtime files.",
+  "vllm": {
+    "repository": "https://github.com/vllm-project/vllm.git",
+    "commit": "5df63a7203cdb9328d824a27b682e77c7b9928be",
+    "version": "0.32.0",
+    "patches": [
+      {
+        "path": "patches/vllm-runtime.patch",
+        "sha256": "c4ee43dddce9ce1b2f5c5e26c0576cda800ac4688fe06645348515b9d6d510bf",
+        "files": [
+          {
+            "path": "vllm/config/vllm.py",
+            "sha256": "d30876a57fff3c7a929e584eb48c2bfa3145a612fe9a950c3072d9b7c8ee88d6"
+          },
+          {
+            "path": "vllm/distributed/kv_transfer/kv_connector/v1/hisparse/worker.py",
+            "sha256": "83cad141105497b90268ebd3db9d9ee15e0d4496ec14355d20b7b1baed28e16e"
+          },
+          {
+            "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py",
+            "sha256": "4268b1ddaab0a356ef2c564bcf52b79cfdc7b33e85face90afd04e8de4743e41"
+          },
+          {
+            "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/stats.py",
+            "sha256": "29469c688af6c4bc3a1129bb4d0da28519f4e812f5e64467abb07d3dae822f7d"
+          },
+          {
+            "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py",
+            "sha256": "f48cd2134b1d62251d8c90b3182b6a762f1e19827a6f6ace1831b962f77bcd23"
+          },
+          {
+            "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/lease.py",
+            "sha256": "2f2e790dee33603ed85aeda5d9930e0850195e30ecf24cb0637741d5d0e3efb4"
+          },
+          {
+            "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/staged_lookup.py",
+            "sha256": "bebb909ff6da50f153ee789fc9422d073bb7304e79ec6aac6eae769e690dee28"
+          },
+          {
+            "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py",
+            "sha256": "90a457d10975d132c5883a00ecbfdac855064725eecfa894c36c8d4ffa4bc5b5"
+          },
+          {
+            "path": "vllm/model_executor/layers/attention/mla_attention.py",
+            "sha256": "299652435946a7945e84edf12832661810e6b09cafe8426d8da2339ae36a4411"
+          },
+          {
+            "path": "vllm/model_executor/layers/attention/sparse_mla_attention.py",
+            "sha256": "798269daf18317ea9a0acc5b901f8a9a179d65f21144ef4e1bf36185efe9f2ed"
+          },
+          {
+            "path": "vllm/model_executor/warmup/kernel_warmup.py",
+            "sha256": "67cec3830838b63847c6ad7314cca382273e8da96f36aeef97fce6e4ecd95aa6"
+          },
+          {
+            "path": "vllm/models/glm5next/common/model.py",
+            "sha256": "ca9617d20431548507910debdfafeab4f9381db4ab783e88478d507c79da21a4"
+          },
+          {
+            "path": "vllm/models/glm5next/common/mtp.py",
+            "sha256": "383d1ae302b3c269572c0a10bcb5af9aac99488eedbe629867c1be02a86bfaed"
+          },
+          {
+            "path": "vllm/v1/attention/backend.py",
+            "sha256": "52d567d752f1e943559fad280a542f8cc77d78b4dc1a594cd8d97ea5fa007c87"
+          },
+          {
+            "path": "vllm/v1/attention/backends/mla/flashattn_mla_sparse.py",
+            "sha256": "0c33fa718c15c7952b71f605d65da05cec6a511982eba0aefcaae70a2dfddd27"
+          },
+          {
+            "path": "vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py",
+            "sha256": "900774d965e079a5188b7dcd47e58f2c5d9e002fa52f656d6292d79fdc4b1030"
+          },
+          {
+            "path": "vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py",
+            "sha256": "775fdf8ab6ebd2007324004abe5ed2f5c818f1cf303d8b28a016a3956419abe3"
+          },
+          {
+            "path": "vllm/v1/attention/backends/mla/flashmla_sparse.py",
+            "sha256": "f9366acaffe7fbe04007a11b698bd529869673ba67481c48b069d13a32cf03e4"
+          },
+          {
+            "path": "vllm/v1/attention/backends/mla/index_group.py",
+            "sha256": "971185354488b5c121d86a1a09685b191ede7c55203ba1e444eca605fdbc16ba"
+          },
+          {
+            "path": "vllm/v1/attention/backends/mla/rocm_aiter_mla.py",
+            "sha256": "e81ac96a5fa9af05450fb7b379bfb6df90175acd3083572a188a0dcdf90e50e3"
+          },
+          {
+            "path": "vllm/v1/attention/backends/mla/sparse_utils.py",
+            "sha256": "37ac8964d9133f9c0a69659aa0838f653f4d804dd9d1d77feb239e5298bda231"
+          },
+          {
+            "path": "vllm/v1/attention/selector.py",
+            "sha256": "a9787819033a518be6649636c68b4173261ff87b872b13f0456b999615ccd673"
+          },
+          {
+            "path": "vllm/v1/hisparse/binding.py",
+            "sha256": "2189a164c007b23e421bb3be79407286bb3cd3cee05f1b351a98e6deffd8cce0"
+          },
+          {
+            "path": "vllm/v1/hisparse/layout.py",
+            "sha256": "0799e0cac5a2cf7ab8be6595f8d4cec79366f7a06b070d33142c3aebc6b7dc22"
+          },
+          {
+            "path": "vllm/v1/hisparse/residency_chunked.py",
+            "sha256": "0d9c1be8fa008b3412a3bd17e7442cac4a48c7d349c8ca6b09f1e863e5c2364e"
+          },
+          {
+            "path": "vllm/v1/hisparse/runtime.py",
+            "sha256": "c47675d7146017c1d50eaae43e4571846d531fc9f4ffe812d962bdbccce60213"
+          },
+          {
+            "path": "vllm/v1/kv_cache_interface.py",
+            "sha256": "77319db85bbc4684705e88c639a91203eb0da95136a96d4b3a82effc775865a4"
+          },
+          {
+            "path": "vllm/v1/metrics/loggers.py",
+            "sha256": "45393f7441b89c51f85cd22118fee1b339d845f258df8fc61288634b9ac9be26"
+          },
+          {
+            "path": "vllm/v1/metrics/stats.py",
+            "sha256": "0308d0de44eb57d86d3ce0f34004d8c42a13294afcd3d13f235d954cafa71d2e"
+          },
+          {
+            "path": "vllm/v1/worker/gpu/model_runner.py",
+            "sha256": "fcf9add5cb88c27693b8dad95919d99f94101cfbc6c3e9e20af81f0c6966ca55"
+          },
+          {
+            "path": "vllm/v1/worker/gpu/spec_decode/mtp/speculator.py",
+            "sha256": "cc38bb4681ecd9e543002e708118becd3d7ce18960c8f8faf0b183cb71c0eff7"
+          },
+          {
+            "path": "vllm/v1/worker/gpu/spec_decode/speculator.py",
+            "sha256": "51619cbce2f10501128df001c18fa050d16bf580c6fd44feed461ff9397a97af"
+          }
+        ]
+      },
+      {
+        "path": "patches/vllm-native.patch",
+        "sha256": "7a8d68540a8d162b6f611cd34e33322380cdd5320df943f5a03d944a3202a9be",
+        "files": [
+          {
+            "path": "CMakeLists.txt",
+            "sha256": "711491949c2cc2cd20e08d59e07611ba1d0fd72dcc2346d356138acc30f98ba7"
+          },
+          {
+            "path": "csrc/attention/mla/cutlass_sm100_mla/kernel/gather_tensor.hpp",
+            "sha256": "af83b6b853a6abf73881c0749b44174f92f69bf6512c3604e612275afe96a2b5"
+          },
+          {
+            "path": "csrc/cache_kernels.cu",
+            "sha256": "b9506a6c1856a6ce3c408350029e28ec2e6308863a5d1092e574449e5d120349"
+          },
+          {
+            "path": "csrc/ops.h",
+            "sha256": "88b1e5ba07aeba7a39884140f08051a3509afb75f38481d65eacbb739f6f1191"
+          },
+          {
+            "path": "csrc/torch_bindings.cpp",
+            "sha256": "3accf9c572d3ce535949e97a4128329ef4fa10a92740fb6ff1ec1fbfa9b31f92"
+          }
+        ]
+      }
+    ],
+    "deployed_image": "sha256:540155b18ee763049423a616628cc1fee5e22176b3b1397775465f9067569bcf"
+  },
+  "flashinfer": {
+    "repository": "https://github.com/flashinfer-ai/flashinfer.git",
+    "commit": "0b46115d238d29ea2e92c6b9b2cb077d40fbc352",
+    "version": "0.7.1",
+    "patches": [
+      {
+        "path": "patches/flashinfer-autotune.patch",
+        "sha256": "3d0ee805a0247c3fd8504dd1dac1c288b751d867ae4140ecc9924f7e8c68d194",
+        "upstream": [
+          "flashinfer#6006",
+          "flashinfer#6139"
+        ]
+      }
+    ]
+  },
+  "router": {
+    "repository": "https://github.com/vllm-project/router.git",
+    "commit": "db02f358da401b60d4ae14eb286163763a0705cc",
+    "version": "0.1.16",
+    "patches": [
+      {
+        "path": "patches/router.patch",
+        "sha256": "3bf8fad10fae2c2f448e37d468e9dfa057f8f9aee71742c03ab365cf195adba2",
+        "files": [
+          {
+            "path": "Cargo.lock",
+            "sha256": "3f108f0cdb55f3153944403d98214712d603ffbb12b8f3ee7a325230b0170bce"
+          },
+          {
+            "path": "Cargo.toml",
+            "sha256": "40a7d347b7f172fe68b12f61cef203a581ea354720119d581a5c88563f5cfb41"
+          },
+          {
+            "path": "src/core/worker_registry.rs",
+            "sha256": "c29e668532a3cf0b8361ca411c4354d3f0f07ccf2103ef21272b46f0b2c33675"
+          },
+          {
+            "path": "src/metrics.rs",
+            "sha256": "de5f65f6dac336b1ce41a5953593b1d0f53d192a79c13127cd59b18ef39ccbd1"
+          },
+          {
+            "path": "src/policies/cache_aware.rs",
+            "sha256": "18ba044ae252eb3a0baa24021073ffa2bb88aac2efb4072c06f16580e09791a6"
+          },
+          {
+            "path": "src/policies/coupled_kv.rs",
+            "sha256": "906c06a10f90e9c94cfbd9fe1e2b91cc33b4757f57c88e36ff2efa5dbca87601"
+          },
+          {
+            "path": "src/policies/mod.rs",
+            "sha256": "4a213ce78d081754d36c0c87e9612d990ee6b692c07f3c96398e975416376f96"
+          },
+          {
+            "path": "src/protocols/spec.rs",
+            "sha256": "601bfb0f75577809ef8ca59230eb5d1d963e27c8526dd97b61b601fdc897bb09"
+          },
+          {
+            "path": "src/routers/http/mod.rs",
+            "sha256": "0750eb4722323c8107d3161b27427b873e0055bb80fa4fc93d05a7cdaaf1e547"
+          },
+          {
+            "path": "src/routers/http/pd_usage.rs",
+            "sha256": "b59e4e11bf5e5e14bc32e7a64c9eec5da1a8b67c69375867439c325fd26c3a48"
+          },
+          {
+            "path": "src/routers/http/token_balance.rs",
+            "sha256": "01a86f975fe0326b67a4b7406f82e37bc139d7de16c3cd5a149b37e644234ea7"
+          },
+          {
+            "path": "src/routers/http/vllm_pd_router.rs",
+            "sha256": "5e3ad235309ec5eb38729ccef429433cceab8dd55a35434176ba9b92224303e1"
+          }
+        ]
+      }
+    ],
+    "deployed_image": "sha256:21c9cfa19e348f84a99102ab02922d5cd3a1ef6d659881cac09e9d6479c4d07b",
+    "source_receipt": "2026-10-30 Linux release build with PD token balance and coupled per-DP KV load balance",
+    "release_repository": "https://github.com/tokmo-infra/router",
+    "release_branch": "vllm-0.32.0-0.1.16-glm5.3-flash",
+    "release_commit": "48740d2ad97f734a8846cc5679668b744c237dc1",
+    "deployed_binary_sha256": "64361aa391fae97c996880c48726218fd96aad90e038db1470f4f5c90898b857",
+    "historical_source_sync_validation": {
+      "reservation_tests": 5,
+      "pd_usage_tests": 12,
+      "kv_hash_tests": 6,
+      "mode": "Original Linux test binary from matching archived sources; no rebuild or GPU services"
+    },
+    "source_sync_validation": {
+      "coupled_policy_tests_passed": 4,
+      "version": "0.1.16"
+    }
+  },
+  "mooncake": {
+    "package": "mooncake-transfer-engine-cuda13",
+    "version": "0.3.13.post1",
+    "native_core_patch": null,
+    "changes": "vLLM connector/Store integration and master configuration",
+    "eviction_high_watermark_ratio": 0.98,
+    "pool_gib_per_D_host": 750
+  },
+  "build": {
+    "python": "3.12",
+    "torch": "2.13.0+cu130",
+    "triton": "3.7.1",
+    "cuda_architectures": [
+      "100",
+      "120"
+    ],
+    "family_architectures": [
+      "10.0f",
+      "12.0f"
+    ],
+    "target": "_C_stable_libtorch",
+    "base_image": "sha256:33333ac91514dba29a27edc90a654b225231dd5b730bc68459e077fe2f9a2e57",
+    "native_sha256": "5c52814f7d27f8da2523a61de8eb1282176583c8db4916cdd6c11260bd8dc3f4"
+  },
+  "provenance_PRs": {
+    "vllm/64072": "daf15951a7deeb33ba47ce0cf436ebcb9146382f",
+    "vllm/58305": "d76d076968d224e34e9452487d77a2d3a9cb11e6",
+    "vllm/63142": "0eb37ba3e3bef61f4bc904e75cfbb76c51e51e2e",
+    "vllm/62478": "22fd7b2357556f13a216fd1edcc6173cf317a02c"
+  },
+  "additional_selected_PRs": [
+    62102,
+    63971,
+    63041
+  ],
+  "not_applied": [
+    63938,
+    63544,
+    44344
+  ],
+  "services": "Runtime topology and launch commands are documented in root DEPLOYMENT.md.",
+  "documented_deployment": {
+    "case": "C230/U345/N345",
+    "topology": "P82 two TP1DP4EP4; D83 and D84 one TP1DP8EP8 each",
+    "network": "P/D explicit CX8",
+    "model_image": "sha256:33333ac91514dba29a27edc90a654b225231dd5b730bc68459e077fe2f9a2e57",
+    "start_percent": 55,
+    "complete_minutes": 12,
+    "Store_GiB": 2250,
+    "document": "DEPLOYMENT-C230.md"
+  },
+  "release_repositories": {
+    "vllm": "https://github.com/tokmo-infra/vllm",
+    "router": "https://github.com/tokmo-infra/router",
+    "branch": "vllm-0.32.0-0.1.16-glm5.3-flash"
+  },
+  "current_deployment": {
+    "document": "DEPLOYMENT.md",
+    "topology": "One P role with two EP4 instances; two D roles with one EP8 instance each",
+    "P_api_server_count": 4,
+    "P_load_recv_threads": 4,
+    "lookup_async": true,
+    "MTP": "native3; P-only fixed-zero and scratch-release experiments removed",
+    "flashinfer_autotune": "native default; no disabling kernel-config in standard commands"
+  },
+  "reverted_PRs": {
+    "flashinfer/7085": {
+      "commit": "03a71490abee5ff44b806bf5286592cd4c856d63",
+      "reason": "SM120 ragged Prefill fused top-k reproduced CUDA illegal memory access; restore native Prefill and Decode indexers"
+    }
+  },
+  "autotune_validation": {
+    "case": "C16/U32/N32 SWE13w from40%",
+    "loaded_configs_per_rank": 106,
+    "round_maxtpm_change_percent": [
+      2.5277343670803365,
+      3.032338253193112
+    ],
+    "weighted_maxtpm_change_percent": 2.74,
+    "report": "FLASHINFER-AUTOTUNE.md"
+  },
+  "rebased_runtime": {
+    "source_image": "sha256:a8006094951c6987afd105723fee8407c40920318e952927f42473aaa4e1c333",
+    "mtp": "same native state allocation and transfer as restored C230; experimental producer-only code removed",
+    "removed_inherited_modules": [
+      "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/fp8_wire.py"
+    ]
+  }
+}

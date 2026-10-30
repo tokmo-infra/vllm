@@ -1,0 +1,5 @@
+ARG ROUTER_BASE_IMAGE
+FROM ${ROUTER_BASE_IMAGE}
+COPY sources/router/target/release/vllm-router /usr/local/bin/vllm-router
+ENTRYPOINT ["/usr/local/bin/vllm-router"]
+CMD ["--version"]
