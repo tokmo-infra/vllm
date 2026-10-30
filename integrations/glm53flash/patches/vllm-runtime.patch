@@ -1,18 +1,3 @@
-diff --git a/vllm/_custom_ops.py b/vllm/_custom_ops.py
---- a/vllm/_custom_ops.py
-+++ b/vllm/_custom_ops.py
-@@ -2747,9 +2747,10 @@
-     slot_mapping: torch.Tensor,
-     kv_cache_dtype: str,
-     scale: torch.Tensor,
-+    skip_scale: bool = False,
- ) -> None:
-     torch.ops._C_cache_ops.concat_and_cache_mla(
--        kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
-+        kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale, skip_scale
-     )
- 
- 
 diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
 --- a/vllm/config/vllm.py
 +++ b/vllm/config/vllm.py
@@ -25,24 +10,6 @@ diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
              ):
                  raise ValueError(
                      "HiSparse is only supported for DSA models with index_topk."
-diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/base.py b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
---- a/vllm/distributed/kv_transfer/kv_connector/v1/base.py
-+++ b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
-@@ -532,6 +532,14 @@
-         """
-         pass
- 
-+    def get_divergent_matched_tokens(
-+        self, request: "Request", num_computed_tokens: int
-+    ) -> tuple[int | None, bool]:
-+        """Look up a hit that can restore state at a divergent local boundary."""
-+        if not self.supports_divergent_local_hybrid_hits:
-+            return 0, False
-+        return self.get_num_new_matched_tokens(request, num_computed_tokens)
-+
-     def get_external_cache_hit_sources(
-         self,
-         request: "Request",
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/hisparse/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/hisparse/worker.py
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/hisparse/worker.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/hisparse/worker.py
@@ -79,46 +46,6 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/hisparse/worker.py b/v
          if self.is_host_writer:
              if self._dma_submitted:
                  compute_stream.wait_event(self.host_write_event)
-diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/fp8_wire.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/fp8_wire.py
-new file mode 100644
---- /dev/null
-+++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/fp8_wire.py
-@@ -0,0 +1,35 @@
-+# SPDX-License-Identifier: Apache-2.0
-+"""Lossless FP8 NoPE512 wire -> GLM packed-MLA import.
-+
-+The source contains static-scale E4M3 bytes. GLM's packed reader accepts four
-+arbitrary FP32 dequantization scales per row. Preserve the 512 bytes and repeat
-+the producer's actual scale; do not requantize or assume scale == 1.
-+"""
-+import math
-+import torch
-+
-+
-+def import_fp8_nope512_blocks(cache, block_ids, scale, scratch=None):
-+    if cache.ndim == 4 and cache.shape[1] == 1:
-+        cache = cache[:, 0]
-+    if cache.dtype != torch.uint8 or cache.ndim != 3 or cache.shape[-1] != 528:
-+        raise ValueError('FP8 wire bridge requires uint8 [block,row,528]')
-+    if cache.stride(1) != 528 or cache.stride(2) != 1:
-+        raise ValueError('FP8 wire bridge requires contiguous rows inside each page')
-+    if not math.isfinite(scale) or scale <= 0:
-+        raise ValueError('invalid producer FP8 dequantization scale')
-+    rows = cache.shape[1]
-+    if scratch is None:
-+        scratch = torch.empty((rows, 512), dtype=torch.uint8, device=cache.device)
-+    if scratch.shape != (rows, 512) or scratch.device != cache.device:
-+        raise ValueError('wire scratch shape/device mismatch')
-+    for block in sorted(set(block_ids)):
-+        if not 0 <= block < cache.shape[0]:
-+            raise ValueError('wire destination block out of range')
-+        page = cache[block]
-+        # RDMA wrote a contiguous rows*512-byte source payload at this address.
-+        # Stage BEFORE expanding, otherwise later input rows would be clobbered.
-+        scratch.copy_(page.view(-1)[:rows * 512].view(rows, 512))
-+        page[:, :512].copy_(scratch)
-+        page[:, 512:].view(torch.float32).fill_(scale)
-+    return scratch
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
@@ -163,56 +90,10 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_conn
  
  
  def _get_tp_ratio(local_tp_size: int, remote_tp_size: int) -> int:
-@@ -622,6 +641,7 @@
-     # peer did not send the field, so the run must not be promoted.
-     registered_row_offsets: list[int] = msgspec.field(default_factory=list)
-     remote_pp_size: int = 1
-+    mla_wire_format: str = ""
- 
- 
- class MooncakeXferResponseStatus(IntEnum):
-@@ -641,6 +661,7 @@
-     ok_reqs: list[ReqId] | None = None
-     err_reqs: list[ReqId] | None = None
-     err_msg: str | None = None
-+    mla_source_scales: dict[str, float] | None = None
- 
- 
- @dataclass
-@@ -703,6 +724,14 @@
- class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
-     _cache_hit_source = CacheHitSource.P2P
- 
-+    @property
-+    def supports_divergent_local_hybrid_hits(self) -> bool:
-+        # A decode pulls the unhashed blocks of every transfer group, so the
-+        # recurrent-state slot arrives even when the attention prefix is local.
-+        # Roles that prefill locally keep the lookup that finds the shared
-+        # prefix boundary.
-+        return self._pulls_mamba_state
-+
-     def __init__(
-         self,
-         vllm_config: VllmConfig,
-@@ -714,6 +743,13 @@
-         assert vllm_config.kv_transfer_config is not None
-         assert vllm_config.kv_transfer_config.engine_id is not None
-         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
-+        self._pulls_mamba_state = (
-+            vllm_config.kv_transfer_config.kv_role == "kv_consumer"
-+            and any(
-+                isinstance(group.kv_cache_spec, MambaSpec)
-+                for group in kv_cache_config.transfer_groups
-+            )
-+        )
- 
-         if role == KVConnectorRole.SCHEDULER:
-             assert kv_cache_config is not None, (
-@@ -863,6 +899,18 @@
-         cls, data: dict[str, Any] | None = None
+@@ -864,6 +883,18 @@
      ) -> KVConnectorStats | None:
          return MooncakeKVConnectorStats(data=data or {})
-+
+ 
 +    @classmethod
 +    def build_prom_metrics(
 +        cls,
@@ -224,43 +105,11 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_conn
 +        return MooncakePromMetrics(
 +            vllm_config, metric_types, labelnames, per_engine_labelvalues
 +        )
- 
++
  
  class MooncakeConnectorScheduler:
-@@ -1181,6 +1229,12 @@
-         logger.info("Initializing Mooncake Transfer Engine worker %s", engine_id)
- 
-         self.vllm_config = vllm_config
-+        self._fp8_wire_bridge = (
-+            vllm_config.kv_transfer_config.kv_connector_extra_config.get(
-+                "fp8_nope512_pd_bridge", False) is True
-+        )
-+        self._mla_wire_scales: dict[str, float] = {}
-+        self._mla_pending_import: dict[str, tuple[list[list[int]], dict[str, float]]] = {}
-         # Capture device BEFORE TransferEngine init — MNNVL's NVLink allocator
-         # may change the current CUDA device during engine.initialize().
-         self.device_id = torch.accelerator.current_device_index()
-@@ -1561,6 +1615,11 @@
-             )
-             await sock.send_multipart((identity, self._encoder.encode(response)))
-             return
-+        if meta.mla_wire_format:
-+            if (meta.mla_wire_format != "static_fp8_nope512_v1"
-+                    or not self._fp8_wire_bridge or not self._mla_wire_scales
-+                    or self.tp_size != 1 or self.pp_size != 1):
-+                raise ValueError("Unsupported Mooncake FP8 wire encoding/topology")
-         for d_req_id, (transfer_id, _) in meta.req_blocks.items():
-             if transfer_id not in self.reqs_need_send:
-                 # This req is not enqueued in P side yet, create it here.
-@@ -1689,6 +1748,7 @@
- 
-             response = MooncakeXferResponse(
-                 status=response_status,
-+                mla_source_scales=(self._mla_wire_scales if meta.mla_wire_format else None),
-                 ok_reqs=[d_req_id for d_req_id, _ in ok_ready_reqs] or None,
-                 err_reqs=err_reqs or None,
-                 err_msg=err_msg,
-@@ -1833,6 +1893,17 @@
+     """Implementation of Scheduler side methods."""
+@@ -1833,6 +1864,17 @@
              if not any(local_block_ids_by_group):
                  continue
  
@@ -278,7 +127,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_conn
              local_block_ids_by_group = self._logical_to_kernel_block_ids(
                  local_block_ids_by_group
              )
-@@ -1840,28 +1911,40 @@
+@@ -1840,28 +1882,40 @@
                  remote_block_ids_by_group
              )
  
@@ -334,7 +183,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_conn
                  (
                      should_transfer,
                      src_region_offset,
-@@ -1897,36 +1980,24 @@
+@@ -1897,36 +1951,24 @@
                      transfer_len=transfer_len,
                  )
  
@@ -389,134 +238,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_conn
  
              logger.debug(
                  "Sending kv_caches for request %s (%d blocks) to %s",
-@@ -2177,6 +2248,8 @@
-             raise RuntimeError("Mooncake batch memory registration failed.")
- 
-         self.device_kv_caches = kv_caches
-+        if self._fp8_wire_bridge:
-+            self._register_fp8_wire_bridge(kv_caches)
-         logger.debug(
-             "registered block_lens=%s kv_block_lens=%s",
-             self.block_len_per_layer,
-@@ -2210,6 +2283,63 @@
-                     "Mooncake sender listener did not become ready within "
-                     f"{ready_timeout:.0f}s."
-                 )
-+
-+    def _register_fp8_wire_bridge(self, kv_caches):
-+        if self.tp_size != 1 or self.pp_size != 1:
-+            raise ValueError("FP8 wire bridge currently supports TP1/PP1 only")
-+        hf = self.model_config.hf_text_config
-+        if hf.kv_lora_rank != 512 or hf.qk_rope_head_dim != 0:
-+            raise ValueError("FP8 wire bridge only supports GLM NoPE512")
-+        context = self.vllm_config.compilation_config.static_forward_context
-+        for name, cache in kv_caches.items():
-+            spec = self._layer_specs.get(name)
-+            if (not isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
-+                    or spec.head_size != 512):
-+                continue  # Indexer also has an MLA spec, but head_size=128.
-+            if cache.ndim == 4 and cache.shape[1] == 1:
-+                cache = cache[:, 0]  # Registered MLA tensors retain a singleton KV head.
-+            if cache.ndim != 3 or not cache[0].is_contiguous():
-+                raise ValueError(f"Unsupported FP8 wire cache view: {name} {cache.shape}")
-+            if self.is_kv_producer:
-+                if cache.shape[-1] != 512 or spec.cache_dtype_str not in ("fp8", "fp8_e4m3"):
-+                    raise ValueError(f"Producer is not standard NoPE512 FP8: {name}")
-+                self._mla_wire_scales[name] = float(context[name]._k_scale_float)
-+            elif self.is_kv_consumer:
-+                if cache.dtype != torch.uint8 or cache.shape[-1] != 528 or spec.cache_dtype_str != "fp8_ds_mla":
-+                    raise ValueError(f"Consumer is not GLM packed NoPE528 FP8: {name}")
-+                indices = [i for i, n in enumerate(self.registered_layer_names) if n == name]
-+                if len(indices) != 1:
-+                    raise ValueError(f"FP8 wire bridge needs named per-layer regions: {name}")
-+                i = indices[0]
-+                if self.registered_group_indices[i] < 0:
-+                    raise ValueError("FP8 wire bridge cannot use opaque shared-group regions")
-+                self.kv_block_len_per_layer[i] = cache.shape[1] * 512
-+        if not any(isinstance(x, MLAAttentionSpec) for x in self._layer_specs.values()):
-+            raise ValueError("FP8 wire bridge found no MLA cache")
-+        logger.info("FP8 NoPE512 wire bridge registered: role=%s producer_scales=%s",
-+                    "producer" if self.is_kv_producer else "consumer", self._mla_wire_scales)
-+
-+    def _import_finished_fp8_wire(self, req_ids):
-+        from .fp8_wire import import_fp8_nope512_blocks
-+        scratch = None
-+        converted = 0
-+        for req_id in req_ids:
-+            pending = self._mla_pending_import.pop(req_id, None)
-+            if pending is None:  # Failed receives have no successful import pending.
-+                continue
-+            blocks, scales = pending
-+            for name, scale in scales.items():
-+                group = self.kv_cache_config.transfer_group_index_by_layer[name]
-+                ids = blocks[group]
-+                if ids:
-+                    scratch = import_fp8_nope512_blocks(
-+                        self.device_kv_caches[name], ids, scale, scratch)
-+                    converted += len(ids)
-+        if converted:
-+            # This runs in the worker thread, after RDMA completion and before
-+            # reporting readiness. GPU work must finish before scheduler reuse.
-+            torch.cuda.current_stream(self.device_id).synchronize()
-+            logger.debug("FP8 wire import completed: %s layer-pages", converted)
- 
-     async def fetch_finished_recving_reqs(self) -> set[ReqId]:
-         finished_recving_reqs = self.finished_recving_reqs
-@@ -2264,6 +2394,8 @@
- 
-         finished_recving_reqs = recv_fut.result() if recv_fut else set()
-         finished_sending_reqs = send_fut.result() if send_fut else set()
-+        if self._fp8_wire_bridge and self.is_kv_consumer and finished_recving_reqs:
-+            self._import_finished_fp8_wire(finished_recving_reqs)
- 
-         if finished_sending_reqs or finished_recving_reqs:
-             logger.debug(
-@@ -2331,6 +2463,8 @@
-                 list(groups) for groups in self.region_shared_groups
-             ],
-             registered_row_offsets=self.region_row_offsets,
-+            mla_wire_format=("static_fp8_nope512_v1"
-+                             if self._fp8_wire_bridge and self.is_kv_consumer else ""),
-         )
- 
-         encoded_data = self._encoder.encode(metadata)
-@@ -2430,6 +2564,16 @@
-             # Empty pulls only release the producer's blocks; the consumer
-             # did not enter WAITING_FOR_REMOTE_KVS.
-             if pull_meta.pull_tasks_count == 0 and any(pull_meta.local_block_ids):
-+                if self._fp8_wire_bridge and self.is_kv_consumer:
-+                    expected = {n for n, spec in self._layer_specs.items()
-+                                if isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
-+                                and spec.head_size == 512}
-+                    if not response.mla_source_scales or set(response.mla_source_scales) != expected:
-+                        self._handle_failed_recv(pull_metas, [req_id], "missing/incompatible FP8 producer scale metadata")
-+                        continue
-+                    self._mla_pending_import[pull_meta.d_req_id] = (
-+                        self._logical_to_kernel_block_ids(pull_meta.local_block_ids),
-+                        response.mla_source_scales)
-                 self.finished_recving_reqs.add(pull_meta.d_req_id)
- 
-         if ok_reqs:
-@@ -2624,6 +2768,7 @@
-             tuple(meta.registered_group_indices),
-             tuple(tuple(groups) for groups in meta.registered_shared_group_ids),
-             tuple(meta.registered_row_offsets),
-+            meta.mla_wire_format,
-         )
-         cached = self._prepared_transfer_regions.get(cache_key)
-         if cached is not None:
-@@ -2705,7 +2850,9 @@
-         # gating on use_mla alone would promote and then fail the length check
-         # for a non-replicated MLA rank with tp_ratio != 1.
-         tp_ratio = _get_tp_ratio(self.tp_size, meta.remote_tp_size)
--        if tp_ratio == 1 or self._producer_cache_is_replicated():
-+        # Different per-layer offsets/strides must not be hidden by copying a
-+        # whole HMA allocation: even same-sized pages may encode different bytes.
-+        if not meta.mla_wire_format and (tp_ratio == 1 or self._producer_cache_is_replicated()):
-             covered_both_sides = len(local_regions) == len(pre_align_local) and len(
-                 remote_regions
-             ) == len(pre_align_remote)
-@@ -2819,21 +2966,28 @@
+@@ -2819,21 +2861,28 @@
          )
  
  
@@ -1030,6 +752,49 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
  class TPShardedStoreLayout(StoreLayout):
      """Store layout shared by divisible TP sizes."""
  
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/lease.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/lease.py
+new file mode 100644
+--- /dev/null
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/lease.py
+@@ -0,0 +1,38 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Re-query expired read leases without accepting an expired transfer."""
++
++from typing import Any
++
++LEASE_EXPIRED = -707
++
++
++def retry_expired_get_once(
++    store: Any,
++    keys: list[str],
++    buffers: list[list[int]],
++    sizes: list[list[int]],
++    results: list[int],
++) -> list[int]:
++    """Issue one fresh full GET only for keys whose native lease expired.
++
++    The full GET API queries current replicas again. A second failure remains
++    a failure; neither lease validation nor the caller's KV-load policy changes.
++    The caller retains the destination buffers until this function returns.
++    """
++    if not len(keys) == len(buffers) == len(sizes) == len(results):
++        raise ValueError("Mooncake GET vectors must have matching lengths")
++    expired = [i for i, value in enumerate(results) if value == LEASE_EXPIRED]
++    merged = list(results)
++    if not expired:
++        return merged
++    retried = store.batch_get_into_multi_buffers(
++        [keys[i] for i in expired],
++        [buffers[i] for i in expired],
++        [sizes[i] for i in expired],
++    )
++    if len(retried) != len(expired):
++        raise ValueError("Mooncake lease refresh returned a different key count")
++    for position, i in enumerate(expired):
++        merged[i] = retried[position]
++    return merged
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/staged_lookup.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/staged_lookup.py
 new file mode 100644
 --- /dev/null
@@ -1146,7 +911,18 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.
      KeyMetadata,
      LBHNCStoreLayout,
      LBNHCStoreLayout,
-@@ -89,6 +90,7 @@
+@@ -56,6 +57,10 @@
+     StoreShardId,
+     TailKeyBoundary,
+     TPShardedStoreLayout,
++)
++from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.lease import (  # noqa: E501
++    LEASE_EXPIRED,
++    retry_expired_get_once,
+ )
+ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.protocol import (  # noqa: E501
+     LOOKUP_MSG,
+@@ -89,6 +94,7 @@
  from vllm.v1.kv_cache_layout import KVCacheLayout
  
  from .metrics import MooncakeStoreConnectorStats
@@ -1154,7 +930,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.
  
  logger = init_logger(__name__)
  
-@@ -110,6 +112,33 @@
+@@ -110,6 +116,33 @@
  
      store_tp_size = extra_config.get("store_tp_size")
      return store_tp_size if type(store_tp_size) is int and store_tp_size > 0 else None
@@ -1188,7 +964,96 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.
  
  
  def _rotate_list(values: list[_T], offset: int) -> list[_T]:
-@@ -1391,6 +1420,10 @@
+@@ -1243,6 +1276,7 @@
+         current_batch_keys: list[str] = key_list_c
+         current_batch_block_ids: list[int] = block_id_list_c
+         batch_bytes = 0
++        load_get_recorded = False
+         try:
+             for (
+                 batch_keys,
+@@ -1252,6 +1286,7 @@
+             ) in load_batches:
+                 current_batch_keys = batch_keys
+                 current_batch_block_ids = batch_block_ids
++                load_get_recorded = False
+                 batch_bytes = _sum_batch_bytes(batch_sizes)
+                 tiers_by_key: dict[str, str] | None = None
+                 if envs.VLLM_MOONCAKE_STORE_TIER_LOG:
+@@ -1280,6 +1315,48 @@
+                     status="partial_failure" if failed else "ok",
+                     num_failed_keys=len(failed),
+                 )
++                load_get_recorded = True
++                expired = [i for i, value in enumerate(res) if value == LEASE_EXPIRED]
++                if expired:
++                    logger.warning(
++                        "Refreshing expired Mooncake read leases once for "
++                        "%d/%d keys of request %s",
++                        len(expired),
++                        len(batch_keys),
++                        req_id,
++                    )
++                    retry_start = time.perf_counter()
++                    retry_bytes = _sum_batch_bytes([batch_sizes[i] for i in expired])
++                    try:
++                        res = retry_expired_get_once(
++                            self.store, batch_keys, batch_addrs, batch_sizes, res
++                        )
++                    except Exception:
++                        self._record_operation(
++                            "load_get_retry",
++                            retry_start,
++                            len(expired),
++                            num_bytes=retry_bytes,
++                            status="error",
++                            num_failed_keys=len(expired),
++                        )
++                        raise
++                    remaining = sum(res[i] < 0 for i in expired)
++                    self._record_operation(
++                        "load_get_retry",
++                        retry_start,
++                        len(expired),
++                        num_bytes=retry_bytes,
++                        status="partial_failure" if remaining else "ok",
++                        num_failed_keys=remaining,
++                    )
++                    failed = [
++                        (key, value, block_id)
++                        for key, value, block_id in zip(
++                            batch_keys, res, batch_block_ids, strict=True
++                        )
++                        if value < 0
++                    ]
+                 if failed:
+                     self._report_load_error(
+                         req_id, [block_id for _, _, block_id in failed]
+@@ -1294,14 +1371,15 @@
+                     break
+         except Exception as e:
+             self._report_load_error(req_id, current_batch_block_ids)
+-            self._record_operation(
+-                "load_get",
+-                load_get_start,
+-                len(current_batch_keys),
+-                num_bytes=batch_bytes,
+-                status="error",
+-                num_failed_keys=len(current_batch_keys),
+-            )
++            if not load_get_recorded:
++                self._record_operation(
++                    "load_get",
++                    load_get_start,
++                    len(current_batch_keys),
++                    num_bytes=batch_bytes,
++                    status="error",
++                    num_failed_keys=len(current_batch_keys),
++                )
+             logger.warning(
+                 "Failed to get Mooncake sub-batch %s, error: %s",
+                 current_batch_keys[:3],
+@@ -1391,6 +1469,10 @@
          assert kv_role is not None
          self.kv_role = kv_role
          extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
@@ -1199,7 +1064,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.
          self.can_put = self.kv_role in ("kv_producer", "kv_both") or (
              extra_config.get("save_decode_cache", False)
          )
-@@ -1558,12 +1591,20 @@
+@@ -1558,12 +1640,20 @@
          self, extra_config: dict[str, Any]
      ) -> tuple[int | None, str, type[TPShardedStoreLayout] | None]:
          """Select the opt-in TP layout and its Store namespace."""
@@ -1221,7 +1086,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.
  
          requested_store_tp_size = resolve_store_tp_size(extra_config)
          cache_layout = self.cache_config.get_resolved_kv_cache_layout()
-@@ -1589,7 +1630,11 @@
+@@ -1589,7 +1679,11 @@
                      )
                  return (
                      requested_store_tp_size,
@@ -1234,7 +1099,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.
                      layout_cls,
                  )
              if self.num_kv_head == 1:
-@@ -1600,11 +1645,13 @@
+@@ -1600,11 +1694,13 @@
                  )
                  return (
                      None,
@@ -1250,7 +1115,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.
              f"@store_pp:{self.pp_size}@store_format:"
              f"rank_local_tp{self.tp_size}_layout_{cache_layout.name}"
          )
-@@ -1644,7 +1691,35 @@
+@@ -1644,7 +1740,35 @@
                  tp_rank=group_tp_rank,
              )
              store_layout: TPShardedStoreLayout | None = None
@@ -1287,7 +1152,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.
                  assert self.store_tp_size is not None
                  store_layout = layout_cls(
                      group_metadata,
-@@ -1728,7 +1803,7 @@
+@@ -1728,7 +1852,7 @@
  
      def register_kv_caches(
          self,
@@ -1296,7 +1161,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.
      ) -> None:
          """Register KV cache tensors and start transfer threads."""
          if self._capacity_only:
-@@ -1748,8 +1823,54 @@
+@@ -1748,8 +1872,54 @@
          assert self.cache_config.num_gpu_blocks is not None
          self.num_blocks = self.cache_config.num_gpu_blocks
          use_group_regions = self._kv_cache_config.hisparse_host_num_blocks is not None
@@ -1353,7 +1218,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.
              store_layer_names = {
                  layer_name
                  for group in self._kv_cache_groups
-@@ -2112,6 +2233,7 @@
+@@ -2112,6 +2282,7 @@
          # candidate_meta stores the (group, hash_bytes) for key slice.
          candidate_keys: list[str] = []
          candidate_meta: list[tuple[int, bytes]] = []
@@ -1361,7 +1226,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.
          fine_grained = self.coord.enable_partial_hash_hits
          lookup_masks = None if fine_grained else self.coord.lookup_mask(token_len)
          for g_idx, db in enumerate(self.token_dbs):
-@@ -2147,39 +2269,79 @@
+@@ -2147,39 +2318,79 @@
                          PoolKey.build_key_string(key_prefix, hash_hex)
                      )
                  candidate_meta.append((g_idx, bytes(h)))
@@ -1456,52 +1321,6 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.
  
          cached_block_pool = ExternalCachedBlockPool(
              self.hash_block_size,
-diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
---- a/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
-+++ b/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
-@@ -214,9 +214,7 @@
- 
-     @property
-     def supports_divergent_local_hybrid_hits(self) -> bool:
--        return bool(self._connectors) and all(
--            c.supports_divergent_local_hybrid_hits for c in self._connectors
--        )
-+        return any(c.supports_divergent_local_hybrid_hits for c in self._connectors)
- 
-     @property
-     def requires_kv_delivery(self) -> bool:
-@@ -436,11 +434,28 @@
-         request: "Request",
-         num_computed_tokens: int,
-     ) -> tuple[int | None, bool]:
-+        return self._get_num_new_matched_tokens(request, num_computed_tokens, False)
-+
-+    def get_divergent_matched_tokens(
-+        self, request: "Request", num_computed_tokens: int
-+    ) -> tuple[int | None, bool]:
-+        return self._get_num_new_matched_tokens(request, num_computed_tokens, True)
-+
-+    def _get_num_new_matched_tokens(
-+        self, request: "Request", num_computed_tokens: int, hit_diverged: bool
-+    ) -> tuple[int | None, bool]:
-         to_return = (0, False)
-         for i, c in enumerate(self._connectors):
--            toks, load_async = c.get_num_new_matched_tokens(
--                request, num_computed_tokens
--            )
-+            if hit_diverged:
-+                if not c.supports_divergent_local_hybrid_hits:
-+                    continue
-+                toks, load_async = c.get_divergent_matched_tokens(
-+                    request, num_computed_tokens
-+                )
-+            else:
-+                toks, load_async = c.get_num_new_matched_tokens(
-+                    request, num_computed_tokens
-+                )
-             # If there is a connector still looking up the matches,
-             # we return None to indicate that we are not done yet.
-             if toks is None:
 diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
 --- a/vllm/model_executor/layers/attention/mla_attention.py
 +++ b/vllm/model_executor/layers/attention/mla_attention.py
@@ -1515,16 +1334,7 @@ diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_
          if use_sparse:
              extra_impl_args["topk_indices_buffer"] = topk_indices_buffer
              if index_group_builder is not None:
-@@ -801,6 +804,8 @@
-             slot_mapping,
-             kv_cache_dtype,
-             k_scale,
-+            kv_cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2")
-+            and self._k_scale_float == 1.0,
-         )
- 
-     def prepare_kv_cache_update(
-@@ -1361,9 +1366,10 @@
+@@ -1361,9 +1364,10 @@
              kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
              # ds_mla layouts pack NoPE + RoPE + scales into one opaque per-token
              # blob, so the size is not derivable from head_size.
@@ -1538,7 +1348,7 @@ diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_
              ),
          )
          if self.sliding_window is not None:
-@@ -1373,6 +1379,7 @@
+@@ -1373,6 +1377,7 @@
              )
          spec = MLAAttentionSpec(
              **common_kwargs,
@@ -1586,109 +1396,45 @@ diff --git a/vllm/model_executor/layers/attention/sparse_mla_attention.py b/vllm
                      kv_cache_dtype=kv_cache_dtype,
                  )
              )
-diff --git a/vllm/models/deepseek_v32/amd/rocm.py b/vllm/models/deepseek_v32/amd/rocm.py
---- a/vllm/models/deepseek_v32/amd/rocm.py
-+++ b/vllm/models/deepseek_v32/amd/rocm.py
-@@ -244,6 +244,7 @@
-             mla_kv_cache=mla_kv_cache,
-             mla_kv_cache_dtype=self.kv_cache_dtype,
-             mla_k_scale=mla_k_scale,
-+            skip_scale=self._k_scale_float == 1.0,
-             has_indexer=has_indexer,
-             index_rope_interleave=self._index_rope_interleave,
-             kv_c_out=kv_c_out,
-diff --git a/vllm/models/deepseek_v32/attention.py b/vllm/models/deepseek_v32/attention.py
---- a/vllm/models/deepseek_v32/attention.py
-+++ b/vllm/models/deepseek_v32/attention.py
-@@ -398,6 +398,7 @@
-             mla_kv_cache=mla_kv_cache,
-             mla_kv_cache_dtype=self.kv_cache_dtype,
-             mla_k_scale=mla_k_scale,
-+            skip_scale=self._k_scale_float == 1.0,
-             has_indexer=has_indexer,
-             index_rope_interleave=self._index_rope_interleave,
-             kv_c_out=kv_c_out,
-@@ -546,6 +547,8 @@
-                 cache_slot_mapping,
-                 self.kv_cache_dtype,
-                 self._k_scale,
-+                self._k_scale_float == 1.0
-+                and self.kv_cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2"),
-             )
- 
-         num_actual = attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
-diff --git a/vllm/models/deepseek_v32/common/kernels.py b/vllm/models/deepseek_v32/common/kernels.py
---- a/vllm/models/deepseek_v32/common/kernels.py
-+++ b/vllm/models/deepseek_v32/common/kernels.py
-@@ -173,6 +173,7 @@
-     mla_cache_entry_stride,
-     MLA_CACHE_BLOCK_SIZE: tl.constexpr,
-     MLA_CACHE_FP8: tl.constexpr,
-+    SKIP_MLA_SCALE: tl.constexpr,
-     mla_cache_scale_ptr,
-     # fp8_ds_mla cache views (block-scaled fp8 NoPE + unquantized bf16 RoPE).
-     # mla_cache_ptr is the fp8 (1-byte) view, so the block/entry strides above
-@@ -383,18 +384,19 @@
-             )
-             # kv_c_normed (KV_DIM elements)
-             if MLA_CACHE_FP8:
--                scale = tl.load(mla_cache_scale_ptr)
--                kv_c_fp8 = (kv_c.to(tl.float32) / scale).to(fp8_dtype)
-+                scale = 1.0
-+                if not SKIP_MLA_SCALE:
-+                    scale = tl.load(mla_cache_scale_ptr)
-+                    kv_c_fp8 = (kv_c.to(tl.float32) / scale).to(fp8_dtype)
-+                else:
-+                    kv_c_fp8 = kv_c.to(tl.float32).to(fp8_dtype)
-                 tl.store(dst + kv_block, kv_c_fp8)
-             else:
-                 tl.store(dst + kv_block, kv_c)
-             # k_pe_roped (from registers, interleaved layout)
-             if MLA_CACHE_FP8:
-                 tl.store(dst + KV_DIM + dim_off * 2, (r1 / scale).to(fp8_dtype))
--                tl.store(
--                    dst + KV_DIM + dim_off * 2 + 1,
--                    (r2 / scale).to(fp8_dtype),
--                )
-+                tl.store(dst + KV_DIM + dim_off * 2 + 1, (r2 / scale).to(fp8_dtype))
-             else:
-                 tl.store(dst + KV_DIM + dim_off * 2, r1)
-                 tl.store(dst + KV_DIM + dim_off * 2 + 1, r2)
-@@ -536,6 +538,7 @@
-     kv_c_out: torch.Tensor | None = None,
-     k_pe_out: torch.Tensor | None = None,
-     index_k_out: torch.Tensor | None = None,
-+    skip_scale: bool = False,
- ) -> torch.Tensor:
-     assert positions.ndim == 1
-     assert q_c.ndim == 2
-@@ -707,6 +710,7 @@
-         mla_entry_stride,
-         mla_block_size,
-         mla_cache_fp8,
-+        mla_cache_fp8 and skip_scale,
-         mla_k_scale,
-         mla_ds_scale_view,
-         mla_ds_rope_view,
-diff --git a/vllm/models/dots3_note/nvidia/attention.py b/vllm/models/dots3_note/nvidia/attention.py
---- a/vllm/models/dots3_note/nvidia/attention.py
-+++ b/vllm/models/dots3_note/nvidia/attention.py
-@@ -724,6 +724,7 @@
-         slot_mapping: torch.Tensor,
-         kv_cache_dtype: str,
-         k_scale: torch.Tensor,
-+        skip_scale: bool = False,
-     ) -> None:
-         super().do_kv_cache_update(
-             kv_c_normed,
-@@ -732,6 +733,7 @@
-             slot_mapping,
-             kv_cache_dtype,
-             k_scale,
-+            skip_scale=skip_scale,
-         )
- 
-     def forward_mha(  # type: ignore[override]
+diff --git a/vllm/model_executor/warmup/kernel_warmup.py b/vllm/model_executor/warmup/kernel_warmup.py
+--- a/vllm/model_executor/warmup/kernel_warmup.py
++++ b/vllm/model_executor/warmup/kernel_warmup.py
+@@ -502,3 +502,35 @@
+     # the file). FlashInfer gates its own autotune(cache=...) save the same way.
+     if tuner._dirty:
+         tuner.save_configs(str(cache_path))
++
++
++_native_kernel_warmup = kernel_warmup
++
++def kernel_warmup(worker, *, process_local_only=False):
++    """Optionally load saved FlashInfer tactics before ordinary warmup."""
++    import os
++
++    if os.environ.get("GLM_FLASHINFER_PRETUNED_ONLY") == "1":
++        if worker.vllm_config.kernel_config.enable_flashinfer_autotune is not False:
++            raise RuntimeError(
++                "GLM_FLASHINFER_PRETUNED_ONLY requires "
++                "enable_flashinfer_autotune=false"
++            )
++        from flashinfer.autotuner import AutoTuner
++
++        from vllm.distributed.parallel_state import get_world_group
++
++        runner = worker.model_runner
++        world = get_world_group()
++        dp = runner.vllm_config.parallel_config.data_parallel_rank
++        path = resolve_flashinfer_autotune_file(runner)
++        path = path.with_name(
++            f"{path.stem}_dp{dp}_rank{world.rank_in_group}{path.suffix}"
++        )
++        if not AutoTuner.get().load_configs(str(path)):
++            raise RuntimeError("pre-tuned FlashInfer cache environment mismatch")
++        logger.info(
++            "GLM_PRETUNED_LOAD_ONLY dp=%s rank=%s file=%s",
++            dp, world.rank_in_group, path,
++        )
++    return _native_kernel_warmup(worker, process_local_only=process_local_only)
 diff --git a/vllm/models/glm5next/common/model.py b/vllm/models/glm5next/common/model.py
 --- a/vllm/models/glm5next/common/model.py
 +++ b/vllm/models/glm5next/common/model.py
@@ -1858,28 +1604,6 @@ diff --git a/vllm/v1/attention/backend.py b/vllm/v1/attention/backend.py
          )
  
  
-diff --git a/vllm/v1/attention/backends/mla/amx_mla.py b/vllm/v1/attention/backends/mla/amx_mla.py
---- a/vllm/v1/attention/backends/mla/amx_mla.py
-+++ b/vllm/v1/attention/backends/mla/amx_mla.py
-@@ -311,6 +311,7 @@
-         slot_mapping: torch.Tensor,
-         kv_cache_dtype: str,
-         k_scale: torch.Tensor,
-+        skip_scale: bool = False,
-     ) -> None:
-         # Overrides the default (CUDA-only concat_and_cache_mla).
-         if kv_cache.numel() == 0:
-diff --git a/vllm/v1/attention/backends/mla/cpu_mla.py b/vllm/v1/attention/backends/mla/cpu_mla.py
---- a/vllm/v1/attention/backends/mla/cpu_mla.py
-+++ b/vllm/v1/attention/backends/mla/cpu_mla.py
-@@ -200,6 +200,7 @@
-         slot_mapping: torch.Tensor,
-         kv_cache_dtype: str,
-         k_scale: torch.Tensor,
-+        skip_scale: bool = False,
-     ) -> None:
-         if kv_cache.numel() == 0:
-             return
 diff --git a/vllm/v1/attention/backends/mla/flashattn_mla_sparse.py b/vllm/v1/attention/backends/mla/flashattn_mla_sparse.py
 --- a/vllm/v1/attention/backends/mla/flashattn_mla_sparse.py
 +++ b/vllm/v1/attention/backends/mla/flashattn_mla_sparse.py
@@ -2467,26 +2191,6 @@ diff --git a/vllm/v1/attention/selector.py b/vllm/v1/attention/selector.py
      )
  
      # A per-KV-group override (keyed by KVCacheSpecKind) takes precedence over
-diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
---- a/vllm/v1/core/sched/scheduler.py
-+++ b/vllm/v1/core/sched/scheduler.py
-@@ -975,11 +975,11 @@
-                         block_aligned_local = (
-                             num_new_local_computed_tokens - partial_tail
-                         )
--                        ext_tokens, load_kv_async = (
--                            self.connector.get_num_new_matched_tokens(
--                                request, block_aligned_local
--                            )
--                        )
-+                        if hit_diverged:
-+                            lookup = self.connector.get_divergent_matched_tokens
-+                        else:
-+                            lookup = self.connector.get_num_new_matched_tokens
-+                        ext_tokens, load_kv_async = lookup(request, block_aligned_local)
-                         if request.skip_reading_prefix_cache:
-                             ext_tokens, load_kv_async = 0, False
- 
 diff --git a/vllm/v1/hisparse/binding.py b/vllm/v1/hisparse/binding.py
 --- a/vllm/v1/hisparse/binding.py
 +++ b/vllm/v1/hisparse/binding.py
@@ -2847,6 +2551,213 @@ diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
              tokens_per_state=tokens_per_state_set.pop(),
              model_version=model_version_set.pop(),
              cache_role=cache_role_set.pop(),
+diff --git a/vllm/v1/metrics/loggers.py b/vllm/v1/metrics/loggers.py
+--- a/vllm/v1/metrics/loggers.py
++++ b/vllm/v1/metrics/loggers.py
+@@ -743,6 +743,18 @@
+         self.counter_num_preempted_reqs = create_metric_per_engine(
+             counter_num_preempted_reqs, per_engine_labelvalues
+         )
++        phase_unavailable = self._counter_cls(
++            name="vllm:request_phase_metrics_unavailable",
++            documentation="Request phase samples without observed ordered milestones.",
++            labelnames=labelnames + ["phase"],
++        )
++        self.counter_phase_metrics_unavailable = {
++            phase: {
++                idx: phase_unavailable.labels(*labels, phase)
++                for idx, labels in per_engine_labelvalues.items()
++            }
++            for phase in ("queue", "prefill", "inference", "decode", "tpot")
++        }
+ 
+         counter_prompt_tokens = self._counter_cls(
+             name="vllm:prompt_tokens",
+@@ -1293,18 +1305,37 @@
+             self.histogram_e2e_time_request[engine_idx].observe(
+                 finished_request.e2e_latency
+             )
+-            self.histogram_queue_time_request[engine_idx].observe(
+-                finished_request.queued_time
+-            )
+-            self.histogram_prefill_time_request[engine_idx].observe(
+-                finished_request.prefill_time
+-            )
+-            self.histogram_inference_time_request[engine_idx].observe(
+-                finished_request.inference_time
+-            )
+-            self.histogram_decode_time_request[engine_idx].observe(
+-                finished_request.decode_time
+-            )
++            for phase, value, histogram in (
++                (
++                    "queue",
++                    finished_request.queued_time,
++                    self.histogram_queue_time_request,
++                ),
++                (
++                    "prefill",
++                    finished_request.prefill_time,
++                    self.histogram_prefill_time_request,
++                ),
++                (
++                    "inference",
++                    finished_request.inference_time,
++                    self.histogram_inference_time_request,
++                ),
++                (
++                    "decode",
++                    finished_request.decode_time,
++                    self.histogram_decode_time_request,
++                ),
++                (
++                    "tpot",
++                    finished_request.mean_time_per_output_token,
++                    self.histogram_request_time_per_output_token,
++                ),
++            ):
++                if value is None:
++                    self.counter_phase_metrics_unavailable[phase][engine_idx].inc()
++                else:
++                    histogram[engine_idx].observe(value)
+             self.histogram_request_num_preemptions[engine_idx].observe(
+                 finished_request.num_preemptions
+             )
+@@ -1320,9 +1351,6 @@
+             )
+             self.histogram_num_generation_tokens_request[engine_idx].observe(
+                 finished_request.num_generation_tokens
+-            )
+-            self.histogram_request_time_per_output_token[engine_idx].observe(
+-                finished_request.mean_time_per_output_token
+             )
+             if finished_request.max_tokens_param:
+                 self.histogram_max_tokens_request[engine_idx].observe(
+diff --git a/vllm/v1/metrics/stats.py b/vllm/v1/metrics/stats.py
+--- a/vllm/v1/metrics/stats.py
++++ b/vllm/v1/metrics/stats.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import math
+ import time
+ from collections import defaultdict, deque
+ from dataclasses import dataclass, field
+@@ -14,6 +15,14 @@
+ from vllm.v1.spec_decode.metrics import SpecDecodingStats
+ 
+ logger = init_logger(__name__)
++
++
++def _observed_interval(start: float, end: float) -> float | None:
++    # Zero is the sentinel for an engine milestone that was never observed.
++    if start <= 0 or end <= 0 or not math.isfinite(start + end) or end < start:
++        return None
++    return end - start
++
+ 
+ if TYPE_CHECKING:
+     from vllm.v1.engine import EngineCoreEvent, EngineCoreOutput, FinishReason
+@@ -295,11 +304,11 @@
+     num_preemptions: int = 0
+     num_generation_tokens: int = 0
+     max_tokens_param: int | None = None
+-    queued_time: float = 0.0
+-    prefill_time: float = 0.0
+-    inference_time: float = 0.0
+-    decode_time: float = 0.0
+-    mean_time_per_output_token: float = 0.0
++    queued_time: float | None = None
++    prefill_time: float | None = None
++    inference_time: float | None = None
++    decode_time: float | None = None
++    mean_time_per_output_token: float | None = None
+     is_corrupted: bool = False
+     num_cached_tokens: int = 0
+ 
+@@ -512,15 +521,19 @@
+         lora_name: str | None,
+     ):
+         num_new_generation_tokens = len(output.new_token_ids)
++        has_new_output = (
++            num_new_generation_tokens > 0 or output.pooling_output is not None
++        )
+ 
+         self.num_generation_tokens += num_new_generation_tokens
+         if is_prefilling:
+             if output.prefill_stats is not None:
+                 self.prompt_token_stats.update_from_output(output.prefill_stats)
+ 
+-            first_token_latency = self._time_since(req_stats.arrival_time)
+-            self.time_to_first_tokens_iter.append(first_token_latency)
+-            req_stats.first_token_latency = first_token_latency
++            if has_new_output:
++                first_token_latency = self._time_since(req_stats.arrival_time)
++                self.time_to_first_tokens_iter.append(first_token_latency)
++                req_stats.first_token_latency = first_token_latency
+ 
+         req_stats.num_generation_tokens += num_new_generation_tokens
+ 
+@@ -545,13 +558,13 @@
+             )
+ 
+         # Process the batch-level "new tokens" engine core event
+-        if is_prefilling:
+-            req_stats.first_token_ts = engine_core_timestamp
+-        else:
+-            itl = engine_core_timestamp - req_stats.last_token_ts
+-            self.inter_token_latencies_iter.append(itl)
+-
+-        req_stats.last_token_ts = engine_core_timestamp
++        if has_new_output:
++            if is_prefilling:
++                req_stats.first_token_ts = engine_core_timestamp
++            elif req_stats.last_token_ts > 0:
++                itl = engine_core_timestamp - req_stats.last_token_ts
++                self.inter_token_latencies_iter.append(itl)
++            req_stats.last_token_ts = engine_core_timestamp
+ 
+     def update_from_events(
+         self,
+@@ -590,25 +603,31 @@
+         e2e_latency = self._time_since(req_stats.arrival_time)
+ 
+         # Queued interval is from first QUEUED event to first SCHEDULED
+-        queued_time = req_stats.scheduled_ts - req_stats.queued_ts
++        queued_time = _observed_interval(req_stats.queued_ts, req_stats.scheduled_ts)
+ 
+         # Prefill interval is from first SCHEDULED to first NEW_TOKEN
+         # Any preemptions during prefill is included in the interval
+-        prefill_time = req_stats.first_token_ts - req_stats.scheduled_ts
++        prefill_time = _observed_interval(
++            req_stats.scheduled_ts, req_stats.first_token_ts
++        )
+ 
+         # Decode interval is from first NEW_TOKEN to last NEW_TOKEN
+         # Any preemptions during decode are included
+-        decode_time = req_stats.last_token_ts - req_stats.first_token_ts
++        decode_time = _observed_interval(
++            req_stats.first_token_ts, req_stats.last_token_ts
++        )
+ 
+         # Inference interval is from first SCHEDULED to last NEW_TOKEN
+         # Any preemptions during prefill or decode are included
+-        inference_time = req_stats.last_token_ts - req_stats.scheduled_ts
++        inference_time = _observed_interval(
++            req_stats.scheduled_ts, req_stats.last_token_ts
++        )
+ 
+         # Do not count the token generated by the prefill phase
+         mean_time_per_output_token = (
+             decode_time / (req_stats.num_generation_tokens - 1)
+-            if req_stats.num_generation_tokens - 1 > 0
+-            else 0
++            if decode_time is not None and req_stats.num_generation_tokens > 1
++            else None
+         )
+ 
+         finished_req = FinishedRequestStats(
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py

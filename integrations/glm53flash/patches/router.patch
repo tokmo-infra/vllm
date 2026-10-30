@@ -1,7 +1,8 @@
 diff --git a/Cargo.lock b/Cargo.lock
+index 58656f4..76330a7 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -7235,7 +7235,6 @@
+@@ -7235,7 +7235,6 @@ dependencies = [
  [[package]]
  name = "vllm-chat"
  version = "0.1.0"
@@ -9,7 +10,7 @@ diff --git a/Cargo.lock b/Cargo.lock
  dependencies = [
   "anyhow",
   "asynk-strim-attr",
-@@ -7273,7 +7272,6 @@
+@@ -7273,7 +7272,6 @@ dependencies = [
  [[package]]
  name = "vllm-engine-core-client"
  version = "0.1.0"
@@ -17,7 +18,7 @@ diff --git a/Cargo.lock b/Cargo.lock
  dependencies = [
   "arc-swap",
   "bytemuck",
-@@ -7307,7 +7305,6 @@
+@@ -7307,7 +7305,6 @@ dependencies = [
  [[package]]
  name = "vllm-llm"
  version = "0.1.0"
@@ -25,7 +26,7 @@ diff --git a/Cargo.lock b/Cargo.lock
  dependencies = [
   "easy-ext",
   "enum-as-inner",
-@@ -7327,7 +7324,6 @@
+@@ -7327,7 +7324,6 @@ dependencies = [
  [[package]]
  name = "vllm-metrics"
  version = "0.1.0"
@@ -33,7 +34,7 @@ diff --git a/Cargo.lock b/Cargo.lock
  dependencies = [
   "itertools 0.14.0",
   "prometheus-client",
-@@ -7336,7 +7332,6 @@
+@@ -7336,7 +7332,6 @@ dependencies = [
  [[package]]
  name = "vllm-parser"
  version = "0.1.0"
@@ -41,7 +42,7 @@ diff --git a/Cargo.lock b/Cargo.lock
  dependencies = [
   "easy-ext",
   "serde",
-@@ -7365,7 +7360,6 @@
+@@ -7365,7 +7360,6 @@ dependencies = [
  [[package]]
  name = "vllm-text"
  version = "0.1.0"
@@ -49,7 +50,7 @@ diff --git a/Cargo.lock b/Cargo.lock
  dependencies = [
   "anyhow",
   "asynk-strim-attr",
-@@ -7390,7 +7384,6 @@
+@@ -7390,7 +7384,6 @@ dependencies = [
  [[package]]
  name = "vllm-tokenizer"
  version = "0.1.0"
@@ -57,7 +58,7 @@ diff --git a/Cargo.lock b/Cargo.lock
  dependencies = [
   "base64 0.22.1",
   "fastokens",
-@@ -7426,6 +7419,7 @@
+@@ -7426,6 +7419,7 @@ dependencies = [
   "futures-util",
   "hf-hub 0.4.3",
   "http",
@@ -66,9 +67,10 @@ diff --git a/Cargo.lock b/Cargo.lock
   "k8s-openapi",
   "kube",
 diff --git a/Cargo.toml b/Cargo.toml
+index 7a63b27..5164e7a 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -36,6 +36,7 @@
+@@ -36,6 +36,7 @@ futures = "0.3"
  pyo3 = { version = "0.26", features = ["extension-module"] }
  dashmap = "6.1.0"
  http = "1.1.0"
@@ -76,7 +78,7 @@ diff --git a/Cargo.toml b/Cargo.toml
  tokio = { version = "1.42.0", features = ["full"] }
  async-trait = "0.1"
  tracing = "0.1"
-@@ -158,3 +159,9 @@
+@@ -158,3 +159,9 @@ codegen-units = 1
  [profile.dev-opt]
  inherits = "dev"
  opt-level = 1
@@ -87,9 +89,10 @@ diff --git a/Cargo.toml b/Cargo.toml
 +vllm-tokenizer = { path = "../vllm-rust-v029/rust/src/tokenizer" }
 +vllm-text = { path = "../vllm-rust-v029/rust/src/text" }
 diff --git a/src/core/worker_registry.rs b/src/core/worker_registry.rs
+index 0d5e6ef..34fc8ab 100644
 --- a/src/core/worker_registry.rs
 +++ b/src/core/worker_registry.rs
-@@ -395,9 +395,7 @@
+@@ -395,9 +395,7 @@ impl WorkerRegistry {
              let mut interval =
                  tokio::time::interval(tokio::time::Duration::from_secs(check_interval_secs));
  
@@ -100,7 +103,7 @@ diff --git a/src/core/worker_registry.rs b/src/core/worker_registry.rs
  
              loop {
                  interval.tick().await;
-@@ -423,14 +421,6 @@
+@@ -423,14 +421,6 @@ impl WorkerRegistry {
                      }
                  }
  
@@ -115,10 +118,178 @@ diff --git a/src/core/worker_registry.rs b/src/core/worker_registry.rs
              }
          });
  
+diff --git a/src/metrics.rs b/src/metrics.rs
+index 93f7735..45040f7 100644
+--- a/src/metrics.rs
++++ b/src/metrics.rs
+@@ -194,6 +194,10 @@ pub fn init_metrics() {
+     }
+ 
+     // PD-specific metrics
++    describe_histogram!(
++        "vllm_router_pd_estimation_seconds",
++        "PD prompt-estimation wall time by phase: slot_wait, blocking_wait, compute, total"
++    );
+     describe_counter!(
+         "vllm_router_pd_requests_total",
+         "Total PD requests by route"
+diff --git a/src/policies/cache_aware.rs b/src/policies/cache_aware.rs
+index 4a7d39a..947b2f0 100644
+--- a/src/policies/cache_aware.rs
++++ b/src/policies/cache_aware.rs
+@@ -96,6 +96,7 @@ pub struct CacheAwarePolicy {
+     config: CacheAwareConfig,
+     trees: Arc<DashMap<String, Arc<Tree>>>, // model_id -> Arc<Tree>
+     eviction_handle: Option<thread::JoinHandle<()>>,
++    coupled_kv: Option<super::coupled_kv::CoupledKv>,
+ }
+ 
+ impl CacheAwarePolicy {
+@@ -134,6 +135,7 @@ impl CacheAwarePolicy {
+             config,
+             trees,
+             eviction_handle,
++            coupled_kv: super::coupled_kv::CoupledKv::from_env(),
+         }
+     }
+ 
+@@ -301,6 +303,13 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
+         _headers: Option<&RequestHeaders>,
+     ) -> Option<usize> {
+         let healthy_indices = get_healthy_worker_indices(workers);
++        if let Some(balance) = &self.coupled_kv {
++            let idx = balance.select(workers)?;
++            workers[idx].increment_processed();
++            RouterMetrics::record_processed_request(workers[idx].url());
++            RouterMetrics::record_policy_decision("coupled_kv", workers[idx].url());
++            return Some(idx);
++        }
+ 
+         if healthy_indices.is_empty() {
+             return None;
+diff --git a/src/policies/coupled_kv.rs b/src/policies/coupled_kv.rs
+new file mode 100644
+index 0000000..60f4072
+--- /dev/null
++++ b/src/policies/coupled_kv.rs
+@@ -0,0 +1,100 @@
++//! Opt-in regular/coupled routing using live per-DP GPU KV and request load.
++//! This does not change benchmark scheduling or claim knowledge of Store hits.
++use crate::core::Worker;
++use parking_lot::Mutex;
++use std::{collections::{HashMap, HashSet}, sync::Arc, time::{Duration, Instant}};
++
++#[derive(Debug, Clone, Copy, Default)]
++struct Native { usage: Option<f64>, running: f64, waiting: f64 }
++#[derive(Debug, Default)]
++pub(super) struct CoupledKv {
++    rows: Arc<Mutex<HashMap<String, (Native, Instant)>>>,
++    watching: Mutex<HashSet<String>>,
++}
++fn parse(base: &str, body: &str) -> HashMap<String, Native> {
++    let mut rows = HashMap::<String, Native>::new();
++    for line in body.lines().filter(|l| l.starts_with("vllm:")) {
++        let Some(metric) = line.split('{').next() else { continue };
++        if !["vllm:kv_cache_usage_perc", "vllm:num_requests_running", "vllm:num_requests_waiting"].contains(&metric) { continue; }
++        let Some(rank) = line.split("engine=\"").nth(1).and_then(|s| s.split('\"').next()).and_then(|s| s.parse::<usize>().ok()) else { continue };
++        let Some(v) = line.split_whitespace().nth(1).and_then(|s| s.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0) else { continue };
++        let row = rows.entry(format!("{base}@{rank}")).or_default();
++        match metric {
++            "vllm:kv_cache_usage_perc" if v <= 1.0 => row.usage = Some(v),
++            "vllm:num_requests_running" => row.running = v,
++            "vllm:num_requests_waiting" => row.waiting = v,
++            _ => {}
++        }
++    }
++    rows
++}
++fn score(inflight: usize, live: Option<Native>) -> f64 {
++    let live = live.unwrap_or_default();
++    let load = (inflight as f64).max(live.running + live.waiting);
++    // Idle cached pages are evictable: do not treat idle usage as active KV.
++    let usage = if load > 0.0 { live.usage.unwrap_or(0.0) } else { 0.0 };
++    load + 2.0 * live.waiting + 8.0 * usage.powi(2)
++        + 20.0 * ((usage - 0.85) / 0.15).max(0.0).powi(2)
++}
++impl CoupledKv {
++    pub(super) fn from_env() -> Option<Self> {
++        (std::env::var("VLLM_ROUTER_COUPLED_KV_BALANCE").as_deref() == Ok("1")).then(Self::default)
++    }
++    pub(super) fn select(&self, workers: &[Arc<dyn Worker>]) -> Option<usize> {
++        for w in workers {
++            let base = w.base_url().to_string();
++            if !self.watching.lock().insert(base.clone()) { continue; }
++            let rows = self.rows.clone();
++            tokio::spawn(async move {
++                let client = match reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(2)).build() { Ok(v) => v, Err(_) => return };
++                loop {
++                    if let Ok(response) = client.get(format!("{base}/metrics")).send().await {
++                        if response.status().is_success() {
++                            if let Ok(body) = response.text().await {
++                                let now = Instant::now();
++                                for (url, row) in parse(&base, &body) {
++                                    if let Some(usage) = row.usage { metrics::gauge!("vllm_router_coupled_live_kv_usage", "worker" => url.clone()).set(usage); }
++                                    metrics::gauge!("vllm_router_coupled_native_running", "worker" => url.clone()).set(row.running);
++                                    metrics::gauge!("vllm_router_coupled_native_waiting", "worker" => url.clone()).set(row.waiting);
++                                    rows.lock().insert(url, (row, now));
++                                }
++                            }
++                        }
++                    }
++                    tokio::time::sleep(Duration::from_secs(1)).await;
++                }
++            });
++        }
++        let rows = self.rows.lock();
++        let selected = workers.iter().enumerate().filter(|(_, w)| w.is_available())
++            .map(|(i, w)| {
++                let live = rows.get(w.url()).filter(|(_, t)| t.elapsed() < Duration::from_secs(5)).map(|(r, _)| *r);
++                let s = score(w.load(), live);
++                metrics::gauge!("vllm_router_coupled_routing_score", "worker" => w.url().to_string()).set(s);
++                (i, s, w.processed_requests())
++            }).min_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.2.cmp(&b.2)))?.0;
++        metrics::counter!("vllm_router_coupled_selected_total", "worker" => workers[selected].url().to_string()).increment(1);
++        Some(selected)
++    }
++}
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test] fn kv_pressure_beats_same_request_count() {
++        assert!(score(4, Some(Native { usage: Some(0.96), running: 4.0, waiting: 0.0 }))
++            > score(4, Some(Native { usage: Some(0.3), running: 4.0, waiting: 0.0 })));
++    }
++    #[test] fn waiting_is_not_mistaken_for_free_capacity() {
++        assert!(score(5, Some(Native { usage: Some(0.2), running: 1.0, waiting: 4.0 })) > score(4, None));
++    }
++    #[test] fn idle_reusable_cache_is_not_active_pressure() {
++        assert_eq!(score(0, Some(Native { usage: Some(0.99), ..Native::default() })), 0.0);
++    }
++    #[test] fn parser_preserves_rank_and_rejects_invalid_usage() {
++        let r = parse("http://p:1", "vllm:kv_cache_usage_perc{engine=\"0\"} 0.98\nvllm:num_requests_waiting{engine=\"0\"} 3\nvllm:kv_cache_usage_perc{engine=\"1\"} NaN\nvllm:kv_cache_usage_perc{engine=\"2\"} 1.2\n");
++        assert_eq!(r["http://p:1@0"].usage, Some(0.98));
++        assert_eq!(r["http://p:1@0"].waiting, 3.0);
++        assert!(!r.contains_key("http://p:1@1"));
++        assert!(r["http://p:1@2"].usage.is_none());
++    }
++}
+diff --git a/src/policies/mod.rs b/src/policies/mod.rs
+index 8686670..2da9a89 100644
+--- a/src/policies/mod.rs
++++ b/src/policies/mod.rs
+@@ -9,6 +9,7 @@ use std::fmt::Debug;
+ use std::sync::Arc;
+ 
+ mod cache_aware;
++mod coupled_kv;
+ mod consistent_hash;
+ mod factory;
+ pub(crate) mod hash_key;
 diff --git a/src/protocols/spec.rs b/src/protocols/spec.rs
+index 3931d02..22e622b 100644
 --- a/src/protocols/spec.rs
 +++ b/src/protocols/spec.rs
-@@ -551,6 +551,111 @@
+@@ -551,6 +551,111 @@ pub struct ChatCompletionRequest {
      pub other: serde_json::Map<String, serde_json::Value>,
  }
  
@@ -230,7 +401,7 @@ diff --git a/src/protocols/spec.rs b/src/protocols/spec.rs
  impl GenerationRequest for ChatCompletionRequest {
      fn is_stream(&self) -> bool {
          self.stream
-@@ -566,8 +671,8 @@
+@@ -566,8 +671,8 @@ impl GenerationRequest for ChatCompletionRequest {
              .and_then(|params| params.get("session_id"))
              .and_then(Value::as_str)
              .filter(|session_id| !session_id.trim().is_empty())
@@ -242,18 +413,22 @@ diff --git a/src/protocols/spec.rs b/src/protocols/spec.rs
  
      fn extract_text_for_program_scheduling(&self) -> String {
 diff --git a/src/routers/http/mod.rs b/src/routers/http/mod.rs
+index fa2acae..3824963 100644
 --- a/src/routers/http/mod.rs
 +++ b/src/routers/http/mod.rs
-@@ -5,6 +5,7 @@
+@@ -5,7 +5,9 @@ pub mod logprobs_merge;
  pub mod openai_router;
  pub mod pd_router;
  pub mod pd_types;
 +mod pd_usage;
  mod program_adapter;
  pub mod router;
++mod token_balance;
  pub mod vllm_pd_router;
+ pub mod vllm_service_discovery;
 diff --git a/src/routers/http/pd_usage.rs b/src/routers/http/pd_usage.rs
 new file mode 100644
+index 0000000..07785c2
 --- /dev/null
 +++ b/src/routers/http/pd_usage.rs
 @@ -0,0 +1,71 @@
@@ -328,10 +503,381 @@ new file mode 100644
 +        assert!(attach_mooncake_prefill_usage(&response(json!(0)),&mut Value::Null).is_err());
 +    }
 +}
+diff --git a/src/routers/http/token_balance.rs b/src/routers/http/token_balance.rs
+new file mode 100644
+index 0000000..e075b63
+--- /dev/null
++++ b/src/routers/http/token_balance.rs
+@@ -0,0 +1,356 @@
++//! Opt-in PD routing by estimated prefill work and capacity-normalized decode KV.
++//! Token counts are estimates on serialized model content, not native cache-hit metrics.
++use crate::core::Worker;
++use lru::LruCache;
++use parking_lot::Mutex;
++use serde::Deserialize;
++use serde_json::Value;
++use sha2::{Digest, Sha256};
++use std::{collections::{HashMap, HashSet}, num::NonZeroUsize, sync::Arc, time::{Duration, Instant}};
++use tokenizers::Tokenizer;
++
++#[derive(Debug, Clone, Deserialize)]
++pub(super) struct Capacity {
++    pub kv_tokens: f64,
++    pub max_seqs: f64,
++}
++#[derive(Debug, Deserialize)]
++struct Config {
++    tokenizer_path: String,
++    workers: HashMap<String, Capacity>,
++    #[serde(default = "default_headroom")]
++    kv_fraction: f64,
++    #[serde(default)]
++    prefill_kv_guard: bool,
++}
++fn default_headroom() -> f64 { 0.85 }
++#[derive(Debug, Default)]
++struct Demand { requests: usize, kv: f64, work: f64 }
++#[derive(Debug, Clone, Copy)]
++struct LiveKv { usage: f64, observed: Instant }
++#[derive(Debug)]
++struct State {
++    live_kv: HashMap<String, LiveKv>,
++    demand: HashMap<String, Demand>,
++    // Completed prefill page-prefix observations, with bounded memory and TTL.
++    // Shared across P workers because their Mooncake Store is shared.
++    prefixes: LruCache<[u8; 32], Instant>,
++}
++#[derive(Debug)]
++pub(super) struct TokenBalancer {
++    config: Config,
++    tokenizer: Tokenizer,
++    pub(super) tokenization_slots: Arc<tokio::sync::Semaphore>,
++    state: Mutex<State>,
++}
++#[derive(Debug)]
++pub(super) struct Estimate {
++    tokens: usize,
++    output: usize,
++    pages: Vec<[u8; 32]>,
++}
++// Fixed phase labels only; dropping also observes cancelled/error paths.
++struct EstimationTimer { phase: &'static str, start: Instant }
++impl EstimationTimer {
++    fn start(phase: &'static str) -> Self { Self { phase, start: Instant::now() } }
++}
++impl Drop for EstimationTimer {
++    fn drop(&mut self) {
++        metrics::histogram!("vllm_router_pd_estimation_seconds", "phase" => self.phase)
++            .record(self.start.elapsed().as_secs_f64());
++    }
++}
++#[derive(Debug)]
++pub(super) struct Reservation {
++    owner: Arc<TokenBalancer>,
++    url: String,
++    kv: f64,
++    work: f64,
++    pages: Vec<[u8;32]>,
++    tokens: usize,
++    started: Instant,
++    stage: &'static str,
++}
++impl Drop for Reservation {
++    fn drop(&mut self) {
++        let mut s = self.owner.state.lock();
++        if let Some(d) = s.demand.get_mut(&self.url) {
++            d.requests = d.requests.saturating_sub(1);
++            d.kv = (d.kv - self.kv).max(0.0);
++            d.work = (d.work - self.work).max(0.0);
++            metrics::gauge!("vllm_router_pd_assigned_requests", "worker" => self.url.clone(), "stage" => self.stage).set(d.requests as f64);
++            metrics::gauge!("vllm_router_pd_assigned_kv_tokens_estimate", "worker" => self.url.clone(), "stage" => self.stage).set(d.kv);
++        }
++    }
++}
++impl Reservation {
++    pub(super) fn complete_prefill(self, response: &Value) {
++        // Only successful P responses seed prefix observations; errors/cancellation do not.
++        if response.pointer("/usage/prompt_tokens").and_then(Value::as_u64).is_some() {
++            let now = Instant::now();
++            let mut s = self.owner.state.lock();
++            for page in &self.pages { s.prefixes.put(*page, now); }
++            metrics::histogram!("vllm_router_pd_prefill_elapsed_seconds", "worker" => self.url.clone()).record(self.started.elapsed().as_secs_f64());
++            if let Some(n) = response.pointer("/usage/prompt_tokens").and_then(Value::as_u64) {
++                metrics::histogram!("vllm_router_pd_prompt_estimate_ratio").record(n as f64 / self.tokens.max(1) as f64);
++            }
++        }
++        // Drop releases exactly this P allocation; D remains reserved through stream EOF.
++    }
++}
++fn decode_score(d: &Demand, cap: &Capacity, tokens: f64, fraction: f64) -> f64 {
++    let kv = (d.kv + tokens) / (cap.kv_tokens * fraction);
++    let requests = (d.requests + 1) as f64 / cap.max_seqs;
++    // Short requests favor smaller batches; long ones favor KV headroom.
++    let length_weight = (tokens / 131072.0).clamp(0.25, 3.0);
++    requests + length_weight * kv + 100.0 * (kv - 1.0).max(0.0)
++}
++fn prefill_score(d: &Demand, cap: &Capacity, work: f64, kv: f64, fraction: f64, live: Option<f64>) -> f64 {
++    let assigned = (d.kv + kv) / (cap.kv_tokens * fraction);
++    let live_excess = live.map(|u| ((u - fraction) / (1.0 - fraction).max(0.01)).max(0.0)).unwrap_or(0.0);
++    let compute = (d.work + work) / cap.max_seqs;
++    compute * (1.0 + 2.0 * assigned.powi(2))
++        + 100_000.0 * (assigned - 1.0).max(0.0).powi(2)
++        + 100_000.0 * live_excess.powi(2)
++        + d.requests as f64 * 256.0
++}
++fn live_kv_rows(base: &str, body: &str, now: Instant) -> Vec<(String, LiveKv)> {
++    body.lines().filter(|l|l.starts_with("vllm:kv_cache_usage_perc{"))
++        .filter_map(|l| {
++            let rank = l.split("engine=\"").nth(1)?.split('"').next()?.parse::<usize>().ok()?;
++            let usage = l.split_whitespace().nth(1)?.parse::<f64>().ok()?;
++            if !usage.is_finite() || !(0.0..=1.0).contains(&usage) { return None; }
++            Some((format!("{}@{}",base,rank),LiveKv{usage,observed:now}))
++        }).collect()
++}
++fn prefill_work(q: f64, c: f64) -> f64 {
++    // Linear token work + attention q*(c+q/2), normalized to 128K.
++    // Deliberately a heuristic, not an offline-fitted nanosecond cost model.
++    q + q * (c + q * 0.5) / 131072.0
++}
++impl TokenBalancer {
++    pub(super) fn from_env() -> Result<Option<Arc<Self>>, String> {
++        let Some(path) = std::env::var_os("VLLM_ROUTER_PD_TOKEN_BALANCE_CONFIG") else { return Ok(None) };
++        let config: Config = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
++        if !config.kv_fraction.is_finite() || config.kv_fraction <= 0.0 || config.kv_fraction > 1.0 || config.workers.is_empty()
++            || config.workers.values().any(|c| !c.kv_tokens.is_finite() || c.kv_tokens <= 0.0 || !c.max_seqs.is_finite() || c.max_seqs <= 0.0) {
++            return Err("invalid PD token-balance capacities".into());
++        }
++        let mut tokenizer = Tokenizer::from_file(&config.tokenizer_path).map_err(|e| e.to_string())?;
++        // BPE caches are thread-local: unbounded blocking-thread fanout multiplies
++        // long-prompt strings. Routing does not need a second full BPE word cache.
++        if let tokenizers::models::ModelWrapper::BPE(mut model) = tokenizer.get_model().clone() {
++            model.resize_cache(0);
++            tokenizer.with_model(model);
++        }
++        tracing::info!(workers=config.workers.len(), kv_fraction=config.kv_fraction, "PD token balance enabled (heuristic cost; estimated token demand)");
++        let enabled=config.prefill_kv_guard;
++        let result=Arc::new(Self { config, tokenizer, tokenization_slots: Arc::new(tokio::sync::Semaphore::new(4)), state: Mutex::new(State {
++            demand: HashMap::new(), live_kv:HashMap::new(), prefixes: LruCache::new(NonZeroUsize::new(262144).unwrap()),
++        }) });
++        if enabled { Self::start_kv_watch(&result); }
++        Ok(Some(result))
++    }
++    fn start_kv_watch(owner: &Arc<Self>) {
++        let weak=Arc::downgrade(owner);
++        tokio::spawn(async move {
++            let client=match reqwest::Client::builder().timeout(Duration::from_secs(2)).no_proxy().build() {
++                Ok(v)=>v,Err(e)=>{tracing::warn!(error=%e,"PD KV metric watcher unavailable");return;}
++            };
++            loop {
++                tokio::time::sleep(Duration::from_secs(1)).await;
++                let Some(owner)=weak.upgrade() else {return};
++                let bases:Vec<_>=owner.config.workers.keys().cloned().collect();
++                let results=futures::future::join_all(bases.into_iter().map(|base| {
++                    let client=client.clone();
++                    async move {
++                        let response=client.get(format!("{}/metrics",base)).send().await.ok()?;
++                        if !response.status().is_success(){return None;}
++                        let body=response.text().await.ok()?;
++                        Some(live_kv_rows(&base,&body,Instant::now()))
++                    }
++                })).await;
++                let mut state=owner.state.lock();
++                for rows in results.into_iter().flatten() {
++                    for (url,row) in rows {
++                        metrics::gauge!("vllm_router_pd_live_kv_usage", "worker"=>url.clone()).set(row.usage);
++                        state.live_kv.insert(url,row);
++                    }
++                }
++            }
++        });
++    }
++    pub(super) async fn estimate_async(self: &Arc<Self>, request: &Value) -> Result<Estimate, String> {
++        let _total = EstimationTimer::start("total");
++        let wait = EstimationTimer::start("slot_wait");
++        let slot = self.tokenization_slots.clone().acquire_owned().await.map_err(|e|e.to_string())?;
++        drop(wait);
++        let owner = self.clone();
++        let value = request.clone();
++        let blocking_wait = EstimationTimer::start("blocking_wait");
++        tokio::task::spawn_blocking(move || {
++            drop(blocking_wait);
++            // A cancelled HTTP future must not release a still-running tokenizer's slot.
++            let _slot = slot;
++            let _compute = EstimationTimer::start("compute");
++            owner.estimate(&value)
++        }).await.map_err(|e|e.to_string())?
++    }
++    pub(super) fn estimate(&self, request: &Value) -> Result<Estimate, String> {
++        // Keep tools ahead of messages, independent of temperature/stream/max_tokens.
++        // No inference is sent, and no benchmark reference token counts are consumed.
++        let content = serde_json::to_string(&serde_json::json!({
++            "tools": request.get("tools"), "messages": request.get("messages"),
++            "prompt": request.get("prompt"), "cache_salt": request.get("cache_salt"),
++            "model": request.get("model"), "chat_template_kwargs": request.get("chat_template_kwargs")
++        })).map_err(|e| e.to_string())?;
++        let encoded = self.tokenizer.encode(content, false).map_err(|e| e.to_string())?;
++        let ids = encoded.get_ids();
++        let mut hash = Sha256::new();
++        hash.update(serde_json::to_vec(&serde_json::json!([request.get("model"),request.get("cache_salt"),request.get("chat_template_kwargs")])).map_err(|e|e.to_string())?);
++        let mut pages = Vec::with_capacity(ids.len() / 256);
++        for page in ids.chunks_exact(256) {
++            for id in page { hash.update(id.to_le_bytes()); }
++            pages.push(hash.clone().finalize().into());
++        }
++        Ok(Estimate { tokens: ids.len().max(1), pages,
++            output: request.get("max_completion_tokens").or_else(||request.get("max_tokens")).and_then(Value::as_u64).unwrap_or(4096) as usize })
++    }
++    pub(super) fn select(self: &Arc<Self>, ps: &[Arc<dyn Worker>], ds: &[Arc<dyn Worker>], e: Estimate)
++        -> Option<(usize, usize, Reservation, Reservation)> {
++        let mut s = self.state.lock();
++        let now = Instant::now();
++        let matched = e.pages.iter().take_while(|h| s.prefixes.peek(*h).is_some_and(|t| now.duration_since(*t) < Duration::from_secs(60))).count();
++        let c = (matched.saturating_sub(1) * 256).min(e.tokens.saturating_sub(1)) as f64;
++        let q = (e.tokens as f64 - c).max(1.0);
++        let work = prefill_work(q, c);
++        let kv = (e.tokens + e.output) as f64 * 1.10; // template/estimate margin
++        let pi = ps.iter().enumerate().filter(|(_,w)|w.is_available())
++            .filter_map(|(i,w)| {
++                let cap = self.config.workers.get(w.base_url())?;
++                let live=s.live_kv.get(w.url()).filter(|v|now.duration_since(v.observed)<Duration::from_secs(5)).map(|v|v.usage);
++                let d = s.demand.entry(w.url().into()).or_default();
++                let score=if self.config.prefill_kv_guard {
++                    prefill_score(d,cap,work,kv,self.config.kv_fraction,live)
++                } else {(d.work + work) / cap.max_seqs + d.requests as f64 * 256.0};
++                Some((i,score))
++            }).min_by(|a,b|a.1.total_cmp(&b.1))?.0;
++        let di = ds.iter().enumerate().filter(|(_,w)|w.is_available())
++            .filter_map(|(i,w)| {
++                let cap = self.config.workers.get(w.base_url())?;
++                let d = s.demand.entry(w.url().into()).or_default();
++                Some((i, decode_score(d, cap, kv, self.config.kv_fraction)))
++            }).min_by(|a,b|a.1.total_cmp(&b.1))?.0;
++        let mut reserve = |w: &Arc<dyn Worker>, stage, kv, work, pages| {
++            let d = s.demand.entry(w.url().into()).or_default();
++            d.requests += 1; d.kv += kv; d.work += work;
++            metrics::counter!("vllm_router_pd_token_balance_selected_total", "worker" => w.url().to_string(), "stage" => stage).increment(1);
++            metrics::gauge!("vllm_router_pd_assigned_requests", "worker" => w.url().to_string(), "stage" => stage).set(d.requests as f64);
++            metrics::gauge!("vllm_router_pd_assigned_kv_tokens_estimate", "worker" => w.url().to_string(), "stage" => stage).set(d.kv);
++            Reservation { owner: self.clone(), url: w.url().into(), kv, work, pages, tokens:e.tokens, started:now, stage }
++        };
++        let p = reserve(&ps[pi], "prefill", if self.config.prefill_kv_guard { kv } else { 0.0 }, work, e.pages);
++        let d = reserve(&ds[di], "decode", kv, 0.0, Vec::new());
++        Some((pi, di, p, d))
++    }
++    pub(super) fn validate_workers(&self, workers: &[Arc<dyn Worker>]) -> Result<(), String> {
++        let missing: HashSet<_> = workers.iter().filter(|w| !self.config.workers.contains_key(w.base_url())).map(|w|w.base_url()).collect();
++        if missing.is_empty() { Ok(()) } else { Err(format!("missing PD capacity config: {:?}", missing)) }
++    }
++}
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn fixture() -> (Arc<TokenBalancer>, Vec<Arc<dyn Worker>>, Vec<Arc<dyn Worker>>) {
++        use crate::core::{BasicWorker,WorkerType};
++        let ps:Vec<Arc<dyn Worker>>=vec![Arc::new(BasicWorker::new("http://p:1".into(),WorkerType::Regular))];
++        let ds:Vec<Arc<dyn Worker>>=vec![Arc::new(BasicWorker::new("http://d:1".into(),WorkerType::Regular))];
++        let workers=HashMap::from([("http://p:1".into(),Capacity{kv_tokens:2e6,max_seqs:24.0}),
++            ("http://d:1".into(),Capacity{kv_tokens:2e6,max_seqs:24.0})]);
++        let b=Arc::new(TokenBalancer{config:Config{tokenizer_path:String::new(),workers,kv_fraction:0.85,prefill_kv_guard:false},
++            tokenizer:Tokenizer::new(tokenizers::models::bpe::BPE::default()),
++            tokenization_slots:Arc::new(tokio::sync::Semaphore::new(4)),
++            state:Mutex::new(State{demand:HashMap::new(),live_kv:HashMap::new(),prefixes:LruCache::new(NonZeroUsize::new(20).unwrap())})});
++        (b,ps,ds)
++    }
++    #[test] fn prefill_and_decode_have_independent_lifetimes() {
++        let (b,ps,ds)=fixture();
++        let (_,_,p,d)=b.select(&ps,&ds,Estimate{tokens:1000,output:400,pages:vec![[1;32]]}).unwrap();
++        assert_eq!(b.state.lock().demand["http://d:1"].requests,1);
++        p.complete_prefill(&serde_json::json!({"usage":{"prompt_tokens":1001}}));
++        assert_eq!(b.state.lock().demand["http://p:1"].requests,0);
++        assert_eq!(b.state.lock().demand["http://d:1"].requests,1);
++        assert_eq!(b.state.lock().prefixes.len(),1);
++        drop(d);
++        assert_eq!(b.state.lock().demand["http://d:1"].kv,0.0);
++        assert_eq!(b.state.lock().demand["http://d:1"].requests,0);
++    }
++    #[tokio::test] async fn async_estimation_preserves_tokens_and_releases_slot() {
++        let (b,_,_) = fixture();
++        let request = serde_json::json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":12});
++        let expected = b.estimate(&request).unwrap();
++        let actual = b.estimate_async(&request).await.unwrap();
++        assert_eq!(actual.tokens, expected.tokens);
++        assert_eq!(actual.output, expected.output);
++        assert_eq!(actual.pages, expected.pages);
++        assert_eq!(b.tokenization_slots.available_permits(), 4);
++    }
++    #[tokio::test] async fn cancelled_slot_wait_does_not_consume_a_permit() {
++        let (b,_,_) = fixture();
++        let all = b.tokenization_slots.clone().acquire_many_owned(4).await.unwrap();
++        let owner = b.clone();
++        let task = tokio::spawn(async move { owner.estimate_async(&serde_json::json!({})).await });
++        tokio::task::yield_now().await;
++        assert!(!task.is_finished());
++        task.abort();
++        assert!(task.await.unwrap_err().is_cancelled());
++        drop(all);
++        assert_eq!(b.tokenization_slots.available_permits(), 4);
++    }
++    #[test] fn cancellation_does_not_publish_cache_and_releases_all_demand() {
++        let (b,ps,ds)=fixture();
++        let (_,_,p,d)=b.select(&ps,&ds,Estimate{tokens:1000,output:400,pages:vec![[2;32]]}).unwrap();
++        drop(p);drop(d);
++        assert_eq!(b.state.lock().prefixes.len(),0);
++        for value in b.state.lock().demand.values() {assert_eq!(value.requests,0);assert_eq!(value.kv,0.0);assert_eq!(value.work,0.0);}
++    }
++    #[test] fn unavailable_workers_are_not_selected() {
++        let (b,ps,ds)=fixture(); ds[0].set_healthy(false);
++        assert!(b.select(&ps,&ds,Estimate{tokens:1000,output:400,pages:vec![]}).is_none());
++        assert_eq!(b.state.lock().demand["http://p:1"].requests,0);
++    }
++    #[test] fn prefill_kv_guard_avoids_pressure_with_equal_compute() {
++        let cap=Capacity{kv_tokens:2_000_000.0,max_seqs:24.0};
++        let d=Demand{requests:3,kv:400_000.0,work:4000.0};
++        assert!(prefill_score(&d,&cap,3000.0,130_000.0,0.85,Some(0.96))>
++                prefill_score(&d,&cap,3000.0,130_000.0,0.85,Some(0.40)));
++        let full=Demand{requests:3,kv:1_700_000.0,work:4000.0};
++        assert!(prefill_score(&full,&cap,3000.0,130_000.0,0.85,None)>
++                prefill_score(&d,&cap,3000.0,130_000.0,0.85,None));
++    }
++    #[test] fn live_kv_parser_keeps_ranks_and_rejects_invalid_data() {
++        let raw="vllm:kv_cache_usage_perc{engine=\"0\",model_name=\"glm\"} 0.95\nvllm:kv_cache_usage_perc{engine=\"1\"} NaN\nvllm:kv_cache_usage_perc{engine=\"2\"} 1.9\n";
++        let rows=live_kv_rows("http://p:1",raw,Instant::now());
++        assert_eq!(rows.len(),1);assert_eq!(rows[0].0,"http://p:1@0");assert_eq!(rows[0].1.usage,0.95);
++    }
++    #[test] fn same_requests_long_kv_avoids_small_ep4() {
++        let d=Demand{requests:8,kv:1_200_000.0,work:0.0};
++        let small=Capacity{kv_tokens:1_944_075.0,max_seqs:24.0};
++        let large=Capacity{kv_tokens:4_821_918.0,max_seqs:24.0};
++        assert!(decode_score(&d,&small,150_000.0,0.85)>decode_score(&d,&large,150_000.0,0.85));
++    }
++    #[test] fn short_count_long_length_tradeoff() {
++        let cap=Capacity{kv_tokens:4_000_000.0,max_seqs:24.0};
++        let a=Demand{requests:8,kv:2_500_000.0,work:0.0};
++        let b=Demand{requests:12,kv:800_000.0,work:0.0};
++        assert!(decode_score(&a,&cap,4000.0,0.85)<decode_score(&b,&cap,4000.0,0.85));
++        assert!(decode_score(&a,&cap,300_000.0,0.85)>decode_score(&b,&cap,300_000.0,0.85));
++    }
++    #[test] fn capacity_penalty_and_prefill_prefix_cost() {
++        let cap=Capacity{kv_tokens:2_000_000.0,max_seqs:24.0};
++        let d=Demand{requests:8,kv:1_700_000.0,work:0.0};
++        assert!(decode_score(&d,&cap,200_000.0,0.85)>10.0);
++        assert!(prefill_work(2000.0,130_000.0)>prefill_work(2000.0,20_000.0));
++        assert!(prefill_work(30_000.0,0.0)>prefill_work(2000.0,130_000.0));
++    }
++}
 diff --git a/src/routers/http/vllm_pd_router.rs b/src/routers/http/vllm_pd_router.rs
+index 2d7909c..287f4f9 100644
 --- a/src/routers/http/vllm_pd_router.rs
 +++ b/src/routers/http/vllm_pd_router.rs
-@@ -9,7 +9,7 @@
+@@ -1,6 +1,7 @@
+ // vLLM PD (Prefill-Decode) Router Implementation
+ // This module extends PdRouterBase to handle vLLM-specific two-stage processing
+ use super::dp_utils;
++use super::token_balance::{TokenBalancer, Reservation as TokenReservation};
+ use super::logprobs_merge;
+ use super::pd_router::PdRouterBase;
+ use super::pd_types::{error_chain, PDRouterError};
+@@ -9,7 +10,7 @@ use crate::config::KvConnector;
  use crate::core::{BasicWorker, Worker, WorkerType};
  use crate::metrics::RouterMetrics;
  use crate::otel_http::{self, ClientRequestOptions};
@@ -340,7 +886,7 @@ diff --git a/src/routers/http/vllm_pd_router.rs b/src/routers/http/vllm_pd_route
  use crate::routers::{header_utils, RouterTrait, WorkerManagement};
  use async_trait::async_trait;
  use axum::{
-@@ -19,6 +19,11 @@
+@@ -19,6 +20,11 @@ use axum::{
      response::{IntoResponse, Response},
  };
  use serde_json::{json, Value};
@@ -352,28 +898,27 @@ diff --git a/src/routers/http/vllm_pd_router.rs b/src/routers/http/vllm_pd_route
  use std::collections::HashMap;
  use std::sync::atomic::{AtomicUsize, Ordering};
  use std::sync::{Arc, RwLock};
-@@ -39,6 +44,8 @@
+@@ -39,6 +45,9 @@ struct MooncakePrefillInfo {
  pub struct VllmPDRouter {
      /// Underlying PD router for most functionality
      pd_router: PdRouterBase,
 +    // Shared by all direct routes; never held across an await.
 +    decode_admission: parking_lot::Mutex<()>,
++    token_balancer: Option<Arc<TokenBalancer>>,
      /// Service discovery registry for dynamic ZMQ address resolution
      service_registry: Arc<ServiceRegistry>,
      /// HTTP client for making requests to discovered services
-@@ -63,6 +70,84 @@
-     mooncake_prefill_info: Arc<Mutex<HashMap<String, MooncakePrefillInfo>>>,
-     /// NIXL push identity per prefill base_url and dp_rank; never held across an await.
+@@ -65,6 +74,84 @@ pub struct VllmPDRouter {
      nixl_prefill_info: RwLock<HashMap<String, HashMap<usize, Value>>>,
-+}
-+
+ }
+ 
 +// One owner, one release, including cancellation and body drop. This is local
 +// assigned demand, not a backend queue or a KV occupancy measurement.
-+struct OwnedLoadReservation(Arc<dyn Worker>);
++struct OwnedLoadReservation(Arc<dyn Worker>, Option<TokenReservation>);
 +impl OwnedLoadReservation {
 +    fn new(worker: Arc<dyn Worker>) -> Self {
 +        worker.increment_load();
-+        Self(worker)
++        Self(worker, None)
 +    }
 +}
 +impl Drop for OwnedLoadReservation {
@@ -443,10 +988,34 @@ diff --git a/src/routers/http/vllm_pd_router.rs b/src/routers/http/vllm_pd_route
 +    let (parts, body) = response.into_parts();
 +    let body = ReservedBody { inner: body, reservation: Some(reservation) };
 +    Response::from_parts(parts, Body::new(body))
++}
++
+ /// Transfer ID prefix used by MoRI-IO to correlate prefill and decode legs.
+ /// Must match `MoRIIOConstants.TRANSFER_PREFIX` in the vLLM Python connector.
+ const MORIIO_TRANSFER_PREFIX: &str = "tx";
+@@ -91,6 +178,21 @@ fn build_prefill_request_builder(
  }
  
- /// Transfer ID prefix used by MoRI-IO to correlate prefill and decode legs.
-@@ -281,11 +366,20 @@
+ impl VllmPDRouter {
++    async fn select_direct_pair(
++        &self, ps: &[Arc<dyn Worker>], ds: &[Arc<dyn Worker>],
++        request: &Value, text: Option<&str>, headers: Option<&RequestHeaders>,
++    ) -> Result<(usize, usize, OwnedLoadReservation, Option<TokenReservation>), String> {
++        if let Some(b) = &self.token_balancer {
++            let estimate = b.estimate_async(request).await?;
++            let (p,d,pr,dr) = b.select(ps,ds,estimate).ok_or("no available PD workers")?;
++            let mut reservation = OwnedLoadReservation::new(ds[d].clone());
++            reservation.1 = Some(dr);
++            return Ok((p,d,reservation,Some(pr)));
++        }
++        let p = self.policy_registry.get_prefill_policy().select_worker_with_headers(ps,text,headers).ok_or("no prefill workers")?;
++        let (d,r) = select_and_reserve_decode(&self.decode_admission,self.policy_registry.get_decode_policy().as_ref(),ds,text,headers).ok_or("no decode workers")?;
++        Ok((p,d,r,None))
++    }
+     /// Query the Mooncake bootstrap server on a prefill node to get engine_id per dp_rank.
+     /// Retries with backoff since the prefill server may not be ready at router startup.
+     async fn query_mooncake_bootstrap(
+@@ -281,11 +383,20 @@ impl VllmPDRouter {
                      );
                      return None;
                  };
@@ -469,7 +1038,16 @@ diff --git a/src/routers/http/vllm_pd_router.rs b/src/routers/http/vllm_pd_route
              }
              KvConnector::MoriIO => {
                  if matches!(self.moriio_transfer_mode(), Some(MoriIOTransferMode::Write)) {
-@@ -1055,6 +1149,10 @@
+@@ -696,7 +807,7 @@ impl VllmPDRouter {
+         }
+ 
+         // Use policy-based load balancing to select prefill and decode workers
+-        let request_text = serde_json::to_string(&request_json).ok();
++        let request_text = if self.token_balancer.is_some() { None } else { serde_json::to_string(&request_json).ok() };
+         let request_str = request_text.as_deref();
+ 
+         let prefill_idx =
+@@ -1055,6 +1166,10 @@ impl VllmPDRouter {
              );
          }
  
@@ -480,7 +1058,7 @@ diff --git a/src/routers/http/vllm_pd_router.rs b/src/routers/http/vllm_pd_route
          let decode_request_str = serde_json::to_string(&decode_request)
              .map_err(|e| format!("Failed to serialize decode request: {}", e))?;
  
-@@ -1273,9 +1371,8 @@
+@@ -1273,9 +1388,8 @@ impl VllmPDRouter {
  
      /// Two-stage request processing for vLLM disaggregated mode
      ///
@@ -492,7 +1070,15 @@ diff --git a/src/routers/http/vllm_pd_router.rs b/src/routers/http/vllm_pd_route
      async fn process_vllm_two_stage_request(
          &self,
          original_request: Value,
-@@ -1313,7 +1410,7 @@
+@@ -1283,6 +1397,7 @@ impl VllmPDRouter {
+         decode_worker: Arc<dyn Worker>,
+         path: &str,
+         headers: Option<&HeaderMap>,
++        prefill_token_reservation: Option<TokenReservation>,
+     ) -> Result<Response, PDRouterError> {
+         debug!("ENTERED process_vllm_two_stage_request method");
+         let start_time = Instant::now();
+@@ -1313,7 +1428,7 @@ impl VllmPDRouter {
          );
  
          // Increment prefill load at the start of the prefill phase
@@ -501,7 +1087,7 @@ diff --git a/src/routers/http/vllm_pd_router.rs b/src/routers/http/vllm_pd_route
  
          let prefill_zmq_addr =
              self.get_zmq_address(prefill_worker.base_url(), ServiceType::Prefill);
-@@ -1408,7 +1505,6 @@
+@@ -1408,7 +1523,6 @@ impl VllmPDRouter {
          {
              Ok(resp) => resp,
              Err(e) => {
@@ -509,7 +1095,12 @@ diff --git a/src/routers/http/vllm_pd_router.rs b/src/routers/http/vllm_pd_route
                  let full_error = error_chain(&e);
                  let duration = start_time.elapsed();
                  RouterMetrics::record_pd_prefill_error(&prefill_base_url);
-@@ -1430,7 +1526,6 @@
+@@ -1426,11 +1540,11 @@ impl VllmPDRouter {
+             prefill_response.headers()
+         );
+ 
++        let prefill_status = prefill_response.status();
+         // Extract prefill response body to get kv_transfer_params
          let prefill_bytes = match prefill_response.bytes().await {
              Ok(bytes) => bytes,
              Err(e) => {
@@ -517,7 +1108,20 @@ diff --git a/src/routers/http/vllm_pd_router.rs b/src/routers/http/vllm_pd_route
                  let full_error = error_chain(&e);
                  let duration = start_time.elapsed();
                  RouterMetrics::record_pd_prefill_error(&prefill_base_url);
-@@ -1460,7 +1555,6 @@
+@@ -1456,11 +1570,19 @@ impl VllmPDRouter {
+             );
+         }
+ 
++        if !prefill_status.is_success() {
++            let error: Value=serde_json::from_slice(&prefill_bytes).unwrap_or(Value::Null);
++            let detail=error.pointer("/error/message").or_else(||error.get("message"))
++                .and_then(Value::as_str).unwrap_or("upstream error body unavailable");
++            RouterMetrics::record_pd_prefill_error(&prefill_base_url);
++            return Err(PDRouterError::NetworkError { message:format!(
++                "Prefill HTTP {} from {}: {}",prefill_status,prefill_base_url,
++                detail.chars().take(1024).collect::<String>()) });
++        }
+         // Parse prefill response to extract kv_transfer_params
          let prefill_response_json: Value = match serde_json::from_slice(&prefill_bytes) {
              Ok(json) => json,
              Err(e) => {
@@ -525,19 +1129,20 @@ diff --git a/src/routers/http/vllm_pd_router.rs b/src/routers/http/vllm_pd_route
                  let duration = start_time.elapsed();
                  RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                  RouterMetrics::record_pd_request(path);
-@@ -1474,9 +1568,8 @@
+@@ -1474,9 +1596,9 @@ impl VllmPDRouter {
          // Stop profiling on prefill server after its work is done
          self.stop_profiling(&prefill_base_url).await;
  
 -        // Prefill phase complete: decrement prefill load, increment decode load
 -        prefill_worker.decrement_load();
 -        decode_worker.increment_load();
-+        // Prefill is complete; decode remains reserved by the direct route.
++        // Prefill is complete; decode remains reserved through response EOF.
++        if let Some(r) = prefill_token_reservation { r.complete_prefill(&prefill_response_json); }
 +        drop(prefill_reservation);
  
          debug!("✅ vLLM Stage 1 completed, starting Stage 2 - Decode");
  
-@@ -1498,6 +1591,11 @@
+@@ -1498,6 +1620,11 @@ impl VllmPDRouter {
                  "No kv_transfer_params for prefill {}, decode will proceed without them",
                  prefill_base_url
              );
@@ -549,7 +1154,7 @@ diff --git a/src/routers/http/vllm_pd_router.rs b/src/routers/http/vllm_pd_route
          }
  
          // Use endpoint_url() to get the base URL without @rank suffix,
-@@ -1558,7 +1656,6 @@
+@@ -1558,7 +1685,6 @@ impl VllmPDRouter {
          {
              Ok(resp) => resp,
              Err(e) => {
@@ -557,7 +1162,7 @@ diff --git a/src/routers/http/vllm_pd_router.rs b/src/routers/http/vllm_pd_route
                  let full_error = error_chain(&e);
                  let duration = start_time.elapsed();
                  RouterMetrics::record_pd_decode_error(&decode_base_url);
-@@ -1574,8 +1671,6 @@
+@@ -1574,8 +1700,6 @@ impl VllmPDRouter {
          // Stop profiling on decode server after response received
          self.stop_profiling(&decode_base_url).await;
  
@@ -566,7 +1171,7 @@ diff --git a/src/routers/http/vllm_pd_router.rs b/src/routers/http/vllm_pd_route
  
          let status = decode_response.status();
          let headers = decode_response.headers().clone();
-@@ -1744,8 +1839,7 @@
+@@ -1744,8 +1868,7 @@ impl VllmPDRouter {
              )
          };
  
@@ -576,7 +1181,7 @@ diff --git a/src/routers/http/vllm_pd_router.rs b/src/routers/http/vllm_pd_route
          self.start_profiling(&prefill_base_url).await;
          self.start_profiling(&decode_base_url).await;
  
-@@ -1772,7 +1866,7 @@
+@@ -1772,7 +1895,7 @@ impl VllmPDRouter {
              ),
          );
  
@@ -585,7 +1190,7 @@ diff --git a/src/routers/http/vllm_pd_router.rs b/src/routers/http/vllm_pd_route
          self.stop_profiling(&prefill_base_url).await;
  
          let prefill_response_json = match prefill_result {
-@@ -1782,7 +1876,6 @@
+@@ -1782,7 +1905,6 @@ impl VllmPDRouter {
                  .ok()
                  .and_then(|b| serde_json::from_slice::<Value>(&b).ok()),
              Ok(resp) => {
@@ -593,7 +1198,7 @@ diff --git a/src/routers/http/vllm_pd_router.rs b/src/routers/http/vllm_pd_route
                  self.stop_profiling(&decode_base_url).await;
                  RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                  RouterMetrics::record_pd_request(path);
-@@ -1796,7 +1889,6 @@
+@@ -1796,7 +1918,6 @@ impl VllmPDRouter {
                  });
              }
              Err(e) => {
@@ -601,7 +1206,7 @@ diff --git a/src/routers/http/vllm_pd_router.rs b/src/routers/http/vllm_pd_route
                  self.stop_profiling(&decode_base_url).await;
                  RouterMetrics::record_pd_prefill_error(&prefill_base_url);
                  RouterMetrics::record_pd_request(path);
-@@ -1817,7 +1909,6 @@
+@@ -1817,7 +1938,6 @@ impl VllmPDRouter {
          let decode_response = match decode_result {
              Ok(resp) => resp,
              Err(e) => {
@@ -609,7 +1214,7 @@ diff --git a/src/routers/http/vllm_pd_router.rs b/src/routers/http/vllm_pd_route
                  self.stop_profiling(&decode_base_url).await;
                  RouterMetrics::record_pd_decode_error(&decode_base_url);
                  RouterMetrics::record_pd_request(path);
-@@ -1832,7 +1923,6 @@
+@@ -1832,7 +1952,6 @@ impl VllmPDRouter {
                  });
              }
          };
@@ -617,34 +1222,86 @@ diff --git a/src/routers/http/vllm_pd_router.rs b/src/routers/http/vllm_pd_route
  
          let needs_logprobs = decode_request.get("logprobs").is_some()
              || decode_request
-@@ -1916,6 +2006,7 @@
+@@ -1916,6 +2035,8 @@ impl VllmPDRouter {
                  kv_connector,
                  mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
                  nixl_prefill_info: RwLock::new(HashMap::new()),
 +                decode_admission: parking_lot::Mutex::new(()),
++                token_balancer: TokenBalancer::from_env()?,
              })
          } else {
              // Direct URL mode (same as PdRouterBase)
-@@ -2006,6 +2097,7 @@
+@@ -1948,6 +2069,11 @@ impl VllmPDRouter {
+             }
+             info!("Initializing prefill and decode policies with workers.");
+ 
++            if let Some(b) = TokenBalancer::from_env()? {
++                b.validate_workers(&prefill_workers)?;
++                b.validate_workers(&decode_workers)?;
++            }
++
+             // Query Mooncake bootstrap servers if kv_connector is mooncake
+             let mooncake_prefill_info = Arc::new(Mutex::new(HashMap::new()));
+             if matches!(kv_connector, KvConnector::Mooncake) {
+@@ -2006,6 +2132,8 @@ impl VllmPDRouter {
                  kv_connector,
                  mooncake_prefill_info,
                  nixl_prefill_info: RwLock::new(HashMap::new()),
 +                decode_admission: parking_lot::Mutex::new(()),
++                token_balancer: TokenBalancer::from_env()?,
              })
          }
      }
-@@ -2250,7 +2342,9 @@
-                 }
-             };
+@@ -2218,7 +2346,7 @@ impl RouterTrait for VllmPDRouter {
+             }
  
+             // Select workers using policy with headers for consistent hash
+-            let request_text = serde_json::to_string(&request_json).ok();
++            let request_text = if self.token_balancer.is_some() { None } else { serde_json::to_string(&request_json).ok() };
+             let request_str = request_text.as_deref();
+             let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
+                 h.iter()
+@@ -2234,42 +2362,17 @@ impl RouterTrait for VllmPDRouter {
+             let prefill_policy = self.policy_registry.get_prefill_policy();
+             let decode_policy = self.policy_registry.get_decode_policy();
+ 
+-            let prefill_idx = match prefill_policy.select_worker_with_headers(
+-                &prefill_workers,
+-                request_str,
+-                request_headers.as_ref(),
+-            ) {
+-                Some(idx) => idx,
+-                None => {
+-                    RouterMetrics::record_pd_error("server_selection");
+-                    return (
+-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+-                        "Prefill policy failed to select a worker".to_string(),
+-                    )
+-                        .into_response();
+-                }
+-            };
+-
 -            let decode_idx = match decode_policy.select_worker_with_headers(
-+            let (decode_idx, decode_reservation) = match select_and_reserve_decode(
-+                &self.decode_admission,
-+                decode_policy.as_ref(),
-                 &decode_workers,
-                 request_str,
-                 request_headers.as_ref(),
-@@ -2268,8 +2362,8 @@
+-                &decode_workers,
+-                request_str,
+-                request_headers.as_ref(),
+-            ) {
+-                Some(idx) => idx,
+-                None => {
+-                    RouterMetrics::record_pd_error("server_selection");
+-                    return (
+-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+-                        "Decode policy failed to select a worker".to_string(),
+-                    )
+-                        .into_response();
+-                }
+-            };
++            let (prefill_idx, decode_idx, decode_reservation, prefill_token_reservation) =
++                match self.select_direct_pair(&prefill_workers, &decode_workers, &request_json,
++                    request_str, request_headers.as_ref()).await {
++                    Ok(v) => v,
++                    Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
++                };
  
              let prefill_worker = &prefill_workers[prefill_idx];
              let decode_worker = &decode_workers[decode_idx];
@@ -655,7 +1312,13 @@ diff --git a/src/routers/http/vllm_pd_router.rs b/src/routers/http/vllm_pd_route
  
              info!(
                  "Chat: Selected prefill={} [policy:{}], decode={} [policy:{}]",
-@@ -2292,7 +2386,7 @@
+@@ -2287,12 +2390,13 @@ impl RouterTrait for VllmPDRouter {
+                     decode_worker.clone(),
+                     "/v1/chat/completions",
+                     headers,
++                    prefill_token_reservation,
+                 )
+                 .await
              {
                  Ok(response) => {
                      info!("Two-stage processing completed successfully");
@@ -664,18 +1327,56 @@ diff --git a/src/routers/http/vllm_pd_router.rs b/src/routers/http/vllm_pd_route
                  }
                  Err(e) => {
                      error!("Two-stage processing failed: {}", e);
-@@ -2421,7 +2515,9 @@
-                 }
-             };
+@@ -2389,7 +2493,7 @@ impl RouterTrait for VllmPDRouter {
+             }
  
+             // Select workers using policy with headers for consistent hash
+-            let request_text = serde_json::to_string(&request_json).ok();
++            let request_text = if self.token_balancer.is_some() { None } else { serde_json::to_string(&request_json).ok() };
+             let request_str = request_text.as_deref();
+             let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
+                 h.iter()
+@@ -2405,42 +2509,17 @@ impl RouterTrait for VllmPDRouter {
+             let prefill_policy = self.policy_registry.get_prefill_policy();
+             let decode_policy = self.policy_registry.get_decode_policy();
+ 
+-            let prefill_idx = match prefill_policy.select_worker_with_headers(
+-                &prefill_workers,
+-                request_str,
+-                request_headers.as_ref(),
+-            ) {
+-                Some(idx) => idx,
+-                None => {
+-                    RouterMetrics::record_pd_error("server_selection");
+-                    return (
+-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+-                        "Prefill policy failed to select a worker".to_string(),
+-                    )
+-                        .into_response();
+-                }
+-            };
+-
 -            let decode_idx = match decode_policy.select_worker_with_headers(
-+            let (decode_idx, decode_reservation) = match select_and_reserve_decode(
-+                &self.decode_admission,
-+                decode_policy.as_ref(),
-                 &decode_workers,
-                 request_str,
-                 request_headers.as_ref(),
-@@ -2439,8 +2535,8 @@
+-                &decode_workers,
+-                request_str,
+-                request_headers.as_ref(),
+-            ) {
+-                Some(idx) => idx,
+-                None => {
+-                    RouterMetrics::record_pd_error("server_selection");
+-                    return (
+-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+-                        "Decode policy failed to select a worker".to_string(),
+-                    )
+-                        .into_response();
+-                }
+-            };
++            let (prefill_idx, decode_idx, decode_reservation, prefill_token_reservation) =
++                match self.select_direct_pair(&prefill_workers, &decode_workers, &request_json,
++                    request_str, request_headers.as_ref()).await {
++                    Ok(v) => v,
++                    Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
++                };
  
              let prefill_worker = &prefill_workers[prefill_idx];
              let decode_worker = &decode_workers[decode_idx];
@@ -686,7 +1387,13 @@ diff --git a/src/routers/http/vllm_pd_router.rs b/src/routers/http/vllm_pd_route
  
              info!(
                  "Completion: Selected prefill={} [policy:{}], decode={} [policy:{}]",
-@@ -2463,7 +2559,7 @@
+@@ -2458,12 +2537,13 @@ impl RouterTrait for VllmPDRouter {
+                     decode_worker.clone(),
+                     "/v1/completions",
+                     headers,
++                    prefill_token_reservation,
+                 )
+                 .await
              {
                  Ok(response) => {
                      info!("Two-stage processing completed successfully");
@@ -695,18 +1402,56 @@ diff --git a/src/routers/http/vllm_pd_router.rs b/src/routers/http/vllm_pd_route
                  }
                  Err(e) => {
                      error!("Two-stage processing failed: {}", e);
-@@ -2643,7 +2739,9 @@
-                 }
-             };
+@@ -2611,7 +2691,7 @@ impl RouterTrait for VllmPDRouter {
+             }
  
+             // Select workers using policy with headers for consistent hash
+-            let request_text = serde_json::to_string(&request_json).ok();
++            let request_text = if self.token_balancer.is_some() { None } else { serde_json::to_string(&request_json).ok() };
+             let request_str = request_text.as_deref();
+             let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
+                 h.iter()
+@@ -2627,40 +2707,16 @@ impl RouterTrait for VllmPDRouter {
+             let prefill_policy = self.policy_registry.get_prefill_policy();
+             let decode_policy = self.policy_registry.get_decode_policy();
+ 
+-            let prefill_idx = match prefill_policy.select_worker_with_headers(
+-                &prefill_workers,
+-                request_str,
+-                request_headers.as_ref(),
+-            ) {
+-                Some(idx) => idx,
+-                None => {
+-                    RouterMetrics::record_pd_error("server_selection");
+-                    return (
+-                        StatusCode::SERVICE_UNAVAILABLE,
+-                        "Prefill policy failed to select a worker".to_string(),
+-                    )
+-                        .into_response();
+-                }
+-            };
+-
 -            let decode_idx = match decode_policy.select_worker_with_headers(
-+            let (decode_idx, decode_reservation) = match select_and_reserve_decode(
-+                &self.decode_admission,
-+                decode_policy.as_ref(),
-                 &decode_workers,
-                 request_str,
-                 request_headers.as_ref(),
-@@ -2661,6 +2759,7 @@
+-                &decode_workers,
+-                request_str,
+-                request_headers.as_ref(),
+-            ) {
+-                Some(idx) => idx,
+-                None => {
+-                    RouterMetrics::record_pd_error("server_selection");
+-                    return (
+-                        StatusCode::SERVICE_UNAVAILABLE,
+-                        "Decode policy failed to select a worker".to_string(),
+-                    )
+-                        .into_response();
+-                }
+-            };
++            let (prefill_idx, decode_idx, decode_reservation, prefill_token_reservation) =
++                match self.select_direct_pair(&prefill_workers, &decode_workers, &request_json,
++                    request_str, request_headers.as_ref()).await {
++                    Ok(v) => v,
++                    Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
++                };
  
              let prefill_worker = &prefill_workers[prefill_idx];
              let decode_worker = &decode_workers[decode_idx];
@@ -714,7 +1459,11 @@ diff --git a/src/routers/http/vllm_pd_router.rs b/src/routers/http/vllm_pd_route
  
              debug!(
                  "Transparent proxy: prefill={}, decode={}",
-@@ -2679,7 +2778,7 @@
+@@ -2676,10 +2732,11 @@ impl RouterTrait for VllmPDRouter {
+                     decode_worker.clone(),
+                     path,
+                     headers,
++                    prefill_token_reservation,
                  )
                  .await
              {
@@ -723,11 +1472,10 @@ diff --git a/src/routers/http/vllm_pd_router.rs b/src/routers/http/vllm_pd_route
                  Err(e) => {
                      error!(
                          "Transparent proxy request failed: prefill={}, decode={}, error={}",
-@@ -2719,6 +2818,171 @@
- mod tests {
+@@ -2720,6 +2777,171 @@ mod tests {
      use super::*;
      use serde_json::json;
-+
+ 
 +    fn reserved_test_worker(url: &str) -> Arc<dyn Worker> {
 +        Arc::new(BasicWorker::new(url.to_string(), WorkerType::Decode))
 +    }
@@ -892,6 +1640,7 @@ diff --git a/src/routers/http/vllm_pd_router.rs b/src/routers/http/vllm_pd_route
 +        drop(sentinel);
 +        assert_eq!(new.load(), 0);
 +    }
- 
++
      #[test]
      fn test_discovery_health_requires_prefill_and_decode_workers() {
+         assert!(!discovery_is_ready(0, 0));

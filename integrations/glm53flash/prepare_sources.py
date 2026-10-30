@@ -11,7 +11,6 @@ from pathlib import Path
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--prefill-only-experiment", action="store_true")
     args = parser.parse_args()
     root = Path(__file__).resolve().parent
     manifest = json.loads((root / "manifest.json").read_text())
@@ -29,8 +28,6 @@ def main():
         commands.extend(
             ["apply", str(root / patch["path"])] for patch in component["patches"]
         )
-        if name == "vllm" and args.prefill_only_experiment:
-            commands.append(["apply", str(root / "experiments/prefill-only.patch")])
         for command in commands:
             subprocess.run(["git", "-C", str(dest), *command], check=True)
     print(f"Prepared sources in {args.output.resolve()}")

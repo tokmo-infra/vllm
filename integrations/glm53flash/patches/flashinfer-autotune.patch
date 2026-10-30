@@ -1,0 +1,34 @@
+diff --git a/flashinfer/fused_moe/core.py b/flashinfer/fused_moe/core.py
+--- a/flashinfer/fused_moe/core.py
++++ b/flashinfer/fused_moe/core.py
+@@ -781,11 +781,8 @@
+                 self.output_dtype,
+                 self.top_k,
+                 self.tp_size,
+-                self.tp_rank,
+                 self.ep_size,
+-                self.ep_rank,
+                 self.cluster_size,
+-                self.cluster_rank,
+                 self.enable_alltoall,
+                 self.use_deepseek_fp8_block_scale,
+                 self.use_w4_group_scaling,
+diff --git a/flashinfer/fused_moe/cute_dsl/tuner.py b/flashinfer/fused_moe/cute_dsl/tuner.py
+--- a/flashinfer/fused_moe/cute_dsl/tuner.py
++++ b/flashinfer/fused_moe/cute_dsl/tuner.py
+@@ -673,7 +673,6 @@
+             self.situ_beta,
+             self.situ_linear_beta,
+             self.num_experts,
+-            self.local_expert_offset,
+             self.use_fused_finalize,
+             self.output_dtype,
+             self.enable_pdl,
+@@ -1136,7 +1135,6 @@
+             self.num_experts,
+             self.top_k,
+             self.num_local_experts,
+-            self.local_expert_offset,
+             self.use_fused_finalize,
+             self.output_dtype,
+             self.enable_pdl,
