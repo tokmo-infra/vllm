@@ -2,9 +2,9 @@
 
 ## 拓扑与参数
 
-| 主机 | 角色 | TP / 全局DP / EP | 本地DP | API | seq/DP | batch/DP | util | graph上限 |
+| 主机 | 角色 | TP / 全局DP / EP | 本地DP | API | seq/DP | batch/DP | util | CUDA Graph / 上限 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 81、83、84 | 各一个P实例 | 1 / 8 / 8 | 8 | 各4 | 64 | 2048 | 0.90 | 256 |
+| 81、83、84 | 各一个P实例 | 1 / 8 / 8 | 8 | 各4 | 32 | 2048 | 0.90 | NONE |
 | 85 | D主节点 | 1 / 32 / 32 | 8，rank 0–7 | 8 | 32 | 2048 | 0.88 | 128 |
 | 86、87、88 | D headless | 1 / 32 / 32 | 各8，起始rank 8/16/24 | 0 | 32 | 2048 | 0.88 | 128 |
 
@@ -109,7 +109,8 @@ EXTRA_ENV=(); EXTRA_MOUNTS=(); API_ARGS=()
 case "$NODE" in
   81|83|84)
     ROLE=prefill; SUFFIX=prefill-$NODE-0; ENGINE="$PROJECT-$SUFFIX"
-    DP=8; SEQS=64; UTIL=0.90; GRAPH=256; ALL2ALL=allgather_reducescatter
+    DP=8; SEQS=32; UTIL=0.90; ALL2ALL=allgather_reducescatter
+    COMPILATION='{"cudagraph_mode":"NONE"}'
     PORT=31010; RPC=18360; BOOTSTRAP=27600; NET_IF=enp3s0f0np0; P2P=PXB
     KV_HCAS=mlx5_1,mlx5_3,mlx5_5,mlx5_7
     EP_HCAS='=mlx5_0:1,mlx5_2:1,mlx5_4:1,mlx5_6:1'
@@ -119,7 +120,8 @@ case "$NODE" in
     ;;
   85|86|87|88)
     ROLE=decode; SUFFIX=decode-$NODE; ENGINE="$PROJECT-dmem088-$SUFFIX"
-    DP=32; SEQS=32; UTIL=0.88; GRAPH=128; ALL2ALL=deepep_v2
+    DP=32; SEQS=32; UTIL=0.88; ALL2ALL=deepep_v2
+    COMPILATION='{"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":128}'
     PORT=31011; RPC=28360; BOOTSTRAP=28600; NET_IF=ens50np0; P2P=PIX
     KV_HCAS=mlx5_2,mlx5_3,mlx5_4,mlx5_7
     EP_HCAS='=mlx5_0:1,mlx5_1:1,mlx5_5:1,mlx5_6:1'
@@ -196,7 +198,7 @@ docker run -d --init --name "$PROJECT-$SUFFIX" --pull=never --network host \
   --enable-auto-tool-choice --tool-call-parser glm47 \
   --enable-prompt-tokens-details --enable-force-include-usage \
   --safetensors-load-strategy lazy --enable-cumem-allocator --no-scheduler-reserve-full-isl \
-  --seed 42 --compilation-config "{\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"max_cudagraph_capture_size\":$GRAPH}" \
+  --seed 42 --compilation-config "$COMPILATION" \
   "${API_ARGS[@]}"
 ~~~
 
@@ -222,7 +224,7 @@ docker run -d --init --name "$PROJECT-api-router-$NODE" --pull=never --network h
 
 ~~~bash
 cat > "$WORK/config/router-token-balance.json" <<'JSON'
-{"tokenizer_path":"/model/tokenizer.json","kv_fraction":0.85,"workers":{"http://11.5.0.81:32110":{"kv_tokens":3957034,"max_seqs":64},"http://11.5.0.83:32110":{"kv_tokens":3957034,"max_seqs":64},"http://11.5.0.84:32110":{"kv_tokens":3957034,"max_seqs":64},"http://11.5.0.85:32111":{"kv_tokens":4094804,"max_seqs":32}}}
+{"tokenizer_path":"/model/tokenizer.json","kv_fraction":0.85,"workers":{"http://11.5.0.81:32110":{"kv_tokens":3957034,"max_seqs":32},"http://11.5.0.83:32110":{"kv_tokens":3957034,"max_seqs":32},"http://11.5.0.84:32110":{"kv_tokens":3957034,"max_seqs":32},"http://11.5.0.85:32111":{"kv_tokens":4094804,"max_seqs":32}}}
 JSON
 docker run -d --init --name "$PROJECT-router-81" --pull=never --network host \
   --log-opt max-size=128m --log-opt max-file=5 --label ai-infra.project="$PROJECT" \
