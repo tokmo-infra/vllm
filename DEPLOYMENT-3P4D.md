@@ -20,8 +20,9 @@
 | P all2all / D all2all | allgather_reducescatter / deepep_v2 |
 | D DeepEP挂载 | $WORK/runtime/deep_ep_elastic.py |
 | DeepEP挂载SHA256 | 7e5775303ba98cd1a2183456a77adc28dcfee78527c422d79ea98991fe6c6b06 |
-| Tokenizer | 每API主机共享8GiB，每API私有L1 64MiB；headless不启用 |
-| L2 | P每台704GiB，D每台816GiB，共5376GiB |
+| Tokenizer CPU预算 | 每GPU等效2GiB，含每API私有L1 64MiB；P每EP8组16GiB，D全局EP32组64GiB |
+| Tokenizer共享池 | P每API主机15.75GiB；D主节点85为63.5GiB；headless不重复建池 |
+| L2 | 七台各750GiB，共5250GiB |
 | L3 | P每台1TiB，D每台3TiB，共15TiB |
 
 ## 公共变量
@@ -60,8 +61,8 @@ docker run -d --init --name "$PROJECT-master-81" --pull=never --network host \
 
 ~~~bash
 case "$NODE" in
-  81|83|84) L2=755914244096; L3=1099511627776; MEM=752g; CPUS=0-255 ;;
-  85|86|87|88) L2=876173328384; L3=3298534883328; MEM=864g; CPUS=0-127 ;;
+  81|83|84) L2=805306368000; L3=1099511627776; MEM=798g; CPUS=0-255 ;;
+  85|86|87|88) L2=805306368000; L3=3298534883328; MEM=798g; CPUS=0-127 ;;
 esac
 L3_PATH=/data/bench/eng-xinhao/mooncake-l3/glm53flash-3p8-d32-l23-sharedcache-c718-a1024-v1/node-$NODE
 TOPOLOGY="$WORK/config/mooncake-topology-store-$NODE.json"
@@ -113,7 +114,7 @@ case "$NODE" in
     KV_HCAS=mlx5_1,mlx5_3,mlx5_5,mlx5_7
     EP_HCAS='=mlx5_0:1,mlx5_2:1,mlx5_4:1,mlx5_6:1'
     PD_ROLE=kv_producer; STORE_ROLE=kv_both; BUFFER=536870912
-    CACHE_GIB=4; APIS=4
+    CACHE_GIB=2; SHARED_GIB=15.75; APIS=4
     API_ARGS=(--api-server-count 4 --renderer-num-workers 1 --host 0.0.0.0 --port "$PORT")
     ;;
   85|86|87|88)
@@ -123,11 +124,11 @@ case "$NODE" in
     KV_HCAS=mlx5_2,mlx5_3,mlx5_4,mlx5_7
     EP_HCAS='=mlx5_0:1,mlx5_1:1,mlx5_5:1,mlx5_6:1'
     PD_ROLE=kv_consumer; STORE_ROLE=kv_consumer; BUFFER=2147483648
-    CACHE_GIB=0; APIS=0
+    CACHE_GIB=0; SHARED_GIB=0; APIS=0
     EXTRA_ENV=(-e NCCL_GIN_TYPE=2 -e AI_INFRA_DEEPEP_V2_NUM_SMS=32 -e VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE=0)
     EXTRA_MOUNTS=(-v "$WORK/runtime/deep_ep_elastic.py:/usr/local/lib/python3.12/dist-packages/deep_ep/buffers/elastic.py:ro")
     if [ "$NODE" = 85 ]; then
-      CACHE_GIB=4; APIS=8
+      CACHE_GIB=2; SHARED_GIB=63.5; APIS=8
       API_ARGS=(--api-server-count 8 --renderer-num-workers 1 --host 0.0.0.0 --port "$PORT")
     else
       API_ARGS=(--data-parallel-start-rank "$(( (NODE-85)*8 ))" --headless)
@@ -142,7 +143,7 @@ if [ "$APIS" -gt 0 ]; then
   mkdir -p "$TOKEN_DIR"
   EXTRA_MOUNTS+=(-v "$TOKEN_DIR:/run/glm-tokenizer:rw")
   EXTRA_ENV+=(-e VLLM_GLM53_TOKENIZER_SHARED_PATH=/run/glm-tokenizer/segments.sqlite3
-    -e VLLM_GLM53_TOKENIZER_SHARED_GIB=8 -e VLLM_GLM53_TOKENIZER_LOCAL_L1_MIB=64
+    -e VLLM_GLM53_TOKENIZER_SHARED_GIB="$SHARED_GIB" -e VLLM_GLM53_TOKENIZER_LOCAL_L1_MIB=64
     -e VLLM_API_PRIVATE_SOCKET_DIR=/run/glm-tokenizer)
 fi
 cat > "$MC_CONFIG" <<JSON
