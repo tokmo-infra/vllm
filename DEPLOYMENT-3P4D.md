@@ -182,7 +182,7 @@ docker run -d --init --name "$PROJECT-$SUFFIX" --pull=never --network host \
   --enable-chunked-prefill --enable-prefix-caching --prefix-match-unit 256 \
   --kv-transfer-config "$KV_CONFIG" --reasoning-parser glm47 \
   --enable-auto-tool-choice --tool-call-parser glm47 \
-  --enable-prompt-tokens-details --enable-force-include-usage \
+  --enable-prompt-tokens-details --enable-force-include-usage --enable-per-request-metrics \
   --safetensors-load-strategy lazy --enable-cumem-allocator --no-scheduler-reserve-full-isl \
   --seed 42 --compilation-config "$COMPILATION" \
   "${API_ARGS[@]}"

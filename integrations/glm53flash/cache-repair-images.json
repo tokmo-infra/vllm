@@ -1,16 +1,16 @@
 {
   "built_on": "p6kd-81",
-  "date": "2026-10-31",
-  "model_image": "sha256:011a4f3284855a4b91e85ec397dd89fdcc2839cb6c1501503706571d894aa2b3",
-  "router_image": "sha256:f1159b8dbe1756368601ca62e7cc520b6b1fa31efd7777e740b342978befdd6f",
+  "date": "2026-11-01",
+  "model_image": "sha256:01c767d8a8cd44100789f61af6100c36b7e2dba06d735a7ed41bc24083d1f632",
+  "router_image": "sha256:a019a805179307fbcf0e3dd3d109d4ba8000fed70957d3df408904b4a5b688b2",
   "model_base": "540155b18ee7",
   "router_base": "21c9cfa19e34",
   "installed_image_cpu_tests": "31 passed",
-  "router_gateway_tests": "7 passed",
+  "router_gateway_tests": "8 passed including real TCP keepalive beyond5s",
   "gpu_inference_test": false,
   "rust_router_sha256": "64361aa391fae97c996880c48726218fd96aad90e038db1470f4f5c90898b857",
-  "vllm_commit": "af1bdc3",
-  "router_commit": "ec27739",
+  "vllm_commit": "a388c64",
+  "router_commit": "5fac0e9",
   "source_hashes_verified_on": [
     81,
     83,
@@ -22,33 +22,34 @@
   ],
   "per_node_images": {
     "81": {
-      "model": "sha256:011a4f3284855a4b91e85ec397dd89fdcc2839cb6c1501503706571d894aa2b3",
-      "router": "sha256:f1159b8dbe1756368601ca62e7cc520b6b1fa31efd7777e740b342978befdd6f"
+      "model": "sha256:01c767d8a8cd44100789f61af6100c36b7e2dba06d735a7ed41bc24083d1f632",
+      "router": "sha256:a019a805179307fbcf0e3dd3d109d4ba8000fed70957d3df408904b4a5b688b2"
     },
     "83": {
-      "model": "sha256:3ff0ab6fc3c5ce98fcbec4d2709c5fc6470eea3f8cf11dab08b010106120623d",
-      "router": "sha256:ecd3d8d130d139d195890e396ec49fe4f913a9dc11c23acd518cf29f8392e2df"
+      "model": "sha256:2e42c6dba73f83f7238e2e3f36078a9297bf7e8c045fea72798d7a66c807286f",
+      "router": "sha256:ce6061578e4d2061845156b74b878376937601a4a667ae949baa34816673da51"
     },
     "84": {
-      "model": "sha256:8482f896c3e151c0af49a5c966e5b7526b8036d70b62ae32605273fb1fc05b21",
-      "router": "sha256:4d8538809a0a5ce64381744e829967896282b3979bec8f31f5872b5f952e4039"
+      "model": "sha256:1d3698c481598f788d986d675052e76b8a62d69fd7b278de176ab8a595cc5cb0",
+      "router": "sha256:3dca369145476edc52be74b863aa73b03f3f7dfd58b648f6fbe882f206726040"
     },
     "85": {
-      "model": "sha256:c5db3cb47aa7b5b13ebf71fbfe05ccbefc131945408339d5e2019c4d89aaa893",
-      "router": "sha256:f1a2c4e6b061add4d1d7e4c6ea2b4e8417b3bc0a263334cfdd422f1c9dc871aa"
+      "model": "sha256:9eae2c28fbd9e1f65e818ea132f27ba11bdd708977ebde3fb048a31245e67e02",
+      "router": "sha256:2f053a5f0f466d043f9277377fead737c0f9284dfd5c35e16bc0738e559bedd2"
     },
     "86": {
-      "model": "sha256:47dd48d87feb2b0c29cc053c4b79487516e0f3a2465155cf57872ff7deb6a162",
-      "router": "sha256:81dc94bf3dee1c5c2378cc21f72f78c2cb326ea866673170a8cfa1d5ea01c897"
+      "model": "sha256:363860dade0b5c11ddd35e8d780c478a27ba187d45c9b0a0ef7f03a042de514d",
+      "router": "sha256:7de05180f8f858500d2f2b6d6474f2faa0fb31af3a376a0724f7ad416783ac69"
     },
     "87": {
-      "model": "sha256:34d9aea2718c9c3c0c656172d5c33bdbf37c7e0227b2b0dd0125319f32f18ab4",
-      "router": "sha256:b601cc183af139aa65c0af8c151e5c81b20cf2753c4d1745083d0cd95cee4d56"
+      "model": "sha256:4646936bbbe72e50e49e0f43aac9f6eb94aa1b4078b12bfa74c575063197bc29",
+      "router": "sha256:89ac8658a343bef625af85e714bd1c02ab2f6f123ab089ab0b94bb107caad180"
     },
     "88": {
-      "model": "sha256:189017ce39a4ae4dce858f3315e811f4d7a54d0adf0d6853ea8f056d5bf9b125",
-      "router": "sha256:01e959ae9bd02eac653c8fe68fe853efa5556f806d4b43f057fa1e5a12002129"
+      "model": "sha256:329121a448c500606ed25d1a1d78ab28c9486fd2166cd88fbd4ed4efc398bb03",
+      "router": "sha256:c293c7d73526471d78b875ebef12939725825ae45d985d4e5508965415ebc5df"
     }
   },
-  "per_node_build_note": "All nodes built the same pinned sources; image IDs differ because builds are independent. No running service was restarted."
+  "per_node_build_note": "All nodes built the same pinned sources; image IDs differ because builds are independent. No running service was restarted.",
+  "update": "Gateway keepalive120s; native inference kernels and Rust router binary unchanged"
 }

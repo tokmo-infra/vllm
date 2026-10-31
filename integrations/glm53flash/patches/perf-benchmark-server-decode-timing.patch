@@ -1,0 +1,309 @@
+From dbd8e5d1b7c4ae5bf25818225e78865258e077e6 Mon Sep 17 00:00:00 2001
+From: yyf <yyf@yyfdeMacBook-Air.local>
+Date: Sun, 1 Nov 2026 00:36:13 +0800
+Subject: [PATCH] feat(metrics): preserve vLLM engine generation timing
+ separately from client clocks
+
+Co-authored-by: Codex <noreply@openai.com>
+Signed-off-by: yyf <yyf@yyfdeMacBook-Air.local>
+---
+ docs/server-decode-timing.md                  |  11 ++
+ perf_benchmark/core/models.py                 |   1 +
+ .../pipeline/results/measurement.py           |   1 +
+ perf_benchmark/pipeline/results/metrics.py    |   6 +-
+ .../executor/openai_chat/rust/src/decoder.rs  |   9 ++
+ perf_benchmark/runtime/http/native_result.py  |   1 +
+ perf_benchmark/runtime/http/rust_executor.py  |   1 +
+ .../runtime/http/rusthttp/src/binding.rs      |   5 +
+ .../runtime/http/rusthttp/src/http.rs         |   1 +
+ .../runtime/http/rusthttp/src/lib.rs          |   1 +
+ .../runtime/http/rusthttp/src/types.rs        |   1 +
+ tests/executor/test_server_decode_timing.py   | 103 ++++++++++++++++++
+ 12 files changed, 140 insertions(+), 1 deletion(-)
+ create mode 100644 docs/server-decode-timing.md
+ create mode 100644 tests/executor/test_server_decode_timing.py
+
+diff --git a/docs/server-decode-timing.md b/docs/server-decode-timing.md
+new file mode 100644
+index 0000000..815ee38
+--- /dev/null
++++ b/docs/server-decode-timing.md
+@@ -0,0 +1,11 @@
++# vLLM逐请求Decode计时
++
++vLLM启动添加`--enable-per-request-metrics`，流式请求使用
++`stream_options.include_usage=true`。OpenAI Chat执行器将最终响应中的
++`metrics.generation_time_ms`等数值保存到请求事实的`server_metrics`扩展字段。
++
++- 引擎Decode速度：`(completion_tokens-1)*1000/generation_time_ms`。
++- 客户端首末输出时钟、TTFT、TPOT及原始Decode分布保持不变。
++- 工具解析或网络缓冲造成多个输出集中到达时，两种计时分别报告。
++- 原价收入和TPM仍按usage与实际窗口时长计算。
++- 缺失引擎时长记为不可用，不从客户端时钟补造，不裁剪或加权样本。
+diff --git a/perf_benchmark/core/models.py b/perf_benchmark/core/models.py
+index 5fe48ec..c2013d6 100644
+--- a/perf_benchmark/core/models.py
++++ b/perf_benchmark/core/models.py
+@@ -127,6 +127,7 @@ class RequestMeasurements:
+     result_ready_ns: int | None = None
+     trace_context: TraceContext | None = None
+     profile: RequestProfile | None = None
++    server_metrics: dict[str, float] | None = None
+ 
+ 
+ @dataclass(slots=True)
+diff --git a/perf_benchmark/pipeline/results/measurement.py b/perf_benchmark/pipeline/results/measurement.py
+index 567500a..919db33 100644
+--- a/perf_benchmark/pipeline/results/measurement.py
++++ b/perf_benchmark/pipeline/results/measurement.py
+@@ -63,6 +63,7 @@ class TurnFact:
+     result_ready_ns: int | None = None
+     trace_context: TraceContext | None = None
+     profile: RequestProfile | None = None
++    server_metrics: Mapping[str, float] | None = None
+ 
+ 
+ 
+diff --git a/perf_benchmark/pipeline/results/metrics.py b/perf_benchmark/pipeline/results/metrics.py
+index f0ea74a..b4efda2 100644
+--- a/perf_benchmark/pipeline/results/metrics.py
++++ b/perf_benchmark/pipeline/results/metrics.py
+@@ -62,6 +62,8 @@ def _computed(fact: TurnFact | SessionFact, metrics):
+             )), metadata=fact.metadata, metrics=metrics,
+         )
+     request = {name: getattr(fact, source) for name, source in _REQUEST_FIELDS.items()}
++    if request.get("server_metrics") is None:
++        request.pop("server_metrics", None)
+     for name in ("profile", "trace_context"):
+         value = request[name]
+         if value is not None:
+@@ -207,7 +209,9 @@ class MetricsCollector:
+         values.update({name: getattr(result if result is not None else turn, name)
+                        for name in ("status", "error", "scenario_passed")})
+         return (AttemptFact if result is not None else TurnFact)(
+-            **values, **{target: getattr(request, name) for name, target in _REQUEST_FIELDS.items()},
++            **values, **{target: freeze_snapshot(getattr(request, name))
++                         if name == "server_metrics" else getattr(request, name)
++                         for name, target in _REQUEST_FIELDS.items()},
+             trial_id=self.trial_id,
+             usage=freeze_snapshot(result.usage if result is not None else turn.usage),
+             metadata=freeze_snapshot(turn.metadata), response_samples=trace.samples if trace else (),
+diff --git a/perf_benchmark/plugins/executor/openai_chat/rust/src/decoder.rs b/perf_benchmark/plugins/executor/openai_chat/rust/src/decoder.rs
+index 8469a60..e9b2e7f 100644
+--- a/perf_benchmark/plugins/executor/openai_chat/rust/src/decoder.rs
++++ b/perf_benchmark/plugins/executor/openai_chat/rust/src/decoder.rs
+@@ -15,6 +15,7 @@ struct Chat {
+     done: bool,
+     chars: i64,
+     usage: BTreeMap<String, i64>,
++    server_metrics: BTreeMap<String, f64>,
+     finish: String,
+     text: String,
+     reasoning: String,
+@@ -105,6 +106,13 @@ impl Decoder for Chat {
+         {
+             self.usage.insert("cached_tokens".into(), n);
+         }
++        // Server engine durations are separate from client-visible SSE clocks.
++        // Tool parsers and network batching may release many deltas together.
++        for key in ["generation_time_ms", "mean_itl_ms", "queue_time_ms", "time_to_first_token_ms"] {
++            if let Some(value) = v["metrics"][key].as_f64().filter(|v| v.is_finite() && *v >= 0.0) {
++                self.server_metrics.insert(key.into(), value);
++            }
++        }
+         let choices = v["choices"].as_array();
+         if !streaming {
+             let choice = choices
+@@ -180,6 +188,7 @@ impl Decoder for Chat {
+             Content {
+                 chars: self.chars,
+                 usage: std::mem::take(&mut self.usage),
++                server_metrics: std::mem::take(&mut self.server_metrics),
+                 finish: self.finish.clone(),
+                 continuation,
+                 valid,
+diff --git a/perf_benchmark/runtime/http/native_result.py b/perf_benchmark/runtime/http/native_result.py
+index 40c8be4..3e57aa9 100644
+--- a/perf_benchmark/runtime/http/native_result.py
++++ b/perf_benchmark/runtime/http/native_result.py
+@@ -21,3 +21,4 @@ class NativeResult(NamedTuple):
+     trigger_ns: int | None
+     decision_ns: int | None
+     applied_ns: int | None
++    server_metrics: dict[str, float] | None = None
+diff --git a/perf_benchmark/runtime/http/rust_executor.py b/perf_benchmark/runtime/http/rust_executor.py
+index be31350..7756cb4 100644
+--- a/perf_benchmark/runtime/http/rust_executor.py
++++ b/perf_benchmark/runtime/http/rust_executor.py
+@@ -100,6 +100,7 @@ class RustHttpExecutorRuntime(RequestRuntime):
+             for key in ("trigger_ns", "decision_ns", "applied_ns"):
+                 setattr(result, key, getattr(value, key))
+             request = result.request
++            request.server_metrics = value.server_metrics
+             request.attempts, request.response_mode = result.attempt, "stream" if spec.streaming else "non_stream"
+             request.started_ns, request.response_completed_ns = value.started_ns, value.completed_ns
+             request.http_status, request.output_chars = value.http_status, value.output_chars
+diff --git a/perf_benchmark/runtime/http/rusthttp/src/binding.rs b/perf_benchmark/runtime/http/rusthttp/src/binding.rs
+index 43d7043..2b62bee 100644
+--- a/perf_benchmark/runtime/http/rusthttp/src/binding.rs
++++ b/perf_benchmark/runtime/http/rusthttp/src/binding.rs
+@@ -518,6 +518,11 @@ fn result_into_py(py: Python<'_>, value: Outcome) -> PyResult<Py<PyAny>> {
+         value.trigger_ns.into_py_any(py)?,
+         value.decision_ns.into_py_any(py)?,
+         value.applied_ns.into_py_any(py)?,
++        if value.server_metrics.is_empty() {
++            py.None()
++        } else {
++            value.server_metrics.into_py_any(py)?
++        },
+     ];
+     class.call1(py, PyTuple::new(py, fields)?)
+ }
+diff --git a/perf_benchmark/runtime/http/rusthttp/src/http.rs b/perf_benchmark/runtime/http/rusthttp/src/http.rs
+index 01dee73..289339c 100644
+--- a/perf_benchmark/runtime/http/rusthttp/src/http.rs
++++ b/perf_benchmark/runtime/http/rusthttp/src/http.rs
+@@ -396,6 +396,7 @@ impl Http {
+         let (content, finish_error) = decoder.finish(out.status);
+         out.output_chars = content.chars;
+         out.usage = content.usage;
++        out.server_metrics = content.server_metrics;
+         out.output_kind = if content.kind.is_empty() {
+             "text"
+         } else {
+diff --git a/perf_benchmark/runtime/http/rusthttp/src/lib.rs b/perf_benchmark/runtime/http/rusthttp/src/lib.rs
+index de71570..54b54ca 100644
+--- a/perf_benchmark/runtime/http/rusthttp/src/lib.rs
++++ b/perf_benchmark/runtime/http/rusthttp/src/lib.rs
+@@ -12,6 +12,7 @@ pub struct Content {
+     pub kind: &'static str,
+     pub chars: i64,
+     pub usage: BTreeMap<String, i64>,
++    pub server_metrics: BTreeMap<String, f64>,
+     pub finish: String,
+     pub continuation: Option<serde_json::Value>,
+     pub valid: bool,
+diff --git a/perf_benchmark/runtime/http/rusthttp/src/types.rs b/perf_benchmark/runtime/http/rusthttp/src/types.rs
+index 75face7..8153db7 100644
+--- a/perf_benchmark/runtime/http/rusthttp/src/types.rs
++++ b/perf_benchmark/runtime/http/rusthttp/src/types.rs
+@@ -35,6 +35,7 @@ pub struct Outcome {
+     pub samples: Vec<[i64; 3]>,
+     pub output_chars: i64,
+     pub usage: BTreeMap<String, i64>,
++    pub server_metrics: BTreeMap<String, f64>,
+     pub finish_reason: Option<String>,
+     pub continuation: Option<serde_json::Value>,
+     pub continuation_valid: bool,
+diff --git a/tests/executor/test_server_decode_timing.py b/tests/executor/test_server_decode_timing.py
+new file mode 100644
+index 0000000..9cd2f47
+--- /dev/null
++++ b/tests/executor/test_server_decode_timing.py
+@@ -0,0 +1,103 @@
++"""Keep engine generation time separate from buffered client-visible output."""
++import json
++
++from aiohttp import web
++from aiohttp.test_utils import TestServer
++import pytest
++
++from perf_benchmark import _native
++from tests.runtime.native_support import request
++
++
++@pytest.mark.parametrize("stream", [True, False])
++async def test_engine_timing_survives_terminal_usage_without_fake_output(stream):
++    timing = {"generation_time_ms": 1000.0, "mean_itl_ms": 1000 / 30,
++              "queue_time_ms": 20.0, "time_to_first_token_ms": 10.0}
++    async def complete(req):
++        if not stream:
++            return web.json_response({"choices": [{"message": {"content": "ok"},
++                "finish_reason": "stop"}], "usage": {"completion_tokens": 31},
++                "metrics": timing})
++        # Both tool deltas arrive in one TCP body. Their arrival span is not
++        # a measurement of the server's one-second generation interval.
++        events = [
++            {"choices": [{"delta": {"tool_calls": [{"index": 0,
++                "function": {"name": "f", "arguments": "{"}}]}}]},
++            {"choices": [{"delta": {"tool_calls": [{"index": 0,
++                "function": {"arguments": "}"}}]}, "finish_reason": "tool_calls"}]},
++            {"choices": [], "usage": {"completion_tokens": 31}, "metrics": timing},
++        ]
++        return web.Response(text="".join("data: " + json.dumps(x) + "\n\n" for x in events)
++                            + "data: [DONE]\n\n", content_type="text/event-stream")
++    app = web.Application()
++    app.router.add_post("/", complete)
++    async with TestServer(app) as server:
++        native = _native.create_trial("openai-chat")
++        try:
++            result = await request(native, {"url": str(server.make_url("/")), "stream": stream})
++            assert result.status == "succeeded"
++            assert result.server_metrics == timing
++            assert result.usage == {"completion_tokens": 31}
++            if stream:
++                assert len(result.samples) == 2  # No output event for the metrics-only frame.
++                assert result.samples[0][1] == result.samples[-1][1]
++            else:
++                assert len(result.samples) == 0
++            assert 30 * 1000 / result.server_metrics["generation_time_ms"] == 30
++        finally:
++            await native.close()
++
++
++async def test_absent_or_invalid_server_metrics_are_not_zero():
++    async def complete(req):
++        return web.json_response({"choices": [{"message": {"content": "ok"}}],
++            "metrics": {"generation_time_ms": -1, "mean_itl_ms": None,
++                        "queue_time_ms": "1000", "tokens_per_second": 999999}})
++    app = web.Application()
++    app.router.add_post("/", complete)
++    async with TestServer(app) as server:
++        native = _native.create_trial("openai-chat")
++        try:
++            result = await request(native, {"url": str(server.make_url("/"))})
++            assert result.status == "succeeded"
++            assert result.server_metrics is None
++        finally:
++            await native.close()
++
++
++async def test_engine_timing_roundtrips_metric_pipeline_and_sqlite(tmp_path, stage_context):
++    from perf_benchmark.core.models import Run, Trial, Session, Turn
++    from perf_benchmark.pipeline.preparation.payloads import PayloadRef
++    from perf_benchmark.pipeline.results.metrics import MetricsRuntime
++    from perf_benchmark.pipeline.results.saver import SaverRuntime
++    from perf_benchmark.plugins.metrics.standard import StandardMetrics
++    from perf_benchmark.plugins.saver.sqlite import SQLiteResultReader, SQLiteSaver
++
++    run = Run(name="server-clock")
++    trial = Trial(id="timing-trial", run_id=run.id)
++    session = Session(id="timing-session", trial_id=trial.id, turns=[])
++    turn = Turn(id="timing-turn", session_id=session.id, request_payload_ref=PayloadRef(0, 1))
++    turn.start()
++    turn.measurements.request.started_ns = 1_000_000_000
++    turn.measurements.request.response_completed_ns = 2_000_000_000
++    timing = {"generation_time_ms": 1000.0, "mean_itl_ms": 1000 / 30}
++    turn.measurements.request.server_metrics = timing
++    turn.succeed()
++    database = tmp_path / "native.db"
++    sink = await SaverRuntime.create(SQLiteSaver({"path": str(database)}), run, stage_context("saver", run=run))
++    metrics = await MetricsRuntime.create(StandardMetrics({}), stage_context("metrics", run=run),
++        publish_results=sink.write_results, wait_for_results=sink.wait_for_headroom)
++    try:
++        await sink.write_trial(trial)
++        await sink.write_session(session)
++        collector = await metrics.open_trial(trial)
++        collector.record_turn(turn)
++        # Snapshot facts must not retain a mutable server-response dictionary.
++        timing["generation_time_ms"] = 99999
++        await metrics.close()
++        await sink.flush()
++        result = tuple(SQLiteResultReader(database).iter_turn_records(run.id))[0]
++        assert result["measurements"]["request"]["server_metrics"]["generation_time_ms"] == 1000
++    finally:
++        await metrics.close()
++        await sink.close()
+-- 
+2.50.1 (Apple Git-155)
+
