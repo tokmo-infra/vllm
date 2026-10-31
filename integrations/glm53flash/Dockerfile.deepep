@@ -1,0 +1,5 @@
+ARG BASE_IMAGE=local/glm53flash-vllm:0.32.0
+FROM ${BASE_IMAGE}
+COPY integrations/glm53flash/patches/deepep-explicit-sms.patch /tmp/deepep-sms.patch
+RUN echo 'a20347291581dde085e1a89a5084cf6c50b34c70e897525e148c98848ee71cf1  /usr/local/lib/python3.12/dist-packages/deep_ep/buffers/elastic.py' | sha256sum -c - && patch --batch --forward --fuzz=0 /usr/local/lib/python3.12/dist-packages/deep_ep/buffers/elastic.py < /tmp/deepep-sms.patch && rm /tmp/deepep-sms.patch
+LABEL glm.deepep="optional explicit SM budget; native kernels unchanged"

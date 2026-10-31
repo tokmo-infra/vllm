@@ -1,0 +1,22 @@
+--- a/elastic.py
++++ b/elastic.py
+@@ -609,6 +609,19 @@
+         # TODO: support this
+         assert num_scaleout_topk == 0
+ 
++        # Deployment override for PCIe-only machines whose bandwidth probes
++        # cannot provide the NVLink/RDMA estimates required by this heuristic.
++        explicit_sms = os.environ.get('AI_INFRA_DEEPEP_V2_NUM_SMS')
++        if explicit_sms is not None:
++            requested_sms = int(explicit_sms)
++            device_sms = torch.cuda.get_device_properties('cuda').multi_processor_count
++            if requested_sms < 4 or requested_sms % 2 or requested_sms > device_sms:
++                raise ValueError(
++                    'AI_INFRA_DEEPEP_V2_NUM_SMS must be even, at least 4, '
++                    'and no greater than the device SM count'
++                )
++            return requested_sms
++
+         # Get bandwidth
+         if rdma_gbs == 0 and self.num_rdma_ranks > 1:
+             rdma_gbs = get_rdma_gbs()

@@ -273,3 +273,21 @@ docker run -d --name glm-router --runtime=runc --network host \
 
 P 速度取 local_compute token计数差，不包括缓存命中；D 速度取generation token计数差。
 多路DP按engine标签分别读取，汇总时按实际采样间隔计算。
+
+## 9. DeepEP 可选通信对照
+
+~~~bash
+docker build --build-arg BASE_IMAGE=local/glm53flash-vllm:0.32.0 \
+  -f integrations/glm53flash/Dockerfile.deepep \
+  -t local/glm53flash-vllm:deepep32-candidate .
+~~~
+
+P/D 模型容器使用该候选镜像，并增加以下环境变量及启动参数。
+
+~~~bash
+-e AI_INFRA_DEEPEP_V2_NUM_SMS=32
+-e VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE=0
+-e NCCL_GIN_TYPE=2
+
+--all2all-backend deepep_v2
+~~~
