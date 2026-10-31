@@ -310,9 +310,13 @@ P/D 模型容器使用该候选镜像，并增加以下环境变量及启动参�
 docker build -f integrations/glm53flash/Dockerfile.shared-tokenizer \
   -t local/glm53flash-vllm:shared-tokenizer-candidate .
 
+mkdir -p /dev/shm/glm53-tokenizer
+printf 'initial' > /dev/shm/glm53-tokenizer/epoch
+
 -v /dev/shm/glm53-tokenizer:/run/glm-tokenizer:rw
 -e VLLM_GLM53_TOKENIZER_SHARED_PATH=/run/glm-tokenizer/segments.db
 -e VLLM_GLM53_TOKENIZER_LOCAL_L1_MIB=64
+-e VLLM_GLM53_TOKENIZER_CACHE_EPOCH_FILE=/run/glm-tokenizer/epoch
 ~~~
 
 | 参数 | P：同机两个EP4、每实例4 API | D：EP8、1 API |

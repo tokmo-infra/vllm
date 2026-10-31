@@ -397,7 +397,8 @@
       ],
       "environment": {
         "VLLM_GLM53_TOKENIZER_SHARED_PATH": "/run/glm-tokenizer/segments.db",
-        "VLLM_GLM53_TOKENIZER_LOCAL_L1_MIB": "64"
+        "VLLM_GLM53_TOKENIZER_LOCAL_L1_MIB": "64",
+        "VLLM_GLM53_TOKENIZER_CACHE_EPOCH_FILE": "/run/glm-tokenizer/epoch"
       },
       "shared_pool_gib": {
         "P_8_API_per_host": 15.5,
