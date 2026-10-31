@@ -4,6 +4,7 @@
 
 import hashlib
 import json
+import sqlite3
 import sys
 import threading
 import time
@@ -42,7 +43,14 @@ def literal_pattern(literals):
 
 
 class SegmentCache:
-    def __init__(self, tokenizer, tokenizer_path, max_bytes=32 * 1024**3):
+    def __init__(
+        self,
+        tokenizer,
+        tokenizer_path,
+        max_bytes=32 * 1024**3,
+        shared_store=None,
+        generation="",
+    ):
         self.tokenizer = tokenizer
         self.backend = tokenizer.backend_tokenizer
         raw = (
@@ -91,16 +99,39 @@ class SegmentCache:
         self.entries = OrderedDict()
         self.bytes = 0
         self.stats = {}
+        self.shared_store = shared_store
+        self.generation = generation
+        self.reset_version = 0
 
     def _segment(self, namespace, text):
         key = (namespace, text)
         hash(key)  # Hash the fresh long string before entering the shared lock.
         with self.lock:
+            generation = self.generation
+            reset_version = self.reset_version
             entry = self.entries.get(key)
             if entry is not None:
                 self.entries.move_to_end(key)
                 return entry[0], True
-        ids = array("I", self.backend.encode(text, add_special_tokens=False).ids)
+        ids = None
+        shared_hit = False
+        if self.shared_store is not None:
+            try:
+                packed = self.shared_store.get(generation, namespace, text)
+                if packed is not None:
+                    ids = array("I")
+                    ids.frombytes(packed)
+                    shared_hit = True
+                self._record_shared("shared_hits" if shared_hit else "shared_misses")
+            except (OSError, ValueError, sqlite3.Error):
+                self._record_shared("shared_errors")
+        if ids is None:
+            ids = array("I", self.backend.encode(text, add_special_tokens=False).ids)
+            if self.shared_store is not None:
+                try:
+                    self.shared_store.put(generation, namespace, text, ids.tobytes())
+                except (OSError, ValueError, sqlite3.Error):
+                    self._record_shared("shared_errors")
         size = (
             sys.getsizeof(text)
             + sys.getsizeof(ids)
@@ -110,14 +141,18 @@ class SegmentCache:
         )
         if size <= self.max_bytes:
             with self.lock:
-                if key not in self.entries:
+                if reset_version == self.reset_version and key not in self.entries:
                     while self.entries and self.bytes + size > self.max_bytes:
                         _, (_, old_size) = self.entries.popitem(last=False)
                         self.bytes -= old_size
                         self.stats["evictions"] = self.stats.get("evictions", 0) + 1
                     self.entries[key] = (ids, size)
                     self.bytes += size
-        return ids, False
+        return ids, shared_hit
+
+    def _record_shared(self, name):
+        with self.lock:
+            self.stats[name] = self.stats.get(name, 0) + 1
 
     def encode(self, text, namespace=""):
         start = time.monotonic()
@@ -163,8 +198,11 @@ class SegmentCache:
                 "cache_entries": len(self.entries),
             }
 
-    def reset(self):
+    def reset(self, generation=None):
         with self.lock:
             self.entries.clear()
             self.bytes = 0
             self.stats.clear()
+            self.reset_version += 1
+            if generation is not None:
+                self.generation = generation

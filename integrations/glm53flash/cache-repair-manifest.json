@@ -1,0 +1,39 @@
+{
+  "name": "glm53flash-cache-repair",
+  "date": "2026-10-31",
+  "base_image": "sha256:540155b18ee763049423a616628cc1fee5e22176b3b1397775465f9067569bcf",
+  "router_base_image": "sha256:21c9cfa19e348f84a99102ab02922d5cd3a1ef6d659881cac09e9d6479c4d07b",
+  "runtime_source": "audited 243b6d0e119e repair, transplanted onto pinned 540155 base; no CUDA/kernel rebuild",
+  "features": [
+    "host-shared exact tokenizer and per-API L1",
+    "private API sockets and prefix/load API affinity",
+    "remote_store_read_batch_bytes",
+    "weighted prefix-owner placement with native allocation fallback",
+    "whole-request invalidation and no repeat cache reads after recompute",
+    "optional AI_INFRA_DEEPEP_V2_NUM_SMS override"
+  ],
+  "runtime_patched_files": [
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py",
+      "base_sha256": "90a457d10975d132c5883a00ecbfdac855064725eecfa894c36c8d4ffa4bc5b5",
+      "result_sha256": "4d7379f8ab651a648ca9076003ede62a9933c54b9c0c0e9cf94f6842eaef8f9a"
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "base_sha256": "d9a39870286c424cef2fc0730e24092ee3df67e848608e2278944846bab804ae",
+      "result_sha256": "b6e81758c1cda5a08e9d194118753e0bacc85e2d2577eb7c0099d9294572797d"
+    },
+    {
+      "path": "vllm/entrypoints/launchers/launcher.py",
+      "base_sha256": "17060e357c846cf6b9d94ae8b60e3edee42dcffda9b6199de8986f03756b1709",
+      "result_sha256": "b449f35f4c1e9b30e2a7d1332993c56e25c9d3c7a33e81934d3fffc95782f887"
+    },
+    {
+      "path": "deep_ep/buffers/elastic.py",
+      "base_sha256": "a20347291581dde085e1a89a5084cf6c50b34c70e897525e148c98848ee71cf1",
+      "result_sha256": "7e5775303ba98cd1a2183456a77adc28dcfee78527c422d79ea98991fe6c6b06"
+    }
+  ],
+  "router_rust_binary_changed": false,
+  "runtime_parameters_applied_to_running_services": false
+}

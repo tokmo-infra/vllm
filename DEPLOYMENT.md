@@ -18,7 +18,7 @@ P端API进程4、KV接收线程4，P/D异步查找开启。保留原生MTP3和�
 在项目根目录构建并替换同名推理镜像，Router镜像不变：
 
 ~~~bash
-docker build -f integrations/glm53flash/Dockerfile.tokenizer-cache \
+docker build -f integrations/glm53flash/Dockerfile.cache-repair \
   -t local/glm53flash-vllm:0.32.0 .
 ~~~
 

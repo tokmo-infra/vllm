@@ -2,7 +2,7 @@
 ARG BASE_IMAGE=sha256:540155b18ee763049423a616628cc1fee5e22176b3b1397775465f9067569bcf
 FROM ${BASE_IMAGE}
 COPY integrations/glm53flash/prepare_tokenizer_overlay.py /tmp/prepare_tokenizer_overlay.py
-COPY vllm/tokenizers/glm53_native_cache.py vllm/tokenizers/glm53_segment_cache_core.py /usr/local/lib/python3.12/dist-packages/vllm/tokenizers/
+COPY vllm/tokenizers/glm53_native_cache.py vllm/tokenizers/glm53_segment_cache_core.py vllm/tokenizers/glm53_shared_segment_store.py /usr/local/lib/python3.12/dist-packages/vllm/tokenizers/
 RUN uv run --no-project --python /usr/bin/python3 /tmp/prepare_tokenizer_overlay.py --output /tmp/glm-overlay && \
     cp /tmp/glm-overlay/base.py /usr/local/lib/python3.12/dist-packages/vllm/renderers/base.py && \
     cp /tmp/glm-overlay/envs.py /usr/local/lib/python3.12/dist-packages/vllm/envs.py && \

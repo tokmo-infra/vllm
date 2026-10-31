@@ -1795,7 +1795,7 @@ def test_store_recving_thread_reports_failed_block_ids():
     )
 
     assert thread.get_and_clear_finished_requests() == {"req-a"}
-    assert thread.get_and_clear_block_ids_with_load_errors() == {1, 2}
+    assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1, 2}
     assert thread.get_and_clear_block_ids_with_load_errors() == set()
 
 
@@ -1812,7 +1812,7 @@ def test_store_recving_thread_reports_failed_block_ids_after_rotation():
         )
     )
 
-    assert thread.get_and_clear_block_ids_with_load_errors() == {2}
+    assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1, 2}
 
 
 def test_store_recving_thread_reports_all_attempted_blocks_on_exception():
@@ -2365,7 +2365,37 @@ def test_recv_thread_stops_after_first_failing_disk_offload_sub_batch():
     thread._handle_request(req)
 
     assert store.batch_get_into_multi_buffers.call_count == 1
-    assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1}
+    assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1, 2}
+
+
+@pytest.mark.parametrize("failure", [[-10, 256], RuntimeError("boom")])
+@pytest.mark.parametrize("is_hma_required", [False, True])
+def test_recv_thread_later_subbatch_failure_invalidates_entire_load(
+    failure, is_hma_required
+):
+    store = MagicMock()
+    store.batch_get_into_multi_buffers.side_effect = [[256, 256], failure]
+    thread = _make_store_recving_thread(
+        store,
+        disk_offload_buffer_budget_bytes=_DISK_OFFLOAD_BUDGET_FOR_SPLIT,
+        is_hma_required=is_hma_required,
+    )
+    req = _make_load_req(
+        "req-a", [b"a0", b"a1", b"a2", b"a3", b"a4"], token_len=80
+    )
+
+    thread._handle_request(req)
+
+    # The first batch succeeded and the last was never read. Neither can be
+    # accepted as part of a complete external load after the second fails.
+    assert store.batch_get_into_multi_buffers.call_count == 2
+    assert thread.get_and_clear_finished_requests() == {"req-a"}
+    assert thread.get_and_clear_failed_requests() == (
+        {"req-a"} if is_hma_required else set()
+    )
+    assert thread.get_and_clear_block_ids_with_load_errors() == (
+        set() if is_hma_required else {0, 1, 2, 3, 4}
+    )
 
 
 def test_recv_thread_skips_split_when_budget_holds_all_keys():
@@ -2425,8 +2455,26 @@ def test_recv_thread_partial_load_failure_reports_block_ids_without_hma():
 
     thread._handle_request(_make_load_req("req-a", [b"h0", b"h1"], token_len=32))
 
-    assert thread.get_and_clear_block_ids_with_load_errors() == {0}
+    assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1}
     assert thread.get_and_clear_failed_requests() == set()
+    assert thread.get_and_clear_finished_requests() == {"req-a"}
+
+
+def test_recv_thread_failed_load_does_not_invalidate_local_prefix_blocks():
+    store = MagicMock()
+    store.batch_get_into_multi_buffers.return_value = [-1, 256]
+    thread = _make_store_recving_thread(store)
+
+    thread._handle_request(
+        _make_load_req(
+            "req-a",
+            [b"h0", b"h1", b"h2"],
+            token_len=48,
+            vllm_cached_tokens=16,
+        )
+    )
+
+    assert thread.get_and_clear_block_ids_with_load_errors() == {1, 2}
     assert thread.get_and_clear_finished_requests() == {"req-a"}
 
 

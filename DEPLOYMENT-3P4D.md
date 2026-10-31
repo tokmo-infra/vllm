@@ -4,24 +4,23 @@
 
 | 主机 | 角色 | TP / 全局DP / EP | 本地DP | API | seq/DP | batch/DP | util | CUDA Graph / 上限 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 81、83、84 | 各一个P实例 | 1 / 8 / 8 | 8 | 各4 | 32 | 2048 | 0.90 | NONE |
-| 85 | D主节点 | 1 / 32 / 32 | 8，rank 0–7 | 8 | 32 | 2048 | 0.88 | 128 |
-| 86、87、88 | D headless | 1 / 32 / 32 | 各8，起始rank 8/16/24 | 0 | 32 | 2048 | 0.88 | 128 |
+| 81、83、84 | 各一个P实例 | 1 / 8 / 8 | 8 | 各4 | 32 | 2048 | 0.95 | NONE |
+| 85 | D主节点 | 1 / 32 / 32 | 8，rank 0–7 | 8 | 32 | 2048 | 0.95 | 128 |
+| 86、87、88 | D headless | 1 / 32 / 32 | 各8，起始rank 8/16/24 | 0 | 32 | 2048 | 0.95 | 128 |
 
 | 项目 | 值 |
 | --- | --- |
-| 推理、API网关、Mooncake镜像 | sha256:243b6d0e119e007f170f3b9139fc03853045d99609183993300a184040dc4362 |
-| 外层Router镜像 | sha256:21c9cfa19e348f84a99102ab02922d5cd3a1ef6d659881cac09e9d6479c4d07b |
+| 推理、Mooncake镜像 | local/glm53flash-vllm:0.32.0，基于540155b18ee7叠加缓存/API修复 |
+| 外层Router、API网关镜像 | local/glm53flash-router:0.1.16，基于21c9cfa19e34增加API代理 |
 | 模型 / KV / MTP | GLM-5.3-Flash-NVFP4 / FP8 / 3 |
 | 上下文 / 匹配粒度 | auto，实际1048576 / 256 |
 | block-size / 实际物理页 | 64 / 8960 |
 | Attention / SSM | FLASHINFER_MLA_SPARSE_SM120 / float32 |
 | MoE / FlashInfer autotune | 原生自动选择 / 原生自动调优 |
 | P all2all / D all2all | allgather_reducescatter / deepep_v2 |
-| D DeepEP挂载 | $WORK/runtime/deep_ep_elastic.py |
-| DeepEP挂载SHA256 | 7e5775303ba98cd1a2183456a77adc28dcfee78527c422d79ea98991fe6c6b06 |
-| Tokenizer CPU预算 | 每GPU等效2GiB，含每API私有L1 64MiB；P每EP8组16GiB，D全局EP32组64GiB |
-| Tokenizer共享池 | P每API主机15.75GiB；D主节点85为63.5GiB；headless不重复建池 |
+| D DeepEP补丁 | 镜像内置，AI_INFRA_DEEPEP_V2_NUM_SMS=32，不再额外挂载elastic.py |
+| Tokenizer CPU预算 | P每GPU等效2GiB，每EP8组16GiB；D主节点85共享8GiB＋8个API各64MiB，共8.5GiB |
+| Tokenizer共享池 | P每API主机15.75GiB＋每API L1 64MiB；D主节点85共享8GiB＋每API L1 64MiB；headless不重复建池 |
 | L2 | 七台各750GiB，共5250GiB |
 | L3 | P每台1TiB，D每台3TiB，共15TiB |
 
@@ -33,8 +32,8 @@ export IP=11.5.0.$NODE
 export PROJECT=glm53flash-3p8-d32-l23-sharedcache-xinhao
 export WORK="${GLM_WORKDIR:-/data/bench/eng-xinhao/vllm-pd/glm53-flash/6000d-3p8-d32-l23-sharedcache-c718-a1024}"
 export MODEL_DIR="${GLM_MODEL_DIR:-/data/models/GLM-5.3-Flash-NVFP4}"
-export IMAGE=sha256:243b6d0e119e007f170f3b9139fc03853045d99609183993300a184040dc4362
-export ROUTER_IMAGE=sha256:21c9cfa19e348f84a99102ab02922d5cd3a1ef6d659881cac09e9d6479c4d07b
+export IMAGE=local/glm53flash-vllm:0.32.0
+export ROUTER_IMAGE=local/glm53flash-router:0.1.16
 export CACHE_PREFIX=glm53flash-mc-l23-sharedcache-c718-a1024-v1
 export ALL_HCAS=mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 export TOKEN_DIR=/dev/shm/$PROJECT/tokenizer
@@ -109,7 +108,7 @@ EXTRA_ENV=(); EXTRA_MOUNTS=(); API_ARGS=()
 case "$NODE" in
   81|83|84)
     ROLE=prefill; SUFFIX=prefill-$NODE-0; ENGINE="$PROJECT-$SUFFIX"
-    DP=8; SEQS=32; UTIL=0.90; ALL2ALL=allgather_reducescatter
+    DP=8; SEQS=32; UTIL=0.95; ALL2ALL=allgather_reducescatter
     COMPILATION='{"cudagraph_mode":"NONE"}'
     PORT=31010; RPC=18360; BOOTSTRAP=27600; NET_IF=enp3s0f0np0; P2P=PXB
     KV_HCAS=mlx5_1,mlx5_3,mlx5_5,mlx5_7
@@ -119,8 +118,8 @@ case "$NODE" in
     API_ARGS=(--api-server-count 4 --renderer-num-workers 1 --host 0.0.0.0 --port "$PORT")
     ;;
   85|86|87|88)
-    ROLE=decode; SUFFIX=decode-$NODE; ENGINE="$PROJECT-dmem088-$SUFFIX"
-    DP=32; SEQS=32; UTIL=0.88; ALL2ALL=deepep_v2
+    ROLE=decode; SUFFIX=decode-$NODE; ENGINE="$PROJECT-dmem095-$SUFFIX"
+    DP=32; SEQS=32; UTIL=0.95; ALL2ALL=deepep_v2
     COMPILATION='{"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":128}'
     PORT=31011; RPC=28360; BOOTSTRAP=28600; NET_IF=ens50np0; P2P=PIX
     KV_HCAS=mlx5_2,mlx5_3,mlx5_4,mlx5_7
@@ -128,9 +127,8 @@ case "$NODE" in
     PD_ROLE=kv_consumer; STORE_ROLE=kv_consumer; BUFFER=2147483648
     CACHE_GIB=0; SHARED_GIB=0; APIS=0
     EXTRA_ENV=(-e NCCL_GIN_TYPE=2 -e AI_INFRA_DEEPEP_V2_NUM_SMS=32 -e VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE=0)
-    EXTRA_MOUNTS=(-v "$WORK/runtime/deep_ep_elastic.py:/usr/local/lib/python3.12/dist-packages/deep_ep/buffers/elastic.py:ro")
     if [ "$NODE" = 85 ]; then
-      CACHE_GIB=2; SHARED_GIB=63.5; APIS=8
+      CACHE_GIB=4; SHARED_GIB=8; APIS=8
       API_ARGS=(--api-server-count 8 --renderer-num-workers 1 --host 0.0.0.0 --port "$PORT")
     else
       API_ARGS=(--data-parallel-start-rank "$(( (NODE-85)*8 ))" --headless)
@@ -212,7 +210,7 @@ for ((i=0;i<APIS;i++)); do SOCKETS+=(--api-socket "/run/glm-tokenizer/api-$i.soc
 docker run -d --init --name "$PROJECT-api-router-$NODE" --pull=never --network host \
   --label ai-infra.project="$PROJECT" --memory 8g --cpus 4 --pids-limit 128 \
   -e NVIDIA_VISIBLE_DEVICES=void -e OMP_NUM_THREADS=1 \
-  -v "$TOKEN_DIR:/run/glm-tokenizer:rw" --entrypoint /opt/glm-opt-venv/bin/python "$IMAGE" \
+  -v "$TOKEN_DIR:/run/glm-tokenizer:rw" --entrypoint python3 "$ROUTER_IMAGE" \
   /opt/glm-cache-repair/glm_api_cache_router.py --port "$PORT" \
   --control-url "http://127.0.0.1:$CONTROL" \
   --shared-cache-path /run/glm-tokenizer/segments.sqlite3 "${SOCKETS[@]}"
@@ -264,3 +262,17 @@ docker run -d --init --name "$PROJECT-router-81" --pull=never --network host \
 | 83、84 | mooncake-store-{NODE}.sh、prefill-{NODE}-0.sh、api-router-{NODE}.sh |
 | 85 | mooncake-store-85.sh、decode-85.sh、api-router-85.sh |
 | 86、87、88 | mooncake-store-{NODE}.sh、decode-{NODE}.sh |
+
+## 镜像构建
+
+vLLM仓库根目录：
+
+~~~bash
+docker build --network none -f integrations/glm53flash/Dockerfile.cache-repair -t local/glm53flash-vllm:0.32.0 .
+~~~
+
+Router仓库根目录：
+
+~~~bash
+docker build --network none -f Dockerfile.glm53flash-cache-repair -t local/glm53flash-router:0.1.16 .
+~~~

@@ -255,6 +255,7 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+        self.kv_load_recompute_req_ids: set[str] = set()
 
         # Grammar compilation failures to finish as per-request errors in
         # update_from_output.
@@ -1108,6 +1109,8 @@ class Scheduler(SchedulerInterface):
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
+                    if request.request_id in self.kv_load_recompute_req_ids:
+                        request.prefix_cache_hit_limit = 0
                     if request.resumable and self.num_hash_lookahead_tokens:
                         # Resident KV can retain a discarded streaming token's
                         # hash. Recomputing KV must use the current token sequence.
@@ -1127,7 +1130,10 @@ class Scheduler(SchedulerInterface):
                     ) = self._get_local_prefix_cache_hit(request, max_cache_hit_length)
 
                     # Get externally-cached tokens if using a KVConnector.
-                    if self.connector is not None:
+                    if (
+                        self.connector is not None
+                        and request.request_id not in self.kv_load_recompute_req_ids
+                    ):
                         # Present a block-aligned local hit to the connector so
                         # a strictly longer remote hit can supersede a local
                         # sub-block tail without racing its copy-on-write.
@@ -1912,6 +1918,8 @@ class Scheduler(SchedulerInterface):
         session.arrival_time = update.arrival_time
         session.sampling_params = update.sampling_params
         session.prefix_cache_hit_limit = session.get_prefix_cache_hit_limit()
+        if session.request_id in self.kv_load_recompute_req_ids:
+            session.prefix_cache_hit_limit = 0
         session.max_tokens = update.max_tokens
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
             self.num_waiting_for_streaming_input -= 1
@@ -3062,6 +3070,7 @@ class Scheduler(SchedulerInterface):
     def _free_blocks(self, request: Request):
         assert request.is_finished()
         self._free_request_blocks(request)
+        self.kv_load_recompute_req_ids.discard(request.request_id)
         del self.requests[request.request_id]
 
     @property
@@ -3695,6 +3704,8 @@ class Scheduler(SchedulerInterface):
                 affected_req_ids.add(req_id)
                 if self.recompute_kv_load_failures:
                     request.num_computed_tokens = 0
+                    request.prefix_cache_hit_limit = 0
+                    self.kv_load_recompute_req_ids.add(req_id)
                     self.failed_recving_kv_req_ids.add(req_id)
         return set() if self.recompute_kv_load_failures else affected_req_ids
 
@@ -3750,6 +3761,13 @@ class Scheduler(SchedulerInterface):
 
         if not total_failed_requests:
             return set()
+
+        if self.recompute_kv_load_failures:
+            for req_id in async_failed_req_ids | sync_failed_req_ids:
+                request = self.requests.get(req_id)
+                if request is not None:
+                    request.prefix_cache_hit_limit = 0
+                    self.kv_load_recompute_req_ids.add(req_id)
 
         # evict invalid blocks and downstream dependent blocks from cache
         # only when not using recompute policy (where blocks will be recomputed

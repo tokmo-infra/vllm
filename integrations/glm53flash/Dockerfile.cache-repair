@@ -1,0 +1,19 @@
+# Stack the audited CPU/API/Store repairs on the supplied native inference image.
+FROM sha256:540155b18ee763049423a616628cc1fee5e22176b3b1397775465f9067569bcf
+COPY integrations/glm53flash/prepare_tokenizer_overlay.py /tmp/prepare_tokenizer_overlay.py
+RUN /opt/glm-opt-venv/bin/python /tmp/prepare_tokenizer_overlay.py --output /tmp/glm-overlay && \
+    cp /tmp/glm-overlay/base.py /usr/local/lib/python3.12/dist-packages/vllm/renderers/base.py && \
+    cp /tmp/glm-overlay/envs.py /usr/local/lib/python3.12/dist-packages/vllm/envs.py && \
+    cp /tmp/glm-overlay/backend.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backend.py && \
+    rm -rf /tmp/glm-overlay /tmp/prepare_tokenizer_overlay.py
+COPY vllm/tokenizers/glm53_native_cache.py vllm/tokenizers/glm53_segment_cache_core.py vllm/tokenizers/glm53_shared_segment_store.py /usr/local/lib/python3.12/dist-packages/vllm/tokenizers/
+COPY vllm/entrypoints/launchers/api_affinity_listener.py /usr/local/lib/python3.12/dist-packages/vllm/entrypoints/launchers/
+COPY vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/placement.py /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/
+COPY integrations/glm53flash/glm_api_cache_router.py /opt/glm-cache-repair/glm_api_cache_router.py
+COPY integrations/glm53flash/patches/vllm-cache-repair-runtime.patch /opt/glm53flash-cache-repair.patch
+RUN cd /usr/local/lib/python3.12/dist-packages && \
+    patch --batch --fuzz=0 -p1 < /opt/glm53flash-cache-repair.patch && \
+    /opt/glm-opt-venv/bin/python -m compileall -q vllm/tokenizers/glm53_native_cache.py vllm/tokenizers/glm53_segment_cache_core.py vllm/tokenizers/glm53_shared_segment_store.py vllm/entrypoints/launchers/launcher.py vllm/entrypoints/launchers/api_affinity_listener.py vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/placement.py vllm/v1/core/sched/scheduler.py deep_ep/buffers/elastic.py /opt/glm-cache-repair/glm_api_cache_router.py
+COPY integrations/glm53flash/cache-repair-manifest.json /opt/glm53flash-cache-repair-manifest.json
+LABEL glm.cache-repair="shared-exact-tokenizer; API-affinity; remote-read-cap; weighted-owner; full-request-recompute" \
+      glm.base="540155b18ee7" glm.deepep="optional explicit SM budget; native kernels unchanged"

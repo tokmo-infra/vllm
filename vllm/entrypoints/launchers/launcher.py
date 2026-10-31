@@ -3,10 +3,12 @@
 
 import asyncio
 import contextlib
+import os
 import signal
 import socket
 from collections.abc import Generator, MutableSequence
 from functools import partial
+from pathlib import Path
 from typing import Any
 
 import uvicorn
@@ -22,6 +24,7 @@ from vllm.entrypoints.common.startup import (
     log_non_default_args,
     log_version_and_model,
 )
+from vllm.entrypoints.launchers.api_affinity_listener import create_private_listener
 from vllm.entrypoints.launchers.utils.ssl import SSLCertRefresher
 from vllm.logger import init_logger
 from vllm.tracing import instrument
@@ -93,20 +96,26 @@ class NoSignalServer(uvicorn.Server):
         for sock in sockets:
             sock.listen(self.config.backlog)
             sock.setblocking(False)
-            self._track(self._accept(sock))
+            self._track(
+                self._accept(
+                    sock,
+                    balance=sock.fileno()
+                    != getattr(self, "_private_listener_fileno", -1),
+                )
+            )
 
     def _track(self, coro) -> None:
         task = asyncio.create_task(coro)
         self._accept_tasks.add(task)
         task.add_done_callback(self._accept_tasks.discard)
 
-    async def _accept(self, sock: socket.socket) -> None:
+    async def _accept(self, sock: socket.socket, balance: bool = True) -> None:
         loop = asyncio.get_running_loop()
         while True:
             await _readable(loop, sock)
             # Connections closed since the last accept; peers refresh likewise.
             self._publish_load()
-            for _ in range(_ACCEPT_DEFER_CHECKS):
+            for _ in range(_ACCEPT_DEFER_CHECKS if balance else 0):
                 if self._least_loaded():
                     break
                 await asyncio.sleep(0.001)
@@ -235,7 +244,54 @@ async def serve_http(
         if engine_client is not None
         else None
     )
-    server_task = loop.create_task(server.serve(sockets=[sock] if sock else None))
+    private_sock = None
+    private_path = None
+    private_inode = None
+    if os.environ.get("VLLM_API_PRIVATE_PORT_BASE") or os.environ.get(
+        "VLLM_API_PRIVATE_SOCKET_DIR"
+    ):
+        if peer_loads is None or sock is None:
+            if watchdog_task is not None:
+                watchdog_task.cancel()
+            raise ValueError(
+                "API private listeners require a shared socket and "
+                "multi-API process identity"
+            )
+        _, api_index = peer_loads
+        try:
+            private_sock = create_private_listener(api_index, len(peer_loads[0]))
+        except BaseException:
+            if watchdog_task is not None:
+                watchdog_task.cancel()
+            raise
+        server._private_listener_fileno = private_sock.fileno()
+        if private_sock.family == socket.AF_UNIX:
+            private_path = Path(private_sock.getsockname())
+            private_inode = private_path.stat()
+            private_port = None
+        else:
+            private_port = private_sock.getsockname()[1]
+
+        async def api_process_identity():
+            return {
+                "api_process": api_index,
+                "private_port": private_port,
+                "private_socket": str(private_path) if private_path else None,
+                "pid": os.getpid(),
+            }
+
+        app.add_api_route(
+            "/internal/api-process", api_process_identity, methods=["GET"]
+        )
+        logger.info(
+            "API process %d private listener: %s",
+            api_index,
+            private_path or private_port,
+        )
+    sockets = [sock] if sock else []
+    if private_sock is not None:
+        sockets.append(private_sock)
+    server_task = loop.create_task(server.serve(sockets=sockets or None))
 
     ssl_cert_refresher = (
         None
@@ -304,6 +360,18 @@ async def serve_http(
         logger.info_once("[shutdown] API server: shutting down FastAPI HTTP server")
         return server.shutdown()
     finally:
+        if private_sock is not None:
+            private_sock.close()
+        if private_path is not None:
+            try:
+                current = private_path.stat()
+                if (current.st_dev, current.st_ino) == (
+                    private_inode.st_dev,
+                    private_inode.st_ino,
+                ):
+                    private_path.unlink()
+            except FileNotFoundError:
+                pass
         if shutdown_task is not None:
             shutdown_task.cancel()
         if watchdog_task is not None:

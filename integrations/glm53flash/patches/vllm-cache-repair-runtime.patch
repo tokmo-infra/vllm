@@ -1,0 +1,294 @@
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+@@ -71,6 +71,9 @@
+     encode_lookup_response,
+ )
+ from vllm.distributed.mooncake_store import MooncakeStoreConfig, setup_mooncake_store
++from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.placement import (
++    normalize_placement_segments, put_with_placement,
++)
+ from vllm.logger import init_logger
+ from vllm.utils.math_utils import cdiv
+ from vllm.utils.network_utils import get_ip, make_zmq_socket
+@@ -446,6 +449,7 @@
+         supports_group_ids: bool = False,
+         record_operation: Callable[..., None] | None = None,
+         group_participates: Sequence[bool] | None = None,
++        placement_segments: tuple[tuple[str, int], ...] = (),
+     ):
+         super().__init__(
+             store,
+@@ -479,6 +483,7 @@
+         # Caller always passes a non-None ReplicateConfig — see
+         # MooncakeStoreWorker.__init__ where store_replicate_config is built.
+         self.replicate_config = replicate_config
++        self.placement_segments = placement_segments
+         self.enable_group_semantics = enable_group_semantics
+         self.supports_group_ids = supports_group_ids
+ 
+@@ -708,8 +713,9 @@
+         batch_bytes = _sum_batch_bytes(sizes)
+         put_start = time.perf_counter()
+         try:
+-            res = self.store.batch_put_from_multi_buffers(
+-                keys, addrs, sizes, self.replicate_config
++            res = put_with_placement(
++                self.store, keys, addrs, sizes, self.replicate_config,
++                self.placement_segments, group_ids,
+             )
+         except Exception as e:
+             self._record_operation(
+@@ -957,11 +963,9 @@
+             batch_bytes = _sum_batch_bytes(sizes)
+             put_start = time.perf_counter()
+             try:
+-                res = self.store.batch_put_from_multi_buffers(
+-                    keys,
+-                    addrs,
+-                    sizes,
+-                    self.replicate_config,
++                res = put_with_placement(
++                    self.store, keys, addrs, sizes, self.replicate_config,
++                    self.placement_segments, group_ids,
+                 )
+             except Exception as e:
+                 self._record_operation(
+@@ -1358,9 +1362,9 @@
+                         if value < 0
+                     ]
+                 if failed:
+-                    self._report_load_error(
+-                        req_id, [block_id for _, _, block_id in failed]
+-                    )
++                    # Later sub-batches were not loaded. Never expose a
++                    # partially written request as a complete cache hit.
++                    self._report_load_error(req_id, block_id_list_c)
+                     logger.warning(
+                         "Failed to get %d Mooncake keys from sub-batch "
+                         "(batch_keys=%d, first_failures=%s)",
+@@ -1370,7 +1374,7 @@
+                     )
+                     break
+         except Exception as e:
+-            self._report_load_error(req_id, current_batch_block_ids)
++            self._report_load_error(req_id, block_id_list_c)
+             if not load_get_recorded:
+                 self._record_operation(
+                     "load_get",
+@@ -1553,10 +1557,25 @@
+                 "may exceed the owner DirectIO budget."
+             )
+ 
++        # Remote stores can own SSDs even when this GPU-side client does not.
++        # This is a per-reader batch cap, not the aggregate owner pool size.
++        remote_budget = extra_config.get("remote_store_read_batch_bytes")
++        if remote_budget is not None and (
++            type(remote_budget) is not int or remote_budget <= 0
++        ):
++            raise ValueError("remote_store_read_batch_bytes must be a positive integer")
+         self.disk_offload_buffer_budget_bytes = (
+-            DEFAULT_MOONCAKE_DISK_STAGING_BUFFER_BYTES
+-            if store_config.enable_offload
+-            else None
++            remote_budget if remote_budget is not None else (
++                DEFAULT_MOONCAKE_DISK_STAGING_BUFFER_BYTES
++                if store_config.enable_offload else None
++            )
++        )
++        self.placement_segments = normalize_placement_segments(
++            extra_config.get("placement_segments", {})
++        )
++        logger.info(
++            "Mooncake remote read batch cap=%s; weighted placement=%s",
++            self.disk_offload_buffer_budget_bytes, self.placement_segments,
+         )
+ 
+         # Start lookup server on rank 0 for scheduler-side prefix queries
+@@ -2064,6 +2083,7 @@
+                 ready_event_sending,
+                 self.enable_kv_events,
+                 self.store_replicate_config,
++                placement_segments=self.placement_segments,
+                 enable_group_semantics=self.enable_group_semantics,
+                 supports_group_ids=self._supports_group_ids,
+                 record_operation=self._record_kv_connector_operation,
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -967,7 +967,10 @@
+                     ) = self._get_local_prefix_cache_hit(request)
+ 
+                     # Get externally-cached tokens if using a KVConnector.
+-                    if self.connector is not None:
++                    if (
++                        self.connector is not None
++                        and not request.skip_reading_prefix_cache
++                    ):
+                         # Present a block-aligned local hit to the connector so
+                         # a strictly longer remote hit can supersede a local
+                         # sub-block tail without racing its copy-on-write.
+@@ -3350,7 +3353,15 @@
+                 affected_req_ids.add(req_id)
+                 if self.recompute_kv_load_failures:
+                     request.num_computed_tokens = 0
++                    # A new lookup can return the same unreadable object. Keep
++                    # this request on local recomputation for its remaining
++                    # lifetime instead of entering an unbounded load loop.
++                    request.skip_reading_prefix_cache = True
+                     self.failed_recving_kv_req_ids.add(req_id)
++                    logger.warning(
++                        "Discarded incomplete hybrid KV load for %s; "
++                        "recomputing with cache reads disabled", req_id,
++                    )
+         return set() if self.recompute_kv_load_failures else affected_req_ids
+ 
+     def _handle_invalid_blocks(
+@@ -3406,6 +3417,12 @@
+         if not total_failed_requests:
+             return set()
+ 
++        if self.recompute_kv_load_failures:
++            for req_id in async_failed_req_ids | sync_failed_req_ids:
++                request = self.requests.get(req_id)
++                if request is not None:
++                    request.skip_reading_prefix_cache = True
++
+         # evict invalid blocks and downstream dependent blocks from cache
+         # only when not using recompute policy (where blocks will be recomputed
+         # and reused by other requests sharing them)
+--- a/vllm/entrypoints/launchers/launcher.py
++++ b/vllm/entrypoints/launchers/launcher.py
+@@ -3,8 +3,10 @@
+ 
+ import asyncio
+ import contextlib
++import os
+ import signal
+ import socket
++from pathlib import Path
+ from collections.abc import Generator, MutableSequence
+ from functools import partial
+ from typing import Any
+@@ -31,6 +33,7 @@
+     H11_MAX_HEADER_COUNT_DEFAULT,
+     H11_MAX_INCOMPLETE_EVENT_SIZE_DEFAULT,
+ )
++from .api_affinity_listener import create_private_listener
+ 
+ logger = init_logger(__name__)
+ 
+@@ -91,20 +94,23 @@
+         for sock in sockets:
+             sock.listen(self.config.backlog)
+             sock.setblocking(False)
+-            self._track(self._accept(sock))
++            shared_listener = sock.fileno() != getattr(
++                self, "_private_listener_fileno", -1
++            )
++            self._track(self._accept(sock, balance=shared_listener))
+ 
+     def _track(self, coro) -> None:
+         task = asyncio.create_task(coro)
+         self._accept_tasks.add(task)
+         task.add_done_callback(self._accept_tasks.discard)
+ 
+-    async def _accept(self, sock: socket.socket) -> None:
++    async def _accept(self, sock: socket.socket, balance: bool = True) -> None:
+         loop = asyncio.get_running_loop()
+         while True:
+             await _readable(loop, sock)
+             # Connections closed since the last accept; peers refresh likewise.
+             self._publish_load()
+-            for _ in range(_ACCEPT_DEFER_CHECKS):
++            for _ in range(_ACCEPT_DEFER_CHECKS if balance else 0):
+                 if self._least_loaded():
+                     break
+                 await asyncio.sleep(0.001)
+@@ -233,7 +239,47 @@
+         if engine_client is not None
+         else None
+     )
+-    server_task = loop.create_task(server.serve(sockets=[sock] if sock else None))
++    private_sock = None
++    private_path = None
++    private_inode = None
++    if (os.environ.get("VLLM_API_PRIVATE_PORT_BASE")
++            or os.environ.get("VLLM_API_PRIVATE_SOCKET_DIR")):
++        if peer_loads is None or sock is None:
++            if watchdog_task is not None:
++                watchdog_task.cancel()
++            raise ValueError("API private listeners require a shared socket and multi-API process identity")
++        _, api_index = peer_loads
++        try:
++            private_sock = create_private_listener(api_index, len(peer_loads[0]))
++        except BaseException:
++            if watchdog_task is not None:
++                watchdog_task.cancel()
++            raise
++        server._private_listener_fileno = private_sock.fileno()
++        if private_sock.family == socket.AF_UNIX:
++            private_path = Path(private_sock.getsockname())
++            private_inode = private_path.stat()
++            private_port = None
++        else:
++            private_port = private_sock.getsockname()[1]
++
++        async def api_process_identity():
++            return {
++                "api_process": api_index,
++                "private_port": private_port,
++                "private_socket": str(private_path) if private_path else None,
++                "pid": os.getpid(),
++            }
++
++        app.add_api_route(
++            "/internal/api-process", api_process_identity, methods=["GET"]
++        )
++        logger.info("API process %d private listener: %s", api_index,
++                    private_path or private_port)
++    sockets = [sock] if sock else []
++    if private_sock is not None:
++        sockets.append(private_sock)
++    server_task = loop.create_task(server.serve(sockets=sockets or None))
+ 
+     ssl_cert_refresher = (
+         None
+@@ -304,6 +350,17 @@
+         logger.info_once("[shutdown] API server: shutting down FastAPI HTTP server")
+         return server.shutdown()
+     finally:
++        if private_sock is not None:
++            private_sock.close()
++        if private_path is not None:
++            try:
++                current = private_path.stat()
++                if (current.st_dev, current.st_ino) == (
++                    private_inode.st_dev, private_inode.st_ino
++                ):
++                    private_path.unlink()
++            except FileNotFoundError:
++                pass
+         shutdown_task.cancel()
+         if watchdog_task is not None:
+             watchdog_task.cancel()
+--- a/deep_ep/buffers/elastic.py
++++ b/deep_ep/buffers/elastic.py
+@@ -608,6 +608,19 @@
+         # For V3.0's group-limited gate, please do not use this function
+         # TODO: support this
+         assert num_scaleout_topk == 0
++
++        # Deployment override for PCIe-only machines whose bandwidth probes
++        # cannot provide the NVLink/RDMA estimates required by this heuristic.
++        explicit_sms = os.environ.get('AI_INFRA_DEEPEP_V2_NUM_SMS')
++        if explicit_sms is not None:
++            requested_sms = int(explicit_sms)
++            device_sms = torch.cuda.get_device_properties('cuda').multi_processor_count
++            if requested_sms < 4 or requested_sms % 2 or requested_sms > device_sms:
++                raise ValueError(
++                    'AI_INFRA_DEEPEP_V2_NUM_SMS must be even, at least 4, '
++                    'and no greater than the device SM count'
++                )
++            return requested_sms
+ 
+         # Get bandwidth
+         if rdma_gbs == 0 and self.num_rdma_ranks > 1:

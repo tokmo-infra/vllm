@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Opt-in exact GLM5.3 CPU cache in the native renderer, one budget per API process."""
+"""Exact GLM5.3 native CPU tokenization with optional shared segment storage."""
 
 import asyncio
 import functools
@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import threading
 import time
 from contextlib import suppress
 from pathlib import Path
@@ -18,6 +19,7 @@ from prometheus_client import REGISTRY, Counter, Gauge, Histogram
 from tokenizers import Tokenizer
 
 from vllm.tokenizers.glm53_segment_cache_core import SegmentCache
+from vllm.tokenizers.glm53_shared_segment_store import SharedSegmentStore
 
 LOGGER = logging.getLogger(__name__)
 EXPECTED_TOKENIZER_SHA256 = (
@@ -47,6 +49,11 @@ LIMIT = Gauge(
 EVICTIONS = Counter(
     "vllm:tokenizer_cache_evictions", "Native segment cache evictions", LABELS
 )
+SHARED = Counter(
+    "vllm:tokenizer_shared_cache_operations",
+    "Shared exact segment backend operations; errors fall back to native encoding",
+    LABELS + ["outcome"],
+)
 TIMING = Histogram(
     "vllm:frontend_stage_seconds",
     "Native frontend stage wall time; stages overlap",
@@ -74,12 +81,34 @@ class NativeCache:
         backend = Tokenizer.from_str(tokenizer.backend_tokenizer.to_str())
         if json.loads(backend.to_str())["model"].get("dropout") not in (None, 0):
             raise ValueError("Tokenizer cache requires deterministic BPE encoding")
-        self.cache = SegmentCache(
-            SimpleNamespace(backend_tokenizer=backend), None, int(gib * 1024**3)
-        )
         self.rank = str(rank)
         self.epoch_path = os.environ.get("VLLM_GLM53_TOKENIZER_CACHE_EPOCH_FILE", "")
         self.epoch = self._epoch()
+        shared_path = os.environ.get("VLLM_GLM53_TOKENIZER_SHARED_PATH", "")
+        shared_store = None
+        local_bytes = int(gib * 1024**3)
+        if shared_path:
+            shared_gib = float(os.environ.get("VLLM_GLM53_TOKENIZER_SHARED_GIB", "8"))
+            local_mib = float(os.environ.get("VLLM_GLM53_TOKENIZER_LOCAL_L1_MIB", "64"))
+            if not math.isfinite(shared_gib) or shared_gib <= 0:
+                raise ValueError("Shared tokenizer budget must be finite and positive")
+            if not math.isfinite(local_mib) or local_mib < 0:
+                raise ValueError(
+                    "Local tokenizer budget must be finite and nonnegative"
+                )
+            shared_store = SharedSegmentStore(
+                shared_path, int(shared_gib * 1024**3), EXPECTED_TOKENIZER_SHA256
+            )
+            local_bytes = min(local_bytes, int(local_mib * 1024**2))
+        self.cache = SegmentCache(
+            SimpleNamespace(backend_tokenizer=backend),
+            None,
+            local_bytes,
+            shared_store=shared_store,
+            generation=self.epoch or "",
+        )
+        self.last_shared_counts = {}
+        self.metrics_lock = threading.Lock()
         self.last_evictions = 0
         self.metrics_registered = False
         LIMIT.labels(self.rank).set(self.cache.max_bytes)
@@ -107,6 +136,7 @@ class NativeCache:
                 SIZE,
                 LIMIT,
                 EVICTIONS,
+                SHARED,
                 TIMING,
                 ENABLED,
                 ACTIVE,
@@ -117,12 +147,14 @@ class NativeCache:
         started = time.monotonic()
         if queued_at is not None:
             TIMING.labels(self.rank, "tokenize_queue").observe(started - queued_at)
-        epoch = self._epoch()
-        if epoch != self.epoch:
-            self.cache.reset()
-            self.last_evictions = 0
-            self.epoch = epoch
-            SIZE.labels(self.rank).set(0)
+        with self.metrics_lock:
+            epoch = self._epoch()
+            if epoch != self.epoch:
+                self.cache.reset(generation=epoch or "")
+                self.last_evictions = 0
+                self.last_shared_counts.clear()
+                self.epoch = epoch
+                SIZE.labels(self.rank).set(0)
         # Keep offsets, multimodal, BOS/EOS and unsupported encoding options on
         # the original tokenizer path. Post-tokenization remains fully native.
         safe = (
@@ -141,11 +173,20 @@ class NativeCache:
         TIMING.labels(self.rank, "cache_encode").observe(time.monotonic() - started)
         for source in ("reused_tokens", "encoded_tokens", "special_tokens"):
             TOKENS.labels(self.rank, source).inc(counts[source])
-        state = self.cache.snapshot()
-        SIZE.labels(self.rank).set(state["cache_bytes"])
-        evicted = state.get("evictions", 0)
-        EVICTIONS.labels(self.rank).inc(evicted - self.last_evictions)
-        self.last_evictions = evicted
+        # Several tokenizer executor threads may complete out of order. Read
+        # cumulative counters inside the same lock as the published baseline.
+        with self.metrics_lock:
+            state = self.cache.snapshot()
+            SIZE.labels(self.rank).set(state["cache_bytes"])
+            evicted = state.get("evictions", 0)
+            EVICTIONS.labels(self.rank).inc(evicted - self.last_evictions)
+            self.last_evictions = evicted
+            for name in ("shared_hits", "shared_misses", "shared_errors"):
+                value = state.get(name, 0)
+                SHARED.labels(self.rank, name).inc(
+                    value - self.last_shared_counts.get(name, 0)
+                )
+                self.last_shared_counts[name] = value
         # If truncation could change the result, use the original implementation
         # (including its truncation_side semantics), not a hand-written slice.
         if kwargs.get("truncation") and len(ids) > kwargs["max_length"]:
