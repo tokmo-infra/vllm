@@ -288,6 +288,18 @@ P/D 模型容器使用该候选镜像，并增加以下环境变量及启动参�
 -e AI_INFRA_DEEPEP_V2_NUM_SMS=32
 -e VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE=0
 -e NCCL_GIN_TYPE=2
+-e NCCL_P2P_DISABLE=0
+-e NCCL_P2P_LEVEL=PIX
+-e NCCL_SHM_DISABLE=1
+-e NCCL_NET=IB
 
 --all2all-backend deepep_v2
 ~~~
+
+85/86/87 对照组的 NCCL HCA：
+
+| 实例 | NCCL_IB_HCA |
+| --- | --- |
+| P85 GPU0—3 | =mlx5_0:1,mlx5_1:1 |
+| P85 GPU4—7 | =mlx5_5:1,mlx5_6:1 |
+| D86、D87 GPU0—7 | =mlx5_0:1,mlx5_1:1,mlx5_5:1,mlx5_6:1 |

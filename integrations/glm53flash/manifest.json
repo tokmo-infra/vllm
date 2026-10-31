@@ -367,7 +367,11 @@
       "environment": {
         "AI_INFRA_DEEPEP_V2_NUM_SMS": "32",
         "VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE": "0",
-        "NCCL_GIN_TYPE": "2"
+        "NCCL_GIN_TYPE": "2",
+        "NCCL_P2P_DISABLE": "0",
+        "NCCL_P2P_LEVEL": "PIX",
+        "NCCL_SHM_DISABLE": "1",
+        "NCCL_NET": "IB"
       },
       "all2all_backend": "deepep_v2",
       "default_enabled": false
