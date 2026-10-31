@@ -61,10 +61,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.lease import ( 
     LEASE_EXPIRED,
     retry_expired_get_once,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.placement import (  # noqa: E501
-    normalize_placement_segments,
-    put_with_placement,
-)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.protocol import (  # noqa: E501
     LOOKUP_MSG,
     RESET_MSG,
@@ -421,7 +417,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
         supports_group_ids: bool = False,
         record_operation: Callable[..., None] | None = None,
         group_participates: Sequence[bool] | None = None,
-        placement_segments: tuple[tuple[str, int], ...] = (),
     ):
         super().__init__(
             store,
@@ -455,7 +450,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # Caller always passes a non-None ReplicateConfig — see
         # MooncakeStoreWorker.__init__ where store_replicate_config is built.
         self.replicate_config = replicate_config
-        self.placement_segments = placement_segments
         self.enable_group_semantics = enable_group_semantics
         self.supports_group_ids = supports_group_ids
 
@@ -685,14 +679,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         batch_bytes = _sum_batch_bytes(sizes)
         put_start = time.perf_counter()
         try:
-            res = put_with_placement(
-                self.store,
-                keys,
-                addrs,
-                sizes,
-                self.replicate_config,
-                self.placement_segments,
-                group_ids,
+            res = self.store.batch_put_from_multi_buffers(
+                keys, addrs, sizes, self.replicate_config
             )
         except Exception as e:
             self._record_operation(
@@ -940,14 +928,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
             batch_bytes = _sum_batch_bytes(sizes)
             put_start = time.perf_counter()
             try:
-                res = put_with_placement(
-                    self.store,
+                res = self.store.batch_put_from_multi_buffers(
                     keys,
                     addrs,
                     sizes,
                     self.replicate_config,
-                    self.placement_segments,
-                    group_ids,
                 )
             except Exception as e:
                 self._record_operation(
@@ -1260,6 +1245,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     block_id_offset = next_block_id_offset
 
         current_batch_keys: list[str] = key_list_c
+        current_batch_block_ids: list[int] = block_id_list_c
         batch_bytes = 0
         load_get_recorded = False
         try:
@@ -1270,6 +1256,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 batch_block_ids,
             ) in load_batches:
                 current_batch_keys = batch_keys
+                current_batch_block_ids = batch_block_ids
                 load_get_recorded = False
                 batch_bytes = _sum_batch_bytes(batch_sizes)
                 tiers_by_key: dict[str, str] | None = None
@@ -1342,7 +1329,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                         if value < 0
                     ]
                 if failed:
-                    self._report_load_error(req_id, block_id_list_c)
+                    self._report_load_error(
+                        req_id, [block_id for _, _, block_id in failed]
+                    )
                     logger.warning(
                         "Failed to get %d Mooncake keys from sub-batch "
                         "(batch_keys=%d, first_failures=%s)",
@@ -1352,7 +1341,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     )
                     break
         except Exception as e:
-            self._report_load_error(req_id, block_id_list_c)
+            self._report_load_error(req_id, current_batch_block_ids)
             if not load_get_recorded:
                 self._record_operation(
                     "load_get",
@@ -1531,27 +1520,10 @@ class MooncakeStoreWorker:
                 "may exceed the owner DirectIO budget."
             )
 
-        remote_budget = extra_config.get("remote_store_read_batch_bytes")
-        if remote_budget is not None and (
-            type(remote_budget) is not int or remote_budget <= 0
-        ):
-            raise ValueError("remote_store_read_batch_bytes must be a positive integer")
         self.disk_offload_buffer_budget_bytes = (
-            remote_budget
-            if remote_budget is not None
-            else (
-                DEFAULT_MOONCAKE_DISK_STAGING_BUFFER_BYTES
-                if store_config.enable_offload
-                else None
-            )
-        )
-        self.placement_segments = normalize_placement_segments(
-            extra_config.get("placement_segments", {})
-        )
-        logger.info(
-            "Mooncake remote read batch cap=%s; weighted placement=%s",
-            self.disk_offload_buffer_budget_bytes,
-            self.placement_segments,
+            DEFAULT_MOONCAKE_DISK_STAGING_BUFFER_BYTES
+            if store_config.enable_offload
+            else None
         )
 
         # Start lookup server on rank 0 for scheduler-side prefix queries
@@ -1979,7 +1951,6 @@ class MooncakeStoreWorker:
                 ready_event_sending,
                 self.enable_kv_events,
                 self.store_replicate_config,
-                placement_segments=self.placement_segments,
                 enable_group_semantics=self.enable_group_semantics,
                 supports_group_ids=self._supports_group_ids,
                 record_operation=self._record_kv_connector_operation,
