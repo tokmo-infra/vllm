@@ -5,8 +5,8 @@
 | 主机 | 角色 | TP / 全局DP / EP | 本地DP | API | seq/DP | batch/DP | util | graph上限 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | 81、83、84 | 各一个P实例 | 1 / 8 / 8 | 8 | 各4 | 64 | 2048 | 0.90 | 256 |
-| 85 | D主节点 | 1 / 32 / 32 | 8，rank 0–7 | 8 | 128 | 2048 | 0.88 | 128 |
-| 86、87、88 | D headless | 1 / 32 / 32 | 各8，起始rank 8/16/24 | 0 | 128 | 2048 | 0.88 | 128 |
+| 85 | D主节点 | 1 / 32 / 32 | 8，rank 0–7 | 8 | 32 | 2048 | 0.88 | 128 |
+| 86、87、88 | D headless | 1 / 32 / 32 | 各8，起始rank 8/16/24 | 0 | 32 | 2048 | 0.88 | 128 |
 
 | 项目 | 值 |
 | --- | --- |
@@ -119,7 +119,7 @@ case "$NODE" in
     ;;
   85|86|87|88)
     ROLE=decode; SUFFIX=decode-$NODE; ENGINE="$PROJECT-dmem088-$SUFFIX"
-    DP=32; SEQS=128; UTIL=0.88; GRAPH=128; ALL2ALL=deepep_v2
+    DP=32; SEQS=32; UTIL=0.88; GRAPH=128; ALL2ALL=deepep_v2
     PORT=31011; RPC=28360; BOOTSTRAP=28600; NET_IF=ens50np0; P2P=PIX
     KV_HCAS=mlx5_2,mlx5_3,mlx5_4,mlx5_7
     EP_HCAS='=mlx5_0:1,mlx5_1:1,mlx5_5:1,mlx5_6:1'
@@ -218,11 +218,11 @@ docker run -d --init --name "$PROJECT-api-router-$NODE" --pull=never --network h
 
 ## 外层Router：81
 
-配置中的KV容量为本次server_info快照；原router.sh启动时从各网关server_info读取。
+配置中的KV容量为原server_info快照；原router.sh启动时从各网关server_info读取。max_seqs按本文件目标配置填写。
 
 ~~~bash
 cat > "$WORK/config/router-token-balance.json" <<'JSON'
-{"tokenizer_path":"/model/tokenizer.json","kv_fraction":0.85,"workers":{"http://11.5.0.81:32110":{"kv_tokens":3957034,"max_seqs":64},"http://11.5.0.83:32110":{"kv_tokens":3957034,"max_seqs":64},"http://11.5.0.84:32110":{"kv_tokens":3957034,"max_seqs":64},"http://11.5.0.85:32111":{"kv_tokens":4094804,"max_seqs":128}}}
+{"tokenizer_path":"/model/tokenizer.json","kv_fraction":0.85,"workers":{"http://11.5.0.81:32110":{"kv_tokens":3957034,"max_seqs":64},"http://11.5.0.83:32110":{"kv_tokens":3957034,"max_seqs":64},"http://11.5.0.84:32110":{"kv_tokens":3957034,"max_seqs":64},"http://11.5.0.85:32111":{"kv_tokens":4094804,"max_seqs":32}}}
 JSON
 docker run -d --init --name "$PROJECT-router-81" --pull=never --network host \
   --log-opt max-size=128m --log-opt max-file=5 --label ai-infra.project="$PROJECT" \
