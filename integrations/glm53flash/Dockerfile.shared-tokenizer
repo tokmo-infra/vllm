@@ -1,0 +1,4 @@
+ARG BASE_IMAGE=sha256:bd6c77d709b8225ebf7b4a9a3890509a4e2df87af846fcc7230b65a7a57d16f7
+FROM ${BASE_IMAGE}
+COPY vllm/tokenizers/glm53_native_cache.py vllm/tokenizers/glm53_segment_cache_core.py vllm/tokenizers/glm53_shared_segment_store.py /usr/local/lib/python3.12/dist-packages/vllm/tokenizers/
+LABEL glm.tokenizer="optional same-host exact shared pool plus private L1"

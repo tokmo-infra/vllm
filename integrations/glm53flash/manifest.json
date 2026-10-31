@@ -375,6 +375,37 @@
       },
       "all2all_backend": "deepep_v2",
       "default_enabled": false
+    },
+    "tokenizer_shared_pool": {
+      "default_enabled": false,
+      "status": "C230 candidate; performance pending",
+      "dockerfile": "Dockerfile.shared-tokenizer",
+      "parent_image": "sha256:bd6c77d709b8225ebf7b4a9a3890509a4e2df87af846fcc7230b65a7a57d16f7",
+      "files": [
+        {
+          "path": "vllm/tokenizers/glm53_native_cache.py",
+          "sha256": "0632ab3c22fc9c3929c3d1a6d74b8347773fa947dceeefb3b22918ab47bbcc4c"
+        },
+        {
+          "path": "vllm/tokenizers/glm53_segment_cache_core.py",
+          "sha256": "f8b8e890af94068c81bfcc82771214b9970e727dbbbcb23d6de3c118fdfd77a9"
+        },
+        {
+          "path": "vllm/tokenizers/glm53_shared_segment_store.py",
+          "sha256": "9e43e45a5c5c9b07176a7533af9d1e11bf62e2154bdb68a854c7e9ca8bc533f7"
+        }
+      ],
+      "environment": {
+        "VLLM_GLM53_TOKENIZER_SHARED_PATH": "/run/glm-tokenizer/segments.db",
+        "VLLM_GLM53_TOKENIZER_LOCAL_L1_MIB": "64"
+      },
+      "shared_pool_gib": {
+        "P_8_API_per_host": 15.5,
+        "D_1_API_per_host": 15.9375
+      },
+      "total_budget_gib_per_host": 16,
+      "api_proxy_included": false,
+      "KV_changes_included": false
     }
   }
 }

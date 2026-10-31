@@ -303,3 +303,24 @@ P/D 模型容器使用该候选镜像，并增加以下环境变量及启动参�
 | P85 GPU0—3 | =mlx5_0:1,mlx5_1:1 |
 | P85 GPU4—7 | =mlx5_5:1,mlx5_6:1 |
 | D86、D87 GPU0—7 | =mlx5_0:1,mlx5_1:1,mlx5_5:1,mlx5_6:1 |
+
+## 10. 共享分词缓存可选对照
+
+~~~bash
+docker build -f integrations/glm53flash/Dockerfile.shared-tokenizer \
+  -t local/glm53flash-vllm:shared-tokenizer-candidate .
+
+-v /dev/shm/glm53-tokenizer:/run/glm-tokenizer:rw
+-e VLLM_GLM53_TOKENIZER_SHARED_PATH=/run/glm-tokenizer/segments.db
+-e VLLM_GLM53_TOKENIZER_LOCAL_L1_MIB=64
+~~~
+
+| 参数 | P：同机两个EP4、每实例4 API | D：EP8、1 API |
+| --- | --- | --- |
+| VLLM_GLM53_TOKENIZER_CACHE_GIB | 2 | 16 |
+| VLLM_GLM53_TOKENIZER_SHARED_GIB | 15.5 | 15.9375 |
+| VLLM_GLM53_TOKENIZER_LOCAL_L1_MIB | 64 | 64 |
+| 每台共享池＋私有L1预算 | 16GiB | 16GiB |
+
+同一台P的两个容器挂载同一目录；不同机器分别使用各自的目录。
+该镜像以原独立分词缓存镜像bd6c77d709b8为父层，不包含API代理或KV放置修改。
