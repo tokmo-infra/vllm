@@ -407,6 +407,32 @@
       "total_budget_gib_per_host": 16,
       "api_proxy_included": false,
       "KV_changes_included": false
+    },
+    "remote_get_batch": {
+      "default_enabled": false,
+      "dockerfile": "Dockerfile.get-batch",
+      "patch": "patches/vllm-get-batch-runtime.patch",
+      "patch_sha256": "8f3eb19213bfb647582b4b9087e67596a7e9fff7af6aa48cee919a611ea18af8",
+      "runtime_worker_base_sha256": "90a457d10975d132c5883a00ecbfdac855064725eecfa894c36c8d4ffa4bc5b5",
+      "runtime_worker_patched_sha256": "f8ea4f90d76b406af3b127ceccdcd0c8b1164fd531b09f61e84e01d1de8091c4",
+      "verified_shared_image": "sha256:a675812789ad6dbd338d44c0bd461050d4e7be5986db71dbfdd0b80af6b118e5",
+      "config": {
+        "remote_get_batch_bytes": 67108864
+      },
+      "comparison": {
+        "case": "C230 formal GET64 vs baseline",
+        "mean_ttft_seconds": [
+          6.056,
+          5.575
+        ],
+        "p99_ttft_seconds": [
+          13.939,
+          12.268
+        ],
+        "failures": 0,
+        "total_tpm_change_percent": -2.11,
+        "aggregate_output_change_percent": 1.86
+      }
     }
   }
 }

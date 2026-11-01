@@ -328,3 +328,18 @@ printf 'initial' > /dev/shm/glm53-tokenizer/epoch
 
 同一台P的两个容器挂载同一目录；不同机器分别使用各自的目录。
 该镜像以原独立分词缓存镜像bd6c77d709b8为父层，不包含API代理或KV放置修改。
+
+## 11. 可选 GET64 延迟优先参数（默认关闭）
+
+使用与目标主机匹配的 shared-tokenizer image 作为不可变 BASE_IMAGE，使用
+`integrations/glm53flash/Dockerfile.get-batch` 构建可选层；仅给匹配的实际
+worker 应用 patch，不用主仓库 worker 覆盖旧 runtime。默认部署命令不变。
+如需启用，在 MooncakeStoreConnector 的 `kv_connector_extra_config` 中加入：
+
+~~~json
+"remote_get_batch_bytes": 67108864
+~~~
+
+该值是 GET 单次软上限，不是磁盘 staging 预算；单 key 可超过上限。
+C230 正式对照 mean TTFT 6.056→5.575s、p99 13.939→12.268s，0 fail；
+总 TPM -2.11%，聚合输出 +1.86%。按延迟/吞吐需求选择，不默认启用。
