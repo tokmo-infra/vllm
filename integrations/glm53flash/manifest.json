@@ -408,16 +408,5 @@
       "api_proxy_included": false,
       "KV_changes_included": false
     }
-  },
-  "optional_api_affinity": {
-    "default": "off; enable with VLLM_API_PRIVATE_SOCKET_DIR",
-    "runtime_parent_launcher_sha256": "17060e357c846cf6b9d94ae8b60e3edee42dcffda9b6199de8986f03756b1709",
-    "dockerfile": "Dockerfile.api-affinity",
-    "runtime_patch": "patches/api-private-listeners-runtime.patch",
-    "runtime_patch_sha256": "3639b13194e17e567245e731e512693cd2f3fa87df8e146cf0089aafe5eb0c80",
-    "source_helper": "vllm/entrypoints/launchers/api_affinity_listener.py",
-    "proxy_repository": "tokmo-infra/router",
-    "proxy_source": "integrations/glm53flash/api_affinity.py",
-    "C230_validation": "run-27dce16ab0f3; native async true; real UDS/SSE neighbor/rank3; 21727 successful,0 failed;55percent11fullminutes"
   }
 }

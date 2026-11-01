@@ -1,8 +1,0 @@
-ARG BASE_IMAGE=local/glm53flash-vllm:shared-tokenizer-candidate
-FROM ${BASE_IMAGE}
-COPY integrations/glm53flash/patches/api-private-listeners-runtime.patch /tmp/api-listeners.patch
-RUN echo '17060e357c846cf6b9d94ae8b60e3edee42dcffda9b6199de8986f03756b1709  /usr/local/lib/python3.12/dist-packages/vllm/entrypoints/launchers/launcher.py' | sha256sum -c - \
-    && patch --batch --forward --fuzz=0 -p1 -d /usr/local/lib/python3.12/dist-packages < /tmp/api-listeners.patch \
-    && rm /tmp/api-listeners.patch
-COPY vllm/entrypoints/launchers/api_affinity_listener.py /usr/local/lib/python3.12/dist-packages/vllm/entrypoints/launchers/api_affinity_listener.py
-LABEL glm.api_affinity="optional private API listeners; native engine scheduling unchanged"
