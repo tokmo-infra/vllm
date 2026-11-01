@@ -55,6 +55,7 @@ export NODE_IP="$D1_IP"  # P用P_IP；D2用D2_IP
 export HCAS=mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 docker run -d --name glm-mooncake-store --network host --ipc host \
   --runtime=runc -e NVIDIA_VISIBLE_DEVICES=void --ulimit memlock=-1:-1 \
+  -e MC_TCP_BIND_ADDRESS="$NODE_IP" \
   --cap-add IPC_LOCK --cap-add SYS_NICE \
   -v "$LIBCUDA_PATH:/opt/host-driver/libcuda.so.1:ro" \
   -e LD_LIBRARY_PATH=/opt/host-driver:/usr/local/cuda/lib64 \
@@ -328,3 +329,43 @@ printf 'initial' > /dev/shm/glm53-tokenizer/epoch
 
 同一台P的两个容器挂载同一目录；不同机器分别使用各自的目录。
 该镜像以原独立分词缓存镜像bd6c77d709b8为父层，不包含API代理或KV放置修改。
+
+## 11. P端API亲和与私有UDS
+
+~~~bash
+docker build -f integrations/glm53flash/Dockerfile.api-affinity \
+  -t local/glm53flash-vllm:shared-api-candidate .
+
+# 在配套Router仓库根目录执行
+docker build -f integrations/glm53flash/Dockerfile.api-affinity \
+  -t local/glm53flash-api-affinity:candidate .
+~~~
+
+每个P实例分别设置SOCKET_DIR和PROXY_PORT。P0用18583，P1用18593。
+
+~~~bash
+export SOCKET_DIR=/dev/shm/glm-api-affinity/p0
+export PROXY_PORT=18583
+export P_API_URL="http://$P_IP:18483"
+mkdir -p "$SOCKET_DIR"
+
+# P模型容器增加
+-v "$SOCKET_DIR:/run/api-affinity:rw"
+-e VLLM_API_PRIVATE_SOCKET_DIR=/run/api-affinity
+-e MC_TCP_BIND_ADDRESS="$P_IP"
+
+docker run -d --name glm-api-affinity-p0 --network host --runtime=runc \
+  --memory 1g --memory-swap 1g -e NVIDIA_VISIBLE_DEVICES=void \
+  -v "$SOCKET_DIR:/run/api-affinity:rw" \
+  local/glm53flash-api-affinity:candidate \
+  --host "$P_IP" --port "$PROXY_PORT" --control-url "$P_API_URL" \
+  --api-socket /run/api-affinity/api-0.sock \
+  --api-socket /run/api-affinity/api-1.sock \
+  --api-socket /run/api-affinity/api-2.sock \
+  --api-socket /run/api-affinity/api-3.sock \
+  --timeout-keep-alive 120
+~~~
+
+Router的P URL和token-balance配置键改为代理URL；bootstrap端口不变。
+metrics、server_info及reset继续使用原P模型URL。P API8时补充api-4.sock至api-7.sock。
+D模型容器增加 `-e MC_TCP_BIND_ADDRESS="$NODE_IP"`。
