@@ -12,18 +12,20 @@ build_dir=$(cd "$2" && pwd)
 runtime_dir=$(cd "$3" && pwd)
 shift 3
 here=$(cd "$(dirname "$0")" && pwd)
-patch_file="$here/patches/mooncake-occupied-accounting.patch"
 
 if [ -e "$source_dir/.git" ]; then
   test "$(git -C "$source_dir" rev-parse HEAD)" = \
     719735896c86b56fabec6cf3e825fb2ea640597a
 fi
-if git -C "$source_dir" apply --check "$patch_file" 2>/dev/null; then
-  git -C "$source_dir" apply "$patch_file"
-else
-  git -C "$source_dir" apply --reverse --check "$patch_file"
-  echo "Occupied-bin accounting patch already applied"
-fi
+for patch_name in mooncake-occupied-accounting.patch mooncake-fit-pressure.patch; do
+  patch_file="$here/patches/$patch_name"
+  if git -C "$source_dir" apply --check "$patch_file" 2>/dev/null; then
+    git -C "$source_dir" apply "$patch_file"
+  else
+    git -C "$source_dir" apply --reverse --check "$patch_file"
+    echo "$patch_name already applied"
+  fi
+done
 
 cmake -S "$source_dir" -B "$build_dir" -G Ninja \
   -DWITH_TE=ON -DWITH_STORE=ON -DWITH_STORE_RUST=OFF \
