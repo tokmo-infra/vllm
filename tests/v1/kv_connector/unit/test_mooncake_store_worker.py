@@ -183,7 +183,6 @@ def _make_store_recving_thread(
     tp_rank: int = 0,
     disk_offload_buffer_budget_bytes: int | None = None,
     is_hma_required: bool = False,
-    remote_get_batch_bytes: int | None = None,
 ) -> mooncake_store_worker.KVCacheStoreRecvingThread:
     from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
 
@@ -207,7 +206,6 @@ def _make_store_recving_thread(
         coord=coord,
         disk_offload_buffer_budget_bytes=disk_offload_buffer_budget_bytes,
         is_hma_required=is_hma_required,
-        remote_get_batch_bytes=remote_get_batch_bytes,
     )
     thread.request_queue.task_done = MagicMock()
     return thread
@@ -1783,36 +1781,6 @@ def test_stale_store_job_cannot_touch_a_reused_request_id():
     assert thread._get_retry_token_ids(live) == (32, list(range(32, 64)))
 
 
-@pytest.mark.cpu_test
-def test_remote_get_split_preserves_entries_and_oversize_key():
-    batches = [(["a", "b", "c"], [[10], [20], [30]], [[4, 4], [3], [20]], [0, 1, 2])]
-    assert worker._split_remote_get_batches(batches, None) is batches
-    assert worker._split_remote_get_batches(batches, 10) == [
-        (["a"], [[10]], [[4, 4]], [0]),
-        (["b"], [[20]], [[3]], [1]),
-        (["c"], [[30]], [[20]], [2]),
-    ]
-
-
-@pytest.mark.cpu_test
-@pytest.mark.parametrize("failure", ["status", "exception", "expired"])
-def test_remote_get_split_failure_reports_whole_load(failure):
-    store = MagicMock()
-    failures = {
-        "status": [[256], [-1]],
-        "exception": [[256], RuntimeError("boom")],
-        "expired": [[256], [-707], [-707]],
-    }
-    store.batch_get_into_multi_buffers.side_effect = failures[failure]
-    thread = _make_store_recving_thread(store, remote_get_batch_bytes=256)
-    thread._handle_request(_make_load_req("req-a", [b"a0", b"a1", b"a2"], token_len=48))
-    assert store.batch_get_into_multi_buffers.call_count == (
-        3 if failure == "expired" else 2
-    )
-    assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1, 2}
-    assert thread.get_and_clear_finished_requests() == {"req-a"}
-
-
 def test_store_recving_thread_reports_failed_block_ids():
     store = MagicMock()
     store.batch_get_into_multi_buffers.return_value = [256, -5, -7]
@@ -2630,35 +2598,6 @@ def test_requester_worker_init_prefers_local_hostname_override(
     worker.MooncakeStoreWorker(_make_vllm_config(rank=1), _make_kv_cache_config())
 
     assert store.setup.call_args.args[0] == "worker-a:50053"
-
-
-@pytest.mark.cpu_test
-@pytest.mark.parametrize("value", [0, -1, True, 1.5, "67108864"])
-def test_remote_get_batch_rejects_invalid_config(value, tmp_path, monkeypatch):
-    store = MagicMock()
-    store.setup.return_value = 0
-    _install_fake_mooncake(monkeypatch, store)
-    _patch_worker_runtime(monkeypatch)
-    monkeypatch.setenv(
-        "MOONCAKE_CONFIG_PATH",
-        _write_mooncake_config(
-            tmp_path,
-            {
-                "metadata_server": "http://metadata/endpoint",
-                "local_buffer_size": "64mb",
-                "protocol": "tcp",
-                "device_name": "",
-                "master_server_address": "10.0.0.7:50051",
-            },
-        ),
-    )
-    with pytest.raises(
-        ValueError, match="remote_get_batch_bytes must be a positive integer"
-    ):
-        worker.MooncakeStoreWorker(
-            _make_vllm_config(extra_config={"remote_get_batch_bytes": value}),
-            _make_kv_cache_config(),
-        )
 
 
 def test_requester_worker_init_skips_disk_budget_when_offload_disabled(

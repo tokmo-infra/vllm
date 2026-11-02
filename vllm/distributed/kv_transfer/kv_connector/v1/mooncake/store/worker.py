@@ -212,37 +212,6 @@ def _split_disk_offload_load_batches(
     return batches, None
 
 
-def _split_remote_get_batches(batches, max_bytes):
-    """Soft per-RPC payload limit; a single indivisible key may exceed it."""
-    if max_bytes is None:
-        return batches
-    result = []
-    for keys, addrs, sizes, block_ids in batches:
-        chunk: tuple[list[str], list[list[int]], list[list[int]], list[int]] = (
-            [],
-            [],
-            [],
-            [],
-        )
-        used = 0
-        for key, addr, size, block_id in zip(
-            keys, addrs, sizes, block_ids, strict=True
-        ):
-            nbytes = sum(size)
-            if chunk[0] and used + nbytes > max_bytes:
-                result.append(chunk)
-                chunk = ([], [], [], [])
-                used = 0
-            chunk[0].append(key)
-            chunk[1].append(addr)
-            chunk[2].append(size)
-            chunk[3].append(block_id)
-            used += nbytes
-        if chunk[0]:
-            result.append(chunk)
-    return result
-
-
 def _call_replica_predicate(replica_desc: Any, method_name: str) -> bool:
     method = getattr(replica_desc, method_name, None)
     if method is None:
@@ -1096,7 +1065,6 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         request_queue: queue.Queue[Any] | None = None,
         group_participates: Sequence[bool] | None = None,
         is_hma_required: bool = False,
-        remote_get_batch_bytes: int | None = None,
     ):
         super().__init__(
             store,
@@ -1120,7 +1088,6 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         # are only unique within a group, so failures are reported per request.
         self._is_hma_required = is_hma_required
         self._failed_requests: set[str] = set()
-        self.remote_get_batch_bytes = remote_get_batch_bytes
         self.disk_offload_buffer_budget_bytes = disk_offload_buffer_budget_bytes
         self.usable_disk_offload_buffer_budget_bytes = (
             None
@@ -1277,12 +1244,6 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     )
                     block_id_offset = next_block_id_offset
 
-        load_batches = _split_remote_get_batches(
-            load_batches, self.remote_get_batch_bytes
-        )
-        whole_request_on_failure = (
-            self.remote_get_batch_bytes is not None and len(load_batches) > 1
-        )
         current_batch_keys: list[str] = key_list_c
         current_batch_block_ids: list[int] = block_id_list_c
         batch_bytes = 0
@@ -1369,12 +1330,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     ]
                 if failed:
                     self._report_load_error(
-                        req_id,
-                        (
-                            block_id_list_c
-                            if whole_request_on_failure
-                            else [block_id for _, _, block_id in failed]
-                        ),
+                        req_id, [block_id for _, _, block_id in failed]
                     )
                     logger.warning(
                         "Failed to get %d Mooncake keys from sub-batch "
@@ -1385,12 +1341,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     )
                     break
         except Exception as e:
-            self._report_load_error(
-                req_id,
-                block_id_list_c
-                if whole_request_on_failure
-                else current_batch_block_ids,
-            )
+            self._report_load_error(req_id, current_batch_block_ids)
             if not load_get_recorded:
                 self._record_operation(
                     "load_get",
@@ -1568,14 +1519,6 @@ class MooncakeStoreWorker:
                 "standalone-store mode without enable_offload: large prefills "
                 "may exceed the owner DirectIO budget."
             )
-
-        # Independent opt-in soft payload cap, not an owner staging budget.
-        self.remote_get_batch_bytes = extra_config.get("remote_get_batch_bytes")
-        if self.remote_get_batch_bytes is not None and (
-            type(self.remote_get_batch_bytes) is not int
-            or self.remote_get_batch_bytes <= 0
-        ):
-            raise ValueError("remote_get_batch_bytes must be a positive integer")
 
         self.disk_offload_buffer_budget_bytes = (
             DEFAULT_MOONCAKE_DISK_STAGING_BUFFER_BYTES
@@ -2030,7 +1973,6 @@ class MooncakeStoreWorker:
                 self.tp_rank,
                 ready_event_recving,
                 disk_offload_buffer_budget_bytes=self.disk_offload_buffer_budget_bytes,
-                remote_get_batch_bytes=self.remote_get_batch_bytes,
                 record_operation=self._record_kv_connector_operation,
                 request_queue=self.recv_request_queue,
                 group_participates=[

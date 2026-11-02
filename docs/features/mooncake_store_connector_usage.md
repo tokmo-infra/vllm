@@ -278,7 +278,6 @@ Strict isolation requires a Mooncake master started with `--enable_multi_tenants
 
 - `load_async` (bool): Enable asynchronous loading for better compute-I/O overlap. Default: `true`.
 - `lookup_async` (bool): Run the external prefix-cache lookup on a background thread so it never blocks the scheduler step. The request is held until the in-flight lookup completes, then resumed on a later step. Default: `false`.
-- `remote_get_batch_bytes` (int): Optional positive soft per-RPC byte limit for Store GETs. Unset by default (no extra splitting); a single indivisible key may exceed the limit. This is independent of the disk offload staging budget. For a split load, any sub-batch failure reports the whole load as failed. Example: `67108864` (64 MiB); measure latency and throughput for your workload.
 - `lookup_rpc_port` (int): Custom port for the ZMQ lookup RPC socket. Default: `0`.
 - `custom_mem_pool` (str): Optional Mooncake allocator for the GPU KV cache.
   `"NVLINK"` is used in the [EGM deployment example](#standalone-egm-over-nvlink);
