@@ -6,7 +6,30 @@ The old RDMA MegaMoE implementation was not cherry-picked. The tokenizer
 cache provenance and deployment carryovers are documented in the
 [serving guide](hierarchical_mega_moe.md).
 
-## Completed checks
+## Verbs pipeline implementation: hardware acceptance deferred
+
+The 2026-11-02 follow-up adds a two-host RC-verbs/GPUDirect DMA-BUF backend,
+CUDA stream memory handshakes, per-transfer epochs and receive credits,
+independent double buffers for input and BF16 return, and a bounded CPU proxy
+watchdog. It is selected explicitly with
+`hierarchical_mega_moe_transport="verbs"`. NCCL remains the default.
+
+The pipeline spans native MegaMoE calls on source-token chunks. It does not
+modify DeepGEMM's internal GEMM-tile scheduler or grid barriers. The acceptance
+harness compares matched serial/pipelined verbs, checks changing payloads and
+graph inputs, and records CUDA and proxy timelines. See the
+[commands and protocol](hierarchical_mega_moe.md#experimental-verbs-pipeline).
+
+The user reserved the two machines for other work and explicitly deferred
+validation. No new transport/layer GPU test or performance run was launched
+after that instruction. C++ compilation, DMA-BUF registration, RC data
+transfer, graph stress, exact numerical parity, and performance are all
+**pending**. Local source-format/type/syntax checks are not GPU validation.
+The earlier small device-capability probe only established that CUDA v2 stream
+memory writes could run and replay on the sampled GPU; it did not validate
+this new transport implementation.
+
+## Archived baseline checks (913d3c421)
 
 - CPU/Gloo: 10 cases cover one to four logical islands, noncontiguous ranks,
   unequal and empty batches, source/receive chunking, masks and physical
@@ -63,10 +86,12 @@ DeepGEMM rejects reducing the SM count for MegaMoE because its locality
 scheduler requires the full GPU. The unsafe prototype and unsupported SM
 reservation knob were removed from the serving backend.
 
-The next task is to profile actual Wide EP16 compute and transport at larger
-per-step token counts. Compute time must be remeasured as batch size grows;
-the earlier 0.78 ms measurement is not a constant for high concurrency.
-Distinguish concurrent requests from scheduler-limited tokens per step.
+Subsequent diagnostic profiling covered larger per-step token counts and
+confirmed the NCCL baseline's serial dispatch/compute/return ordering. Those
+results do not validate the new verbs pipeline. Compute must be remeasured
+for each batch and tile size; the earlier 0.78 ms measurement is not a constant
+for high concurrency. Distinguish concurrent requests from scheduler-limited
+tokens per step.
 
 Pending acceptance includes: complete native-extension build, real model
 startup and accuracy, source EPLB load-accounting integration under serving,

@@ -348,6 +348,25 @@ class DeepGemmMegaMoEExperts(nn.Module):
             groups = get_hierarchical_groups(ep.device_group, ep.cpu_group)
             if len(groups.topology.nodes) < 2:
                 raise ValueError("RDMA MegaMoE expects at least two physical hosts")
+            pipeline_transport = None
+            if config.hierarchical_mega_moe_transport == "verbs":
+                from vllm.distributed.roce.transport import get_verbs_transport
+
+                if (
+                    vllm_config.model_config is not None
+                    and vllm_config.model_config.enable_sleep_mode
+                ):
+                    raise ValueError(
+                        "Verbs MegaMoE does not support sleep-mode memory remapping"
+                    )
+                pipeline_transport = get_verbs_transport(
+                    groups,
+                    hcas=config.hierarchical_mega_moe_rdma_hcas,
+                    gid_index=config.hierarchical_mega_moe_rdma_gid_index,
+                    qps=config.hierarchical_mega_moe_rdma_qps,
+                    traffic_class=config.hierarchical_mega_moe_rdma_traffic_class,
+                    timeout_seconds=config.hierarchical_mega_moe_rdma_timeout_seconds,
+                )
             self.hierarchy = HierarchicalMegaMoE(
                 groups,
                 num_experts,
@@ -355,6 +374,8 @@ class DeepGemmMegaMoEExperts(nn.Module):
                 wire_dtype=config.hierarchical_mega_moe_wire_dtype,
                 fused_pack=True,
                 source_chunk_size=config.hierarchical_mega_moe_chunk_size,
+                pipeline_transport=pipeline_transport,
+                overlap=config.hierarchical_mega_moe_overlap,
             )
             self._mega_group = groups.local_group
             self._kernel_num_experts = num_local_experts * groups.topology.local_size

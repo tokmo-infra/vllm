@@ -318,10 +318,36 @@ class KernelConfig:
     to compare with the BF16 reconstruction and requantization reference."""
 
     hierarchical_mega_moe_chunk_size: int = Field(default=0, ge=0)
-    """Source tokens per network tile. Zero sends the complete padded batch.
-    Positive values bound wire-buffer memory but add network/kernel launches.
-    Transfers and native MegaMoE are ordered: the native kernel needs the full
-    GPU, so overlapping NCCL compute kernels is unsafe."""
+    """Source tokens per network tile. Zero selects the entire batch for NCCL,
+    or at most 2048 source rows fitting one native call for the verbs pipeline.
+    Positive values bound wire-buffer memory but add network/kernel launches."""
+
+    hierarchical_mega_moe_transport: Literal["nccl", "verbs"] = "nccl"
+    """Cross-host transport. Verbs uses a CPU progress thread, GPU DMA-BUF
+    buffers and CUDA stream memory operations. It requires two hosts, CUDA
+    driver headers and libibverbs development libraries for its JIT extension.
+    The verbs path is experimental and has not completed GPU validation."""
+
+    hierarchical_mega_moe_overlap: bool = True
+    """Pipeline dispatch, native compute and BF16 return with the verbs backend.
+    Disable for a matched serial reference. NCCL always remains stream-ordered."""
+
+    hierarchical_mega_moe_rdma_hcas: tuple[str, ...] = ()
+    """One HCA name (optionally HCA:port) per host-local EP lane, in lane order.
+    Required for verbs; GPU/NIC affinity must be verified for the deployment."""
+
+    hierarchical_mega_moe_rdma_gid_index: int = Field(default=0, ge=0, le=255)
+    """RoCE GID index for the verbs backend."""
+
+    hierarchical_mega_moe_rdma_qps: int = Field(default=4, ge=1, le=8)
+    """RC queue pairs per cross-host GPU lane for the verbs backend."""
+
+    hierarchical_mega_moe_rdma_traffic_class: int = Field(default=0, ge=0, le=255)
+    """Per-QP RoCE traffic class. Does not modify NIC or switch QoS settings."""
+
+    hierarchical_mega_moe_rdma_timeout_seconds: int = Field(default=120, gt=0)
+    """Proxy watchdog deadline per transfer. A transport failure terminates the
+    worker instead of releasing a CUDA graph wait with invalid output."""
 
     moe_backend: MoEBackend = "auto"
     """Backend for MoE expert computation kernels. Available options:
@@ -331,8 +357,8 @@ class KernelConfig:
     - "batched_triton": Use batched Triton experts (moe_mmk) on the batched
       activation format ([E_local, max_num_tokens, K])
     - "deep_gemm": Use DeepGEMM kernels (FP8 block-quantized only)
-    - "deep_gemm_hierarchical_mega_moe": Use node-local MegaMoE with NCCL
-      inter-node dispatch and combine (SM100 MXFP4, TP1, expert parallel)
+    - "deep_gemm_hierarchical_mega_moe": Use node-local MegaMoE with NCCL or
+      experimental pipelined verbs inter-node exchange (SM100 MXFP4, TP1, EP)
     - "deep_gemm_mega_moe": Use DeepGEMM mega MoE kernels
     - "cutlass": Use vLLM CUTLASS kernels
     - "flashinfer_trtllm": Use FlashInfer with TRTLLM-GEN kernels

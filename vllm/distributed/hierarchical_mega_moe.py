@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Bounded, stream-ordered network tiles around native NVLink MegaMoE.
+"""Bounded network tiles around native NVLink MegaMoE.
 
 The network owns peer-major wire slots; the compute stream alone owns the
 symmetric MegaMoE workspace. Every source row contributes one partial per
@@ -10,11 +10,15 @@ island. Only the source adds shared experts and records logical routing loads.
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 
 from vllm.distributed.megamoe_transport import MegaMoETransport, ProcessGroupTransport
+
+if TYPE_CHECKING:
+    from vllm.distributed.roce.transport import VerbsTransport
 
 
 def has_uniform_token_counts(tokens, counts, world_size):
@@ -87,6 +91,8 @@ class HierarchicalGroups:
     local_group: dist.ProcessGroup
     lane_group: dist.ProcessGroup
     world_group: dist.ProcessGroup
+    verbs_transport: "VerbsTransport | None" = None
+    verbs_signature: tuple | None = None
 
     @classmethod
     def create(cls, global_ranks, hosts, rank, backend, world_group=None):
@@ -116,6 +122,10 @@ class HierarchicalGroups:
         return cls(topology, local, lane, world_group or dist.group.WORLD)
 
     def close(self):
+        if self.verbs_transport is not None:
+            self.verbs_transport.close()
+            self.verbs_transport = None
+            self.verbs_signature = None
         dist.destroy_process_group(self.lane_group)
         dist.destroy_process_group(self.local_group)
 
@@ -182,6 +192,8 @@ class HierarchicalMegaMoE:
         fused_pack=False,
         source_chunk_size=0,
         transport: MegaMoETransport | None = None,
+        pipeline_transport=None,
+        overlap=True,
     ):
         if not 0 < num_experts < 2**31 or num_experts % groups.topology.world_size:
             raise ValueError("Expert count must fit int32 and divide EP size")
@@ -196,6 +208,8 @@ class HierarchicalMegaMoE:
         self.fused_pack = fused_pack
         self.source_chunk_size = source_chunk_size
         self.transport = transport or ProcessGroupTransport(groups.lane_group)
+        self.pipeline_transport = pipeline_transport
+        self.overlap = overlap
         self.last_dispatch_tokens = 0
         self._tables: dict[torch.device, tuple[torch.Tensor, ...]] = {}
 
@@ -242,7 +256,12 @@ class HierarchicalMegaMoE:
         self.last_dispatch_tokens = nodes * tokens
         if tokens == 0:
             return torch.empty_like(hidden)
-        capacity = min(tokens, self.source_chunk_size or tokens)
+        default_capacity = (
+            min(2048, max(1, self.chunk // nodes))
+            if self.pipeline_transport is not None
+            else tokens
+        )
+        capacity = min(tokens, self.source_chunk_size or default_capacity)
         if self.wire_dtype == "mxfp8":
             x_bytes = width + width // 32
         else:
@@ -250,6 +269,17 @@ class HierarchicalMegaMoE:
         gate_offset = (x_bytes + 3) // 4 * 4
         route_offset = gate_offset + 4 * ids.shape[1]
         row_bytes = route_offset + 4 * ids.shape[1]
+        if self.pipeline_transport is not None:
+            return self._forward_pipeline(
+                hidden,
+                weights,
+                ids,
+                capacity,
+                row_bytes,
+                (width, x_bytes, gate_offset, route_offset),
+                local_moe,
+                local_moe_mxfp8,
+            )[:source_tokens]
         output = torch.empty_like(hidden)
         storage = self._slot(hidden, nodes * capacity, row_bytes)
         # The upstream MegaMoE kernel occupies the full GPU and requires all
@@ -291,6 +321,10 @@ class HierarchicalMegaMoE:
         )
 
     def _dispatch(self, hidden, weights, ids, slot):
+        self._pack(hidden, weights, ids, slot)
+        self.transport.exchange(slot.receive, slot.send)
+
+    def _pack(self, hidden, weights, ids, slot):
         if hidden.is_cuda and self.fused_pack:
             from vllm.distributed.megamoe_rdma_ops import pack_fixed
 
@@ -306,7 +340,6 @@ class HierarchicalMegaMoE:
             )
         else:
             slot.send.copy_(self._pack_torch(hidden, weights, ids))
-        self.transport.exchange(slot.receive, slot.send)
 
     def _compute(self, slot, width, x_bytes, gate_offset, route_offset, local, direct):
         payload = slot.receive[:, :x_bytes]
@@ -330,6 +363,9 @@ class HierarchicalMegaMoE:
 
     def _return(self, slot, output):
         self.transport.exchange(slot.returned, slot.partial)
+        self._combine(slot, output)
+
+    def _combine(self, slot, output):
         if output.is_cuda and self.fused_pack:
             from vllm.distributed.megamoe_rdma_ops import combine_fixed
 
@@ -344,6 +380,79 @@ class HierarchicalMegaMoE:
             output.copy_(
                 slot.returned.view(-1, *output.shape).sum(0, dtype=torch.float32)
             )
+
+    def _forward_pipeline(
+        self, hidden, weights, ids, capacity, row_bytes, layout, local, direct
+    ):
+        if not hidden.is_cuda or hidden.dtype != torch.bfloat16:
+            raise ValueError("The verbs pipeline requires CUDA BF16 activations")
+        tokens, width = hidden.shape
+        width, x_bytes, gate_offset, route_offset = layout
+        padding = -tokens % capacity
+        if padding:
+            hidden = torch.nn.functional.pad(hidden, (0, 0, 0, padding))
+            weights = torch.nn.functional.pad(weights, (0, 0, 0, padding))
+            ids = torch.nn.functional.pad(ids, (0, 0, 0, padding), value=-1)
+        slots = self.pipeline_transport.plan(capacity, width, row_bytes, hidden.dtype)
+        wires = [slot.wire() for slot in slots]
+        count = hidden.shape[0] // capacity
+        output = torch.empty_like(hidden)
+
+        def dispatch(index):
+            position = index % len(slots)
+            rows = slice(index * capacity, (index + 1) * capacity)
+            self._pack(hidden[rows], weights[rows], ids[rows], wires[position])
+            slots[position].dispatch.submit()
+
+        def combine(index):
+            position = index % len(slots)
+            slots[position].returning.wait()
+            rows = slice(index * capacity, (index + 1) * capacity)
+            self._combine(wires[position], output[rows])
+
+        if not self.overlap:
+            for index in range(count):
+                position = index % len(slots)
+                dispatch(index)
+                slots[position].dispatch.wait()
+                self._compute(
+                    wires[position],
+                    width,
+                    x_bytes,
+                    gate_offset,
+                    route_offset,
+                    local,
+                    direct,
+                )
+                slots[position].returning.submit()
+                combine(index)
+            return output[:tokens]
+
+        for index in range(min(len(slots), count)):
+            dispatch(index)
+        for index in range(count):
+            position = index % len(slots)
+            slots[position].dispatch.wait()
+            # Input and output slots have independent lifetimes. Reuse input
+            # after its native compute; reuse output only after return+combine.
+            if index >= len(slots):
+                combine(index - len(slots))
+            self._compute(
+                wires[position],
+                width,
+                x_bytes,
+                gate_offset,
+                route_offset,
+                local,
+                direct,
+            )
+            slots[position].returning.submit()
+            following = index + len(slots)
+            if following < count:
+                dispatch(following)
+        for index in range(max(0, count - len(slots)), count):
+            combine(index)
+        return output[:tokens]
 
     def _pack_torch(self, hidden, weights, ids):
         topology = self.groups.topology
