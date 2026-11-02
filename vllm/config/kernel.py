@@ -125,6 +125,7 @@ MoEBackend = Literal[
     "batched_triton",
     "deep_gemm",
     "deep_gemm_mega_moe",
+    "deep_gemm_hierarchical_mega_moe",
     "cutlass",
     "flashinfer_trtllm",
     "flashinfer_cutlass",
@@ -163,7 +164,9 @@ PASSTHROUGH_ALL2ALL_BACKEND: Final = "passthrough"
 # "Native" here meaning that the backend does not use the fused MoE path.
 # Currently only relevant for the vLLM provided DeepGEMM MegaMoE.,
 # TODO: migrate to the fused MoE path ultimately.
-NATIVE_MEGA_MOE_BACKENDS = frozenset({"deep_gemm_mega_moe"})
+NATIVE_MEGA_MOE_BACKENDS = frozenset(
+    {"deep_gemm_mega_moe", "deep_gemm_hierarchical_mega_moe"}
+)
 
 # Every megakernel backend. The FlashInfer variants run through the standard
 # fused-MoE model path; the quantization method binds the kernel.
@@ -305,6 +308,21 @@ class KernelConfig:
     in a single launch (DeepSeek-V4.1 on MI355X, DeepSeek-V4-Pro at TP8 on
     MI355X). A deployment that cannot run it is refused at startup."""
 
+    hierarchical_mega_moe_wire_dtype: Literal["bfloat16", "mxfp8"] = "mxfp8"
+    """Dispatch activation format for hierarchical MegaMoE. MXFP8 uses native
+    1x32 E8M0 scales; gates/IDs and BF16 return partials are not compressed.
+    Uneven eager batches are padded to a common size before dispatch."""
+
+    hierarchical_mega_moe_direct_staging: bool = True
+    """Copy received MXFP8 directly into native MegaMoE input buffers. Disable
+    to compare with the BF16 reconstruction and requantization reference."""
+
+    hierarchical_mega_moe_chunk_size: int = Field(default=0, ge=0)
+    """Source tokens per network tile. Zero sends the complete padded batch.
+    Positive values bound wire-buffer memory but add network/kernel launches.
+    Transfers and native MegaMoE are ordered: the native kernel needs the full
+    GPU, so overlapping NCCL compute kernels is unsafe."""
+
     moe_backend: MoEBackend = "auto"
     """Backend for MoE expert computation kernels. Available options:
 
@@ -313,6 +331,8 @@ class KernelConfig:
     - "batched_triton": Use batched Triton experts (moe_mmk) on the batched
       activation format ([E_local, max_num_tokens, K])
     - "deep_gemm": Use DeepGEMM kernels (FP8 block-quantized only)
+    - "deep_gemm_hierarchical_mega_moe": Use node-local MegaMoE with NCCL
+      inter-node dispatch and combine (SM100 MXFP4, TP1, expert parallel)
     - "deep_gemm_mega_moe": Use DeepGEMM mega MoE kernels
     - "cutlass": Use vLLM CUTLASS kernels
     - "flashinfer_trtllm": Use FlashInfer with TRTLLM-GEN kernels

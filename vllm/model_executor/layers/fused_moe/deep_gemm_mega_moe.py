@@ -12,7 +12,7 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from inspect import signature
-from typing import Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import torch
 import torch.nn as nn
@@ -35,6 +35,9 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
+
+if TYPE_CHECKING:
+    from vllm.distributed.hierarchical_mega_moe import HierarchicalMegaMoE
 
 logger = init_logger(__name__)
 
@@ -256,6 +259,7 @@ class DeepGemmMegaMoEExperts(nn.Module):
 
     """
 
+    hierarchy: "HierarchicalMegaMoE | None" = None
     _symm_buffers: ClassVar[dict[tuple, Any]] = {}
     _synchronized_ep_groups: ClassVar[set[tuple[int, int]]] = set()
 
@@ -320,6 +324,52 @@ class DeepGemmMegaMoEExperts(nn.Module):
 
         self.num_shared_experts, self.shared_spec = self._fusable_shared_experts(
             shared_experts
+        )
+        self.hierarchy = None
+        self._mega_group = None
+        self._kernel_num_experts = self.num_experts
+        if vllm_config.kernel_config.moe_backend == "deep_gemm_hierarchical_mega_moe":
+            from vllm.distributed import get_tensor_model_parallel_world_size
+            from vllm.distributed.hierarchical_mega_moe import (
+                HierarchicalMegaMoE,
+                get_hierarchical_groups,
+            )
+
+            if get_tensor_model_parallel_world_size() != 1:
+                raise ValueError("RDMA MegaMoE currently requires TP1")
+            if weight_format != MEGA_MOE_MXFP4 or self.has_fused_shared_experts:
+                raise ValueError("RDMA MegaMoE requires MXFP4 and unfused shared MLP")
+            if vllm_config.parallel_config.use_ubatching:
+                raise ValueError(
+                    "Hierarchical MegaMoE does not support DBO or ubatching"
+                )
+            config = vllm_config.kernel_config
+            ep = get_ep_group()
+            groups = get_hierarchical_groups(ep.device_group, ep.cpu_group)
+            if len(groups.topology.nodes) < 2:
+                raise ValueError("RDMA MegaMoE expects at least two physical hosts")
+            self.hierarchy = HierarchicalMegaMoE(
+                groups,
+                num_experts,
+                self.max_num_tokens,
+                wire_dtype=config.hierarchical_mega_moe_wire_dtype,
+                fused_pack=True,
+                source_chunk_size=config.hierarchical_mega_moe_chunk_size,
+            )
+            self._mega_group = groups.local_group
+            self._kernel_num_experts = num_local_experts * groups.topology.local_size
+            logger.info_once(
+                "RDMA MegaMoE: %d hosts, %d local GPUs, %d global experts; "
+                "%s wire, node-local MXFP4 MegaMoE",
+                len(groups.topology.nodes),
+                groups.topology.local_size,
+                num_experts,
+                self.hierarchy.wire_dtype,
+            )
+        self._direct_mxfp8 = (
+            config.hierarchical_mega_moe_direct_staging
+            if self.hierarchy is not None
+            else False
         )
         self._create_weights()
         for name, param in self.named_parameters(recurse=False):
@@ -612,11 +662,11 @@ class DeepGemmMegaMoEExperts(nn.Module):
         from vllm.utils.deep_gemm import _import_deep_gemm
 
         deep_gemm = _import_deep_gemm()
-        group = get_ep_group().device_group
+        group = self._mega_group or get_ep_group().device_group
         key = (
             id(group),
             torch.accelerator.current_device_index(),
-            self.num_experts,
+            self._kernel_num_experts,
             self.max_num_tokens,
             self.top_k,
             self.hidden_size,
@@ -630,7 +680,7 @@ class DeepGemmMegaMoEExperts(nn.Module):
         if symm_buffer is None:
             args = (
                 group,
-                self.num_experts,
+                self._kernel_num_experts,
                 self.max_num_tokens,
                 self.top_k,
                 self.hidden_size,
@@ -660,8 +710,12 @@ class DeepGemmMegaMoEExperts(nn.Module):
 
         deep_gemm = _import_deep_gemm()
         args = (
-            get_ep_group().world_size,
-            self.num_experts,
+            (
+                get_ep_group().world_size
+                if self._mega_group is None
+                else torch.distributed.get_world_size(self._mega_group)
+            ),
+            self._kernel_num_experts,
             self.get_symm_buffer().num_max_tokens_per_rank,
             num_tokens,
             self.top_k,
@@ -768,8 +822,121 @@ class DeepGemmMegaMoEExperts(nn.Module):
         if self.capture_fn is not None:
             self.capture_fn(topk_ids)
 
+        if self.hierarchy is None:
+            y = self._forward_local(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                is_padding=is_padding,
+                eplb_state=self.eplb_state,
+            )
+        else:
+            y = self._forward_rdma(hidden_states, topk_weights, topk_ids, is_padding)
+        if shared_experts is not None:
+            y += shared_experts(hidden_states)
+        return y
+
+    def _forward_rdma(self, hidden, weights, ids, is_padding):
+        assert self.hierarchy is not None
+        from vllm.distributed.hierarchical_mega_moe import has_uniform_token_counts
+        from vllm.model_executor.layers.fused_moe.router.base_router import (
+            eplb_map_to_physical_and_record,
+        )
+        from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+
+        if is_padding is not None:
+            ids = torch.where(is_padding.unsqueeze(1), -1, ids)
+        state = self.eplb_state
+        if state.logical_to_physical_map is not None:
+            ids = eplb_map_to_physical_and_record(
+                topk_ids=ids,
+                expert_load_view=state.expert_load_view,
+                logical_to_physical_map=state.logical_to_physical_map,
+                logical_replica_count=state.logical_replica_count,
+                record_enabled=state.should_record_tensor,
+                num_unpadded_tokens=(
+                    state.num_unpadded_tokens_tensors[dbo_current_ubatch_id()]
+                    if state.num_unpadded_tokens_tensors is not None
+                    else None
+                ),
+            )
+        fixed_capacity = False
+        if is_forward_context_available():
+            context = get_forward_context()
+            key = f"rdma_megamoe_uniform:{hidden.shape[0]}"
+            if key not in context.additional_kwargs:
+                counts = (
+                    context.dp_metadata.num_tokens_across_dp_cpu
+                    if context.dp_metadata is not None
+                    else None
+                )
+                context.additional_kwargs[key] = has_uniform_token_counts(
+                    hidden.shape[0], counts, self.hierarchy.groups.topology.world_size
+                )
+            fixed_capacity = context.additional_kwargs[key]
+        return self.hierarchy.forward(
+            hidden,
+            weights,
+            ids,
+            lambda x, gate, routes: self._forward_local(
+                x,
+                gate,
+                routes,
+                is_padding=None,
+                eplb_state=None,
+            ),
+            fixed_capacity=fixed_capacity,
+            local_moe_mxfp8=self._forward_mxfp8 if self._direct_mxfp8 else None,
+        )
+
+    def _launch_mega_moe(self, deep_gemm, output, buffer, kwargs):
+        getattr(deep_gemm, self.weight_format.kernel)(
+            output,
+            self.l1_weights,
+            self.l2_weights,
+            buffer,
+            fast_math=self.fast_math,
+            **kwargs,
+        )
+
+    def _forward_mxfp8(self, packed, topk_weights, topk_ids):
+        from vllm.distributed.megamoe_rdma_ops import stage_mxfp8
         from vllm.utils.deep_gemm import _import_deep_gemm
 
+        num_tokens = packed.shape[0]
+        if num_tokens > self.max_num_tokens:
+            raise ValueError("RDMA receive chunk exceeds the MegaMoE buffer capacity")
+        buffer = self.get_symm_buffer()
+        stage_mxfp8(
+            packed,
+            topk_weights,
+            topk_ids,
+            buffer.x[:num_tokens],
+            buffer.x_sf[:num_tokens],
+            buffer.topk_idx[:num_tokens],
+            buffer.topk_weights[:num_tokens],
+        )
+        y = torch.empty(
+            (num_tokens, self.hidden_size), device=packed.device, dtype=torch.bfloat16
+        )
+        deep_gemm = _import_deep_gemm()
+        self._launch_mega_moe(deep_gemm, y, buffer, self._kernel_kwargs)
+        return y
+
+    def _forward_local(
+        self,
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        *,
+        is_padding,
+        eplb_state,
+    ):
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        num_tokens = hidden_states.shape[0]
+        if num_tokens > self.max_num_tokens:
+            raise ValueError("RDMA receive chunk exceeds the MegaMoE buffer capacity")
         deep_gemm = _import_deep_gemm()
         fmt = self.weight_format
         symm_buffer = self.get_symm_buffer()
@@ -799,7 +966,7 @@ class DeepGemmMegaMoEExperts(nn.Module):
                 w2_global_scale=self.w2_weight_scale_2,
                 l2_alpha=self._l2_alpha,
                 l2_activation_scale=l2_activation_scale,
-                eplb_state=self.eplb_state,
+                eplb_state=eplb_state,
             )
             kwargs.update(
                 l1_alpha=self.w13_weight_scale_2,
@@ -821,23 +988,14 @@ class DeepGemmMegaMoEExperts(nn.Module):
                 shared_x_sf=shared_x_sf,
                 shared_block_m=shared_block_m,
                 hidden_quant=fmt.hidden_quant,
-                eplb_state=self.eplb_state,
+                eplb_state=eplb_state,
             )
 
         if self.has_fused_shared_experts:
             kwargs["shared_l1_weights"] = self._kernel_weights("shared_l1")
             kwargs["shared_l2_weights"] = self._kernel_weights("shared_l2")
         y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
-        getattr(deep_gemm, fmt.kernel)(
-            y,
-            self.l1_weights,
-            self.l2_weights,
-            symm_buffer,
-            fast_math=self.fast_math,
-            **kwargs,
-        )
-        if shared_experts is not None:
-            y += shared_experts(hidden_states)
+        self._launch_mega_moe(deep_gemm, y, symm_buffer, kwargs)
         return y
 
 

@@ -870,6 +870,7 @@ steps:
   commands:
   - pytest -v -s reasoning
   - pytest -v -s renderers
+  - pytest -v -s tokenizers_/test_dsv41_native_cache.py
 
 - label: ":computer: (CPU) Tool Parsers"
   key: cpu-tool-parsers

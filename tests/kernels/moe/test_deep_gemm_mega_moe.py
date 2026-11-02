@@ -10,6 +10,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from vllm.config import VllmConfig
 from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
     MEGA_MOE_BF16,
     MEGA_MOE_MXFP4,
@@ -53,10 +54,8 @@ def sm100_mega_moe_layout(monkeypatch):
 
 
 def _make_experts(**kwargs) -> DeepGemmMegaMoEExperts:
-    vllm_config = SimpleNamespace(
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=4),
-        compilation_config=SimpleNamespace(static_forward_context={}),
-    )
+    vllm_config = VllmConfig()
+    kwargs.setdefault("max_num_tokens", 4)
     kwargs.setdefault("activation", MegaMoEActivation())
     kwargs.setdefault("weight_format", MEGA_MOE_MXFP4)
     return DeepGemmMegaMoEExperts(vllm_config, **kwargs)
@@ -1402,3 +1401,35 @@ def test_deep_gemm_mega_moe_matches_reference(dist_init, fmt_name, shared, act_n
     assert output.dtype == torch.bfloat16
     assert _calc_diff(output, expected) < 1e-3
     assert F.cosine_similarity(output.float(), expected, dim=-1).min() > 0.99
+
+
+@requires_sm100
+@pytest.mark.parametrize("tokens", [7, 65, 936, 1025])
+@pytest.mark.parametrize("width", [256, 5120])
+def test_network_mxfp8_staging_preserves_native_bytes(tokens, width):
+    """A received strided wire row must produce the native FP8/scale/routing bytes."""
+    from vllm.distributed.megamoe_rdma_ops import pack_mxfp8, stage_mxfp8
+
+    torch.manual_seed(17)
+    hidden = (torch.randn(tokens, width, device="cuda") * 17).bfloat16()
+    hidden[0] = 0
+    hidden[1, :32] = 1e-6
+    ids = torch.randint(-1, 192, (tokens, 6), device="cuda", dtype=torch.int32)
+    gates = torch.rand(tokens, 6, device="cuda")
+    expected = (
+        torch.empty(tokens, width, device="cuda", dtype=torch.float8_e4m3fn),
+        torch.empty(width // 128, tokens, device="cuda", dtype=torch.int32).t(),
+        torch.empty(tokens, 6, device="cuda", dtype=torch.int64),
+        torch.empty(tokens, 6, device="cuda", dtype=torch.float32),
+    )
+    actual = tuple(torch.empty_like(t) for t in expected)
+    prepare_megamoe_inputs(hidden, gates, ids, *expected)
+    packed = pack_mxfp8(hidden)
+    wire = torch.empty(tokens, packed.shape[1] + 48, device="cuda", dtype=torch.uint8)
+    wire[:, : packed.shape[1]].copy_(packed)
+    stage_mxfp8(wire[:, : packed.shape[1]], gates, ids, *actual)
+    for received, native in zip(actual, expected):
+        assert torch.equal(
+            received.contiguous().view(torch.uint8),
+            native.contiguous().view(torch.uint8),
+        )

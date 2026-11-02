@@ -2498,6 +2498,9 @@ def get_node_count() -> int:
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    from vllm.distributed.hierarchical_mega_moe import destroy_hierarchical_groups
+
+    destroy_hierarchical_groups()
     global _TP, _ETP
 
     if _ETP and _ETP is not _TP:

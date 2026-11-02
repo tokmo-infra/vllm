@@ -172,6 +172,10 @@ steps:
   - vllm/models/deepseek_v4/common/ops/
   - vllm/models/deepseek_v4/nvidia/
   - vllm/model_executor/layers/fused_moe/deep_gemm_mega_moe.py
+  - vllm/distributed/megamoe_rdma_ops.py
+  - vllm/distributed/hierarchical_mega_moe.py
+  - vllm/distributed/megamoe_transport.py
+  - vllm/config/kernel.py
   - vllm/model_executor/layers/fused_moe/prepare_megamoe.py
   - vllm/utils/deep_gemm.py
   - tests/kernels/test_fused_deepseek_v4_qnorm_rope_kv_insert.py

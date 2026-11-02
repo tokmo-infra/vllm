@@ -428,6 +428,9 @@ def _run_flashinfer_autotune_dummy_runs(
                 **dummy_run_kwargs,
             )
             autotune_indexer_wq_b(runner.get_model(), max_tuning_tokens)
+            draft_model = getattr(speculator, "model", None)
+            if draft_model is not None:
+                autotune_indexer_wq_b(draft_model, max_tuning_tokens)
 
 
 def _autotune_cache_fingerprint(path: Path) -> tuple[str, int] | None:

@@ -1,0 +1,307 @@
+--- a/src/backend/preprocess.rs
++++ b/src/backend/preprocess.rs
+@@ -146,6 +146,39 @@
+ pub(crate) struct HttpTokenInput {
+     pub prompts: Arc<[Vec<u32>]>,
+     pub source: &'static str,
++}
++
++/// Task-local limits; upstream behavior is unchanged when no override is set.
++pub(crate) fn http_preparation_budget(default: Duration) -> Duration {
++    std::env::var("AI_INFRA_HTTP_PREPARATION_BUDGET_SECS")
++        .ok()
++        .and_then(|value| value.parse::<u64>().ok())
++        .filter(|value| (1..=600).contains(value))
++        .map(Duration::from_secs)
++        .unwrap_or(default)
++}
++
++static HTTP_RENDER_AFFINITY: std::sync::OnceLock<DashMap<[u8; 32], String>> =
++    std::sync::OnceLock::new();
++
++fn http_render_identity(body: &serde_json::Value) -> Option<[u8; 32]> {
++    use sha2::{Digest, Sha256};
++    let salt = body.get("cache_salt")?.as_str()?;
++    let identity = serde_json::to_vec(&(body.get("model"), salt)).ok()?;
++    Some(Sha256::digest(identity).into())
++}
++
++pub(crate) fn record_http_render_affinity(body: &serde_json::Value, base: &str) {
++    if std::env::var("AI_INFRA_HTTP_RENDER_HOMOGENEOUS").as_deref() != Ok("1") {
++        return;
++    }
++    if let Some(key) = http_render_identity(body) {
++        let affinity = HTTP_RENDER_AFFINITY.get_or_init(DashMap::new);
++        // The measured workload has 12000 live sessions; bound stale history.
++        if affinity.len() < 32768 || affinity.contains_key(&key) {
++            affinity.insert(key, base.to_owned());
++        }
++    }
+ }
+ 
+ pub(crate) async fn prepare_http_token_inputs(
+@@ -194,6 +227,27 @@
+         1
+     };
+     let tokenize_fallback = std::sync::OnceLock::new();
++    // Only enable after verifying that all eight P endpoints have the same
++    // model, tokenizer, template/options and effective render contract. The
++    // native cache-aware selector still consumes backend-effective token IDs;
++    // only the redundant per-candidate HTTP preparation is shared.
++    let homogeneous = std::env::var("AI_INFRA_HTTP_RENDER_HOMOGENEOUS").as_deref() == Ok("1")
++        && urls.len() > 1;
++    let all_urls = urls.clone();
++    if homogeneous {
++        use std::sync::atomic::{AtomicUsize, Ordering};
++        static NEXT_RENDER: AtomicUsize = AtomicUsize::new(0);
++        // Follow the P endpoint selected by the native cache-aware policy on
++        // the previous turn. This keeps its private CPU segment caches warm;
++        // the policy still independently chooses the actual prefill worker.
++        let index = http_render_identity(body).map(|key| {
++            HTTP_RENDER_AFFINITY.get_or_init(DashMap::new).get(&key)
++                .and_then(|base| urls.iter().position(|url| url == base.value()))
++                .unwrap_or_else(|| u64::from_le_bytes(key[..8].try_into().unwrap()) as usize % urls.len())
++        }).unwrap_or_else(|| NEXT_RENDER.fetch_add(1, Ordering::Relaxed) % urls.len());
++        urls = vec![urls.swap_remove(index)];
++    }
++    let selected_url = urls.first().cloned();
+     let mut inputs: std::collections::HashMap<_, _> = urls
+         .iter()
+         .map(|url| (url.clone(), Err("preparation_unavailable")))
+@@ -251,6 +305,24 @@
+     while let Ok(Some((url, result))) = tokio::time::timeout_at(deadline, results.next()).await {
+         inputs.insert(url, result);
+     }
++    if homogeneous {
++        let result = selected_url
++            .and_then(|url| inputs.remove(&url))
++            .unwrap_or(Err("preparation_unavailable"));
++        return all_urls
++            .into_iter()
++            .map(|url| {
++                let shared = match &result {
++                    Ok(input) => Ok(HttpTokenInput {
++                        prompts: input.prompts.clone(),
++                        source: "render_homogeneous",
++                    }),
++                    Err(reason) => Err(*reason),
++                };
++                (url, shared)
++            })
++            .collect();
++    }
+     inputs
+ }
+ 
+@@ -264,7 +336,7 @@
+ ) -> Result<serde_json::Value, &'static str> {
+     let mut request = client
+         .post(format!("{}{path}", base.trim_end_matches('/')))
+-        .timeout(std::time::Duration::from_secs(5))
++        .timeout(http_preparation_budget(Duration::from_secs(5)))
+         .json(body);
+     if let Some(key) = api_key {
+         request = request.bearer_auth(key);
+@@ -878,6 +950,49 @@
+ #[cfg(all(test, feature = "cpu", feature = "ready"))]
+ mod tests {
+     #[tokio::test]
++    async fn ai_infra_homogeneous_render_is_one_rpc_and_shares_exact_ids() {
++        use super::{prepare_http_token_inputs, record_http_render_affinity};
++        use axum::{routing::post, Json, Router};
++        use serde_json::json;
++        use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
++        let calls = Arc::new(AtomicUsize::new(0));
++        let observed = calls.clone();
++        let app = Router::new().route(
++            "/{worker}/v1/chat/completions/render",
++            post(move |axum::extract::Path(worker): axum::extract::Path<String>, Json(body): Json<serde_json::Value>| {
++                let calls = observed.clone();
++                async move {
++                    assert_eq!(worker, "b", "Render must follow the previous actual P placement");
++                    calls.fetch_add(1, Ordering::Relaxed);
++                    assert_eq!(body["tools"][0]["function"]["name"], "lookup");
++                    Json(json!({"token_ids": [7, 8, 9]}))
++                }
++            }),
++        );
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let base = format!("http://{}", listener.local_addr().unwrap());
++        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
++        let urls = vec![format!("{base}/a"), format!("{base}/b")];
++        let body = json!({"model": "test", "cache_salt": "affinity-test",
++                          "messages": [{"role": "user", "content": "long prefix"}],
++                          "tools": [{"type": "function", "function": {"name": "lookup"}}]});
++        std::env::set_var("AI_INFRA_HTTP_RENDER_HOMOGENEOUS", "1");
++        record_http_render_affinity(&body, &urls[1]);
++        let results = prepare_http_token_inputs(
++            &reqwest::Client::new(), urls.clone(), &body, "/v1/chat/completions",
++            None, None, Duration::from_secs(1),
++        ).await;
++        std::env::remove_var("AI_INFRA_HTTP_RENDER_HOMOGENEOUS");
++        assert_eq!(calls.load(Ordering::Relaxed), 1);
++        let first = results[&urls[0]].as_ref().unwrap();
++        let second = results[&urls[1]].as_ref().unwrap();
++        assert_eq!(first.prompts.as_ref(), &[vec![7, 8, 9]]);
++        assert!(Arc::ptr_eq(&first.prompts, &second.prompts));
++        assert_eq!(first.source, "render_homogeneous");
++        server.abort();
++    }
++
++    #[tokio::test]
+     async fn shared_http_preparation_retains_good_workers_and_exact_tool_payloads() {
+         use super::prepare_http_token_inputs;
+         use axum::{routing::post, Json, Router};
+--- a/src/routers/http/pd_router.rs
++++ b/src/routers/http/pd_router.rs
+@@ -6,7 +6,7 @@
+     Loads, PDRouterError, PdAttempt, PdEndpoint, PdLoadManager, PdPrefillInput, PdRequestContext,
+     PdSelection, Stage, StageDecision,
+ };
+-use crate::backend::preprocess::prepare_http_token_inputs;
++use crate::backend::preprocess::{http_preparation_budget, prepare_http_token_inputs};
+ use crate::core::worker::WorkerMetadata;
+ use crate::core::{
+     BasicWorker, CircuitBreaker, CircuitBreakerConfig, ConnectionMode, DPAwareWorker, HealthConfig,
+@@ -481,7 +481,7 @@
+             route,
+             headers,
+             self.api_key.as_deref(),
+-            Duration::from_secs(1),
++            http_preparation_budget(Duration::from_secs(1)),
+         )
+         .await;
+         Some(
+--- a/src/routers/http/vllm_pd_router.rs
++++ b/src/routers/http/vllm_pd_router.rs
+@@ -785,6 +785,9 @@
+     ///
+     /// stream=false and stream_options removal are always applied at top level.
+     fn prepare_prefill_request(mut request: Value, path: &str) -> Value {
++        if Self::reuse_prefill_prompt_ids(path) {
++            request["return_token_ids"] = json!(true);
++        }
+         if path.contains("inference/v1/generate") {
+             // Generate API: max_tokens and min_tokens are in sampling_params
+             if let Some(sampling_params) = request.get_mut("sampling_params") {
+@@ -814,6 +817,25 @@
+             obj.remove("stream_options");
+         }
+         request
++    }
++
++    fn reuse_prefill_prompt_ids(path: &str) -> bool {
++        path == "/v1/chat/completions"
++            && std::env::var("AI_INFRA_PD_REUSE_PROMPT_IDS").as_deref() == Ok("1")
++    }
++
++    fn attach_prefill_prompt_ids(response: &Value, params: &mut Value) -> Result<(), String> {
++        let ids = response.get("prompt_token_ids").filter(|value| {
++            value.as_array().is_some_and(|ids| {
++                !ids.is_empty() && ids.iter().all(|id| {
++                    id.as_u64().is_some_and(|id| u32::try_from(id).is_ok())
++                })
++            })
++        }).ok_or("Prefill response has no valid prompt_token_ids")?;
++        params.as_object_mut().ok_or("Prefill returned no KV transfer metadata")?
++            .insert("prompt_token_ids".into(), ids.clone());
++        RouterMetrics::record_kv_routing_input("pd", "prefill_prompt_ids_reused");
++        Ok(())
+     }
+ 
+     fn discovery_candidates(
+@@ -942,6 +964,17 @@
+             })
+             .collect();
+         let decode_tokens = decode_inputs.unwrap_or_default();
++        // This deployment requires real cache-aware decisions. Never silently
++        // change its policy to least-load when HTTP token preparation fails.
++        if prefill_policy.name() == "cache_aware"
++            && std::env::var("AI_INFRA_CACHE_AWARE_REQUIRE_TOKENS").as_deref() == Ok("1")
++            && prefill_workers.iter().filter(|worker| worker.is_available()).any(|worker| {
++                !prefill_tokens.contains_key(worker.base_url())
++            })
++        {
++            RouterMetrics::record_pd_error("cache_aware_token_preparation");
++            return None;
++        }
+         let [prefill_cache, decode_cache] = [
+             (prefill_policy.as_ref(), prefill_workers, &prefill_tokens),
+             (decode_policy.as_ref(), decode_workers, &decode_tokens),
+@@ -977,6 +1010,12 @@
+         // inferred from KV overlap or DP rank equality.
+         self.pd_router
+             .select_and_admit(prefill_workers, decode_workers, &context)
++            .map(|(selection, attempt)| {
++                crate::backend::preprocess::record_http_render_affinity(
++                    request, prefill_workers[selection.prefill.worker_index].base_url(),
++                );
++                (selection, attempt)
++            })
+     }
+ 
+     /// Cheap opt-in gate: only Program-capable requests are serialized twice.
+@@ -1627,7 +1666,7 @@
+                 obj.remove("ec_transfer_params");
+             }
+         }
+-        if let Some(params) = self
++        if let Some(mut params) = self
+             .build_decode_kv_transfer_params(
+                 &prefill_base_url,
+                 Some(&prefill_response_json),
+@@ -1638,8 +1677,17 @@
+             )
+             .await
+         {
++            if Self::reuse_prefill_prompt_ids(path) {
++                Self::attach_prefill_prompt_ids(&prefill_response_json, &mut params)
++                    .map_err(|message| PDRouterError::NetworkError { message })?;
++            }
+             decode_request["kv_transfer_params"] = params;
+         } else {
++            if Self::reuse_prefill_prompt_ids(path) {
++                return Err(PDRouterError::NetworkError {
++                    message: "Prefill returned no KV transfer metadata for token-ID reuse".into(),
++                });
++            }
+             warn!(
+                 "No kv_transfer_params for prefill {}, decode will proceed without them",
+                 prefill_base_url
+@@ -1742,6 +1790,10 @@
+         decode_worker: &Arc<dyn Worker>,
+         path: &str,
+     ) -> Option<(Value, Value, String)> {
++        // Native D reuse requires P's completed prompt IDs before dispatch.
++        if Self::reuse_prefill_prompt_ids(path) {
++            return None;
++        }
+         let prefill_base_url = prefill_worker.base_url().to_string();
+         let prefill_dp_rank = prefill_worker.dp_rank();
+         let concurrent = match self.kv_connector {
+@@ -2582,6 +2634,25 @@
+ 
+ #[cfg(all(test, feature = "cpu", feature = "ready"))]
+ mod tests {
++    #[test]
++    fn ai_infra_prompt_id_handoff_preserves_kv_and_rejects_corrupt_ids() {
++        let response = json!({"prompt_token_ids": [3, 7, 9]});
++        let mut params = json!({"do_remote_prefill": true, "remote_engine_id": "engine",
++                                "remote_block_ids": [11, 12]});
++        VllmPDRouter::attach_prefill_prompt_ids(&response, &mut params).unwrap();
++        assert_eq!(params["prompt_token_ids"], json!([3, 7, 9]));
++        assert_eq!(params["remote_block_ids"], json!([11, 12]));
++        assert_eq!(params["remote_engine_id"], "engine");
++        for ids in [json!(null), json!([]), json!([true]), json!([-1]),
++                    json!([4294967296_u64]), json!(["3"])] {
++            let response = json!({"prompt_token_ids": ids});
++            let mut metadata = json!({"do_remote_prefill": true});
++            assert!(VllmPDRouter::attach_prefill_prompt_ids(&response, &mut metadata).is_err());
++            assert_eq!(metadata, json!({"do_remote_prefill": true}));
++        }
++        assert!(VllmPDRouter::attach_prefill_prompt_ids(&response, &mut json!(null)).is_err());
++    }
++
+     async fn finalize_decode_response(
+         response: reqwest::Response,
+         prefill: Option<&Value>,

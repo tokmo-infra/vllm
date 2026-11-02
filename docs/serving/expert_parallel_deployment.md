@@ -31,6 +31,9 @@ vLLM provides multiple communication backends for EP. Use `--all2all-backend` to
 | `flashinfer_nvlink_two_sided` | MNNVL systems | FlashInfer's two-sided A2A strategy for multi-node NVLink | Systems with NVLink across nodes |
 | `mori` | ROCm | MoRI EP: EPv2 (dispatch/combine over a CCO symmetric-memory window) where supported, otherwise EPv1 | AMD Instinct; see [MoRI EP](#mori-ep-rocm) |
 
+For experimental native MegaMoE inside NVLink hosts with RoCE between hosts,
+see [Hierarchical MegaMoE over RoCE](hierarchical_mega_moe.md).
+
 ## Single Node Deployment
 
 ### Configuration
