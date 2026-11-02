@@ -410,26 +410,5 @@
     "vllm_source_snapshot": "e39fef0657b0c1582b2d2bbeb1828b40a77a71d7",
     "router_source_snapshot": "48740d2ad97f734a8846cc5679668b744c237dc1",
     "historical_model": "sha256:540155b18ee763049423a616628cc1fee5e22176b3b1397775465f9067569bcf"
-  },
-  "optional_extensions": {
-    "deepep_explicit_sms": {
-      "dockerfile": "Dockerfile.deepep",
-      "patch": "patches/deepep-explicit-sms.patch",
-      "patch_sha256": "2723df82b02c8aabfa155e5435a1b9a4c81400dbe4fc25eadf1f4ba079171a67",
-      "target": "/usr/local/lib/python3.12/dist-packages/deep_ep/buffers/elastic.py",
-      "base_sha256": "a20347291581dde085e1a89a5084cf6c50b34c70e897525e148c98848ee71cf1",
-      "patched_sha256": "7e5775303ba98cd1a2183456a77adc28dcfee78527c422d79ea98991fe6c6b06",
-      "environment": {
-        "AI_INFRA_DEEPEP_V2_NUM_SMS": "32",
-        "VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE": "0",
-        "NCCL_GIN_TYPE": "2",
-        "NCCL_P2P_DISABLE": "0",
-        "NCCL_P2P_LEVEL": "PIX",
-        "NCCL_SHM_DISABLE": "1",
-        "NCCL_NET": "IB"
-      },
-      "all2all_backend": "deepep_v2",
-      "default_enabled": false
-    }
   }
 }
