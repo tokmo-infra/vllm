@@ -366,6 +366,7 @@ class DeepGemmMegaMoEExperts(nn.Module):
                     qps=config.hierarchical_mega_moe_rdma_qps,
                     traffic_class=config.hierarchical_mega_moe_rdma_traffic_class,
                     timeout_seconds=config.hierarchical_mega_moe_rdma_timeout_seconds,
+                    host_staging=config.hierarchical_mega_moe_rdma_host_staging,
                 )
             self.hierarchy = HierarchicalMegaMoE(
                 groups,

@@ -61,6 +61,7 @@ void store(uint32_t* address, uint32_t value) {
 struct Region {
   ibv_mr* mr = nullptr;
   int fd = -1;
+  bool relaxed_ordering = true;
   Region(ibv_pd* pd, uint64_t address, size_t bytes) {
     require(address % kPage == 0 && bytes % kPage == 0,
             "RDMA buffers must be 64-KiB aligned and padded");
@@ -71,8 +72,15 @@ struct Region {
     cuda_check(cuMemGetHandleForAddressRange(
                    &fd, address, bytes, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0),
                "export GPU DMA-BUF");
+    const int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE;
+    // Completion still guarantees visibility. Receive credits prevent
+    // overlapping generations from writing the same region concurrently.
     mr = ibv_reg_dmabuf_mr(pd, 0, bytes, address, fd,
-                           IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+                           access | IBV_ACCESS_RELAXED_ORDERING);
+    if (!mr && (errno == EINVAL || errno == EOPNOTSUPP)) {
+      relaxed_ordering = false;
+      mr = ibv_reg_dmabuf_mr(pd, 0, bytes, address, fd, access);
+    }
     if (!mr) {
       ::close(fd);
       fd = -1;
@@ -83,6 +91,26 @@ struct Region {
   ~Region() {
     if (mr) ibv_dereg_mr(mr);
     if (fd >= 0) ::close(fd);
+  }
+};
+
+struct HostSend {
+  void* address = nullptr;
+  ibv_mr* mr = nullptr;
+  HostSend(ibv_pd* pd, size_t bytes) {
+    cuda_check(cuMemHostAlloc(&address, bytes, CU_MEMHOSTALLOC_PORTABLE),
+               "allocate pinned send staging");
+    mr = ibv_reg_mr(pd, address, bytes, IBV_ACCESS_LOCAL_WRITE);
+    if (!mr) {
+      const auto error = std::string(std::strerror(errno));
+      cuMemFreeHost(address);
+      address = nullptr;
+      throw std::runtime_error("register pinned send staging: " + error);
+    }
+  }
+  ~HostSend() {
+    if (mr) ibv_dereg_mr(mr);
+    if (address) cuMemFreeHost(address);
   }
 };
 
@@ -101,6 +129,8 @@ struct Trace {
 };
 struct Job {
   std::unique_ptr<Region> send_region, receive_region;
+  std::unique_ptr<HostSend> host_send;
+  CUevent produced = nullptr, staged = nullptr;
   uint64_t send, receive, remote_receive = 0;
   uint32_t remote_key = 0;
   size_t bytes;
@@ -110,6 +140,8 @@ struct Job {
   uint64_t epoch = 0, peer_epoch = 0, request_ns = 0, post_ns = 0;
   uint32_t sent_mask = 0, received_mask = 0;
   ~Job() {
+    if (produced) cuEventDestroy(produced);
+    if (staged) cuEventDestroy(staged);
     if (flags) cuMemFreeHost(flags);
   }
 };
@@ -117,7 +149,7 @@ struct Job {
 class Endpoint {
  public:
   Endpoint(const std::string& hca, int port, int gid_index, int qps,
-           int traffic_class, int timeout_seconds, int self)
+           int traffic_class, int timeout_seconds, int self, bool host_staging)
       : port_(port),
         gid_index_(gid_index),
         count_(qps),
@@ -133,6 +165,9 @@ class Endpoint {
     try {
       cuda_check(cuCtxGetCurrent(&cuda_context_), "get current CUDA context");
       require(cuda_context_ != nullptr, "Initialize CUDA before RDMA");
+      if (host_staging)
+        cuda_check(cuStreamCreate(&staging_stream_, CU_STREAM_NON_BLOCKING),
+                   "create send staging stream");
       CUdevice device;
       cuda_check(cuCtxGetDevice(&device), "get CUDA device");
       int ordering = 0, flush = 0;
@@ -276,7 +311,15 @@ class Endpoint {
     job->send = send;
     job->receive = receive;
     job->bytes = peer_bytes;
-    job->send_region = std::make_unique<Region>(pd_, send, allocation_bytes);
+    if (staging_stream_) {
+      job->host_send = std::make_unique<HostSend>(pd_, peer_bytes);
+      cuda_check(cuEventCreate(&job->produced, CU_EVENT_DISABLE_TIMING),
+                 "create send producer event");
+      cuda_check(cuEventCreate(&job->staged, CU_EVENT_DISABLE_TIMING),
+                 "create send staged event");
+    } else {
+      job->send_region = std::make_unique<Region>(pd_, send, allocation_bytes);
+    }
     job->receive_region =
         std::make_unique<Region>(pd_, receive, allocation_bytes);
     cuda_check(
@@ -291,9 +334,11 @@ class Endpoint {
             "Connect endpoint before registering buffers");
     require(jobs_.size() < (1u << 24), "Too many registered transfers");
     auto id = jobs_.size();
-    auto result = py::dict("id"_a = id, "address"_a = receive,
-                           "key"_a = job->receive_region->mr->rkey,
-                           "bytes"_a = peer_bytes);
+    auto result = py::dict(
+        "id"_a = id, "address"_a = receive,
+        "key"_a = job->receive_region->mr->rkey, "bytes"_a = peer_bytes,
+        "relaxed_ordering"_a = job->receive_region->relaxed_ordering,
+        "host_staging"_a = staging_stream_ != nullptr);
     jobs_.push_back(std::move(job));
     return result;
   }
@@ -310,28 +355,63 @@ class Endpoint {
   }
 
   void submit(uint32_t id, uint64_t stream_pointer) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto& job = *jobs_.at(id);
-    require(job.connected && !closed_, "Transfer is not connected");
+    uint64_t send, receive, request;
+    size_t bytes;
+    void* host_send = nullptr;
+    CUevent produced = nullptr, staged = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      const auto& job = *jobs_.at(id);
+      require(job.connected && !closed_, "Transfer is not connected");
+      send = job.send;
+      receive = job.receive;
+      bytes = job.bytes;
+      request = job.device_flags + offsetof(Flags, request);
+      if (job.host_send) {
+        host_send = job.host_send->address;
+        produced = job.produced;
+        staged = job.staged;
+      }
+    }
+    // CUDA enqueue calls can block when the stream command queue is full.
+    // The proxy must still drain RDMA while the GPU waits for a completion.
     auto stream = reinterpret_cast<CUstream>(stream_pointer);
-    cuda_check(
-        cuMemcpyDtoDAsync(job.receive + self_ * job.bytes,
-                          job.send + self_ * job.bytes, job.bytes, stream),
-        "copy self contribution");
+    cuda_check(cuMemcpyDtoDAsync(receive + self_ * bytes, send + self_ * bytes,
+                                 bytes, stream),
+               "copy self contribution");
+    auto publish_stream = stream;
+    if (host_send) {
+      cuda_check(cuEventRecord(produced, stream), "record send producer");
+      cuda_check(cuStreamWaitEvent(staging_stream_, produced, 0),
+                 "wait for send producer");
+      cuda_check(cuMemcpyDtoHAsync(host_send, send + (1 - self_) * bytes, bytes,
+                                   staging_stream_),
+                 "stage outgoing payload");
+      publish_stream = staging_stream_;
+    }
     // The default write includes a stream memory fence: the NIC cannot read
     // send storage until earlier packing/GEMM work is globally visible.
-    cuda_check(cuStreamWriteValue32(stream,
-                                    job.device_flags + offsetof(Flags, request),
-                                    1, CU_STREAM_WRITE_VALUE_DEFAULT),
+    cuda_check(cuStreamWriteValue32(publish_stream, request, 1,
+                                    CU_STREAM_WRITE_VALUE_DEFAULT),
                "publish RDMA request");
+    if (staged)
+      cuda_check(cuEventRecord(staged, staging_stream_), "record staged send");
   }
 
   void wait(uint32_t id, uint64_t stream_pointer) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto& job = *jobs_.at(id);
-    require(job.connected && !closed_, "Transfer is not connected");
+    CUdeviceptr done;
+    CUevent staged;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      const auto& job = *jobs_.at(id);
+      require(job.connected && !closed_, "Transfer is not connected");
+      done = job.device_flags + offsetof(Flags, done);
+      staged = job.staged;
+    }
     auto stream = reinterpret_cast<CUstream>(stream_pointer);
-    auto done = job.device_flags + offsetof(Flags, done);
+    // The memory wait alone does not join a forked CUDA graph capture stream.
+    if (staged)
+      cuda_check(cuStreamWaitEvent(stream, staged, 0), "join send staging");
     cuda_check(cuStreamWaitValue32(stream, done, 1, CU_STREAM_WAIT_VALUE_EQ),
                "wait for RDMA completion");
     cuda_check(
@@ -399,9 +479,13 @@ class Endpoint {
       size_t begin = job.bytes * q / count_;
       size_t end = job.bytes * (q + 1) / count_;
       ibv_sge sge{};
-      sge.addr = job.send + (1 - self_) * job.bytes + begin;
+      sge.addr =
+          job.host_send
+              ? reinterpret_cast<uint64_t>(job.host_send->address) + begin
+              : job.send + (1 - self_) * job.bytes + begin;
       sge.length = end - begin;
-      sge.lkey = job.send_region->mr->lkey;
+      sge.lkey =
+          job.host_send ? job.host_send->mr->lkey : job.send_region->mr->lkey;
       ibv_send_wr wr{}, *bad = nullptr;
       wr.wr_id = (uint64_t{id} << 8) | q;
       wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
@@ -517,6 +601,8 @@ class Endpoint {
     if (cq_) ibv_destroy_cq(cq_);
     if (pd_) ibv_dealloc_pd(pd_);
     if (context_) ibv_close_device(context_);
+    if (staging_stream_) cuStreamDestroy(staging_stream_);
+    staging_stream_ = nullptr;
     credit_mr_ = nullptr;
     cq_ = nullptr;
     pd_ = nullptr;
@@ -526,6 +612,7 @@ class Endpoint {
   int port_, gid_index_, count_, traffic_class_, self_;
   uint64_t timeout_ns_;
   CUcontext cuda_context_ = nullptr;
+  CUstream staging_stream_ = nullptr;
   ibv_context* context_ = nullptr;
   ibv_pd* pd_ = nullptr;
   ibv_cq* cq_ = nullptr;
@@ -546,7 +633,7 @@ class Endpoint {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   py::class_<Endpoint>(module, "Endpoint")
-      .def(py::init<const std::string&, int, int, int, int, int, int>())
+      .def(py::init<const std::string&, int, int, int, int, int, int, bool>())
       .def("info", &Endpoint::info)
       .def("connect", &Endpoint::connect)
       .def("register_job", &Endpoint::register_job)

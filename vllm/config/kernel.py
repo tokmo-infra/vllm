@@ -326,7 +326,7 @@ class KernelConfig:
     """Cross-host transport. Verbs uses a CPU progress thread, GPU DMA-BUF
     buffers and CUDA stream memory operations. It requires two hosts, CUDA
     driver headers and libibverbs development libraries for its JIT extension.
-    The verbs path is experimental and has not completed GPU validation."""
+    The verbs path is experimental; full-model acceptance remains pending."""
 
     hierarchical_mega_moe_overlap: bool = True
     """Pipeline dispatch, native compute and BF16 return with the verbs backend.
@@ -341,6 +341,12 @@ class KernelConfig:
 
     hierarchical_mega_moe_rdma_qps: int = Field(default=4, ge=1, le=8)
     """RC queue pairs per cross-host GPU lane for the verbs backend."""
+
+    hierarchical_mega_moe_rdma_host_staging: bool = False
+    """Stage outgoing verbs payloads in pinned CPU memory with an independent
+    CUDA copy stream. Receives stay GPUDirect. This preserves BF16 return
+    precision and may improve throughput when NIC reads from GPU are slow.
+    Adds pinned host memory and PCIe traffic; benchmark against direct sends."""
 
     hierarchical_mega_moe_rdma_traffic_class: int = Field(default=0, ge=0, le=255)
     """Per-QP RoCE traffic class. Does not modify NIC or switch QoS settings."""

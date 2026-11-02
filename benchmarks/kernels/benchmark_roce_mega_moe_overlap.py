@@ -77,9 +77,15 @@ def check_payload(transport, args):
 
 def check_graph_pair(serial, pipeline, model, x, gates, ids, args, shift):
     original = tuple(value.clone() for value in (x, gates, ids))
+    if dist.get_rank() == 0:
+        print("capturing serial", flush=True)
     serial_graph, reference = capture(serial)
+    if dist.get_rank() == 0:
+        print("capturing pipeline", flush=True)
     pipeline_graph, actual = capture(pipeline)
     for generation in range(4):
+        if dist.get_rank() == 0:
+            print(f"checking generation={generation}", flush=True)
         x.copy_(original[0] * (1 - generation / 8))
         gates.copy_(original[1])
         if generation:
@@ -142,6 +148,7 @@ def main():
     )
     parser.add_argument("--gid", type=int, default=0)
     parser.add_argument("--qps", type=int, default=4)
+    parser.add_argument("--host-staging", action="store_true")
     parser.add_argument("--traffic-class", type=int, default=0)
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--experts", type=int, default=384)
@@ -156,6 +163,21 @@ def main():
     parser.add_argument("--stress-replays", type=int, default=1000)
     parser.add_argument("--fast-math", action="store_true")
     parser.add_argument("--trace", action="store_true")
+    parser.add_argument(
+        "--include-nccl-baseline",
+        action="store_true",
+        help="Measure the full-batch NCCL path with the same replay timing",
+    )
+    parser.add_argument(
+        "--nccl-only",
+        action="store_true",
+        help="Measure NCCL in a separate process run",
+    )
+    parser.add_argument(
+        "--transport-only",
+        action="store_true",
+        help="Measure full-batch dispatch, BF16 return and concurrent transport",
+    )
     parser.add_argument("--output-directory", type=Path, required=True)
     args = parser.parse_args()
     local = int(os.environ["LOCAL_RANK"])
@@ -171,22 +193,114 @@ def main():
         qps=args.qps,
         traffic_class=args.traffic_class,
         timeout_seconds=args.timeout,
+        host_staging=args.host_staging,
     )
     args.output_directory.mkdir(parents=True, exist_ok=True)
     per_rank = args.experts // dist.get_world_size()
-    model = NativeExperts(
-        groups.local_group, range(rank * per_rank, (rank + 1) * per_rank), args
+    model = (
+        None
+        if args.transport_only
+        else NativeExperts(
+            groups.local_group, range(rank * per_rank, (rank + 1) * per_rank), args
+        )
     )
     records = []
+
+    def checkpoint():
+        (args.output_directory / f"partial-rank{rank}.json").write_text(
+            json.dumps(records, indent=2) + "\n"
+        )
+
     check_payload(transport, args)
     for tokens in map(int, args.tokens.split(",")):
+        if args.transport_only:
+            row_bytes = args.hidden + args.hidden // 32 + 8 * args.top_k
+            slots = transport.plan(tokens, args.hidden, row_bytes, torch.bfloat16)
+            dispatch, returning = slots[0].dispatch, slots[0].returning
+            for transfer in (dispatch, returning):
+                transfer.send.fill_(transport.rank + 1)
+            for name, transfers in (
+                ("dispatch_only", (dispatch,)),
+                ("return_only", (returning,)),
+                ("dispatch_return_concurrent", (dispatch, returning)),
+            ):
+
+                def exchange(transfers=transfers):
+                    for transfer in transfers:
+                        transfer.submit()
+                    for transfer in transfers:
+                        transfer.wait()
+
+                graph, _ = capture(exchange)
+                for transfer in transfers:
+                    for peer, received in enumerate(transfer.receive.chunk(2)):
+                        assert torch.all(received == peer + 1).item()
+                records.append(
+                    dict(
+                        tokens=tokens,
+                        tile=tokens,
+                        effective_tile=tokens,
+                        wire_tokens=tokens,
+                        case=name,
+                        samples_ms=measure(graph, args),
+                    )
+                )
+                checkpoint()
+                del graph
+            continue
+        assert model is not None
         torch.manual_seed(1234 + rank)
         x = (torch.rand(tokens, args.hidden, device="cuda") * 0.01).bfloat16()
         ids = (
             torch.rand(tokens, args.experts, device="cuda").topk(args.top_k, 1).indices
         )
         gates = torch.rand(tokens, args.top_k, device="cuda").softmax(1)
+        if args.include_nccl_baseline or args.nccl_only:
+            if rank == 0:
+                print(f"measuring NCCL tokens={tokens}", flush=True)
+            baseline = HierarchicalMegaMoE(
+                groups,
+                args.experts,
+                args.chunk,
+                wire_dtype="mxfp8",
+                fused_pack=True,
+            )
+            graph, output = capture(
+                partial(
+                    baseline.forward,
+                    x,
+                    gates,
+                    ids,
+                    model,
+                    fixed_capacity=True,
+                    local_moe_mxfp8=model.direct,
+                )
+            )
+            torch.testing.assert_close(
+                output.float(),
+                oracle(x, gates, ids, args.intermediate),
+                rtol=0.08,
+                atol=0.01,
+            )
+            if rank == 0:
+                print(f"timing NCCL tokens={tokens}", flush=True)
+            records.append(
+                dict(
+                    tokens=tokens,
+                    tile=0,
+                    effective_tile=tokens,
+                    wire_tokens=tokens,
+                    case="baseline_nccl",
+                    samples_ms=measure(graph, args),
+                )
+            )
+            checkpoint()
+            del graph, output, baseline
+        if args.nccl_only:
+            continue
         for tile in map(int, args.tiles.split(",")):
+            if rank == 0:
+                print(f"validating tokens={tokens} tile={tile}", flush=True)
             adapters = [
                 HierarchicalMegaMoE(
                     groups,
@@ -215,16 +329,19 @@ def main():
             # Uneven eager source counts include an empty rank. The remaining
             # ranks force padding and, for most shapes, a final partial tile.
             count = 0 if rank == 0 else max(1, tokens - rank - 1)
-            eager = [
-                adapter.forward(
-                    x[:count],
-                    gates[:count],
-                    ids[:count],
-                    model,
-                    local_moe_mxfp8=model.direct,
+            eager = []
+            for adapter in adapters:
+                if rank == 0:
+                    print(f"eager overlap={adapter.overlap}", flush=True)
+                eager.append(
+                    adapter.forward(
+                        x[:count],
+                        gates[:count],
+                        ids[:count],
+                        model,
+                        local_moe_mxfp8=model.direct,
+                    )
                 )
-                for adapter in adapters
-            ]
             torch.testing.assert_close(eager[1], eager[0], rtol=0, atol=0)
             torch.testing.assert_close(
                 eager[1].float(),
@@ -232,6 +349,8 @@ def main():
                 rtol=0.08,
                 atol=0.01,
             )
+            if rank == 0:
+                print("checking graph pair", flush=True)
             serial, pipeline, reference, actual = check_graph_pair(
                 *callbacks,
                 model,
@@ -242,6 +361,8 @@ def main():
                 shift=per_rank * groups.topology.local_size,
             )
             for name, graph in (("serial_verbs", serial), ("pipeline_verbs", pipeline)):
+                if rank == 0:
+                    print(f"timing {name} tokens={tokens} tile={tile}", flush=True)
                 samples = measure(graph, args)
                 torch.testing.assert_close(actual, reference, rtol=0, atol=0)
                 records.append(
@@ -256,6 +377,7 @@ def main():
                         samples_ms=samples,
                     )
                 )
+                checkpoint()
             if args.trace:
                 transport.set_tracing(True)
                 context = (

@@ -48,6 +48,7 @@ Kernel configuration fields:
 | `hierarchical_mega_moe_direct_staging` | `true` | Copy received MXFP8 bytes/scales into native buffers. Set `false` to reconstruct BF16 and requantize for comparison. Ignored for BF16 wire. |
 | `hierarchical_mega_moe_chunk_size` | `0` | Source tokens per network tile. NCCL zero sends the complete padded batch. Verbs zero selects at most 2048 source rows fitting one native call. Smaller tiles bound temporary memory but add launches. |
 | `hierarchical_mega_moe_transport` | `nccl` | `verbs` selects the experimental two-host GPUDirect pipeline described below. |
+| `hierarchical_mega_moe_rdma_host_staging` | `false` | Use an independent CUDA copy stream and pinned CPU send buffers; receives remain GPUDirect and BF16 return precision is preserved. Benchmark on the target topology. |
 | `hierarchical_mega_moe_overlap` | `true` | Pipeline verbs transfers and native compute. Disable for a matched serial verbs reference. NCCL remains ordered. |
 | `hierarchical_mega_moe_rdma_hcas` | `[]` | Required for verbs: one `HCA[:port]` per local EP lane, in lane order. |
 | `hierarchical_mega_moe_rdma_gid_index` | `0` | RoCE GID index for verbs. |
@@ -61,6 +62,22 @@ cluster. Inspect NCCL logs to confirm the intended RDMA transport and NICs.
 Benchmark `NCCL_NET_GDR_READ` on the actual topology; its best value is not
 portable across clusters. See the [deployment carryovers](#deployment-carryovers)
 for the previous experiment's CPU-side fixes.
+
+Check PCIe routing before tuning the transport. On the measured B300 pair,
+ACS request/completion redirection limited GPU bidirectional RDMA to about
+153 Gb/s per direction while host memory reached 390 Gb/s. A controlled
+redirect-only change on the relevant switch ports restored approximately
+390 Gb/s for GPU memory too. Merely seeing a 400G link and a nearby GPU/NIC
+in `nvidia-smi topo -m` does not establish a fast peer path. Have the platform
+owner validate ACS and device isolation for the deployment; this backend
+does not change PCI registers. See the
+[controlled routing experiment](hierarchical_mega_moe_validation.md#pcie-routing-diagnosis).
+
+With corrected routing, direct verbs sends, four QPs and 2048 source rows per
+tile achieved 1.54x/1.59x over the faster tested NCCL configuration at
+8192/16384 tokens per GPU. That comparison used `NCCL_NET_GDR_READ=1`.
+Pinned-host staging is an optional workaround when the GPU send path remains
+constrained; it is not the recommended path for that corrected topology.
 
 ## Data path and correctness
 
@@ -112,14 +129,14 @@ change or a transport whose progress does not compete with that scheduler.
 
 ## Experimental verbs pipeline
 
-**Implementation status: GPU build, correctness, graph replay, and performance
-validation are pending.** The source and acceptance harness are prepared; no
-speedup is established for this backend. The previously recorded results refer
-to the NCCL baseline. Hardware testing was deferred at the user's request.
+**Implementation status: single-layer hardware validation is available; full
+model serving acceptance remains pending.** See the
+[validation report](hierarchical_mega_moe_validation.md) for the measured
+baseline, matched-tiling comparisons, network diagnostics and limitations.
 
 This path uses standard RC verbs and GPU DMA-BUF registration, without the
 GPUNetIO device-QP requirement. A CPU progress thread submits NIC operations;
-payloads remain in GPU memory. It requires Linux, CUDA driver development
+payloads remain in GPU memory by default. It requires Linux, CUDA driver development
 headers, a C++17 compiler, Ninja, libibverbs development headers/libraries and
 working GPU DMA-BUF export. The small C++ extension is compiled on first use
 with PyTorch's extension cache. Only two equal-sized NVLink hosts are supported.
@@ -152,13 +169,32 @@ The synchronization protocol has these invariants:
    or the supported host GPUDirect flush API. It then clears the request and
    publishes completion. A stream memory wait releases the consumer, followed
    by a GPU acknowledgement before the next request can reuse that job.
-4. All local CUDA dependencies are on one stream. The proxy independently
+   Memory registration requests relaxed ordering and falls back to ordinary
+   ordering if the provider rejects that option. Completion visibility is
+   unchanged; the credit protocol prevents overlapping writes to reused slots.
+4. Direct-send CUDA dependencies are on one stream. The proxy independently
    progresses network traffic while native MegaMoE owns all SMs. No NCCL
    communication kernel runs concurrently with the native grid on this path.
+   CUDA enqueue calls run outside the proxy mutex: an enqueue may block under
+   stream backpressure, so holding that mutex would prevent the network work
+   needed to unblock the GPU and would also stop the watchdog.
 5. One endpoint and shape-keyed plans are shared by sequential MoE layers.
    Concurrent forwards or overlapping graph replays using the same endpoint
    are unsupported. Warm up every tile shape before capture. Finish work and
    retire graphs before closing the groups and releasing registered storage.
+
+With `hierarchical_mega_moe_rdma_host_staging=true`, an independent CUDA copy
+stream waits for each producer, copies the remote-bound bytes to a pinned
+CPU buffer, and publishes the request. The NIC then reads CPU memory and
+writes directly to the peer GPU. A consumer joins that copy stream with a
+CUDA event before its usual completion wait, including during graph capture.
+This lets copies and RDMA progress during later native compute without using
+communication CTAs. The completed return/consume protocol protects both GPU
+and pinned buffers against premature reuse. Only the send path is staged;
+BF16 return values are unchanged. Each cached two-slot shape adds
+`2 * source_tile_rows * (dispatch_row_bytes + return_row_bytes)` pinned bytes
+per rank, approximately 60.8 MiB at 2048 rows for the measured model shape.
+Pinned-memory and PCIe costs can outweigh the benefit on other topologies.
 
 For the two-host deployment, replace the original `--kernel-config` with:
 
@@ -184,7 +220,7 @@ GPU-to-NIC bandwidth. The host proxy also needs CPU scheduling capacity; do not
 constrain an entire worker and its progress thread to a single busy CPU core.
 NCCL/Gloo settings still apply to bootstrap, the baseline and local group setup.
 
-### Pending single-layer acceptance
+### Reproduce single-layer acceptance
 
 Run the following on both hosts only after GPUs are available. Start with the
 small correctness command, then run the sweep. `tokens` means source tokens
@@ -208,6 +244,7 @@ small correctness command, then run the sweep. `tokens` means source tokens
     --gid 3 --traffic-class 106 --qps 4 \
     --tokens 768,1536,4096,8192,16384 --tiles 256,512,1024,2048 \
     --stress-replays 1000 --samples 5 --iterations 20 --trace \
+    --include-nccl-baseline \
     --output-directory /tmp/roce-overlap-sweep
 ```
 
@@ -218,6 +255,12 @@ rank), tail padding, all-masked inputs, and physical expert relocation across
 hosts during graph replay. Oracle tolerances retain the existing quantized
 single-layer benchmark's limits; serial/pipeline parity has zero tolerance.
 Failures must be investigated before reporting performance.
+
+`--include-nccl-baseline` measures the full-batch NCCL path using the same
+warmup and sample timing. `--nccl-only` runs just that baseline, while
+`--transport-only` isolates full-batch dispatch, BF16 return and concurrent
+dispatch/return without native compute. Partial rank files preserve completed
+measurements if a later case fails; do not present a failed run as acceptance.
 
 Outputs include all ranks' sample latencies, rank 0/8 CUDA timelines, and each
 rank's proxy request/post/completion timestamps. Proxy intervals bound the

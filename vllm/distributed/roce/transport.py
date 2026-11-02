@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Two-host, graph-replayable GPUDirect RDMA with a host progress thread.
 
-All GPU work uses the caller's stream. A transfer publishes a request with a
-stream memory write, and its consumer waits with a stream memory wait. Neither
-operation launches a CUDA kernel. The proxy owns RC QPs, exchanges per-epoch
-receive credits, and signals completion only after send and receive CQs drain.
+Compute uses the caller's stream. Optional pinned-host send staging uses a
+copy stream joined by CUDA events. Stream memory writes publish requests and
+stream memory waits guard consumers without a communication kernel. The proxy
+owns RC QPs, exchanges per-epoch credits, and drains send and receive CQs.
 """
 
 import functools
@@ -115,6 +115,7 @@ class VerbsTransport:
         qps: int = 4,
         traffic_class: int = 0,
         timeout_seconds: int = 120,
+        host_staging: bool = False,
     ):
         topology = groups.topology
         if len(topology.nodes) != 2:
@@ -157,6 +158,7 @@ class VerbsTransport:
                 traffic_class,
                 timeout_seconds,
                 self.rank,
+                host_staging,
             )
             remote = self._peer(self.endpoint.info())
             self.endpoint.connect(remote)
@@ -188,7 +190,10 @@ class VerbsTransport:
             # Deregister before local tensors can be recycled by the allocator.
             self.close()
             raise
-        self.labels[metadata["id"]] = label
+        self.labels[metadata["id"]] = label | {
+            "relaxed_ordering": metadata["relaxed_ordering"],
+            "host_staging": metadata["host_staging"],
+        }
         return Transfer(
             self.endpoint,
             metadata["id"],
