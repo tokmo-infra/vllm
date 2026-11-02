@@ -1,0 +1,381 @@
+--- a/mooncake-store/include/allocator.h
++++ b/mooncake-store/include/allocator.h
+@@ -139,18 +139,34 @@
+     void AttachUsageTracker(
+         const std::shared_ptr<StorageUsageTracker>& usage_tracker);
+ 
++    // Storage-domain watermarks use occupied allocator space, including bin
++    // rounding. size() and buffer descriptors continue to report payload bytes.
++    [[nodiscard]] size_t occupied_size() const noexcept {
++        return occupied_size_.load(std::memory_order_relaxed);
++    }
++
+    protected:
+     [[nodiscard]] size_t GetUsageBytes() const noexcept {
+         return cur_size_.load(std::memory_order_relaxed);
+     }
+-    void RecordAllocation(size_t bytes) noexcept;
+-    void RecordDeallocation(size_t bytes) noexcept;
+-    void SetUsageBytesForRestore(size_t bytes) noexcept {
+-        cur_size_.store(bytes, std::memory_order_relaxed);
++    void RecordAllocation(size_t bytes) noexcept {
++        RecordAllocation(bytes, bytes);
++    }
++    void RecordDeallocation(size_t bytes) noexcept {
++        RecordDeallocation(bytes, bytes);
++    }
++    void RecordAllocation(size_t payload_bytes, size_t occupied_bytes) noexcept;
++    void RecordDeallocation(size_t payload_bytes, size_t occupied_bytes) noexcept;
++    // Restore before attaching a tracker or publishing the allocator.
++    void SetUsageBytesForRestore(size_t payload_bytes,
++                                 size_t occupied_bytes) noexcept {
++        cur_size_.store(payload_bytes, std::memory_order_relaxed);
++        occupied_size_.store(occupied_bytes, std::memory_order_relaxed);
+     }
+ 
+    private:
+     std::atomic_size_t cur_size_{0};
++    std::atomic_size_t occupied_size_{0};
+     std::unique_ptr<StorageUsageRegistration> usage_registration_;
+ };
+ 
+@@ -314,7 +330,7 @@
+ 
+    private:
+     void RestoreUsageBytes(size_t bytes) noexcept {
+-        SetUsageBytesForRestore(bytes);
++        SetUsageBytesForRestore(bytes, offset_allocator_->occupiedSize());
+     }
+ 
+     // metadata
+--- a/mooncake-store/include/offset_allocator/offset_allocator.h
++++ b/mooncake-store/include/offset_allocator/offset_allocator.h
+@@ -190,6 +190,10 @@
+     // Get comprehensive metrics including fragmentation analysis (thread-safe)
+     [[nodiscard]]
+     OffsetAllocatorMetrics get_metrics() const;
++
++    // Exact occupied bin space, excluding the unaddressable capacity tail.
++    // Used to restore watermark accounting without changing snapshot format.
++    [[nodiscard]] uint64_t occupiedSize() const;
+ 
+     // Serialize the allocator with serializer.
+     template <typename T>
+--- a/mooncake-store/include/segment.h
++++ b/mooncake-store/include/segment.h
+@@ -439,7 +439,9 @@
+     [[nodiscard]] StorageUsageSnapshot GetMemoryUsageSnapshot() const;
+ 
+     /**
+-     * @brief Return aggregate DRAM usage in O(1) without segment_mutex_.
++     * @brief Return occupied DRAM usage in O(1) without segment_mutex_.
++     * Offset allocations include bin rounding for watermark decisions.
++     * GetMemoryUsageSnapshot() retains payload bytes for existing metrics.
+      *
+      * Best-effort: used/capacity may tear briefly across mount/unmount,
+      * matching the previous metric-gauge watermark reads. An unmounted
+--- a/mooncake-store/src/allocator.cpp
++++ b/mooncake-store/src/allocator.cpp
+@@ -17,20 +17,24 @@
+         return;
+     }
+     usage_registration_ = std::make_unique<StorageUsageRegistration>(
+-        usage_tracker, cur_size_, capacity());
+-}
+-
+-void BufferAllocatorBase::RecordAllocation(size_t bytes) noexcept {
+-    cur_size_.fetch_add(bytes, std::memory_order_relaxed);
++        usage_tracker, occupied_size_, capacity());
++}
++
++void BufferAllocatorBase::RecordAllocation(size_t payload_bytes,
++                                           size_t occupied_bytes) noexcept {
++    cur_size_.fetch_add(payload_bytes, std::memory_order_relaxed);
++    occupied_size_.fetch_add(occupied_bytes, std::memory_order_relaxed);
+     if (usage_registration_) {
+-        usage_registration_->AddUsedBytes(bytes);
+-    }
+-}
+-
+-void BufferAllocatorBase::RecordDeallocation(size_t bytes) noexcept {
+-    cur_size_.fetch_sub(bytes, std::memory_order_relaxed);
++        usage_registration_->AddUsedBytes(occupied_bytes);
++    }
++}
++
++void BufferAllocatorBase::RecordDeallocation(size_t payload_bytes,
++                                             size_t occupied_bytes) noexcept {
++    cur_size_.fetch_sub(payload_bytes, std::memory_order_relaxed);
++    occupied_size_.fetch_sub(occupied_bytes, std::memory_order_relaxed);
+     if (usage_registration_) {
+-        usage_registration_->RemoveUsedBytes(bytes);
++        usage_registration_->RemoveUsedBytes(occupied_bytes);
+     }
+ }
+ 
+@@ -360,7 +364,7 @@
+         return nullptr;
+     }
+ 
+-    RecordAllocation(size);
++    RecordAllocation(size, offset_allocator_->normalizedAllocationSize(size));
+     if (replica_type_ == ReplicaType::MEMORY) {
+         MasterMetricManager::instance().inc_allocated_mem_size(segment_name_,
+                                                                size);
+@@ -377,7 +381,8 @@
+         // when the OffsetAllocationHandle goes out of scope
+         size_t freed_size = handle->size();
+         handle->offset_handle_.reset();
+-        RecordDeallocation(freed_size);
++        RecordDeallocation(
++            freed_size, offset_allocator_->normalizedAllocationSize(freed_size));
+         if (replica_type_ == ReplicaType::MEMORY) {
+             MasterMetricManager::instance().dec_allocated_mem_size(
+                 segment_name_, freed_size);
+--- a/mooncake-store/src/offset_allocator.cpp
++++ b/mooncake-store/src/offset_allocator.cpp
+@@ -646,8 +646,22 @@
+     if (fake_size > SmallFloat::MAX_BIN_SIZE) {
+         return 0;
+     }
++#ifdef OFFSET_ALLOCATOR_NOT_ROUND_UP
++    return fake_size << m_multiplier_bits;
++#else
+     return static_cast<uint64_t>(SmallFloat::floatToUint(
+                SmallFloat::uintToFloatRoundUp(static_cast<uint32>(fake_size))))
++           << m_multiplier_bits;
++#endif
++}
++
++uint64_t OffsetAllocator::occupiedSize() const {
++    MutexLocker guard(&m_mutex);
++    if (!m_allocator) {
++        return 0;
++    }
++    return (static_cast<uint64_t>(m_allocator->m_size) -
++            m_allocator->m_freeStorage)
+            << m_multiplier_bits;
+ }
+ 
+--- a/mooncake-store/tests/buffer_allocator_test.cpp
++++ b/mooncake-store/tests/buffer_allocator_test.cpp
+@@ -11,6 +11,7 @@
+ #include <vector>
+ 
+ #include "allocator.h"
++#include "segment.h"
+ #include "types.h"
+ 
+ namespace mooncake {
+@@ -111,6 +112,167 @@
+     }
+ }
+ 
++TEST_F(BufferAllocatorTest, OffsetWatermarkCountsOccupiedBinSpace) {
++    constexpr size_t kCapacity = 1024ULL * 1024 * 1024;
++    auto allocator = std::make_shared<OffsetBufferAllocator>(
++        "occupied-kv", 0x100000000ULL, kCapacity, "occupied-kv");
++    auto tracker = std::make_shared<StorageUsageTracker>();
++    allocator->AttachUsageTracker(tracker);
++    const std::vector<size_t> sizes = {
++        53870592, 49381376, 49381376, 60318720, 123, 5003, 777};
++    std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
++    size_t payload = 0;
++    for (size_t bytes : sizes) {
++        auto buffer = allocator->allocate(bytes);
++        ASSERT_NE(buffer, nullptr);
++        EXPECT_EQ(buffer->get_descriptor().size_, bytes);
++        payload += bytes;
++        buffers.push_back(std::move(buffer));
++        EXPECT_EQ(allocator->size(), payload);
++        EXPECT_EQ(tracker->GetUsage().used_bytes,
++                  allocator->getOffsetAllocator()->occupiedSize());
++        EXPECT_EQ(allocator->occupied_size(), tracker->GetUsage().used_bytes);
++    }
++    EXPECT_GT(tracker->GetUsage().used_bytes, payload);
++    const size_t before_failure = tracker->GetUsage().used_bytes;
++    EXPECT_EQ(allocator->allocate(kCapacity), nullptr);
++    EXPECT_EQ(tracker->GetUsage().used_bytes, before_failure);
++    buffers.erase(buffers.begin() + 1);
++    EXPECT_EQ(tracker->GetUsage().used_bytes,
++              allocator->getOffsetAllocator()->occupiedSize());
++    buffers.clear();
++    EXPECT_EQ(tracker->GetUsage().used_bytes, 0u);
++    EXPECT_EQ(allocator->size(), 0u);
++}
++
++TEST_F(BufferAllocatorTest, OffsetOccupiedUsageSupportsLateAttachAndTeardown) {
++    auto tracker = std::make_shared<StorageUsageTracker>();
++    auto allocator = std::make_shared<OffsetBufferAllocator>(
++        "occupied-lifetime", 0x100000000ULL, 16 * 1024 * 1024,
++        "occupied-lifetime");
++    auto buffer = allocator->allocate(5003);
++    ASSERT_NE(buffer, nullptr);
++    allocator->AttachUsageTracker(tracker);
++    allocator->AttachUsageTracker(tracker);
++    EXPECT_EQ(tracker->GetUsage().used_bytes,
++              allocator->getOffsetAllocator()->occupiedSize());
++    EXPECT_EQ(tracker->GetUsage().capacity_bytes, allocator->capacity());
++    allocator.reset();
++    EXPECT_EQ(tracker->GetUsage().used_bytes, 0u);
++    EXPECT_EQ(tracker->GetUsage().capacity_bytes, 0u);
++    buffer.reset();
++    EXPECT_EQ(tracker->GetUsage().used_bytes, 0u);
++}
++
++TEST_F(BufferAllocatorTest, OffsetOccupiedUsageIsSymmetricUnderConcurrency) {
++    auto tracker = std::make_shared<StorageUsageTracker>();
++    auto allocator = std::make_shared<OffsetBufferAllocator>(
++        "occupied-concurrent", 0x100000000ULL, 16 * 1024 * 1024,
++        "occupied-concurrent");
++    allocator->AttachUsageTracker(tracker);
++    std::atomic<size_t> failures{0};
++    std::vector<std::thread> threads;
++    for (size_t rank = 0; rank < 4; ++rank) {
++        threads.emplace_back([&, rank] {
++            for (size_t i = 0; i < 1000; ++i) {
++                auto a = allocator->allocate(5003 + rank + i % 123);
++                auto b = allocator->allocate(777 + rank);
++                if (!a || !b) ++failures;
++            }
++        });
++    }
++    for (auto& thread : threads) thread.join();
++    EXPECT_EQ(failures.load(), 0u);
++    EXPECT_EQ(allocator->size(), 0u);
++    EXPECT_EQ(allocator->occupied_size(), 0u);
++    EXPECT_EQ(tracker->GetUsage().used_bytes, 0u);
++    EXPECT_EQ(allocator->getOffsetAllocator()->occupiedSize(), 0u);
++}
++
++TEST_F(BufferAllocatorTest, OffsetDescriptorRestorePreservesBothUsageMeasures) {
++    constexpr size_t kBase = 0x100000000ULL;
++    constexpr size_t kCapacity = 16 * 1024 * 1024;
++    const std::string segment = "occupied-restore";
++    auto original = std::make_shared<OffsetBufferAllocator>(
++        segment, kBase, kCapacity, segment);
++    auto a = original->allocate(5003);
++    auto hole = original->allocate(777);
++    auto b = original->allocate(123);
++    ASSERT_TRUE(a && hole && b);
++    std::vector<AllocatedBuffer::Descriptor> descriptors = {
++        a->get_descriptor(), b->get_descriptor()};
++    hole.reset();
++    auto restored = RestoreOffsetBufferAllocator(
++        segment, kBase, kCapacity, segment, descriptors);
++    ASSERT_TRUE(restored.has_value());
++    auto tracker = std::make_shared<StorageUsageTracker>();
++    restored->allocator->AttachUsageTracker(tracker);
++    EXPECT_EQ(restored->allocator->size(), 5126u);
++    EXPECT_EQ(tracker->GetUsage().used_bytes, original->occupied_size());
++    restored->buffers.clear();
++    EXPECT_EQ(tracker->GetUsage().used_bytes, 0u);
++    EXPECT_EQ(restored->allocator->occupied_size(), 0u);
++}
++
++TEST_F(BufferAllocatorTest, OffsetOccupiedSizeDoesNotCountMetadataExhaustion) {
++    auto allocator = offset_allocator::OffsetAllocator::create(
++        0x100000000ULL, 16 * 1024 * 1024, 8, 8);
++    std::vector<offset_allocator::OffsetAllocationHandle> handles;
++    size_t expected = 0;
++    for (size_t i = 0; i < 16; ++i) {
++        auto handle = allocator->allocate(5003);
++        if (!handle) break;
++        expected += allocator->normalizedAllocationSize(5003);
++        handles.push_back(std::move(*handle));
++    }
++    ASSERT_GT(handles.size(), 0u);
++    ASSERT_LT(handles.size(), 16u);
++    EXPECT_EQ(allocator->storageReport().totalFreeSpace, 0u);
++    EXPECT_EQ(allocator->occupiedSize(), expected);
++    handles.clear();
++    EXPECT_EQ(allocator->occupiedSize(), 0u);
++}
++
++TEST_F(BufferAllocatorTest, OffsetSegmentPreservesPayloadMetricsWithOccupiedWatermark) {
++    SegmentManager manager(BufferAllocatorType::OFFSET);
++    Segment segment;
++    segment.id = generate_uuid();
++    segment.name = "occupied-segment";
++    segment.base = 0x100000000ULL;
++    segment.size = 16 * 1024 * 1024;
++    auto client = generate_uuid();
++    std::shared_ptr<BufferAllocatorBase> allocator;
++    {
++        auto access = manager.getSegmentAccess();
++        ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
++        allocator = access.GetAllocator(segment.id);
++    }
++    auto buffer = allocator->allocate(5003);
++    ASSERT_NE(buffer, nullptr);
++    EXPECT_EQ(buffer->size(), 5003u);
++    EXPECT_GT(manager.GetMemoryUsage().used_bytes, 5003u);
++    EXPECT_EQ(manager.GetMemoryUsage().used_bytes, allocator->occupied_size());
++    const auto snapshot = manager.GetMemoryUsageSnapshot();
++    EXPECT_EQ(snapshot.used_bytes, 5003u);
++    EXPECT_EQ(snapshot.segments.at(segment.name).used_bytes, 5003u);
++    buffer.reset();
++    EXPECT_EQ(manager.GetMemoryUsage().used_bytes, 0u);
++}
++
++TEST_F(BufferAllocatorTest, CachelibPayloadAccountingRemainsUnchanged) {
++    auto tracker = std::make_shared<StorageUsageTracker>();
++    auto allocator = std::make_shared<CachelibBufferAllocator>(
++        "cachelib-usage", 0x100000000ULL, 16 * 1024 * 1024,
++        "cachelib-usage");
++    allocator->AttachUsageTracker(tracker);
++    auto buffer = allocator->allocate(5003);
++    ASSERT_NE(buffer, nullptr);
++    EXPECT_EQ(allocator->size(), 5003u);
++    EXPECT_EQ(tracker->GetUsage().used_bytes, 5003u);
++    buffer.reset();
++    EXPECT_EQ(tracker->GetUsage().used_bytes, 0u);
++}
++
+ TEST_F(BufferAllocatorTest, OffsetLargestFreeRegionRemainsExact) {
+     constexpr size_t CAPACITY = 16 * 1024 * 1024;
+     auto allocator = std::make_shared<OffsetBufferAllocator>(
+--- a/mooncake-store/tests/serializer_test.cpp
++++ b/mooncake-store/tests/serializer_test.cpp
+@@ -217,6 +217,41 @@
+     EXPECT_EQ(restored->status, SegmentStatus::OK);
+ }
+ 
++TEST_F(SerializerTest, OffsetSnapshotRestoresOccupiedUsageWithoutFormatChange) {
++    auto original = std::make_shared<OffsetBufferAllocator>(
++        "occupied-snapshot", 0x300000000ULL, 16 * 1024 * 1024,
++        "occupied-snapshot");
++    auto first = original->allocate(5003);
++    auto second = original->allocate(777);
++    ASSERT_TRUE(first && second);
++    msgpack::sbuffer buffer;
++    MsgpackPacker packer(&buffer);
++    ASSERT_TRUE(Serializer<OffsetBufferAllocator>::serialize(*original, packer)
++                    .has_value());
++    auto object = msgpack::unpack(buffer.data(), buffer.size());
++    ASSERT_EQ(object.get().via.array.size, 6u);
++    auto result = Serializer<OffsetBufferAllocator>::deserialize(object.get());
++    ASSERT_TRUE(result.has_value());
++    auto restored = result.value();
++    EXPECT_EQ(restored->size(), original->size());
++    EXPECT_EQ(restored->occupied_size(), original->occupied_size());
++    auto tracker = std::make_shared<StorageUsageTracker>();
++    restored->AttachUsageTracker(tracker);
++    EXPECT_EQ(tracker->GetUsage().used_bytes, original->occupied_size());
++    const size_t occupied = tracker->GetUsage().used_bytes;
++    {
++        auto extra = restored->allocate(123);
++        ASSERT_NE(extra, nullptr);
++        EXPECT_EQ(restored->occupied_size(),
++                  restored->getOffsetAllocator()->occupiedSize());
++    }
++    EXPECT_EQ(tracker->GetUsage().used_bytes, occupied);
++    restored.reset();
++    result.value().reset();
++    EXPECT_EQ(tracker->GetUsage().used_bytes, 0u);
++    EXPECT_EQ(tracker->GetUsage().capacity_bytes, 0u);
++}
++
+ }  // namespace mooncake::test
+ 
+ int main(int argc, char** argv) {
