@@ -62,6 +62,9 @@ export MASTER_IMAGE=${MASTER_IMAGE:-$IMAGE}
 docker run -d --name glm-mooncake-master --network host --memory 4g \
   --runtime=runc -e NVIDIA_VISIBLE_DEVICES=void \
   -e MC_TCP_BIND_ADDRESS="$MASTER_IP" -e MOONCAKE_REQUESTER_LOCAL_HOSTNAME="$MASTER_IP" \
+  -e MC_EVICTION_FIT_REQUEST_BYTES="${MC_EVICTION_FIT_REQUEST_BYTES:-0}" \
+  -e MC_EVICTION_FIT_MIN_SLOTS="${MC_EVICTION_FIT_MIN_SLOTS:-64}" \
+  -e MC_EVICTION_FIT_CHECK_MS="${MC_EVICTION_FIT_CHECK_MS:-1000}" \
   --entrypoint mooncake_master "$MASTER_IMAGE" \
   --rpc_port=61241 --enable_http_metadata_server=true \
   --http_metadata_server_host=0.0.0.0 --http_metadata_server_port=61242 \
@@ -69,7 +72,7 @@ docker run -d --name glm-mooncake-master --network host --memory 4g \
   --allocation_strategy=local_first --logtostderr=true
 ~~~
 
-可选 Master 占用计账镜像：
+可选 Master 占用计账及大块压力淘汰镜像（先执行，再运行上方命令）：
 
 ~~~bash
 git clone https://github.com/kvcache-ai/Mooncake.git /tmp/mooncake-occupied-source
@@ -78,8 +81,11 @@ bash integrations/glm53flash/build-mooncake-master.sh \
   /tmp/mooncake-occupied-source /tmp/mooncake-occupied-build ./mooncake-master-runtime
 docker build -f integrations/glm53flash/Dockerfile.mooncake-master \
   --build-arg BASE_IMAGE=local/glm53flash-vllm:0.32.0 \
-  -t local/glm53flash-mooncake-master:occupied-20261102 .
-export MASTER_IMAGE=local/glm53flash-mooncake-master:occupied-20261102
+  -t local/glm53flash-mooncake-master:fitpressure-20261102 .
+export MASTER_IMAGE=local/glm53flash-mooncake-master:fitpressure-20261102
+export MC_EVICTION_FIT_REQUEST_BYTES=60318720
+export MC_EVICTION_FIT_MIN_SLOTS=64
+export MC_EVICTION_FIT_CHECK_MS=1000
 ~~~
 
 ## 3. Mooncake Store：P、D1、D2 各执行一次

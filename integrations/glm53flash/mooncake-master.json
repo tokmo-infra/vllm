@@ -3,13 +3,13 @@
   "commit": "719735896c86b56fabec6cf3e825fb2ea640597a",
   "patch": "patches/mooncake-occupied-accounting.patch",
   "patch_sha256": "d81b0a25af222857275d9c6f73b4dbfc777b3c2e3c21fa006a3370679c50d94d",
-  "scope": "Master only; offset watermark uses occupied bin bytes, public payload metrics and snapshot format unchanged",
+  "scope": "Master only; occupied-bin watermarks plus opt-in free-bin-fit pressure triggering native BatchEvict; payload metrics, lease/refcount/pin/group eligibility and SDK unchanged",
   "default_enabled": false,
   "SDK_replaced": false,
   "build_script": "build-mooncake-master.sh",
   "dockerfile": "Dockerfile.mooncake-master",
   "build_type": "Release -O2 -DNDEBUG; USE_CUDA=OFF",
-  "validated_release_sha256": "192323efa3b5294576d736998c8b5bf17eb81bb4d6154f79316f61dda8054f65",
+  "validated_release_sha256": "f2d0ace27503bee039dfcd0b5188b0921408f1adefce53f8c3f6623fa4fb3c1d",
   "native_tests_passed": 39,
   "pinned_original_sha256": {
     "mooncake-store/include/allocator.h": "b35a826d35a53773334b61393ed7e8f9f4898f6e4c78a1a3cfedf28cf8331681",
@@ -21,6 +21,53 @@
     "mooncake-store/tests/serializer_test.cpp": "664bc1a32ce810ab80c4b0c06f6128e04cad5457553acbd8f85a15beaa5125fd"
   },
   "formal_validation": {
+    "run_id": "run-c821b0f9352d",
+    "workload": "C200/U300/N300 SWE13w",
+    "complete_minutes": 10,
+    "successful_window_requests": 4321,
+    "TPM": 57793817.8,
+    "mean_TTFT_s": 7.699599585905114,
+    "request_failures": 0,
+    "failed_PUT_keys": 0,
+    "comparison_failed_PUT_keys": 110,
+    "common_window_source_pairs": 3291,
+    "matched_extra_recompute_tokens_before": 34560,
+    "matched_extra_recompute_tokens_after": 3328,
+    "client_memory": "8GiB both runs",
+    "note": "Same pinned dataset and inference parameters. Formal windows9/10min and cohorts differ; no claim that all TPM change is caused by the patch. TTFT mean did not improve; async/FP8/MTP3/graphs retained.",
+    "fit_pressure_triggers": 16,
+    "native_ratio_triggers": 3,
+    "evicted_keys": 38402.0,
+    "evicted_bytes": 1973749317632.0
+  },
+  "candidate_image_tag": "local/glm53flash-mooncake-master:fitpressure-20261102",
+  "image_smoke": "network-none entrypoint --help exit1 and exact ELF sha256; actual overlay Master passed PD/L2 and formal C200",
+  "additional_patches": [
+    {
+      "path": "patches/mooncake-fit-pressure.patch",
+      "sha256": "ba417a3dfb6aade7ed6dcf1fac9f5bb63097f1b0e05d12b77c11da621de28e76",
+      "default_enabled": false
+    }
+  ],
+  "validated_occupied_only_release_sha256": "192323efa3b5294576d736998c8b5bf17eb81bb4d6154f79316f61dda8054f65",
+  "fit_pressure": {
+    "default_request_bytes": 0,
+    "validated_environment": {
+      "MC_EVICTION_FIT_REQUEST_BYTES": "60318720",
+      "MC_EVICTION_FIT_MIN_SLOTS": "64",
+      "MC_EVICTION_FIT_CHECK_MS": "1000"
+    },
+    "helper_tests_passed": 4,
+    "selected_protection_tests_passed": 16,
+    "protection_scope": "9 defaultoff native; 1 enabled lease/pin/group/refcount; 6 defaultoff HA durable, not full HA-pressure stress",
+    "protection_fixture": "tests/mooncake-fit-pressure-protection.inc",
+    "fixture_environment": {
+      "MC_EVICTION_FIT_REQUEST_BYTES": "60318720",
+      "MC_EVICTION_FIT_MIN_SLOTS": "3",
+      "MC_EVICTION_FIT_CHECK_MS": "1000"
+    }
+  },
+  "occupied_only_formal_validation": {
     "run_id": "run-bfd80cb8e183",
     "workload": "C200/U300/N300 SWE13w",
     "complete_minutes": 9,
@@ -31,7 +78,6 @@
     "comparison_failed_PUT_keys": 121,
     "note": "Candidate retained separately; CPU cap20 to8GiB and different completed-request cohorts prevent pure performance attribution. Extra fallback not eliminated."
   },
-  "candidate_image_on_83": "sha256:cbd5dd9405c3a90f065fe594cb6dfb61b9bd306b7fc6d0ad17c491526c3537dd",
-  "candidate_image_tag": "local/glm53flash-mooncake-master:occupied-20261102",
-  "image_smoke": "network-none --help and exact ELF sha256; no model/SDK replacement"
+  "occupied_only_candidate_image_tag": "local/glm53flash-mooncake-master:occupied-20261102",
+  "candidate_image_on_83": "sha256:63e6460994dbec8ec15a3d67c55b46b649f3d97fb9204bdfbb03afb278216805"
 }
