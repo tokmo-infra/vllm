@@ -907,6 +907,7 @@ def test_store_sending_thread_retries_skipped_range_after_pressure():
     # saved offset stays at 0.
     thread._store_pressure_active = True
     thread._skip_store_requests.add("req-a")
+    thread._store_pressure_probe_at = math.inf
 
     _run_store_req(
         thread,
@@ -1253,6 +1254,7 @@ def test_partial_tail_offload_honors_active_pressure_gate():
     thread = _make_partial_tail_send_thread(store)
     thread._store_pressure_active = True
     thread._skip_store_requests.add("req-a")
+    thread._store_pressure_probe_at = math.inf
 
     _run_store_req(thread, _make_partial_tail_req([1, 2, 3]))
 
