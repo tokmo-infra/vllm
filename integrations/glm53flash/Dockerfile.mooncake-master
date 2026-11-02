@@ -1,0 +1,7 @@
+ARG BASE_IMAGE=local/glm53flash-vllm:0.32.0
+FROM ${BASE_IMAGE}
+COPY mooncake-master-runtime/ /opt/glm53flash-mooncake-master/
+COPY integrations/glm53flash/mooncake-master-entrypoint.sh /usr/local/bin/mooncake_master
+RUN chmod 755 /usr/local/bin/mooncake_master /opt/glm53flash-mooncake-master/mooncake_master
+LABEL glm.mooncake.scope="Master-only occupied-bin watermark accounting"
+ENTRYPOINT ["mooncake_master"]

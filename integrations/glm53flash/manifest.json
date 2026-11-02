@@ -268,7 +268,8 @@
     "native_core_patch": null,
     "changes": "vLLM connector/Store integration and master configuration",
     "eviction_high_watermark_ratio": 0.98,
-    "pool_gib_per_D_host": 750
+    "pool_gib_per_D_host": 750,
+    "optional_master_manifest": "mooncake-master.json"
   },
   "build": {
     "python": "3.12",
