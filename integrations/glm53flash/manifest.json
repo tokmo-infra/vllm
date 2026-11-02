@@ -168,7 +168,7 @@
         ]
       }
     ],
-    "deployed_image": "sha256:540155b18ee763049423a616628cc1fee5e22176b3b1397775465f9067569bcf"
+    "historical_deployed_image": "sha256:540155b18ee763049423a616628cc1fee5e22176b3b1397775465f9067569bcf"
   },
   "flashinfer": {
     "repository": "https://github.com/flashinfer-ai/flashinfer.git",
@@ -311,7 +311,8 @@
     "start_percent": 55,
     "complete_minutes": 12,
     "Store_GiB": 2250,
-    "document": "DEPLOYMENT-C230.md"
+    "document": "DEPLOYMENT-C230.md",
+    "historical": true
   },
   "release_repositories": {
     "vllm": "https://github.com/tokmo-infra/vllm",
@@ -325,7 +326,61 @@
     "P_load_recv_threads": 4,
     "lookup_async": true,
     "MTP": "native3; P-only fixed-zero and scratch-release experiments removed",
-    "flashinfer_autotune": "native default; no disabling kernel-config in standard commands"
+    "flashinfer_autotune": "native default; no disabling kernel-config in standard commands",
+    "nodes": "P81, D83, D84",
+    "historical_reference": {
+      "run": "run-8bb8d266fb55",
+      "workload": "SWE8w C230/U345/N345",
+      "tpm": 55954500,
+      "note": "not the new SWE13w C200/U300/N300 result"
+    },
+    "model_tag": "local/glm53flash-vllm:0.32.0",
+    "router_tag": "local/glm53flash-router:0.1.16",
+    "shared_model_image_ids": {
+      "P81": "sha256:2c91fd527d05992e2b373938c44556fc94259ce6a6069a7158c2d1f2568cd828",
+      "D83": "sha256:a933ba26983722a147849be4c4e8d13fa4db8e6751e13e05f25ed374f85410f7",
+      "D84": "sha256:38a1cea116271a2b886339b4788ddb31f0dcba96a94bf897c734ed9c6df40cb1"
+    },
+    "router_image": "sha256:21c9cfa19e348f84a99102ab02922d5cd3a1ef6d659881cac09e9d6479c4d07b",
+    "api_proxy": false,
+    "api_affinity": false,
+    "private_uds": false,
+    "tokenizer_shared_pool": {
+      "default_enabled": true,
+      "status": "shared-tokenizer no-API-proxy baseline, run-8bb8d266fb55",
+      "dockerfile": "Dockerfile.shared-tokenizer",
+      "parent_image": "sha256:bd6c77d709b8225ebf7b4a9a3890509a4e2df87af846fcc7230b65a7a57d16f7",
+      "files": [
+        {
+          "path": "vllm/tokenizers/glm53_native_cache.py",
+          "sha256": "0632ab3c22fc9c3929c3d1a6d74b8347773fa947dceeefb3b22918ab47bbcc4c"
+        },
+        {
+          "path": "vllm/tokenizers/glm53_segment_cache_core.py",
+          "sha256": "f8b8e890af94068c81bfcc82771214b9970e727dbbbcb23d6de3c118fdfd77a9"
+        },
+        {
+          "path": "vllm/tokenizers/glm53_shared_segment_store.py",
+          "sha256": "9e43e45a5c5c9b07176a7533af9d1e11bf62e2154bdb68a854c7e9ca8bc533f7"
+        }
+      ],
+      "environment": {
+        "VLLM_GLM53_TOKENIZER_SHARED_PATH": "/run/glm-tokenizer/segments.db",
+        "VLLM_GLM53_TOKENIZER_LOCAL_L1_MIB": "64",
+        "VLLM_GLM53_TOKENIZER_CACHE_EPOCH_FILE": "/run/glm-tokenizer/epoch",
+        "VLLM_GLM53_TOKENIZER_CACHE_GIB": {
+          "P": "2",
+          "D": "16"
+        }
+      },
+      "shared_pool_gib": {
+        "P_8_API_per_host": 15.5,
+        "D_1_API_per_host": 15.9375
+      },
+      "total_budget_gib_per_host": 16,
+      "api_proxy_included": false,
+      "KV_changes_included": false
+    }
   },
   "reverted_PRs": {
     "flashinfer/7085": {
@@ -351,10 +406,10 @@
     ]
   },
   "release_images": {
-    "model": "sha256:540155b18ee763049423a616628cc1fee5e22176b3b1397775465f9067569bcf",
     "router": "sha256:21c9cfa19e348f84a99102ab02922d5cd3a1ef6d659881cac09e9d6479c4d07b",
     "vllm_source_snapshot": "e39fef0657b0c1582b2d2bbeb1828b40a77a71d7",
-    "router_source_snapshot": "48740d2ad97f734a8846cc5679668b744c237dc1"
+    "router_source_snapshot": "48740d2ad97f734a8846cc5679668b744c237dc1",
+    "historical_model": "sha256:540155b18ee763049423a616628cc1fee5e22176b3b1397775465f9067569bcf"
   },
   "optional_extensions": {
     "deepep_explicit_sms": {
@@ -375,38 +430,6 @@
       },
       "all2all_backend": "deepep_v2",
       "default_enabled": false
-    },
-    "tokenizer_shared_pool": {
-      "default_enabled": false,
-      "status": "C230 candidate; performance pending",
-      "dockerfile": "Dockerfile.shared-tokenizer",
-      "parent_image": "sha256:bd6c77d709b8225ebf7b4a9a3890509a4e2df87af846fcc7230b65a7a57d16f7",
-      "files": [
-        {
-          "path": "vllm/tokenizers/glm53_native_cache.py",
-          "sha256": "0632ab3c22fc9c3929c3d1a6d74b8347773fa947dceeefb3b22918ab47bbcc4c"
-        },
-        {
-          "path": "vllm/tokenizers/glm53_segment_cache_core.py",
-          "sha256": "f8b8e890af94068c81bfcc82771214b9970e727dbbbcb23d6de3c118fdfd77a9"
-        },
-        {
-          "path": "vllm/tokenizers/glm53_shared_segment_store.py",
-          "sha256": "9e43e45a5c5c9b07176a7533af9d1e11bf62e2154bdb68a854c7e9ca8bc533f7"
-        }
-      ],
-      "environment": {
-        "VLLM_GLM53_TOKENIZER_SHARED_PATH": "/run/glm-tokenizer/segments.db",
-        "VLLM_GLM53_TOKENIZER_LOCAL_L1_MIB": "64",
-        "VLLM_GLM53_TOKENIZER_CACHE_EPOCH_FILE": "/run/glm-tokenizer/epoch"
-      },
-      "shared_pool_gib": {
-        "P_8_API_per_host": 15.5,
-        "D_1_API_per_host": 15.9375
-      },
-      "total_budget_gib_per_host": 16,
-      "api_proxy_included": false,
-      "KV_changes_included": false
     }
   }
 }

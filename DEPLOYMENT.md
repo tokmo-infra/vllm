@@ -1,4 +1,6 @@
-# 1P2D · GLM-5.3 Flash 启动命令
+# 1P2D · GLM-5.3 Flash 共享 Tokenizer 基线
+
+历史参考 run-8bb8d266fb55：SWE8w C230/U345/N345，55% 后完整窗口 5595.45 万 TPM；这不是新 SWE13w C200/U300/N300 的测量结果。新轮计划在 P81、D83、D84 启动，部署及压测由主代理负责。
 
 ## 1. 拓扑与参数
 
@@ -8,7 +10,8 @@
 | D | D1、D2 各 TP1/DP8/EP8，每DP seq16、batch1024，graph64，util0.95 |
 | 公共 | GLM-5.3 Flash NVFP4，KV FP8，MTP3，prefix256，max-model-len auto |
 | Mooncake | P、D1、D2 各750 GiB，共2250 GiB；水位98%；local_first |
-| Router | P/D 均 cache_aware，负载阈值4 / 1.5 |
+| Router | 原生 21c9，P/D 均 cache_aware，负载阈值4 / 1.5，无 API 代理、亲和或私有 UDS |
+| Tokenizer | 每机共享池 + 每 API 64 MiB L1，合计 16 GiB/台，等效 2 GiB/GPU |
 
 P端API进程4、KV接收线程4，P/D异步查找开启。保留原生MTP3和原生后端，不启用P-only实验，不传禁用FlashInfer自动调优的参数。
 
@@ -17,7 +20,11 @@ P端API进程4、KV接收线程4，P/D异步查找开启。保留原生MTP3和�
 ~~~bash
 export IMAGE=local/glm53flash-vllm:0.32.0
 export ROUTER_IMAGE=local/glm53flash-router:0.1.16
-export MODEL_IMAGE_ID=sha256:540155b18ee763049423a616628cc1fee5e22176b3b1397775465f9067569bcf
+# 每台机器按角色选择本机已有的历史共享镜像 ID（并非统一 ID）。
+# P81: sha256:2c91fd527d05992e2b373938c44556fc94259ce6a6069a7158c2d1f2568cd828
+# D83: sha256:a933ba26983722a147849be4c4e8d13fa4db8e6751e13e05f25ed374f85410f7
+# D84: sha256:38a1cea116271a2b886339b4788ddb31f0dcba96a94bf897c734ed9c6df40cb1
+export MODEL_IMAGE_ID='<本机对应共享镜像完整ID>'
 export ROUTER_IMAGE_ID=sha256:21c9cfa19e348f84a99102ab02922d5cd3a1ef6d659881cac09e9d6479c4d07b
 docker tag "$MODEL_IMAGE_ID" "$IMAGE"
 docker tag "$ROUTER_IMAGE_ID" "$ROUTER_IMAGE"
@@ -25,13 +32,28 @@ export MODEL_DIR=/path/to/GLM-5.3-Flash-NVFP4
 export WORK=/path/to/glm-pd
 export CACHE_DIR="$WORK/cache"
 export CACHE_NAMESPACE=glm53flash-prefix256-v1
-export API_KEY='replace-at-runtime'
+read -rs -p "API key: " API_KEY; echo; export API_KEY
 export MASTER_IP='<master-ip>'
 export P_IP='<prefill-rdma-ip>'
 export D1_IP='<decode-1-rdma-ip>' D2_IP='<decode-2-rdma-ip>'
 export ROUTER_IP="$D1_IP"
 mkdir -p "$WORK" "$CACHE_DIR"
+# 每台主机单独初始化；P0/P1 必须挂载同一目录。仅在服务停止且需要清空时删除旧池。
+export TOKENIZER_DIR=/dev/shm/glm53-tokenizer
+mkdir -p "$TOKENIZER_DIR"
+chmod 700 "$TOKENIZER_DIR"
+# 仅在所有使用该池的服务停止时初始化或更新 epoch。
+printf '%s' 'admission-generation' > "$TOKENIZER_DIR/epoch"
 ~~~
+
+共享池容量是逻辑预算；请确认宿主 tmpfs 空间、内存和容器权限足够，并预留至少 16 GiB 宿主内存。换轮需要清空缓存时，先停止使用该池的全部服务，再清理池并重建 epoch；勿在运行中直接删除数据库。
+
+| 环境变量 | P81：8 API/台 | D83/84：1 API/台 |
+| --- | --- | --- |
+| VLLM_GLM53_TOKENIZER_CACHE_GIB | 2 | 16 |
+| VLLM_GLM53_TOKENIZER_SHARED_GIB | 15.5 | 15.9375 |
+| VLLM_GLM53_TOKENIZER_LOCAL_L1_MIB | 64 | 64 |
+| 共享池 + L1 | 15.5 + 8 × 0.0625 = 16 GiB | 15.9375 + 0.0625 = 16 GiB |
 
 ## 2. Mooncake master
 
@@ -131,6 +153,11 @@ EOF
     --device /dev/infiniband --cap-add IPC_LOCK --cap-add SYS_NICE \
     --ulimit memlock=-1:-1 --ulimit stack=67108864:67108864 \
     -v "$MODEL_DIR:/model:ro" -v "$WORK:/work" -v "$CACHE_DIR/p$IDX:/root/.cache" \
+    -v "$TOKENIZER_DIR:/run/glm-tokenizer:rw" \
+    -e VLLM_GLM53_TOKENIZER_SHARED_PATH=/run/glm-tokenizer/segments.db \
+    -e VLLM_GLM53_TOKENIZER_SHARED_GIB=15.5 -e VLLM_GLM53_TOKENIZER_CACHE_GIB=2 \
+    -e VLLM_GLM53_TOKENIZER_LOCAL_L1_MIB=64 \
+    -e VLLM_GLM53_TOKENIZER_CACHE_EPOCH_FILE=/run/glm-tokenizer/epoch \
     -e VLLM_HOST_IP="$P_IP" -e NCCL_SOCKET_IFNAME="$NET_IF" \
     -e GLOO_SOCKET_IFNAME="$NET_IF" -e NCCL_IB_HCA="$IB_HCA" \
     -e NCCL_IB_GID_INDEX=3 -e MC_GID_INDEX=3 -e NCCL_DEBUG=INFO \
@@ -186,6 +213,11 @@ docker run -d --name glm-D --init --memory 96g --memory-swap 96g --network host 
   --cap-add IPC_LOCK --cap-add SYS_NICE --ulimit stack=67108864:67108864 \
   --gpus all --device /dev/infiniband --ulimit memlock=-1:-1 \
   -v "$MODEL_DIR:/model:ro" -v "$WORK:/work" -v "$CACHE_DIR:/root/.cache" \
+  -v "$TOKENIZER_DIR:/run/glm-tokenizer:rw" \
+  -e VLLM_GLM53_TOKENIZER_SHARED_PATH=/run/glm-tokenizer/segments.db \
+  -e VLLM_GLM53_TOKENIZER_SHARED_GIB=15.9375 -e VLLM_GLM53_TOKENIZER_CACHE_GIB=16 \
+  -e VLLM_GLM53_TOKENIZER_LOCAL_L1_MIB=64 \
+  -e VLLM_GLM53_TOKENIZER_CACHE_EPOCH_FILE=/run/glm-tokenizer/epoch \
   -e VLLM_HOST_IP="$NODE_IP" -e NCCL_SOCKET_IFNAME="$NET_IF" \
   -e GLOO_SOCKET_IFNAME="$NET_IF" -e NCCL_IB_HCA="$IB_HCA" \
   -e NCCL_IB_GID_INDEX=3 -e MC_GID_INDEX=3 -e NCCL_DEBUG=INFO \
@@ -257,6 +289,8 @@ docker run -d --name glm-router --runtime=runc --network host \
   --worker-startup-check-interval 5 --log-level info --api-key "$API_KEY"
 ~~~
 
+Router 直接连接 vLLM 原生 HTTP 监听器，不部署 API 代理、亲和或私有 UDS。
+
 启动顺序：master → 三台Store → 两个D → 两个P → Router。
 模型输出usage由 enable-prompt-tokens-details、enable-force-include-usage 提供；
 流式请求传 stream_options.include_usage=true，思考参数沿用 enable_thinking=true / xhigh。
@@ -273,58 +307,3 @@ docker run -d --name glm-router --runtime=runc --network host \
 
 P 速度取 local_compute token计数差，不包括缓存命中；D 速度取generation token计数差。
 多路DP按engine标签分别读取，汇总时按实际采样间隔计算。
-
-## 9. DeepEP 可选通信对照
-
-~~~bash
-docker build --build-arg BASE_IMAGE=local/glm53flash-vllm:0.32.0 \
-  -f integrations/glm53flash/Dockerfile.deepep \
-  -t local/glm53flash-vllm:deepep32-candidate .
-~~~
-
-P/D 模型容器使用该候选镜像，并增加以下环境变量及启动参数。
-
-~~~bash
--e AI_INFRA_DEEPEP_V2_NUM_SMS=32
--e VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE=0
--e NCCL_GIN_TYPE=2
--e NCCL_P2P_DISABLE=0
--e NCCL_P2P_LEVEL=PIX
--e NCCL_SHM_DISABLE=1
--e NCCL_NET=IB
-
---all2all-backend deepep_v2
-~~~
-
-85/86/87 对照组的 NCCL HCA：
-
-| 实例 | NCCL_IB_HCA |
-| --- | --- |
-| P85 GPU0—3 | =mlx5_0:1,mlx5_1:1 |
-| P85 GPU4—7 | =mlx5_5:1,mlx5_6:1 |
-| D86、D87 GPU0—7 | =mlx5_0:1,mlx5_1:1,mlx5_5:1,mlx5_6:1 |
-
-## 10. 共享分词缓存可选对照
-
-~~~bash
-docker build -f integrations/glm53flash/Dockerfile.shared-tokenizer \
-  -t local/glm53flash-vllm:shared-tokenizer-candidate .
-
-mkdir -p /dev/shm/glm53-tokenizer
-printf 'initial' > /dev/shm/glm53-tokenizer/epoch
-
--v /dev/shm/glm53-tokenizer:/run/glm-tokenizer:rw
--e VLLM_GLM53_TOKENIZER_SHARED_PATH=/run/glm-tokenizer/segments.db
--e VLLM_GLM53_TOKENIZER_LOCAL_L1_MIB=64
--e VLLM_GLM53_TOKENIZER_CACHE_EPOCH_FILE=/run/glm-tokenizer/epoch
-~~~
-
-| 参数 | P：同机两个EP4、每实例4 API | D：EP8、1 API |
-| --- | --- | --- |
-| VLLM_GLM53_TOKENIZER_CACHE_GIB | 2 | 16 |
-| VLLM_GLM53_TOKENIZER_SHARED_GIB | 15.5 | 15.9375 |
-| VLLM_GLM53_TOKENIZER_LOCAL_L1_MIB | 64 | 64 |
-| 每台共享池＋私有L1预算 | 16GiB | 16GiB |
-
-同一台P的两个容器挂载同一目录；不同机器分别使用各自的目录。
-该镜像以原独立分词缓存镜像bd6c77d709b8为父层，不包含API代理或KV放置修改。
