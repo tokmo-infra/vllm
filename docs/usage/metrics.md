@@ -1,10 +1,9 @@
 # Production Metrics
 
-Request phase histograms require observed, ordered engine milestones. Requests
-cancelled before scheduling or before their first output do not contribute zero
-or negative samples to unavailable phases. Such omissions are counted in
-`vllm:request_phase_metrics_unavailable_total` with a `phase` label; request
-outcomes and end-to-end latency are still recorded.
+本GLM分支的`963215c6`修复请求阶段计时：只使用已观察且顺序有效的引擎事件。
+请求在调度前或首次输出前取消时，缺失阶段不再被记为0或负数；
+`vllm:request_phase_metrics_unavailable_total`按`phase`标签统计这些缺失，
+请求结果与端到端延迟仍正常记录。该修复可用于通用请求统计和性能分析。
 
 vLLM exposes a number of metrics that can be used to monitor the health of the
 system. These metrics are exposed via the `/metrics` endpoint on the vLLM

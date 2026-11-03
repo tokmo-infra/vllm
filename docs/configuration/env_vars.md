@@ -2,9 +2,9 @@
 
 vLLM uses the following environment variables to configure the system:
 
-The branch-specific, default-off `VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION`
-experiment is documented in [Hot-tail admission](../design/hot_tail_admission.md).
-It does not disable preemption globally and is not enabled by baseline commands.
+本GLM分支的`ec48a62d`提供可选的P端末段容量预算，减少部分Mamba请求因块不足而抢占重算。
+`VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION`默认关闭；适用条件和诊断变量见
+[部署与配置](../../DEPLOYMENT.md)。
 
 !!! warning
     Please note that `VLLM_PORT` and `VLLM_HOST_IP` set the port and ip for vLLM's **internal usage**. It is not the port and ip for the API server. If you use `--host $VLLM_HOST_IP` and `--port $VLLM_PORT` to start the API server, it will not work.

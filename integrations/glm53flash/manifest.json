@@ -316,7 +316,7 @@
     "start_percent": 55,
     "complete_minutes": 12,
     "Store_GiB": 2250,
-    "document": "DEPLOYMENT-C230.md",
+    "document": "archive/glm53flash-before-cn-history-20261103:DEPLOYMENT-C230.md",
     "historical": true
   },
   "release_repositories": {
@@ -401,7 +401,7 @@
       3.032338253193112
     ],
     "weighted_maxtpm_change_percent": 2.74,
-    "report": "FLASHINFER-AUTOTUNE.md"
+    "report": "archive/glm53flash-before-cn-history-20261103:FLASHINFER-AUTOTUNE.md"
   },
   "rebased_runtime": {
     "source_image": "sha256:a8006094951c6987afd105723fee8407c40920318e952927f42473aaa4e1c333",
