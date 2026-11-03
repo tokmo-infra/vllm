@@ -6,6 +6,125 @@ The old RDMA MegaMoE implementation was not cherry-picked. The tokenizer
 cache provenance and deployment carryovers are documented in the
 [serving guide](hierarchical_mega_moe.md).
 
+## Payload optimizations: real-layer DEP8 comparison, 2026-11-03
+
+P0 transmits only active tail rows; P1 optionally compresses remote BF16
+partials as MXFP8; P3 compacts tokens independently for each destination host.
+The source keeps its local BF16 partial. Registered capacities, native call
+shapes and the collective schedule remain static for CUDA graph replay.
+
+The primary comparison uses the actual DeepSeek-V4.1-Flash-1017 layer-20
+checkpoint weights and previously captured SWE hidden states, routes and gate
+weights: H=5120, I=2304, E=384, top-k=6, TP1. Each of hosts 89/91 runs eight
+B300 GPUs. DEP8 means two independent DP8/EP8 islands, each retaining all
+384 experts; Wide EP16 shards them across both hosts. Every physical GPU has
+the same source rows in both arms. The operation includes staging, native
+MoE, network and reduction, excluding attention and shared experts.
+
+The main table uses a 4096-row native workspace, matching the archived decode
+configuration's token capacity, and source tile 2048. With DSpark5, 512 source
+requests imply up to 3072 target verification tokens per GPU. Inputs come
+from a 24,576-row captured pool; 768/1536 shapes use disjoint rows across ranks,
+while 3072/4096 cycle through it. This is a real-weight layer shape replay,
+not a simultaneous captured batch, a five-layer execution, or serving throughput.
+
+Each case has 100 untimed replays and seven samples of 20 timed CUDA graph
+replays. Each sample takes the maximum over all 16 ranks; the table reports
+the median. Existing resident serving/store processes were left in place;
+the benchmark did not change PCIe, NIC or QoS settings. All comparison arms
+used this same environment. Old code is `f33f1bc834bae7207efb9b806c4e3eb0184833a0`.
+Raw per-rank samples, spread, errors, source hashes and byte traces are in
+[the recorded data](../../tokmo/validation/20261103-payload.json).
+
+| Tokens/GPU | DEP8 (ms) | Old EP16, BF16 return (ms) | New EP16, BF16 return (ms) | New EP16, MXFP8 return (ms) | MXFP8 latency reduction vs old EP16 | MXFP8 / DEP8 latency |
+| --- | --- | --- | --- | --- | --- | --- |
+| 768 | 0.360 | 0.665 | 0.708 | 0.640 | 3.8% | 1.78x |
+| 1536 | 0.612 | 1.166 | 1.211 | 1.070 | 8.2% | 1.75x |
+| 3072 | 1.090 | 2.046 | 1.914 | 1.820 | 11.1% | 1.67x |
+| 4096 | 1.412 | 2.381 | 2.457 | 2.292 | 3.7% | 1.62x |
+
+The complete P0/P1/P3 path reduces the measured latency by 3.7–11.1% on these
+shapes, but remains 1.62–1.78x slower than DEP8. Without return compression,
+the 3072-token tail case improves by approximately 6.5%; the other three
+BF16-return cases regress by approximately 3.2–6.4%. Count transfer, prefix
+scan and mapping costs matter when two-host routing already selects almost
+every destination. These results do not establish a universal speedup or
+larger-EP performance.
+
+### Numerical and protocol checks
+
+- Twelve CPU/distributed routing tests and fourteen GPU packing/staging/map
+  tests passed. GPU maps cover 2/4/8 islands, zero counts and partial tiles.
+- Actual RDMA passed changing payloads, asymmetric lengths, zero-length epochs
+  followed by nonzero epochs, and four logical islands on the two physical
+  hosts. This tests independent peers, not four-host bandwidth or EP32 acceptance.
+- Native EP16 checks passed uneven/empty eager sources, 257/64 double-buffer
+  reuse, 2049/2048 tail traffic, changing graph inputs, masked routes and
+  physical expert relocation. Synthetic serial/pipeline parity is exact.
+- Real-weight BF16 output passes the preexisting cross-topology bounds:
+  normalized squared error <1e-5, maximum per-token relative L2 <0.005,
+  minimum token cosine >0.99998. Measured worst-rank relative L2 is about 0.28%.
+- Real-weight MXFP8 wire/reduction output exactly matches a separate reference
+  that rounds remote partials and transports them as BF16. Relative L2 against
+  DEP8 is approximately 2.0–2.7%, with minimum token cosine about 0.99961.
+  Some outlier channels have absolute error 512; passing the transport
+  reference does not approve model quality. BF16 remains the default; enable
+  `hierarchical_mega_moe_return_dtype="mxfp8"` explicitly and evaluate the model.
+
+The historical implementation failed a changed-input graph-versus-fresh
+check on real data, including after explicit device synchronization and a
+rank barrier. The root cause was not established in this scoped optimization.
+Those failed runs contribute no timings. The old-code timing reference was
+rerun with `--reference-version --fixed-input-only`; original captured inputs
+passed DEP8 comparisons both before and after timing. It is a fixed-input
+timing reference, not acceptance of historical changed-input replay. The new
+implementation passed those changed-input checks without omitting them.
+
+An initial MXFP8 synthetic run exceeded the combined 8% native-oracle bound.
+Subsequent checks retain that bound on a matched BF16-return path and verify
+additional return rounding separately; the real-weight test uses exact
+quantized-reference comparison rather than enlarging a model-quality bound.
+Failed setup, import and rendezvous attempts are excluded from all results.
+
+Proxy byte traces at 2049 tokens/tile2048 show an average 21,421,530 bytes
+sent per rank versus the former dense-capacity 63,766,528 bytes, a 66.4%
+reduction. At full-tile shapes the reduction is approximately 32.9%. These
+trace counts are synthetic-routing measurements, not latency speedups.
+The fixed native shapes still execute; compaction does not shrink their
+registered workspace or invocation capacity.
+
+### Historical screenshot comparison
+
+The previous 0.225/0.323/0.741-ms DEP8 numbers and 0.510/0.872/1.570-ms EP16
+numbers use synthetic experts/routing. Keep that table separate from the real
+checkpoint comparison above. The added column below uses the same synthetic
+dimensions, tile2048 and CUDA-event timing; it predates the final optimization
+that skips quantizing the unused local return region.
+
+| Tokens/GPU | Historical independent DEP8 (ms) | Historical EP16 (ms) | Old EP16 remeasured (ms) | New EP16, MXFP8 return (ms) |
+| --- | --- | --- | --- | --- |
+| 768 | 0.225 | 0.510 | 0.522 | 0.495 |
+| 1536 | 0.323 | 0.872 | 0.886 | 0.788 |
+| 4096 | 0.741 | 1.570 | 1.591 | 1.469 |
+
+A 6144-token expansion shape also passed with an 8192-row native capacity. It is
+recorded separately and is outside the archived decode configuration's
+4096-token capacity. Do not combine its latency with the primary table.
+
+The runtime was the pinned v0.32 backport image with the changed transport
+and packing files overlaid. Its helper module paths differ from this branch:
+the validation container used the image's native staging helper plus the
+branch's quantization helper and three checkpoint-layout methods, extracted
+unchanged. Native DeepGEMM kernels and checkpoint weights were not modified.
+No full-model quality evaluation, MTP-layer acceptance or serving deployment
+was performed. The archived `tokmo` image has not been rebuilt with these
+changes; rebuild/backport it before using the new configuration fields.
+
+Reproduce the primary comparison using the
+[checkpoint replay command](hierarchical_mega_moe.md#replay-checkpoint-weights-and-captured-inputs-against-dep8).
+The recorded raw data includes every timed rank, not only rank 0. The previous
+archive measurements below remain unchanged.
+
 ## Verbs pipeline: two-host single-layer validation
 
 The 2026-11-02 follow-up adds a two-host RC-verbs/GPUDirect DMA-BUF backend,

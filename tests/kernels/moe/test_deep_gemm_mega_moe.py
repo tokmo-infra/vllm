@@ -1433,3 +1433,86 @@ def test_network_mxfp8_staging_preserves_native_bytes(tokens, width):
             received.contiguous().view(torch.uint8),
             native.contiguous().view(torch.uint8),
         )
+
+
+@requires_sm100
+@pytest.mark.parametrize("nodes", [2, 4, 8])
+@pytest.mark.parametrize("valid_tokens", [0, 33])
+def test_network_compaction_and_remote_return_preserve_token_mapping(
+    nodes, valid_tokens
+):
+    """Tail rows and unselected islands send nothing; returns restore source order."""
+    from vllm.distributed.megamoe_rdma_ops import (
+        combine_compact,
+        pack_compact,
+        pack_fixed,
+        pack_mxfp8,
+        unpack_mxfp8,
+    )
+
+    torch.manual_seed(71)
+    tokens, width, top_k = 65, 256, 6
+    experts = nodes * 16
+    x = torch.randn(tokens, width, device="cuda").bfloat16()
+    ids = torch.randint(experts, (tokens, top_k), device="cuda", dtype=torch.int64)
+    ids[::4] = -1
+    gates = torch.rand(tokens, top_k, device="cuda")
+    tables = (
+        torch.arange(nodes, device="cuda").repeat_interleave(2),
+        torch.arange(2, device="cuda").repeat(nodes),
+        torch.arange(nodes, device="cuda"),
+    )
+    dense, _, _, _ = pack_fixed(x, gates, ids, tables, experts, 2 * nodes, "mxfp8")
+    packed = torch.empty_like(dense)
+    row_map = torch.empty(nodes, tokens, device="cuda", dtype=torch.int32)
+    counts = torch.empty(nodes, device="cuda", dtype=torch.int32)
+    pack_compact(
+        x,
+        gates,
+        ids,
+        tables,
+        experts,
+        2 * nodes,
+        "mxfp8",
+        packed,
+        row_map,
+        counts,
+        valid_tokens,
+        True,
+    )
+    for peer in range(nodes):
+        selected = ((ids >= 0) & (ids // 16 == peer)).any(1) & (
+            torch.arange(tokens, device="cuda") < valid_tokens
+        )
+        source = selected.nonzero().flatten()
+        count = source.numel()
+        assert counts[peer].item() == count
+        torch.testing.assert_close(
+            row_map[peer, source],
+            torch.arange(count, device="cuda", dtype=torch.int32),
+            rtol=0,
+            atol=0,
+        )
+        assert torch.all(row_map[peer, ~selected] == -1).item()
+        assert torch.equal(
+            packed.view(nodes, tokens, -1)[peer, :count],
+            dense.view(nodes, tokens, -1)[peer, source],
+        )
+    partials = torch.randn(nodes * tokens, width, device="cuda").bfloat16()
+    fp8 = pack_mxfp8(partials)
+    remote = torch.full_like(fp8, 255)
+    pack_mxfp8(partials, out=remote, exclude_rows=(0, tokens))
+    assert torch.all(remote[:tokens] == 255).item()
+    assert torch.equal(remote[tokens:], fp8[tokens:])
+    for precision in ("bfloat16", "mxfp8"):
+        returned = remote if precision == "mxfp8" else partials
+        decoded = unpack_mxfp8(fp8, width) if precision == "mxfp8" else partials
+        expected = torch.zeros(tokens, width, device="cuda", dtype=torch.float32)
+        for peer in range(nodes):
+            selected = row_map[peer] >= 0
+            source = row_map[peer, selected].long() + peer * tokens
+            values = partials if peer == 0 else decoded
+            expected[selected] += values[source].float()
+        output = torch.empty_like(x)
+        combine_compact(returned, partials, row_map, output, 0, precision)
+        torch.testing.assert_close(output, expected.bfloat16(), rtol=0, atol=0)

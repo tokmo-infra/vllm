@@ -46,9 +46,11 @@ Kernel configuration fields:
 | --- | --- | --- |
 | `hierarchical_mega_moe_wire_dtype` | `mxfp8` | Native 1x32 E4M3 activations/E8M0 scales on dispatch; `bfloat16` provides a reference path. |
 | `hierarchical_mega_moe_direct_staging` | `true` | Copy received MXFP8 bytes/scales into native buffers. Set `false` to reconstruct BF16 and requantize for comparison. Ignored for BF16 wire. |
+| `hierarchical_mega_moe_sparse_dispatch` | `true` | Verbs only: compact each destination's selected token rows on the GPU. Registered capacities and native call shapes stay fixed. `false` is a dense reference; tail padding is still excluded from the network. |
+| `hierarchical_mega_moe_return_dtype` | `bfloat16` | Verbs only: `mxfp8` compresses remote island partials with 1x32 E8M0 scales. The source uses its own BF16 partial directly. Validate model quality before enabling this lossy transport. |
 | `hierarchical_mega_moe_chunk_size` | `0` | Source tokens per network tile. NCCL zero sends the complete padded batch. Verbs zero selects at most 2048 source rows fitting one native call. Smaller tiles bound temporary memory but add launches. |
-| `hierarchical_mega_moe_transport` | `nccl` | `verbs` selects the experimental two-host GPUDirect pipeline described below. |
-| `hierarchical_mega_moe_rdma_host_staging` | `false` | Use an independent CUDA copy stream and pinned CPU send buffers; receives remain GPUDirect and BF16 return precision is preserved. Benchmark on the target topology. |
+| `hierarchical_mega_moe_transport` | `nccl` | `verbs` selects the experimental multi-host GPUDirect pipeline described below. |
+| `hierarchical_mega_moe_rdma_host_staging` | `false` | Use an independent CUDA copy stream and pinned CPU send buffers; receives remain GPUDirect and the configured return precision is preserved. Benchmark on the target topology. |
 | `hierarchical_mega_moe_overlap` | `true` | Pipeline verbs transfers and native compute. Disable for a matched serial verbs reference. NCCL remains ordered. |
 | `hierarchical_mega_moe_rdma_hcas` | `[]` | Required for verbs: one `HCA[:port]` per local EP lane, in lane order. |
 | `hierarchical_mega_moe_rdma_gid_index` | `0` | RoCE GID index for verbs. |
@@ -92,8 +94,8 @@ partials back and the source sums them in FP32 before converting to BF16.
 The MXFP8 packer uses the same quantization primitive as native MegaMoE.
 Direct staging preserves activation and scale bytes, including the native
 packed/strided scale layout. It removes the receive-side BF16 reconstruction
-and requantization. Return partials remain BF16; return compression is not
-implemented. EPLB mapping and load recording happen once at the source,
+and requantization. Return partials use the configured BF16 or MXFP8 format.
+EPLB mapping and load recording happen once at the source,
 before routing physical slots to hosts. Logical routing capture stays at
 the source as well.
 
@@ -104,6 +106,29 @@ the collective schedule. Capture without uniform CPU-side DP metadata is
 rejected instead of reading device counts during capture. Warm up before
 capturing so topology tensors, communicators and native buffers exist.
 
+### Variable-length verbs payloads
+
+The verbs path separates a registered peer slot's capacity from its current
+row count. A GPU prefix scan builds one stable source-to-compact-row map per
+destination. Each token is sent at most once per selected host. Tail and
+empty-rank rows send no payload. A zero-row peer still exchanges an epoch
+credit, retaining one common collective schedule without a CPU count sync.
+
+Credits advertise current byte counts. Peers transfer only those bytes and
+copy received row counts to the GPU after completion. Unused receive routes
+are masked before the fixed-shape native calls. Return traffic uses dispatch
+receive counts; the source restores token order using its saved map. Input
+maps and pending return maps have separate lifetimes, allowing input-slot
+reuse while an older return is in flight. The protocol supports equal-sized
+multi-host groups; two-host tests do not establish larger-EP hardware acceptance.
+All hosts must upgrade their Python transport and JIT extension together:
+protocol 2 credits include payload lengths and reject protocol 1 peers.
+
+For MXFP8 returns, a GPU packing kernel encodes native BF16 partials. Source
+reduction decodes remote MXFP8 directly into an FP32 sum and adds the original
+local BF16 partial. Final output is BF16. Expert weights and the native kernel
+are unchanged. Compare quality with BF16 returns before enabling it for a model.
+
 ## Performance limits and concurrency
 
 Native MegaMoE is fast because dispatch, both GEMMs, activation and combine
@@ -112,8 +137,10 @@ NVLink domain. RoCE does not extend CUDA peer pointers into an equivalent
 NVLink memory domain. This backend adds an explicit network boundary around
 the native kernel; it does not turn two RoCE hosts into an NVL72 supernode.
 
-For hidden size 5120 and top-k 6, dispatch uses 5328 bytes per source token
-per destination host and return uses 10240 bytes. On two eight-GPU hosts,
+For hidden size 5120 and top-k 6, dispatch uses 5328 bytes per selected source
+token per destination host. BF16 return uses 10240 bytes; MXFP8 return uses
+5280 bytes, a 48.4% reduction. Compaction also excludes unselected hosts and
+tail rows. For the dense BF16 reference on two eight-GPU hosts,
 936 tokens/GPU require about 116.6 MB sent per host over the complete round
 trip. Eight 400-Gbit/s links imply a theoretical 0.291 ms serialization
 floor, before protocol overhead, packing and compute. At 4096 tokens that
@@ -139,11 +166,16 @@ GPUNetIO device-QP requirement. A CPU progress thread submits NIC operations;
 payloads remain in GPU memory by default. It requires Linux, CUDA driver development
 headers, a C++17 compiler, Ninja, libibverbs development headers/libraries and
 working GPU DMA-BUF export. The small C++ extension is compiled on first use
-with PyTorch's extension cache. Only two equal-sized NVLink hosts are supported.
+with PyTorch's extension cache. Hosts must have equal-sized NVLink islands.
+Each GPU lane opens an independent RC endpoint to every remote host. Their
+credits and completion flags are independent; all remote contributions must
+complete before compute or reduction consumes the shared peer-major slot.
+The local contribution is copied once, and remote peers write disjoint rows.
+Two-host calls retain one endpoint and the original synchronization protocol.
 
 The compute stream packs two input tiles, publishes their requests, and waits
 for the current tile's receive. It runs native MegaMoE, publishes that tile's
-BF16 return, and reuses its input slot to prefetch a later tile. Before reusing
+return in the configured format, and reuses its input slot to prefetch a later tile. Before reusing
 an output slot it waits for the older return and combines that result. The
 last two returns are drained before the forward finishes. Input and output
 slots have separate lifetimes, so return can proceed during later compute.
@@ -163,7 +195,10 @@ The synchronization protocol has these invariants:
 2. Both peers advertise the same job's next 64-bit epoch before either writes
    data. Advertising grants a receive credit only after the prior receive was
    consumed and the new send was produced. Each QP transfers one disjoint
-   stripe and delivers a write-with-immediate completion.
+   nonempty stripe and delivers a write-with-immediate completion. Zero-byte
+   stripes complete through the credit protocol. Two length slots preserve
+   current-epoch metadata if a zero-length transfer allows the next credit
+   to arrive before the local proxy posts the current epoch.
 3. The proxy waits for every send completion and every receive stripe. GPU
    receive visibility uses the device's advertised owner-ordering guarantee,
    or the supported host GPUDirect flush API. It then clears the request and
@@ -178,7 +213,7 @@ The synchronization protocol has these invariants:
    CUDA enqueue calls run outside the proxy mutex: an enqueue may block under
    stream backpressure, so holding that mutex would prevent the network work
    needed to unblock the GPU and would also stop the watchdog.
-5. One endpoint and shape-keyed plans are shared by sequential MoE layers.
+5. The lane's peer endpoints and shape-keyed plans are shared by sequential MoE layers.
    Concurrent forwards or overlapping graph replays using the same endpoint
    are unsupported. Warm up every tile shape before capture. Finish work and
    retire graphs before closing the groups and releasing registered storage.
@@ -191,8 +226,9 @@ CUDA event before its usual completion wait, including during graph capture.
 This lets copies and RDMA progress during later native compute without using
 communication CTAs. The completed return/consume protocol protects both GPU
 and pinned buffers against premature reuse. Only the send path is staged;
-BF16 return values are unchanged. Each cached two-slot shape adds
-`2 * source_tile_rows * (dispatch_row_bytes + return_row_bytes)` pinned bytes
+the configured wire format is unchanged. Staging currently copies the full
+registered send capacity; NIC transfers still use active byte counts. Each cached two-slot shape adds
+`2 * (hosts - 1) * source_tile_rows * (dispatch_row_bytes + return_row_bytes)` pinned bytes
 per rank, approximately 60.8 MiB at 2048 rows for the measured model shape.
 Pinned-memory and PCIe costs can outweigh the benefit on other topologies.
 
@@ -219,6 +255,28 @@ does not repair inconsistent DSCP/PFC configuration or establish attainable
 GPU-to-NIC bandwidth. The host proxy also needs CPU scheduling capacity; do not
 constrain an entire worker and its progress thread to a single busy CPU core.
 NCCL/Gloo settings still apply to bootstrap, the baseline and local group setup.
+
+Sparse destination dispatch is enabled by default for verbs. To additionally
+enable lossy MXFP8 remote returns, add
+`"hierarchical_mega_moe_return_dtype": "mxfp8"` to that kernel configuration.
+Use `"hierarchical_mega_moe_sparse_dispatch": false` and BF16 returns for the
+dense reference. Tail rows are excluded in both modes.
+
+For four eight-GPU hosts, use global DP32/EP32, local DP8 and TP1, with each
+host's DP start rank set to `8 * node_rank`. The same kernel configuration
+discovers four islands automatically. A 2048-row source tile gathers 8192 rows
+per local lane; the native workspace must fit that tile or compute splits it
+into smaller calls. Each lane needs three progress threads and three sets of
+QP stripes. Dense dispatch and BF16 returns send three remote copies per
+source row, so EP32 does not imply better latency than local EP8. Validate
+bandwidth, correctness and matched workload performance on all four hosts.
+
+Batch size must distinguish requests, effective tokens and graph padding.
+For this DeepSeek DSpark5 checkpoint's default anchor mode, 1024 requests per
+DP rank produce up to 6144 target verification tokens and 5120 parallel draft
+query tokens. The three draft layers run once per draft pass. CUDA Graph
+selection uses padded token counts and the required batch descriptor; a
+request count alone does not identify the selected target or draft graph.
 
 ### Reproduce single-layer acceptance
 
@@ -253,8 +311,17 @@ output bit-for-bit with matched-tiling serial verbs, and checks a separate
 synthetic-expert oracle. It exercises unequal eager counts (including an empty
 rank), tail padding, all-masked inputs, and physical expert relocation across
 hosts during graph replay. Oracle tolerances retain the existing quantized
-single-layer benchmark's limits; serial/pipeline parity has zero tolerance.
+single-layer benchmark's limits for BF16 returns; serial/pipeline parity has
+zero tolerance. MXFP8 runs also execute a matched BF16-return reference:
+the native oracle keeps `rtol=0.08, atol=0.01`, while additional return rounding
+uses `rtol=0.065, atol=0.01`. This extra relative bound applies to these
+nonnegative synthetic partials; it is not a model-quality acceptance threshold.
 Failures must be investigated before reporting performance.
+
+Use `--sparse-dispatch --return-dtype mxfp8` to exercise all three payload
+optimizations. `--transport-only --virtual-island-size 2` with four local
+processes per host checks four logical islands on two physical hosts. This
+checks multi-peer synchronization, not four-host bandwidth or native EP32.
 
 `--include-nccl-baseline` measures the full-batch NCCL path using the same
 warmup and sample timing. `--nccl-only` runs just that baseline, while
@@ -266,10 +333,52 @@ Outputs include all ranks' sample latencies, rank 0/8 CUDA timelines, and each
 rank's proxy request/post/completion timestamps. Proxy intervals bound the
 transfer's NIC service and polling time; they are not direct NIC hardware
 timestamps. Compare the maximum rank for each sample, then summarize samples.
+The `scheduled_rows` field reports fixed compute capacity, not transmitted
+rows; proxy trace `bytes` records actual NIC payload lengths.
 Also rerun the unchanged NCCL baseline in the same environment. A valid result
 must show actual overlap and lower whole-layer latency, not just shorter
 isolated communication spans. Whole-model numerical and serving acceptance
 remain separate work after this single-layer step.
+
+### Replay checkpoint weights and captured inputs against DEP8
+
+`benchmark_roce_mega_moe_replay.py` compares independent local DEP8 islands
+with Wide EP using the same captured hidden states, gates, expert IDs and
+checkpoint weights. It times the complete routed MoE operation, including
+packing, network transfers and reduction. Attention and shared experts are
+outside this boundary. Each physical GPU receives the same source rows in
+both topologies. Keep source tokens per GPU and the total physical GPU count
+fixed; the DEP8 arm replicates all experts on each host.
+
+The input `.pt` pool contains `hidden[N,5120]`, `gates[N,6]`, `ids[N,6]`,
+`reference[N,5120]`, `fast_math` and
+`kernel_kwargs={"activation_clamp": 10.0}`. Use actual captured target-layer
+rows with their matching reference output. The harness selects rows by rank
+and cycles through the pool when it is smaller than the requested global
+shape. Report that reuse; it does not reconstruct a simultaneous production
+batch or a sequential multi-layer execution.
+
+```bash
+.venv/bin/python -m torch.distributed.run \
+    --nnodes=2 --nproc-per-node=8 --node-rank="$NODE_RANK" \
+    --master-addr="$HEAD_IP" --master-port=29725 \
+    benchmarks/kernels/benchmark_roce_mega_moe_replay.py \
+    --model "$MODEL" --inputs /path/to/layer20-pool.pt \
+    --hcas mlx5_0:1,mlx5_6:1,mlx5_8:1,mlx5_10:1,mlx5_12:1,mlx5_14:1,mlx5_18:1,mlx5_20:1 \
+    --gid 3 --traffic-class 106 --qps 4 \
+    --tokens 768,1536,3072,4096 --tile 2048 --chunk 4096 \
+    --samples 7 --iterations 20 --stress-replays 100 \
+    --output-directory /tmp/roce-checkpoint-replay
+```
+
+BF16 Wide EP uses the existing cross-topology numerical bounds. The MXFP8
+wire/reduction result must exactly match an independent reference that rounds
+remote partials and transmits them as BF16. Its error against DEP8 is recorded
+separately, without claiming model-quality acceptance. Changed-input graph
+checks use fresh executions in the same topology, and all-masked rows must
+return zero. `--fixed-input-only` omits those changed-input checks explicitly;
+it is useful for a narrowly scoped historical timing reference, not acceptance.
+Use `--reference-version` only with the old transport implementation installed.
 
 ## Reproduce the measurements
 

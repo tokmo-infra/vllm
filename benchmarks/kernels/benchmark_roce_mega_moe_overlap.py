@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Two-host single-layer acceptance for the experimental verbs pipeline.
+"""Multi-host single-layer acceptance for the experimental verbs pipeline.
 
 Run on exclusive GPUs. Checks transport bytes, changed-input graph replays,
 tails, masked routes, empty ranks and exact matched-tiling serial parity.
@@ -20,6 +20,7 @@ import torch.distributed as dist
 from benchmark_hierarchical_mega_moe import NativeExperts, oracle
 
 from vllm.distributed.hierarchical_mega_moe import (
+    HierarchicalGroups,
     HierarchicalMegaMoE,
     destroy_hierarchical_groups,
     get_hierarchical_groups,
@@ -58,24 +59,76 @@ def check_payload(transport, args):
     graph, _ = capture(exchange)
     for generation in range(8):
         for index, transfer in enumerate(transfers):
-            for peer in range(2):
+            for peer in range(transport.size):
                 value = (
                     transport.rank * 67 + peer * 29 + generation * 11 + index
                 ) % 251
-                transfer.send.chunk(2)[peer].fill_(value)
+                transfer.send.chunk(transport.size)[peer].fill_(value)
         for _ in range(3):
             graph.replay()
         torch.accelerator.synchronize()
         for index, transfer in enumerate(transfers):
-            for peer in range(2):
+            for peer in range(transport.size):
                 expected = (
                     peer * 67 + transport.rank * 29 + generation * 11 + index
                 ) % 251
-                assert torch.all(transfer.receive.chunk(2)[peer] == expected).item()
+                assert torch.all(
+                    transfer.receive.chunk(transport.size)[peer] == expected
+                ).item()
+    del graph
+
+    # Independent counts in each direction, including zero-length traffic.
+    counts = torch.empty(transport.size, dtype=torch.int32, device="cuda")
+
+    def variable_exchange():
+        for transfer in transfers:
+            transfer.submit(counts)
+        for transfer in transfers:
+            transfer.wait()
+
+    counts.fill_(257)
+    graph, _ = capture(variable_exchange)
+    for generation in range(8):
+        expected_counts = [
+            (transport.rank * 31 + peer * 17 + generation * 7) % 258
+            if generation % 4 != 3
+            else 0
+            for peer in range(transport.size)
+        ]
+        counts.copy_(torch.tensor(expected_counts, device="cuda", dtype=torch.int32))
+        for transfer in transfers:
+            transfer.send.fill_(transport.rank + generation * 11)
+            transfer.receive.fill_(255)
+        graph.replay()
+        torch.accelerator.synchronize()
+        for transfer in transfers:
+            for peer in range(transport.size):
+                rows = (
+                    (peer * 31 + transport.rank * 17 + generation * 7) % 258
+                    if generation % 4 != 3
+                    else 0
+                )
+                assert transfer.receive_counts[peer].item() == rows
+                if peer != transport.rank:
+                    actual = transfer.receive.chunk(transport.size)[peer]
+                    assert torch.all(actual[:rows] == peer + generation * 11).item()
+                    assert torch.all(actual[rows:] == 255).item()
     del graph
 
 
-def check_graph_pair(serial, pipeline, model, x, gates, ids, args, shift):
+def check_output(actual, expected, bf16=None):
+    if bf16 is not None:
+        # Synthetic experts produce nonnegative partials, so E4M3 rounding
+        # cannot be amplified by cancellation. Keep native-oracle error and
+        # the additional return quantization error as separate checks.
+        torch.testing.assert_close(actual, bf16, rtol=0.065, atol=0.01)
+        actual = bf16
+    torch.testing.assert_close(actual.float(), expected, rtol=0.08, atol=0.01)
+
+
+def check_graph_pair(
+    serial, pipeline, model, x, gates, ids, args, shift, return_reference=None
+):
     original = tuple(value.clone() for value in (x, gates, ids))
     if dist.get_rank() == 0:
         print("capturing serial", flush=True)
@@ -83,6 +136,9 @@ def check_graph_pair(serial, pipeline, model, x, gates, ids, args, shift):
     if dist.get_rank() == 0:
         print("capturing pipeline", flush=True)
     pipeline_graph, actual = capture(pipeline)
+    bf16_graph, bf16 = (
+        capture(return_reference) if return_reference is not None else (None, None)
+    )
     for generation in range(4):
         if dist.get_rank() == 0:
             print(f"checking generation={generation}", flush=True)
@@ -103,12 +159,13 @@ def check_graph_pair(serial, pipeline, model, x, gates, ids, args, shift):
             model.l2[1][slot].fill_((124 - logical % 5) * 0x01010101)
         serial_graph.replay()
         pipeline_graph.replay()
+        if bf16_graph is not None:
+            bf16_graph.replay()
         torch.testing.assert_close(actual, reference, rtol=0, atol=0)
-        torch.testing.assert_close(
-            actual.float(),
+        check_output(
+            actual,
             oracle(x, gates, original[2], args.intermediate),
-            rtol=0.08,
-            atol=0.01,
+            bf16,
         )
         if generation:
             assert torch.count_nonzero(actual[::3]).item() == 0
@@ -149,6 +206,10 @@ def main():
     parser.add_argument("--gid", type=int, default=0)
     parser.add_argument("--qps", type=int, default=4)
     parser.add_argument("--host-staging", action="store_true")
+    parser.add_argument("--sparse-dispatch", action="store_true")
+    parser.add_argument(
+        "--return-dtype", choices=("bfloat16", "mxfp8"), default="bfloat16"
+    )
     parser.add_argument("--traffic-class", type=int, default=0)
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--experts", type=int, default=384)
@@ -178,17 +239,38 @@ def main():
         action="store_true",
         help="Measure full-batch dispatch, BF16 return and concurrent transport",
     )
+    parser.add_argument(
+        "--virtual-island-size",
+        type=int,
+        default=0,
+        help="Split each host into smaller islands for multi-peer transport checks",
+    )
     parser.add_argument("--output-directory", type=Path, required=True)
     args = parser.parse_args()
     local = int(os.environ["LOCAL_RANK"])
     torch.accelerator.set_device_index(local)
     dist.init_process_group("nccl", device_id=torch.device("cuda", local))
     cpu = dist.new_group(backend="gloo")
-    groups = get_hierarchical_groups(dist.group.WORLD, cpu)
     rank = dist.get_rank()
+    hcas = tuple(args.hcas.split(","))
+    if args.virtual_island_size:
+        size = args.virtual_island_size
+        local_size = int(os.environ["LOCAL_WORLD_SIZE"])
+        if not args.transport_only or size < 1 or local_size % size:
+            parser.error("Virtual islands require transport-only and divide local EP")
+        groups = HierarchicalGroups.create(
+            list(range(dist.get_world_size())),
+            [str(peer // size) for peer in range(dist.get_world_size())],
+            rank,
+            "nccl",
+        )
+        offset = local // size * size
+        hcas = hcas[offset : offset + size]
+    else:
+        groups = get_hierarchical_groups(dist.group.WORLD, cpu)
     transport = get_verbs_transport(
         groups,
-        hcas=tuple(args.hcas.split(",")),
+        hcas=hcas,
         gid_index=args.gid,
         qps=args.qps,
         traffic_class=args.traffic_class,
@@ -233,14 +315,16 @@ def main():
 
                 graph, _ = capture(exchange)
                 for transfer in transfers:
-                    for peer, received in enumerate(transfer.receive.chunk(2)):
+                    for peer, received in enumerate(
+                        transfer.receive.chunk(transport.size)
+                    ):
                         assert torch.all(received == peer + 1).item()
                 records.append(
                     dict(
                         tokens=tokens,
                         tile=tokens,
                         effective_tile=tokens,
-                        wire_tokens=tokens,
+                        scheduled_rows=tokens,
                         case=name,
                         samples_ms=measure(graph, args),
                     )
@@ -289,7 +373,7 @@ def main():
                     tokens=tokens,
                     tile=0,
                     effective_tile=tokens,
-                    wire_tokens=tokens,
+                    scheduled_rows=tokens,
                     case="baseline_nccl",
                     samples_ms=measure(graph, args),
                 )
@@ -311,9 +395,26 @@ def main():
                     source_chunk_size=tile,
                     pipeline_transport=transport,
                     overlap=overlap,
+                    sparse_dispatch=args.sparse_dispatch,
+                    return_dtype=args.return_dtype,
                 )
                 for overlap in (False, True)
             ]
+            if args.return_dtype == "mxfp8":
+                adapters.append(
+                    HierarchicalMegaMoE(
+                        groups,
+                        args.experts,
+                        args.chunk,
+                        wire_dtype="mxfp8",
+                        fused_pack=True,
+                        source_chunk_size=tile,
+                        pipeline_transport=transport,
+                        overlap=False,
+                        sparse_dispatch=args.sparse_dispatch,
+                        return_dtype="bfloat16",
+                    )
+                )
             callbacks = [
                 partial(
                     adapter.forward,
@@ -343,22 +444,22 @@ def main():
                     )
                 )
             torch.testing.assert_close(eager[1], eager[0], rtol=0, atol=0)
-            torch.testing.assert_close(
-                eager[1].float(),
+            check_output(
+                eager[1],
                 oracle(x[:count], gates[:count], ids[:count], args.intermediate),
-                rtol=0.08,
-                atol=0.01,
+                eager[2] if len(eager) == 3 else None,
             )
             if rank == 0:
                 print("checking graph pair", flush=True)
             serial, pipeline, reference, actual = check_graph_pair(
-                *callbacks,
+                *callbacks[:2],
                 model,
                 x,
                 gates,
                 ids,
                 args,
                 shift=per_rank * groups.topology.local_size,
+                return_reference=callbacks[2] if len(callbacks) == 3 else None,
             )
             for name, graph in (("serial_verbs", serial), ("pipeline_verbs", pipeline)):
                 if rank == 0:
@@ -370,10 +471,12 @@ def main():
                         tokens=tokens,
                         tile=tile,
                         effective_tile=min(tokens, tile),
-                        wire_tokens=(tokens + min(tokens, tile) - 1)
+                        scheduled_rows=(tokens + min(tokens, tile) - 1)
                         // min(tokens, tile)
                         * min(tokens, tile),
                         case=name,
+                        sparse_dispatch=args.sparse_dispatch,
+                        return_dtype=args.return_dtype,
                         samples_ms=samples,
                     )
                 )
@@ -431,7 +534,10 @@ def main():
         )
     torch.accelerator.synchronize()
     dist.barrier()
-    destroy_hierarchical_groups()
+    if args.virtual_island_size:
+        groups.close()
+    else:
+        destroy_hierarchical_groups()
     dist.destroy_process_group(cpu)
     dist.destroy_process_group()
 

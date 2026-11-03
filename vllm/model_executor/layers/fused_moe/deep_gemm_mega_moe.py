@@ -377,6 +377,8 @@ class DeepGemmMegaMoEExperts(nn.Module):
                 source_chunk_size=config.hierarchical_mega_moe_chunk_size,
                 pipeline_transport=pipeline_transport,
                 overlap=config.hierarchical_mega_moe_overlap,
+                sparse_dispatch=config.hierarchical_mega_moe_sparse_dispatch,
+                return_dtype=config.hierarchical_mega_moe_return_dtype,
             )
             self._mega_group = groups.local_group
             self._kernel_num_experts = num_local_experts * groups.topology.local_size

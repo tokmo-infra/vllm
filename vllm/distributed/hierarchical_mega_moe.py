@@ -194,6 +194,8 @@ class HierarchicalMegaMoE:
         transport: MegaMoETransport | None = None,
         pipeline_transport=None,
         overlap=True,
+        sparse_dispatch=False,
+        return_dtype="bfloat16",
     ):
         if not 0 < num_experts < 2**31 or num_experts % groups.topology.world_size:
             raise ValueError("Expert count must fit int32 and divide EP size")
@@ -201,6 +203,8 @@ class HierarchicalMegaMoE:
             raise ValueError("Invalid chunk capacity")
         if wire_dtype not in ("bfloat16", "mxfp8"):
             raise ValueError("Wire dtype must be bfloat16 or mxfp8")
+        if return_dtype not in ("bfloat16", "mxfp8"):
+            raise ValueError("Return dtype must be bfloat16 or mxfp8")
         self.groups = groups
         self.num_experts = num_experts
         self.chunk = max_tokens_per_chunk
@@ -210,6 +214,8 @@ class HierarchicalMegaMoE:
         self.transport = transport or ProcessGroupTransport(groups.lane_group)
         self.pipeline_transport = pipeline_transport
         self.overlap = overlap
+        self.sparse_dispatch = sparse_dispatch
+        self.return_dtype = return_dtype
         self.last_dispatch_tokens = 0
         self._tables: dict[torch.device, tuple[torch.Tensor, ...]] = {}
 
@@ -279,6 +285,7 @@ class HierarchicalMegaMoE:
                 (width, x_bytes, gate_offset, route_offset),
                 local_moe,
                 local_moe_mxfp8,
+                source_tokens,
             )[:source_tokens]
         output = torch.empty_like(hidden)
         storage = self._slot(hidden, nodes * capacity, row_bytes)
@@ -382,10 +389,26 @@ class HierarchicalMegaMoE:
             )
 
     def _forward_pipeline(
-        self, hidden, weights, ids, capacity, row_bytes, layout, local, direct
+        self,
+        hidden,
+        weights,
+        ids,
+        capacity,
+        row_bytes,
+        layout,
+        local,
+        direct,
+        source_tokens,
     ):
         if not hidden.is_cuda or hidden.dtype != torch.bfloat16:
             raise ValueError("The verbs pipeline requires CUDA BF16 activations")
+        from vllm.distributed.megamoe_rdma_ops import (
+            combine_compact,
+            mask_received_routes,
+            pack_compact,
+            pack_mxfp8,
+        )
+
         tokens, width = hidden.shape
         width, x_bytes, gate_offset, route_offset = layout
         padding = -tokens % capacity
@@ -393,7 +416,9 @@ class HierarchicalMegaMoE:
             hidden = torch.nn.functional.pad(hidden, (0, 0, 0, padding))
             weights = torch.nn.functional.pad(weights, (0, 0, 0, padding))
             ids = torch.nn.functional.pad(ids, (0, 0, 0, padding), value=-1)
-        slots = self.pipeline_transport.plan(capacity, width, row_bytes, hidden.dtype)
+        slots = self.pipeline_transport.plan(
+            capacity, width, row_bytes, hidden.dtype, self.return_dtype
+        )
         wires = [slot.wire() for slot in slots]
         count = hidden.shape[0] // capacity
         output = torch.empty_like(hidden)
@@ -401,42 +426,35 @@ class HierarchicalMegaMoE:
         def dispatch(index):
             position = index % len(slots)
             rows = slice(index * capacity, (index + 1) * capacity)
-            self._pack(hidden[rows], weights[rows], ids[rows], wires[position])
-            slots[position].dispatch.submit()
+            slot = slots[position]
+            pack_compact(
+                hidden[rows],
+                weights[rows],
+                ids[rows],
+                self._tables[hidden.device],
+                self.num_experts,
+                self.groups.topology.world_size,
+                self.wire_dtype,
+                slot.dispatch.send,
+                slot.row_map,
+                slot.dispatch.send_counts,
+                max(0, min(capacity, source_tokens - index * capacity)),
+                self.sparse_dispatch,
+            )
+            slot.dispatch.submit(slot.dispatch.send_counts)
 
-        def combine(index):
+        def compute(index):
             position = index % len(slots)
-            slots[position].returning.wait()
-            rows = slice(index * capacity, (index + 1) * capacity)
-            self._combine(wires[position], output[rows])
-
-        if not self.overlap:
-            for index in range(count):
-                position = index % len(slots)
-                dispatch(index)
-                slots[position].dispatch.wait()
-                self._compute(
-                    wires[position],
-                    width,
-                    x_bytes,
-                    gate_offset,
-                    route_offset,
-                    local,
-                    direct,
-                )
-                slots[position].returning.submit()
-                combine(index)
-            return output[:tokens]
-
-        for index in range(min(len(slots), count)):
-            dispatch(index)
-        for index in range(count):
-            position = index % len(slots)
-            slots[position].dispatch.wait()
-            # Input and output slots have independent lifetimes. Reuse input
-            # after its native compute; reuse output only after return+combine.
-            if index >= len(slots):
-                combine(index - len(slots))
+            slot = slots[position]
+            slot.dispatch.wait()
+            mask_received_routes(
+                slot.dispatch.receive,
+                slot.dispatch.receive_counts,
+                capacity,
+                ids.shape[1],
+                gate_offset,
+                route_offset,
+            )
             self._compute(
                 wires[position],
                 width,
@@ -446,7 +464,44 @@ class HierarchicalMegaMoE:
                 local,
                 direct,
             )
-            slots[position].returning.submit()
+            if self.return_dtype == "mxfp8":
+                pack_mxfp8(
+                    slot.partial,
+                    out=slot.returning.send,
+                    exclude_rows=(self.pipeline_transport.rank * capacity, capacity),
+                )
+            slot.return_map.copy_(slot.row_map)
+            slot.returning.submit(slot.dispatch.receive_counts)
+
+        def combine(index):
+            position = index % len(slots)
+            slots[position].returning.wait()
+            rows = slice(index * capacity, (index + 1) * capacity)
+            slot = slots[position]
+            combine_compact(
+                slot.returning.receive,
+                slot.partial,
+                slot.return_map,
+                output[rows],
+                self.pipeline_transport.rank,
+                self.return_dtype,
+            )
+
+        if not self.overlap:
+            for index in range(count):
+                dispatch(index)
+                compute(index)
+                combine(index)
+            return output[:tokens]
+
+        for index in range(min(len(slots), count)):
+            dispatch(index)
+        for index in range(count):
+            # Input and output slots have independent lifetimes. Reuse input
+            # after its native compute; reuse output only after return+combine.
+            if index >= len(slots):
+                combine(index - len(slots))
+            compute(index)
             following = index + len(slots)
             if following < count:
                 dispatch(following)

@@ -4,6 +4,8 @@
 
 P/D/Store 明确使用 `xinhao-vllm-roce-megamoe:4c711ac-20261103`；Router 明确使用 `xinhao-vllm-router:e9b0421-tokenids-20261103`。完整ID和代码来源在 `images.env`。当前镜像是v0.32 backport：RoCE核心文件对应4c711ac，完整vLLM源码树与该分支不同。这里归档启动配置，不宣称已经通过D5整模型精度、稳定性或性能验收。
 
+P0/P1/P3 的源码实现、真实第20层与 DEP8 的对比见[单层验证报告](../docs/serving/hierarchical_mega_moe_validation.md#payload-optimizations-real-layer-dep8-comparison-2026-11-03)。MXFP8 回传需要显式启用，并有额外量化误差；默认回传仍为 BF16。本目录引用的旧镜像尚未包含这些改动，部署前须重建或 backport，不能直接向旧镜像传入新增配置字段。
+
 ## 部署位置与前置检查
 
 将本目录内容同步到四台节点的 `WORKDIR`（`cluster.env` 默认 `/data2/bench/eng-xinhao/vllm-pd/dsv41-flash-1017/b300-8p2-d16-rdma-megamoe-main`），在该目录执行命令。宿主机需有Docker/NVIDIA运行时、Python3、RDMA设备、模型目录及配置中的SSD挂载。镜像必须已存在，不自动拉取。示例私网IP和HCA来自当前89/91/92/93实机拓扑，换节点须重新核验。

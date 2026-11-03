@@ -60,7 +60,7 @@ def _distributed_case(rank, hosts, rendezvous, source_chunk_size):
     )
     try:
         # Zero source rows, uneven receives and several chunk rounds occur together.
-        count = (0, 1, 5, 2, 3, 0)[rank]
+        count = (0, 1, 5, 2, 3, 0, 2, 4)[rank]
         hidden = torch.arange(count * 3, dtype=torch.float32).reshape(count, 3) / 10
         hidden += rank
         ids = torch.tensor(
@@ -151,6 +151,7 @@ def _check_fixed_capacity_dispatch(adapter, topo, per_rank, experts, rank):
     [
         ("a", "b", "c", "b", "c", "a"),
         ("a", "b", "c", "d"),
+        ("a", "b", "c", "d", "d", "c", "b", "a"),
         ("a", "b", "b", "a"),
         ("a", "a"),
     ],

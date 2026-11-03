@@ -310,12 +310,22 @@ class KernelConfig:
 
     hierarchical_mega_moe_wire_dtype: Literal["bfloat16", "mxfp8"] = "mxfp8"
     """Dispatch activation format for hierarchical MegaMoE. MXFP8 uses native
-    1x32 E8M0 scales; gates/IDs and BF16 return partials are not compressed.
+    1x32 E8M0 scales; gates/IDs are not compressed. Return precision is separate.
     Uneven eager batches are padded to a common size before dispatch."""
 
     hierarchical_mega_moe_direct_staging: bool = True
     """Copy received MXFP8 directly into native MegaMoE input buffers. Disable
     to compare with the BF16 reconstruction and requantization reference."""
+
+    hierarchical_mega_moe_sparse_dispatch: bool = True
+    """With verbs, compact tokens independently for each destination host.
+    Fixed registered capacities and GPU row counts support CUDA graph replay.
+    Unused tail rows are never transmitted, including with dense dispatch."""
+
+    hierarchical_mega_moe_return_dtype: Literal["bfloat16", "mxfp8"] = "bfloat16"
+    """Verbs return precision. MXFP8 compresses remote island partials using
+    1x32 E8M0 scales; the source adds its own BF16 partial without quantizing it.
+    BF16 remains the reference; validate model quality before enabling MXFP8."""
 
     hierarchical_mega_moe_chunk_size: int = Field(default=0, ge=0)
     """Source tokens per network tile. Zero selects the entire batch for NCCL,
@@ -324,7 +334,7 @@ class KernelConfig:
 
     hierarchical_mega_moe_transport: Literal["nccl", "verbs"] = "nccl"
     """Cross-host transport. Verbs uses a CPU progress thread, GPU DMA-BUF
-    buffers and CUDA stream memory operations. It requires two hosts, CUDA
+    buffers and CUDA stream memory operations. It requires multiple hosts, CUDA
     driver headers and libibverbs development libraries for its JIT extension.
     The verbs path is experimental; full-model acceptance remains pending."""
 
