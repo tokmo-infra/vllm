@@ -2,6 +2,8 @@
 
 vLLM uses the following environment variables to configure the system:
 
+For `VLLM_MEGAMOE_TRANSPORT`, see the [experimental MegaMoE NVSHMEM transport](../design/mega_moe_rdma.md) build requirements and validation status. Its default is `nvlink`.
+
 !!! warning
     Please note that `VLLM_PORT` and `VLLM_HOST_IP` set the port and ip for vLLM's **internal usage**. It is not the port and ip for the API server. If you use `--host $VLLM_HOST_IP` and `--port $VLLM_PORT` to start the API server, it will not work.
 

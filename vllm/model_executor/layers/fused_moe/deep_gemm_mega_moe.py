@@ -282,6 +282,14 @@ class DeepGemmMegaMoEExperts(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        if (
+            envs.VLLM_MEGAMOE_TRANSPORT == "nvshmem"
+            and vllm_config.parallel_config.num_ubatches > 1
+        ):
+            raise ValueError(
+                "MegaMoE NVSHMEM requires serialized buffer use; "
+                "disable DBO and microbatch overlap."
+            )
         if activation.name not in weight_format.activations:
             raise NotImplementedError(
                 f"DeepGEMM MegaMoE {weight_format.name} experts support "
@@ -617,8 +625,31 @@ class DeepGemmMegaMoEExperts(nn.Module):
 
         deep_gemm = _import_deep_gemm()
         group = get_ep_group().device_group
+        transport = envs.VLLM_MEGAMOE_TRANSPORT
+        transport_kwargs = {}
+        if transport == "nvshmem":
+            if (
+                self.weight_format.mma_type != "fp8xfp4"
+                or self.activation.name != "swiglu"
+            ):
+                raise ValueError(
+                    "MegaMoE NVSHMEM currently supports FP8 x MXFP4 SwiGLU only."
+                )
+            # Check the imported package as well as the compiled extension: an
+            # external deep_gemm takes precedence over vLLM's vendored build.
+            get_abi = getattr(deep_gemm, "get_mega_moe_rdma_abi_version", None)
+            if get_abi is None or get_abi() != 1:
+                raise RuntimeError(
+                    "VLLM_MEGAMOE_TRANSPORT=nvshmem requires the RDMA DeepGEMM "
+                    "build with DG_ENABLE_NVSHMEM=1. Loaded package: "
+                    f"{deep_gemm.__file__}"
+                )
+            transport_kwargs = dict(
+                transport=transport, bootstrap_group=get_ep_group().cpu_group
+            )
         key = (
             id(group),
+            transport,
             torch.accelerator.current_device_index(),
             self.num_experts,
             self.max_num_tokens,
@@ -654,6 +685,7 @@ class DeepGemmMegaMoEExperts(nn.Module):
                     num_shared_experts=self.num_shared_experts,
                     mma_type=self.weight_format.mma_type,
                     activation=self.activation.name,
+                    **transport_kwargs,
                 )
             self._symm_buffers[key] = symm_buffer
         return symm_buffer

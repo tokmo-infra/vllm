@@ -122,13 +122,38 @@ if(DEEPGEMM_ARCHS)
 
   set(_dg_dir "${CMAKE_CURRENT_BINARY_DIR}/deepgemm_C")
   set(_dg_marker "${_dg_dir}/.built")
+  set(_dg_nvshmem "$ENV{DG_ENABLE_NVSHMEM}")
+  if(_dg_nvshmem STREQUAL "")
+    set(_dg_nvshmem "0")
+  endif()
+  if(NOT _dg_nvshmem MATCHES "^[01]$")
+    message(FATAL_ERROR "DG_ENABLE_NVSHMEM must be 0 or 1")
+  endif()
+  set(_dg_nvshmem_home "$ENV{NVSHMEM_HOME}")
+  if(_dg_nvshmem STREQUAL "1")
+    if(NOT EXISTS "${deepgemm_SOURCE_DIR}/csrc/runtime/mega_moe_rdma.hpp")
+      message(FATAL_ERROR
+        "DG_ENABLE_NVSHMEM=1 requires the MegaMoE RDMA DeepGEMM fork via DEEPGEMM_SRC_DIR")
+    endif()
+    if(NOT IS_DIRECTORY "${_dg_nvshmem_home}/include")
+      message(FATAL_ERROR "NVSHMEM_HOME must point to the NVSHMEM installation")
+    endif()
+  endif()
+  # Switching transport build options must invalidate a previous native build.
+  set(_dg_options "${CMAKE_CURRENT_BINARY_DIR}/deepgemm_build_options.txt")
+  file(CONFIGURE OUTPUT "${_dg_options}"
+    CONTENT "DG_ENABLE_NVSHMEM=@_dg_nvshmem@\nNVSHMEM_HOME=@_dg_nvshmem_home@\n" @ONLY)
   add_custom_command(
     OUTPUT "${_dg_marker}"
-    COMMAND "${Python_EXECUTABLE}"
+    COMMAND "${CMAKE_COMMAND}" -E env
+            "DG_ENABLE_NVSHMEM=${_dg_nvshmem}"
+            "NVSHMEM_HOME=${_dg_nvshmem_home}"
+            "${Python_EXECUTABLE}"
             "${CMAKE_SOURCE_DIR}/tools/build_deepgemm_C.py"
             "${deepgemm_SOURCE_DIR}" "${_dg_dir}"
     COMMAND "${CMAKE_COMMAND}" -E touch "${_dg_marker}"
     DEPENDS "${CMAKE_SOURCE_DIR}/tools/build_deepgemm_C.py"
+            "${_dg_options}"
             "${deepgemm_SOURCE_DIR}/csrc/python_api.cpp"
             "${deepgemm_SOURCE_DIR}/deep_gemm/_C.py"
             "${deepgemm_SOURCE_DIR}/setup.py"
