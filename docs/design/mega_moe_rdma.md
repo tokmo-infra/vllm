@@ -5,8 +5,9 @@ for DeepGEMM MegaMoE. The default is `nvlink`. This first implementation is
 limited to SM100-family GPUs, FP8 activations, MXFP4 routed weights and SwiGLU,
 including the existing FP8 fused shared-expert path. Both DeepGEMM build modes
 and single-node B300 kernel correctness have been validated with CUDA 13.0,
-including forced remote staging with P2P disabled. Multi-node correctness,
-model evaluation and performance validation are still pending.
+including forced remote staging with P2P disabled. Cross-node EP8 correctness
+and synthetic MoE layer timing have also been exercised with four GPUs per
+node. Model evaluation and end-to-end serving performance remain pending.
 
 Build vLLM against the matching DeepGEMM development tree:
 
@@ -60,6 +61,18 @@ buffers, eager output and 20 changing-route CUDA Graph replays. NVSHMEM output
 matched NVLink exactly. This used branch Python sources with the validation
 image's existing vLLM binary extensions and newly built DeepGEMM; a full vLLM
 source build and model serving were not exercised.
+
+Cross-node validation uses the paired DeepGEMM harness with exact native EP1
+reference checks, including shared experts, an empty rank and masked routes.
+Its optional `--benchmark-iterations` mode restores identical seeded inputs
+before timing and checks results after each batch. See the paired DeepGEMM
+`docs/mega_moe_rdma.md` for commands and layer timing results. These results do
+not establish a serving TPOT or throughput improvement.
+
+IBGDA configuration also needs runtime verification. In the tested environment,
+`NVSHMEM_IB_ENABLE_IBGDA=1` enabled the transport, but a requested GPU NIC handler
+fell back to CPU host memory after an I/O-memory mapping error. Inspect the
+actual handler in NVSHMEM logs before attributing results to GPU-only progress.
 
 This transport extends the MoE EP path only. Keep TP/GEMM-RS and Engram sharing
 within their supported NVLink domains. Both main and draft physical expert
