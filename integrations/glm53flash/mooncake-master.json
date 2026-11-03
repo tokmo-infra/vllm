@@ -1,0 +1,32 @@
+{
+  "repository": "https://github.com/kvcache-ai/Mooncake.git",
+  "commit": "719735896c86b56fabec6cf3e825fb2ea640597a",
+  "build_script": "build-mooncake-master.sh",
+  "dockerfile": "Dockerfile.mooncake-master",
+  "build_type": "Release -O2 -DNDEBUG; USE_CUDA=OFF",
+  "pinned_original_sha256": {
+    "mooncake-store/include/allocator.h": "b35a826d35a53773334b61393ed7e8f9f4898f6e4c78a1a3cfedf28cf8331681",
+    "mooncake-store/include/offset_allocator/offset_allocator.h": "e4bc66e98a26d7f34924376f7f116e7572eab38c82dcdebd5ae4d7a9391d298c",
+    "mooncake-store/include/segment.h": "a4b28c39f1c5adc5d31a4a668446c00e4d06db8bb3d3f618ed48141f9ef42960",
+    "mooncake-store/src/allocator.cpp": "36154e8e9a4ac856c14e5b10750cca6d355658f54c62b9fda7ff2141abc11da6",
+    "mooncake-store/src/offset_allocator.cpp": "e0262bcc9ae0aa6fcf146484f7ef1e7b2a82148ff3330080c74b6cfcdd7bebba",
+    "mooncake-store/tests/buffer_allocator_test.cpp": "cf1c4f48408cab26fbf20841cc9f25c024234bcf391cbf6d21002f8370ecbb23",
+    "mooncake-store/tests/serializer_test.cpp": "664bc1a32ce810ab80c4b0c06f6128e04cad5457553acbd8f85a15beaa5125fd"
+  },
+  "patches": [
+    {
+      "path": "patches/mooncake-occupied-accounting.patch",
+      "sha256": "d81b0a25af222857275d9c6f73b4dbfc777b3c2e3c21fa006a3370679c50d94d"
+    },
+    {
+      "path": "patches/mooncake-fit-pressure.patch",
+      "sha256": "ba417a3dfb6aade7ed6dcf1fac9f5bb63097f1b0e05d12b77c11da621de28e76"
+    }
+  ],
+  "fit_pressure_defaults": {
+    "MC_EVICTION_FIT_REQUEST_BYTES": 0,
+    "MC_EVICTION_FIT_MIN_SLOTS": 64,
+    "MC_EVICTION_FIT_CHECK_MS": 1000
+  },
+  "SDK_version": "0.3.13.post1"
+}

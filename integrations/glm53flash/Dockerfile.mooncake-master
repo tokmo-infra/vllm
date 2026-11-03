@@ -1,0 +1,7 @@
+ARG BASE_IMAGE=sha256:bd6c77d709b8225ebf7b4a9a3890509a4e2df87af846fcc7230b65a7a57d16f7
+FROM ${BASE_IMAGE}
+COPY mooncake-master-runtime/ /opt/glm53flash-mooncake-master/
+COPY integrations/glm53flash/mooncake-master-entrypoint.sh /usr/local/bin/mooncake_master
+RUN chmod 755 /usr/local/bin/mooncake_master /opt/glm53flash-mooncake-master/mooncake_master
+LABEL glm.mooncake.scope="Master-only occupied-bin accounting and opt-in fit-pressure eviction"
+ENTRYPOINT ["mooncake_master"]

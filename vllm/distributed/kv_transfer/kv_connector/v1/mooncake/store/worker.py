@@ -99,6 +99,7 @@ from .staged_lookup import LookupCandidate, staged_lookup_exists
 logger = init_logger(__name__)
 
 MOONCAKE_NO_AVAILABLE_HANDLE = -200
+_STORE_PRESSURE_PROBE_INTERVAL_S = 1.0
 _T = TypeVar("_T")
 
 
@@ -485,6 +486,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # Pause store requests when CPU/disk offloading is under pressure.
         self._store_pressure_active = False
         self._skip_store_requests: set[str] = set()
+        self._store_pressure_probe_at = 0.0
 
         # Per-request high-water mark of tokens actually persisted; the next
         # batch resumes here, so pressure-skipped or failed ranges are retried.
@@ -580,12 +582,31 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
     def _should_skip_request(self, req_id: str) -> bool:
         with self.done_task_lock:
-            return self._store_pressure_active and req_id in self._skip_store_requests
+            if (
+                not self._store_pressure_active
+                or req_id not in self._skip_store_requests
+            ):
+                return False
+            now = time.monotonic()
+            if now < self._store_pressure_probe_at:
+                return True
+            # All active requests may have failed allocation. Requiring another
+            # request's successful PUT to reopen the gate can then suppress every
+            # later checkpoint even after the Store has evicted enough data.
+            # Reserve one probe per sending thread; the caller uses only this
+            # job's pinned blocks and still retires it through the normal finally.
+            self._store_pressure_probe_at = now + _STORE_PRESSURE_PROBE_INTERVAL_S
+        logger.info("Mooncake store pressure recovery probe for request %s", req_id)
+        return False
 
     def _mark_request_skipped_for_pressure(self, req_meta: ReqMeta) -> bool:
         req_id = req_meta.req_id
         with self.done_task_lock:
             already_skipped = req_id in self._skip_store_requests
+            if not self._store_pressure_active:
+                self._store_pressure_probe_at = (
+                    time.monotonic() + _STORE_PRESSURE_PROBE_INTERVAL_S
+                )
             self._store_pressure_active = True
             # The pressure itself is global, but only a live job may sentence its
             # own request to being skipped.
@@ -599,6 +620,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 return False
             self._store_pressure_active = False
             self._skip_store_requests.clear()
+            self._store_pressure_probe_at = 0.0
         return True
 
     def _boundary_puts(

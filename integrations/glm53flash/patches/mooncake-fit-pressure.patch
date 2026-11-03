@@ -1,0 +1,287 @@
+diff --git a/mooncake-store/include/fit_pressure.h b/mooncake-store/include/fit_pressure.h
+new file mode 100644
+index 0000000..8f61d29
+--- /dev/null
++++ b/mooncake-store/include/fit_pressure.h
+@@ -0,0 +1,91 @@
++#pragma once
++
++#include <algorithm>
++#include <charconv>
++#include <cstdint>
++#include <cstdlib>
++#include <limits>
++#include <memory>
++#include <optional>
++#include <string_view>
++#include <unordered_set>
++#include <vector>
++
++#include "allocator.h"
++
++namespace mooncake::fit_pressure {
++struct Config {
++    uint64_t request_bytes = 0;
++    uint64_t min_slots = 64;
++    uint64_t check_ms = 1000;
++};
++
++inline bool ParseUint(const char* text, uint64_t& value) {
++    if (!text || !*text) return false;
++    const std::string_view s(text);
++    const auto result = std::from_chars(s.data(), s.data() + s.size(), value);
++    return result.ec == std::errc{} && result.ptr == s.data() + s.size();
++}
++
++// Invalid enabled configurations fail closed. Default 0 never samples.
++inline std::optional<Config> ReadConfig() {
++    Config c;
++    const char* request = std::getenv("MC_EVICTION_FIT_REQUEST_BYTES");
++    if (!request) return c;
++    if (!ParseUint(request, c.request_bytes)) return std::nullopt;
++    if (!c.request_bytes) return c;
++    if (c.request_bytes > std::numeric_limits<size_t>::max()) return std::nullopt;
++    const char* slots = std::getenv("MC_EVICTION_FIT_MIN_SLOTS");
++    const char* ms = std::getenv("MC_EVICTION_FIT_CHECK_MS");
++    if ((slots && !ParseUint(slots, c.min_slots)) ||
++        (ms && !ParseUint(ms, c.check_ms)) || !c.min_slots ||
++        c.check_ms < 1000 || c.check_ms > 86400000) return std::nullopt;
++    return c;
++}
++
++inline uint64_t SatAdd(uint64_t a, uint64_t b) {
++    const auto max = std::numeric_limits<uint64_t>::max();
++    return a > max - b ? max : a + b;
++}
++inline uint64_t SatMul(uint64_t a, uint64_t b) {
++    const auto max = std::numeric_limits<uint64_t>::max();
++    return b && a > max / b ? max : a * b;
++}
++struct Sample { uint64_t slots = 0; uint64_t free_bytes_lower_bound = 0; size_t allocators = 0; };
++inline void AddReport(Sample& sample,
++                      const offset_allocator::OffsetAllocStorageReportFull& report,
++                      uint64_t normalized) {
++    for (const auto& bin : report.freeRegions) {
++        sample.slots = SatAdd(sample.slots, SatMul(bin.count, bin.size / normalized));
++        sample.free_bytes_lower_bound = SatAdd(sample.free_bytes_lower_bound,
++                                               SatMul(bin.count, bin.size));
++    }
++}
++
++// manager lock must already be released. Partial or unknown data is unavailable,
++// not zero: this avoids triggering from an incomplete segment population.
++inline std::optional<Sample> SampleAllocators(
++    const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
++    uint64_t request_bytes) {
++    if (allocators.empty() || !request_bytes ||
++        request_bytes > std::numeric_limits<size_t>::max()) return std::nullopt;
++    Sample sample;
++    std::unordered_set<const offset_allocator::OffsetAllocator*> seen;
++    for (const auto& base : allocators) {
++        auto offset = std::dynamic_pointer_cast<OffsetBufferAllocator>(base);
++        if (!offset) return std::nullopt;
++        auto allocator = offset->getOffsetAllocator();
++        if (!allocator) return std::nullopt;
++        if (!seen.insert(allocator.get()).second) continue;
++        auto normalized = allocator->normalizedAllocationSize(static_cast<size_t>(request_bytes));
++        if (!normalized) return std::nullopt;
++        AddReport(sample, allocator->storageReportFull(), normalized);
++        ++sample.allocators;
++    }
++    return sample.allocators ? std::optional<Sample>(sample) : std::nullopt;
++}
++inline bool ShouldEvict(const Config& c, const std::optional<Sample>& sample) {
++    return c.request_bytes && sample && sample->free_bytes_lower_bound &&
++           sample->slots < c.min_slots;
++}
++}  // namespace mooncake::fit_pressure
+diff --git a/mooncake-store/include/segment.h b/mooncake-store/include/segment.h
+index 85c7939..73013d8 100644
+--- a/mooncake-store/include/segment.h
++++ b/mooncake-store/include/segment.h
+@@ -428,6 +428,11 @@ class SegmentManager {
+                                      client_by_name_, segment_mutex_);
+     }
+ 
++    // Copies live allocator references under the segment lock. nullopt means
++    // empty or unsupported (including CXL), never a zero-slot observation.
++    [[nodiscard]] std::optional<std::vector<std::shared_ptr<BufferAllocatorBase>>>
++    SnapshotFitAllocators() const;
++
+     SegmentView getView() const { return SegmentView(this); }
+ 
+     /**
+diff --git a/mooncake-store/src/master_service.cpp b/mooncake-store/src/master_service.cpp
+index d95cedb..f8f6b75 100644
+--- a/mooncake-store/src/master_service.cpp
++++ b/mooncake-store/src/master_service.cpp
+@@ -1,3 +1,4 @@
++#include "fit_pressure.h"
+ #include "master_service.h"
+ 
+ #include <algorithm>
+@@ -9053,6 +9054,10 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
+ void MasterService::EvictionThreadFunc() {
+     VLOG(1) << "action=eviction_thread_started";
+ 
++    const auto fit_config = fit_pressure::ReadConfig();
++    if (!fit_config) LOG(ERROR) << "[EVICT-FIT] invalid config; disabled";
++    auto next_fit_check = std::chrono::steady_clock::now() +
++        std::chrono::milliseconds(fit_config ? fit_config->check_ms : 1000);
+     auto last_discard_time = std::chrono::system_clock::now();
+     auto next_dfs_eviction_time = std::chrono::steady_clock::now();
+     while (eviction_running_) {
+@@ -9073,6 +9078,32 @@ void MasterService::EvictionThreadFunc() {
+             BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
+             LOG(INFO) << "[EVICT-DONE] BatchEvict execution completed.";
+             last_discard_time = now;
++        } else if (fit_config && fit_config->request_bytes && eviction_ratio_ > 0.0 &&
++                   std::chrono::steady_clock::now() >= next_fit_check) {
++            const auto start = std::chrono::steady_clock::now();
++            const auto allocators = segment_manager_.SnapshotFitAllocators();
++            const auto sample = allocators
++                ? fit_pressure::SampleAllocators(*allocators, fit_config->request_bytes)
++                : std::nullopt;
++            const auto sample_us = std::chrono::duration_cast<std::chrono::microseconds>(
++                std::chrono::steady_clock::now() - start).count();
++            const bool pressure = fit_pressure::ShouldEvict(*fit_config, sample);
++            LOG(INFO) << "[EVICT-FIT] available=" << bool(sample)
++                      << " pressure=" << pressure
++                      << " slots=" << (sample ? sample->slots : 0)
++                      << " free_lower=" << (sample ? sample->free_bytes_lower_bound : 0)
++                      << " allocators=" << (sample ? sample->allocators : 0)
++                      << " request=" << fit_config->request_bytes
++                      << " min_slots=" << fit_config->min_slots
++                      << " sample_us=" << sample_us;
++            if (pressure) {
++                // Same 5% object budget, eligibility and group handling as native.
++                BatchEvict(0.05, 0.025);
++                last_discard_time = now;
++            }
++            // Completion-based pacing; even a long eviction cannot catch up in a loop.
++            next_fit_check = std::chrono::steady_clock::now() +
++                             std::chrono::milliseconds(fit_config->check_ms);
+         } else if (now - last_discard_time > put_start_release_timeout_sec_) {
+             // Try discarding expired processing keys and ongoing replication
+             // tasks if we have not done this for a long time.
+diff --git a/mooncake-store/src/segment.cpp b/mooncake-store/src/segment.cpp
+index 703509f..3c610b2 100644
+--- a/mooncake-store/src/segment.cpp
++++ b/mooncake-store/src/segment.cpp
+@@ -127,6 +127,22 @@ std::vector<std::string> ScopedAllocatorAccess::GetHostOrderedSegments(
+     return BuildHostOrderedSegments(*segments_by_host_, writer_host_id, key);
+ }
+ 
++std::optional<std::vector<std::shared_ptr<BufferAllocatorBase>>>
++SegmentManager::SnapshotFitAllocators() const {
++    std::shared_lock<std::shared_mutex> lock(segment_mutex_);
++    std::vector<std::shared_ptr<BufferAllocatorBase>> result;
++    for (const auto& [id, mounted] : mounted_segments_) {
++        (void)id;
++        if (mounted.status != SegmentStatus::OK) continue;
++        if (mounted.segment.protocol == "cxl" || !mounted.buf_allocator ||
++            !std::dynamic_pointer_cast<OffsetBufferAllocator>(mounted.buf_allocator))
++            return std::nullopt;
++        result.push_back(mounted.buf_allocator);
++    }
++    if (result.empty()) return std::nullopt;
++    return result;
++}
++
+ StorageUsageSnapshot SegmentManager::GetMemoryUsageSnapshot() const {
+     std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+     StorageUsageSnapshot snapshot;
+diff --git a/mooncake-store/tests/fit_pressure_test.cpp b/mooncake-store/tests/fit_pressure_test.cpp
+new file mode 100644
+index 0000000..836e885
+--- /dev/null
++++ b/mooncake-store/tests/fit_pressure_test.cpp
+@@ -0,0 +1,78 @@
++#include <gtest/gtest.h>
++#include <cstdlib>
++#include <limits>
++#include "fit_pressure.h"
++#include "segment.h"
++
++using namespace mooncake;
++using namespace mooncake::fit_pressure;
++using namespace mooncake::offset_allocator;
++namespace {
++constexpr uint64_t MiB = 1024 * 1024;
++
++TEST(FitPressure, NativeNormalizationAndFitCounts) {
++    auto base = std::make_shared<OffsetBufferAllocator>("s", 0x100000000, 256 * MiB, "test");
++    auto offset = base->getOffsetAllocator();
++    ASSERT_TRUE(offset);
++    for (auto [bytes, expected_bin] : {
++             std::pair<uint64_t, uint64_t>{49381376, 48 * MiB},
++             {51 * MiB, 52 * MiB}, {60318720, 60 * MiB}}) {
++        const auto normalized = offset->normalizedAllocationSize(bytes);
++        EXPECT_EQ(normalized, expected_bin);
++        auto report = offset->storageReportFull();
++        uint64_t expected = 0;
++        for (const auto& bin : report.freeRegions)
++            expected += bin.count * (bin.size / normalized);
++        auto sample = SampleAllocators({base}, bytes);
++        ASSERT_TRUE(sample);
++        EXPECT_EQ(sample->slots, expected);
++    }
++}
++
++TEST(FitPressure, PlentyFreeButNoFit) {
++    OffsetAllocStorageReportFull report{};
++    report.freeRegions[0] = {44 * MiB, 1300};
++    Sample sample;
++    AddReport(sample, report, 48 * MiB);
++    EXPECT_EQ(sample.slots, 0);
++    EXPECT_GT(sample.free_bytes_lower_bound, 50ULL * 1024 * MiB);
++    EXPECT_TRUE(ShouldEvict({48 * MiB, 64, 1000}, sample));
++}
++
++TEST(FitPressure, DedupEmptyUnsupportedAndOverflow) {
++    auto a = std::make_shared<OffsetBufferAllocator>("s", 0x100000000, 128 * MiB, "test");
++    auto single = SampleAllocators({a}, 48 * MiB);
++    auto duplicate = SampleAllocators({a, a}, 48 * MiB);
++    ASSERT_TRUE(single); ASSERT_TRUE(duplicate);
++    EXPECT_EQ(single->slots, duplicate->slots);
++    EXPECT_EQ(duplicate->allocators, 1);
++    EXPECT_FALSE(SampleAllocators({}, 48 * MiB));
++    SegmentManager empty(BufferAllocatorType::OFFSET);
++    EXPECT_FALSE(empty.SnapshotFitAllocators());
++    auto other = std::make_shared<DummyBufferAllocator>("dummy", "test");
++    EXPECT_FALSE(SampleAllocators({a, other}, 48 * MiB));
++    EXPECT_FALSE(SampleAllocators({a}, 0));
++    OffsetAllocStorageReportFull report{};
++    const auto max = std::numeric_limits<uint64_t>::max();
++    report.freeRegions[0] = {max, max};
++    Sample overflow;
++    AddReport(overflow, report, 1);
++    EXPECT_EQ(overflow.slots, max);
++    EXPECT_EQ(overflow.free_bytes_lower_bound, max);
++}
++
++TEST(FitPressure, DefaultOffAndInvalidParameters) {
++    unsetenv("MC_EVICTION_FIT_REQUEST_BYTES");
++    unsetenv("MC_EVICTION_FIT_MIN_SLOTS");
++    unsetenv("MC_EVICTION_FIT_CHECK_MS");
++    auto config = ReadConfig(); ASSERT_TRUE(config);
++    EXPECT_EQ(config->request_bytes, 0);
++    EXPECT_FALSE(ShouldEvict(*config, Sample{0, 100, 1}));
++    setenv("MC_EVICTION_FIT_REQUEST_BYTES", "60318720", 1);
++    setenv("MC_EVICTION_FIT_CHECK_MS", "10", 1);
++    EXPECT_FALSE(ReadConfig());
++    unsetenv("MC_EVICTION_FIT_CHECK_MS");
++    EXPECT_TRUE(ReadConfig());
++    unsetenv("MC_EVICTION_FIT_REQUEST_BYTES");
++}
++}  // namespace
+--- a/mooncake-store/tests/CMakeLists.txt
++++ b/mooncake-store/tests/CMakeLists.txt
+@@ -36,6 +36,7 @@
+ endfunction()
+ 
+ add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
++add_store_test(fit_pressure_test fit_pressure_test.cpp)
+ add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
+ add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
+ add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
