@@ -40,13 +40,29 @@ def capture(fn):
     return graph, output
 
 
-def check_payload(transport, args):
+def check_payload(transport, args, local_group):
     """Changing the generation exposes stale ready flags and reversed peers."""
     row_bytes = args.hidden + args.hidden // 32 + 8 * args.top_k
     slots = transport.plan(257, args.hidden, row_bytes, torch.bfloat16)
     transfers = [
         transfer for slot in slots for transfer in (slot.dispatch, slot.returning)
     ]
+    if args.symmetric_storage:
+        from vllm.distributed.roce.transport import PeerBuffer
+
+        if not args.peer_reads:
+            raise ValueError("Symmetric receives require --peer-reads")
+        rows = 257 * transport.size
+        size = ((rows * row_bytes + 65535) // 65536) * 65536
+        handles = [PeerBuffer(local_group, size) for _ in range(2)]
+        regions = [handle.region for handle in handles]
+        send, receive = [
+            region[: rows * row_bytes].view(rows, row_bytes) for region in regions
+        ]
+        symmetric_transfer = transport.register_transfer(
+            send, receive, *regions, dict(phase="symmetric-probe")
+        )
+        transfers.insert(0, symmetric_transfer)
 
     def exchange():
         for transfer in transfers:
@@ -76,6 +92,111 @@ def check_payload(transport, args):
                     transfer.receive.chunk(transport.size)[peer] == expected
                 ).item()
     del graph
+
+    if args.symmetric_storage:
+        lane = dist.get_rank(local_group)
+        peer_lane = (lane + 1) % dist.get_world_size(local_group)
+        peer_receive = (
+            handles[1].peers[peer_lane][: rows * row_bytes].view(rows, row_bytes)
+        )
+
+        def symmetric_exchange():
+            symmetric_transfer.submit_fixed()
+            symmetric_transfer.wait_fixed()
+
+        graph, _ = capture(symmetric_exchange)
+        for generation in range(8):
+            symmetric_transfer.send.fill_(transport.rank * 67 + lane * 13 + generation)
+            graph.replay()
+            torch.accelerator.synchronize()
+            dist.barrier(group=local_group)
+            for node in range(transport.size):
+                expected = node * 67 + peer_lane * 13 + generation
+                torch.testing.assert_close(
+                    peer_receive.chunk(transport.size)[node],
+                    torch.full_like(
+                        symmetric_transfer.receive.chunk(transport.size)[0], expected
+                    ),
+                    rtol=0,
+                    atol=0,
+                )
+            dist.barrier(group=local_group)
+        del graph
+
+    if transport.size == 2:
+        # The responder cannot produce its send until it consumes the request.
+        # Coupling credit/receive completion to local send readiness deadlocks.
+        transfer = transfers[0]
+
+        def request_response():
+            transfer.reserve()
+            if transport.rank == 0:
+                transfer.publish_fixed()
+                transfer.wait_receive(fixed=True)
+            else:
+                transfer.wait_receive(fixed=True)
+                transfer.send.copy_(transfer.receive)
+                transfer.publish_fixed()
+            transfer.wait_send()
+
+        transfer.send.zero_()
+        transfer.receive.zero_()
+        graph, _ = capture(request_response)
+        for generation in range(8):
+            if transport.rank == 0:
+                transfer.send.fill_(generation + 31)
+            graph.replay()
+            torch.accelerator.synchronize()
+            peer_rows = transfer.receive.chunk(transport.size)[1 - transport.rank]
+            assert torch.all(peer_rows == generation + 31).item()
+        del graph
+
+    if args.resident_probe:
+        if transport.size != 2 or args.host_staging:
+            raise ValueError("Resident probe needs two islands and device sends")
+        from dataclasses import astuple
+
+        from torch.utils.cpp_extension import load
+
+        probe = load(
+            name="vllm_roce_resident_probe",
+            sources=[str(Path(__file__).with_name("roce_resident_probe.cu"))],
+            extra_cuda_cflags=["-O3", "-std=c++17"],
+        )
+        transfer = transfers[0]
+        flags = torch.tensor(
+            astuple(transfer.peer_signals[1 - transport.rank]),
+            dtype=torch.int64,
+            device="cuda",
+        )
+        generation = torch.zeros((), dtype=torch.int32, device="cuda")
+
+        def resident():
+            probe.roundtrip(
+                transfer.send.data_ptr(),
+                transfer.receive.data_ptr(),
+                flags.data_ptr(),
+                generation.data_ptr(),
+                transport.rank,
+                transfer.send.nbytes // transport.size,
+                row_bytes,
+                torch.cuda.current_stream().cuda_stream,
+                60_000_000_000,
+            )
+
+        graph, _ = capture(resident)
+        for epoch in range(32):
+            generation.fill_(epoch)
+            graph.replay()
+            torch.accelerator.synchronize()
+            expected = (torch.arange(row_bytes, device="cuda") * 7 + epoch * 13) % 251
+            if transport.rank == 0:
+                expected = (expected + 1) % 251
+            received = transfer.receive.chunk(2)[1 - transport.rank][0]
+            torch.testing.assert_close(
+                received, expected.to(torch.uint8), rtol=0, atol=0
+            )
+        del graph
 
     # Independent counts in each direction, including zero-length traffic.
     counts = torch.empty(transport.size, dtype=torch.int32, device="cuda")
@@ -206,6 +327,9 @@ def main():
     parser.add_argument("--gid", type=int, default=0)
     parser.add_argument("--qps", type=int, default=4)
     parser.add_argument("--host-staging", action="store_true")
+    parser.add_argument("--peer-reads", action="store_true")
+    parser.add_argument("--resident-probe", action="store_true")
+    parser.add_argument("--symmetric-storage", action="store_true")
     parser.add_argument("--sparse-dispatch", action="store_true")
     parser.add_argument(
         "--return-dtype", choices=("bfloat16", "mxfp8"), default="bfloat16"
@@ -276,6 +400,7 @@ def main():
         traffic_class=args.traffic_class,
         timeout_seconds=args.timeout,
         host_staging=args.host_staging,
+        peer_reads=args.peer_reads,
     )
     args.output_directory.mkdir(parents=True, exist_ok=True)
     per_rank = args.experts // dist.get_world_size()
@@ -293,7 +418,7 @@ def main():
             json.dumps(records, indent=2) + "\n"
         )
 
-    check_payload(transport, args)
+    check_payload(transport, args, groups.local_group)
     for tokens in map(int, args.tokens.split(",")):
         if args.transport_only:
             row_bytes = args.hidden + args.hidden // 32 + 8 * args.top_k

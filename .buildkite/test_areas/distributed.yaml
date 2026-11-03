@@ -2,6 +2,29 @@ group: Distributed
 depends_on: 
   - image-build
 steps:
+- label: ":nvidia: (B200) MegaMoE Graph Replay"
+  key: distributed-megamoe-replay-b200
+  timeout_in_minutes: 20
+  working_dir: "/vllm-workspace/tests"
+  device: b200-k8s
+  num_devices: 2
+  source_file_dependencies:
+  - cmake/external_projects/deepgemm.cmake
+  - cmake/patches/
+  - vllm/model_executor/layers/fused_moe/prepare_megamoe.py
+  - vllm/distributed/megamoe_rdma_ops.py
+  - vllm/distributed/megamoe_native_overlap.py
+  - vllm/distributed/hierarchical_mega_moe.py
+  - vllm/distributed/roce/
+  - vllm/model_executor/layers/fused_moe/deep_gemm_mega_moe.py
+  - vllm/models/deepseek_v4/nvidia/model.py
+  - tests/distributed/test_megamoe_replay.py
+  - tests/distributed/test_megamoe_combine.py
+  commands:
+  - >-
+    pytest -v -s
+    distributed/test_megamoe_replay.py
+    distributed/test_megamoe_combine.py
 - label: ":nvidia: (L4) Distributed Comm Ops"
   key: distributed-comm-ops
   automatic_shard: true
@@ -14,6 +37,7 @@ steps:
   - "!vllm/distributed/kv_transfer/"
   - tests/distributed
   commands:
+  - pytest -v -s distributed/test_roce_protocol.py
   - pytest -v -s distributed/test_hierarchical_mega_moe.py
   - pytest -v -s distributed/test_localization.py
   - pytest -v -s distributed/test_comm_ops.py

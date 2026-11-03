@@ -46,7 +46,7 @@ Kernel configuration fields:
 | --- | --- | --- |
 | `hierarchical_mega_moe_wire_dtype` | `mxfp8` | Native 1x32 E4M3 activations/E8M0 scales on dispatch; `bfloat16` provides a reference path. |
 | `hierarchical_mega_moe_direct_staging` | `true` | Copy received MXFP8 bytes/scales into native buffers. Set `false` to reconstruct BF16 and requantize for comparison. Ignored for BF16 wire. |
-| `hierarchical_mega_moe_sparse_dispatch` | `true` | Verbs only: compact each destination's selected token rows on the GPU. Registered capacities and native call shapes stay fixed. `false` is a dense reference; tail padding is still excluded from the network. |
+| `hierarchical_mega_moe_sparse_dispatch` | `true` | Verbs only: compact each destination's selected token rows on the GPU. Registered capacities and native call shapes stay fixed. `false` with BF16 returns selects a fixed-length dense path: it transfers masked padding but skips row-count CPU/GPU copies, compaction maps and receive-tail masking. MXFP8 returns retain the counted transfer path. |
 | `hierarchical_mega_moe_return_dtype` | `bfloat16` | Verbs only: `mxfp8` compresses remote island partials with 1x32 E8M0 scales. The source uses its own BF16 partial directly. Validate model quality before enabling this lossy transport. |
 | `hierarchical_mega_moe_chunk_size` | `0` | Source tokens per network tile. NCCL zero sends the complete padded batch. Verbs zero selects at most 2048 source rows fitting one native call. Smaller tiles bound temporary memory but add launches. |
 | `hierarchical_mega_moe_transport` | `nccl` | `verbs` selects the experimental multi-host GPUDirect pipeline described below. |
@@ -128,6 +128,13 @@ For MXFP8 returns, a GPU packing kernel encodes native BF16 partials. Source
 reduction decodes remote MXFP8 directly into an FP32 sum and adds the original
 local BF16 partial. Final output is BF16. Expert weights and the native kernel
 are unchanged. Compare quality with BF16 returns before enabling it for a model.
+
+With sparse dispatch disabled and BF16 returns, peers instead exchange the
+registered tile capacity, including masked padding. This fixed-length path
+skips row-count copies, compaction maps and receive-tail masking while retaining
+the same epoch credits and completion fences. It can reduce overhead when most
+source rows select experts on every host; sparse dispatch can save more traffic
+when many rows have no destination on a host. Measure both on the target load.
 
 ## Performance limits and concurrency
 
@@ -260,7 +267,8 @@ Sparse destination dispatch is enabled by default for verbs. To additionally
 enable lossy MXFP8 remote returns, add
 `"hierarchical_mega_moe_return_dtype": "mxfp8"` to that kernel configuration.
 Use `"hierarchical_mega_moe_sparse_dispatch": false` and BF16 returns for the
-dense reference. Tail rows are excluded in both modes.
+fixed-length dense path. Its masked tail rows are transferred but contribute
+zero to the result; the sparse path excludes them from the payload.
 
 For four eight-GPU hosts, use global DP32/EP32, local DP8 and TP1, with each
 host's DP start rank set to `8 * node_rank`. The same kernel configuration
@@ -410,6 +418,96 @@ MSCCL++ [PR 935](https://github.com/microsoft/mscclpp/pull/935) and
 design references; they are not drop-in native MXFP8 MegaMoE integrations.
 
 ## Deployment carryovers
+
+### Native overlap development interfaces
+
+The pinned DeepGEMM build applies
+`cmake/patches/deepgemm-roce-overlap.patch`. Its hash selects a separate build
+checkout. An explicit `DEEPGEMM_SRC_DIR` remains caller-owned and must contain
+the compatible API and headers. Rebuild the extension after layout or API
+changes; replacing CUDA headers alone is insufficient for workspace changes.
+
+The native MXFP8 entry point has opt-in development arguments:
+
+- `scheduler_workspace`: CUDA `int64[4, stride]` readiness counters. The Python
+  wrapper resets them on each invocation, including graph replay. The stride
+  must cover the maximum pool block count plus its task counter.
+- `routing_groups` on `SymmBuffer`: partitions routing into virtual experts
+  while reusing physical weights. Expert ids must use the corresponding
+  rank/group/expert order. This does not by itself enable streaming input.
+- `shared_output`: contiguous BF16 `[original_tokens, hidden]`. Shared computes
+  only this input prefix and writes it independently; `y` then contains only
+  Routed. The caller owns the final Shared addition.
+- `early_combine`: dispatch warps consume ready producer tiles and reduce
+  token outputs before the kernel's final completion barrier.
+- `input_descriptors` and `input_chunk_size`: CUDA `int64[local_ranks, groups, 3]`
+  holds receive-ready addresses, local-peer wire addresses and row strides.
+  Wire addresses and row strides must be 16-byte aligned for native TMA pulls;
+  the serving adapter pads odd-top-k layouts without moving gates or route IDs.
+  Metadata is sealed independently per input group; routed activation/scales
+  are pulled directly from the registered MXFP8 wire buffers.
+- `streaming_diagnostics`: optional CUDA `int64[groups, 4]` timestamps for input
+  observation, count sealing, first FC1 and first FC2 completion. Compare these
+  on the same GPU; CPU monotonic clocks have a different origin.
+- `return_descriptors` and `return_chunk_size`: CUDA `int64[chunks, 4]`, with
+  columns `request_address`, `send_rows_address`, `publish_timestamp_ns`, and
+  `local_fc2_done_timestamp_ns`. Each row describes a contiguous output chunk.
+  A zero request address records timing without publishing a transfer. GPU
+  timestamps use `%globaltimer`; the final column describes local FC2, not
+  completion of remote work or of the entire kernel.
+
+For native publication, reserve receive credits before launching MegaMoE.
+Output storage must be registered and remain immutable until send completion.
+Consumers must join receive completion before reading it and acknowledge that
+read before granting another receive credit. These lifetimes also apply across
+layers and graph replay. `PeerBuffer` supplies aligned CUDA IPC storage for
+GPUDirect and local peer reads. `register_transfer(..., copy_self=False)` is
+required when the caller keeps its local partial in place or registers chunk
+views with a larger peer stride; a full local copy could overlap a remote slot.
+Pooled storage uses `acquire_before_send=True`: every producer first calls
+`wait_send`, including the first generation. The initial completion is seeded
+at registration. Subsequent completions protect the NIC's read lifetime while
+the next layer can begin unrelated work. Receive consumption remains a separate
+dependency. Protocol version 4 uses an additional control QP and rotates ready
+send candidates; mixed protocol versions fail at connection setup.
+
+`combine_fixed(..., shared=...)` and `combine_compact(..., shared=...)` fuse the
+final Shared add while retaining FP32 node accumulation, an intermediate BF16
+Routed rounding, and BF16 output. Shared must be contiguous BF16 with the output
+shape and device.
+
+The serving adapter opts in through
+`hierarchical_mega_moe_native_overlap=true`. It requires direct verbs transport,
+MXFP8 dispatch and BF16 return. `hierarchical_mega_moe_native_chunk_size`
+defaults to 256 source rows (halved for top-k at most three); virtual-expert
+capacity limits the number of groups. `hierarchical_mega_moe_dispatch_slots`
+and `hierarchical_mega_moe_return_slots` independently select 1–8 generations,
+defaulting to two. Layer indices choose stable slots for graph capture. This
+initial pool implementation does not dynamically select another free slot if
+the chosen slot is still sending.
+
+Shared runs only on original local rows, emits a separate BF16 result and is
+added by the final node reduction. The outer model's Shared MLP is disabled
+only after its weights have been successfully adopted by the native backend.
+
+These interfaces remain experimental, disabled by default, and have not yet
+passed full-model acceptance. Development probes show overhead relative to the
+native reference; they do not establish a serving throughput improvement. Use
+`benchmark_mega_moe_ready.py` for independent-workspace numerical comparisons
+and `benchmark_mega_moe_return.py` for real-QP return publication and traces.
+Virtual islands in the latter are an intra-host protocol test, not a physical
+two-host performance measurement.
+
+Acceptance uses complete serving requests with the same P5/D5 settings, model,
+request corpus, sampling parameters and graph configuration: DEP2 prefill with
+DEP8 decode, original DEP16 decode, and optimized DEP16 decode. Sweep request
+concurrency from 1 to 4096, repeat each point and retain failed samples. Report
+full GSM8K accuracy before/after stress, output throughput, throughput per
+decode GPU, TTFT, TPOT and tail latency. A same-image overlap-disabled run is
+required when the native library revision differs from the original baseline.
+Kernel probes support diagnosis; they are not the performance acceptance gate.
+
+### Existing deployment settings
 
 This branch cherry-picks the exact DSV4.1 native tokenizer cache from
 `9170113763ceabe68e01156c1d4fb18c7a69ace8`, then adapts formatting and its

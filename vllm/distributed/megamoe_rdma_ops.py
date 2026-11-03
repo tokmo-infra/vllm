@@ -116,6 +116,7 @@ def pack_fixed(
     *,
     out=None,
     row_map=None,
+    row_alignment=1,
 ):
     _validate_activations(hidden)
     tokens, width = hidden.shape
@@ -124,6 +125,9 @@ def pack_fixed(
     activation_bytes = width + width // 32 if fp8 else 2 * width
     route_offset = activation_bytes + 4 * top_k
     row_bytes = route_offset + 4 * top_k
+    if row_alignment not in (1, 16):
+        raise ValueError("Dispatch rows support packed or 16-byte TMA alignment")
+    row_bytes = triton.cdiv(row_bytes, row_alignment) * row_alignment
     if out is None:
         out = torch.empty(
             (nodes * tokens, row_bytes), device=hidden.device, dtype=torch.uint8
@@ -351,11 +355,13 @@ def _combine_compact(
     local,
     row_map,
     output,
+    shared,
     T: tl.constexpr,
     H: tl.constexpr,
     N: tl.constexpr,
     SELF: tl.constexpr,
     FP8: tl.constexpr,
+    HAS_SHARED: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -384,20 +390,28 @@ def _combine_compact(
                 tl.float32
             )
         total += value
+    if HAS_SHARED:
+        routed = total.to(tl.bfloat16).to(tl.float32)
+        total = routed + tl.load(shared + index, index < T * H, 0).to(tl.float32)
     tl.store(output + index, total, index < T * H)
 
 
-def combine_compact(returned, local, row_map, out, self_rank, return_dtype):
+def combine_compact(
+    returned, local, row_map, out, self_rank, return_dtype, *, shared=None
+):
+    _validate_shared_output(shared, out)
     _combine_compact[(triton.cdiv(out.numel(), 1024),)](
         returned,
         local,
         row_map,
         out,
+        shared if shared is not None else out,
         out.shape[0],
         out.shape[1],
         row_map.shape[0],
         self_rank,
         return_dtype == "mxfp8",
+        shared is not None,
         1024,
     )
 
@@ -438,7 +452,13 @@ def unpack_mxfp8(wire, width):
 
 @triton.jit
 def _reduce_partials(
-    partials, output, ELEMENTS: tl.constexpr, NODES: tl.constexpr, BLOCK: tl.constexpr
+    partials,
+    output,
+    shared,
+    ELEMENTS: tl.constexpr,
+    NODES: tl.constexpr,
+    HAS_SHARED: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
     index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     total = tl.full((BLOCK,), 0, tl.float32)
@@ -446,18 +466,37 @@ def _reduce_partials(
         total += tl.load(partials + node * ELEMENTS + index, index < ELEMENTS, 0).to(
             tl.float32
         )
+    if HAS_SHARED:
+        routed = total.to(tl.bfloat16).to(tl.float32)
+        total = routed + tl.load(shared + index, index < ELEMENTS, 0).to(tl.float32)
     tl.store(output + index, total, index < ELEMENTS)
 
 
-def combine_fixed(returned, tokens, width, nodes, *, out=None):
+def _validate_shared_output(shared, out):
+    if shared is not None and (
+        shared.shape != out.shape
+        or shared.device != out.device
+        or shared.dtype != torch.bfloat16
+        or out.dtype != torch.bfloat16
+        or not shared.is_contiguous()
+        or not out.is_contiguous()
+    ):
+        raise ValueError("Shared and output must be matching contiguous BF16 tensors")
+
+
+def combine_fixed(returned, tokens, width, nodes, *, out=None, shared=None):
+    """Sum node partials in FP32, round to BF16, then optionally add BF16 Shared."""
     if out is None:
         out = torch.empty((tokens, width), device=returned.device, dtype=returned.dtype)
+    _validate_shared_output(shared, out)
     if out.numel():
         _reduce_partials[(triton.cdiv(out.numel(), 1024),)](
             returned,
             out,
+            shared if shared is not None else out,
             tokens * width,
             nodes,
+            shared is not None,
             1024,
         )
     return out

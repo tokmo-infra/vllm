@@ -376,8 +376,11 @@ class DeepseekV4MoE(nn.Module):
         fuse_shared_experts = bool(
             self.shared_experts is not None
             and not envs.VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION
-            and vllm_config.kernel_config.moe_backend
-            != "deep_gemm_hierarchical_mega_moe"
+            and (
+                vllm_config.kernel_config.moe_backend
+                != "deep_gemm_hierarchical_mega_moe"
+                or vllm_config.kernel_config.hierarchical_mega_moe_native_overlap
+            )
             and (self.use_sequence_parallel or self.tp_size == 1)
         )
 

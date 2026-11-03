@@ -93,6 +93,7 @@ class HierarchicalGroups:
     world_group: dist.ProcessGroup
     verbs_transport: "VerbsTransport | None" = None
     verbs_signature: tuple | None = None
+    cpu_group: dist.ProcessGroup | None = None
 
     @classmethod
     def create(cls, global_ranks, hosts, rank, backend, world_group=None):
@@ -157,6 +158,7 @@ def get_hierarchical_groups(device_group, cpu_group):
         dist.get_backend(device_group),
         device_group,
     )
+    result.cpu_group = cpu_group
     _GROUPS[key] = result
     return result
 
@@ -228,6 +230,10 @@ class HierarchicalMegaMoE:
         *,
         fixed_capacity=False,
         local_moe_mxfp8: Callable | None = None,
+        native_moe: Callable | None = None,
+        native_chunk_size: int = 256,
+        native_dispatch_slot: int = 0,
+        native_return_slot: int = 0,
     ):
         if (
             hidden.ndim != 2
@@ -262,6 +268,59 @@ class HierarchicalMegaMoE:
         self.last_dispatch_tokens = nodes * tokens
         if tokens == 0:
             return torch.empty_like(hidden)
+        if native_moe is not None:
+            from vllm.distributed.megamoe_native_overlap import (
+                NativeOverlapPlan,
+                streaming_shape,
+            )
+
+            transport = self.pipeline_transport
+            if (
+                transport is None
+                or self.wire_dtype != "mxfp8"
+                or self.return_dtype != "bfloat16"
+            ):
+                raise ValueError(
+                    "Native overlap requires verbs, MXFP8 input and BF16 return"
+                )
+            chunks, capacity = streaming_shape(
+                tokens, nodes, self.num_experts, native_chunk_size
+            )
+            key = (
+                self.num_experts,
+                chunks,
+                capacity,
+                width,
+                ids.shape[1],
+                native_dispatch_slot,
+                native_return_slot,
+            )
+            plan = transport.native_plans.get(key)
+            if plan is None:
+                if capturing:
+                    raise RuntimeError(
+                        "Warm up native RDMA storage before graph capture"
+                    )
+                plan = NativeOverlapPlan(
+                    self.groups,
+                    transport,
+                    self.num_experts,
+                    chunks,
+                    capacity,
+                    width,
+                    ids.shape[1],
+                    native_dispatch_slot,
+                    native_return_slot,
+                )
+                transport.native_plans[key] = plan
+            padding = plan.tokens - tokens
+            if padding:
+                hidden = torch.nn.functional.pad(hidden, (0, 0, 0, padding))
+                weights = torch.nn.functional.pad(weights, (0, 0, 0, padding))
+                ids = torch.nn.functional.pad(ids, (0, 0, 0, padding), value=-1)
+            plan.dispatch(hidden, weights, ids, self._tables[hidden.device])
+            shared = native_moe(plan, hidden, weights, ids)
+            return plan.combine(shared)[:source_tokens]
         default_capacity = (
             min(2048, max(1, self.chunk // nodes))
             if self.pipeline_transport is not None
@@ -422,11 +481,17 @@ class HierarchicalMegaMoE:
         wires = [slot.wire() for slot in slots]
         count = hidden.shape[0] // capacity
         output = torch.empty_like(hidden)
+        # Dense tiles include masked padding, so every peer knows the length.
+        fixed_dense = not self.sparse_dispatch and self.return_dtype == "bfloat16"
 
         def dispatch(index):
             position = index % len(slots)
             rows = slice(index * capacity, (index + 1) * capacity)
             slot = slots[position]
+            if fixed_dense:
+                self._pack(hidden[rows], weights[rows], ids[rows], wires[position])
+                slot.dispatch.submit_fixed()
+                return
             pack_compact(
                 hidden[rows],
                 weights[rows],
@@ -446,15 +511,18 @@ class HierarchicalMegaMoE:
         def compute(index):
             position = index % len(slots)
             slot = slots[position]
-            slot.dispatch.wait()
-            mask_received_routes(
-                slot.dispatch.receive,
-                slot.dispatch.receive_counts,
-                capacity,
-                ids.shape[1],
-                gate_offset,
-                route_offset,
-            )
+            if fixed_dense:
+                slot.dispatch.wait_fixed()
+            else:
+                slot.dispatch.wait()
+                mask_received_routes(
+                    slot.dispatch.receive,
+                    slot.dispatch.receive_counts,
+                    capacity,
+                    ids.shape[1],
+                    gate_offset,
+                    route_offset,
+                )
             self._compute(
                 wires[position],
                 width,
@@ -470,14 +538,21 @@ class HierarchicalMegaMoE:
                     out=slot.returning.send,
                     exclude_rows=(self.pipeline_transport.rank * capacity, capacity),
                 )
-            slot.return_map.copy_(slot.row_map)
-            slot.returning.submit(slot.dispatch.receive_counts)
+            if fixed_dense:
+                slot.returning.submit_fixed()
+            else:
+                slot.return_map.copy_(slot.row_map)
+                slot.returning.submit(slot.dispatch.receive_counts)
 
         def combine(index):
             position = index % len(slots)
-            slots[position].returning.wait()
             rows = slice(index * capacity, (index + 1) * capacity)
             slot = slots[position]
+            if fixed_dense:
+                slot.returning.wait_fixed()
+                self._combine(wires[position], output[rows])
+                return
+            slot.returning.wait()
             combine_compact(
                 slot.returning.receive,
                 slot.partial,

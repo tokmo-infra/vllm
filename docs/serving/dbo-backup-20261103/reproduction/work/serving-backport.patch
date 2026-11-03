@@ -1,0 +1,228 @@
+--- frozen-image/vllm/models/deepseek_v4/nvidia/model.py
++++ optimized-image/vllm/models/deepseek_v4/nvidia/model.py
+@@ -305,6 +305,10 @@
+ 
+         self._backend: DeepGemmMegaMoEBackend | None = None
+         self.hierarchy = None
++        self._native_overlap = vllm_config.kernel_config.hierarchical_mega_moe_native_overlap
++        self._native_chunk_size = vllm_config.kernel_config.hierarchical_mega_moe_native_chunk_size
++        self._native_dispatch_slot = self.layer_id % vllm_config.kernel_config.hierarchical_mega_moe_dispatch_slots if self._native_overlap else 0
++        self._native_return_slot = self.layer_id % vllm_config.kernel_config.hierarchical_mega_moe_return_slots if self._native_overlap else 0
+         self._hierarchical_direct_mxfp8 = (
+             vllm_config.kernel_config.hierarchical_mega_moe_direct_staging
+         )
+@@ -325,6 +329,13 @@
+             if vllm_config.parallel_config.use_ubatching:
+                 raise ValueError("Hierarchical MegaMoE does not support ubatching")
+             config = vllm_config.kernel_config
++            if self._native_overlap and (
++                config.hierarchical_mega_moe_transport != "verbs"
++                or config.hierarchical_mega_moe_wire_dtype != "mxfp8"
++                or config.hierarchical_mega_moe_return_dtype != "bfloat16"
++                or config.hierarchical_mega_moe_rdma_host_staging
++            ):
++                raise ValueError("Native overlap requires direct verbs MXFP8/BF16 storage")
+             pipeline_transport = None
+             if config.hierarchical_mega_moe_transport == "verbs":
+                 from vllm.distributed.roce.transport import get_verbs_transport
+@@ -340,6 +351,7 @@
+                     traffic_class=config.hierarchical_mega_moe_rdma_traffic_class,
+                     timeout_seconds=config.hierarchical_mega_moe_rdma_timeout_seconds,
+                     host_staging=config.hierarchical_mega_moe_rdma_host_staging,
++                    peer_reads=self._native_overlap,
+                 )
+             self.hierarchy = HierarchicalMegaMoE(
+                 groups, self.num_experts, self.max_num_tokens,
+@@ -469,7 +481,7 @@
+ 
+     def finalize_weights(self, shared_experts: DeepseekV4MLP | None = None) -> None:
+         backend = self._ensure_backend()
+-        from vllm.utils.deep_gemm import _import_deep_gemm
++        from vllm.distributed.megamoe_serving_backend import _import_deep_gemm
+ 
+         deep_gemm = _import_deep_gemm()
+         if self._transformed_l1_weights is None:
+@@ -515,12 +527,13 @@
+     def has_fused_shared_experts(self) -> bool:
+         return self._transformed_shared_l1_weights is not None
+ 
+-    def get_symm_buffer(self):
+-        from vllm.utils.deep_gemm import _import_deep_gemm
++    def get_symm_buffer(self, *, routing_groups=1, token_capacity=None):
++        from vllm.distributed.megamoe_serving_backend import _import_deep_gemm
+ 
+         deep_gemm = _import_deep_gemm()
+ 
+         backend = self._ensure_backend()
++        token_capacity = token_capacity or self.max_num_tokens
+         group = (
+             self._mega_group
+             if self._mega_group is not None
+@@ -531,7 +544,8 @@
+             id(group),
+             device,
+             self._kernel_num_experts,
+-            self.max_num_tokens,
++            token_capacity,
++            routing_groups,
+             self.top_k,
+             self.hidden_size,
+             self.intermediate_size,
+@@ -543,7 +557,7 @@
+             symm_buffer = deep_gemm.get_symm_buffer_for_mega_moe(
+                 group,
+                 self._kernel_num_experts,
+-                self.max_num_tokens,
++                token_capacity,
+                 self.top_k,
+                 self.hidden_size,
+                 self.intermediate_size,
+@@ -551,6 +565,7 @@
+                     self.num_shared_experts if self.has_fused_shared_experts else 0
+                 ),
+                 mma_type=backend.mma_type,
++                **({"routing_groups": routing_groups} if routing_groups != 1 else {}),
+             )
+             self._symm_buffer_cache[key] = symm_buffer
+         return symm_buffer
+@@ -689,6 +704,15 @@
+                         fast_math=fast_math,
+                     )
+                 ) if self._hierarchical_direct_mxfp8 else None,
++                native_moe=(
++                    lambda plan, hidden, gates, ids: self._forward_streaming(
++                        plan, hidden, gates, ids,
++                        activation_clamp=activation_clamp, fast_math=fast_math,
++                    )
++                ) if self._native_overlap else None,
++                native_chunk_size=max(1, self._native_chunk_size // (2 if self.top_k <= 3 else 1)),
++                native_dispatch_slot=self._native_dispatch_slot,
++                native_return_slot=self._native_return_slot,
+             )
+         return self._forward_local(
+             hidden_states,
+@@ -698,6 +722,48 @@
+             fast_math=fast_math,
+             is_padding=is_padding,
+         )
++
++    def _forward_streaming(self, plan, hidden, weights, ids, *, activation_clamp, fast_math):
++        from vllm.distributed.megamoe_serving_backend import _import_deep_gemm
++
++        dg = _import_deep_gemm()
++        backend = self._ensure_backend()
++        buffer = self.get_symm_buffer(
++            routing_groups=plan.nodes * plan.chunks,
++            token_capacity=cdiv(self.max_num_tokens, 1024) * 1024 * plan.nodes,
++        )
++        kwargs = {}
++        shared = None
++        if self.has_fused_shared_experts:
++            block_m = dg.get_block_m_for_mega_moe(
++                plan.groups.topology.local_size, buffer.num_experts,
++                buffer.num_max_tokens_per_rank, plan.nodes * plan.tokens,
++                self.top_k, backend.mma_type,
++            )
++            prepare_megamoe_inputs(
++                hidden, weights, ids,
++                buffer.x[:plan.tokens], buffer.x_sf[:plan.tokens],
++                buffer.topk_idx[:plan.tokens], buffer.topk_weights[:plan.tokens],
++                shared_x_sf=buffer.shared_l1_acts_sf,
++                shared_block_m=block_m, hidden_quant=backend.hidden_quant,
++            )
++            shared = plan.shared_output
++            kwargs.update(
++                shared_l1_weights=self._transformed_shared_l1_weights,
++                shared_l2_weights=self._transformed_shared_l2_weights,
++                shared_output=shared,
++            )
++        dg.fp8_fp4_mega_moe(
++            plan.partial, self._transformed_l1_weights,
++            self._transformed_l2_weights, buffer,
++            activation_clamp=activation_clamp, fast_math=fast_math,
++            scheduler_workspace=plan.scheduler_workspace(buffer),
++            early_combine=True, input_descriptors=plan.input_descriptors,
++            input_chunk_size=plan.capacity,
++            return_descriptors=plan.return_descriptors,
++            return_chunk_size=plan.return_chunk, **kwargs,
++        )
++        return shared
+ 
+     def _forward_hierarchical_mxfp8(
+         self, packed, topk_weights, topk_ids, *, activation_clamp, fast_math
+@@ -735,7 +801,7 @@
+         fast_math=True,
+         is_padding=None,
+     ):
+-        from vllm.utils.deep_gemm import _import_deep_gemm
++        from vllm.distributed.megamoe_serving_backend import _import_deep_gemm
+ 
+         deep_gemm = _import_deep_gemm()
+         num_tokens = hidden_states.shape[0]
+@@ -968,8 +1034,10 @@
+         # remains tensor-sharded, so retain the serial path.
+         fuse_shared_experts = bool(
+             self.shared_experts is not None
+-            and vllm_config.kernel_config.moe_backend
+-            != "deep_gemm_hierarchical_mega_moe"
++            and (
++                vllm_config.kernel_config.moe_backend != "deep_gemm_hierarchical_mega_moe"
++                or vllm_config.kernel_config.hierarchical_mega_moe_native_overlap
++            )
+             and not envs.VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION
+             and (self.use_sequence_parallel or self.tp_size == 1)
+         )
+--- frozen-image/vllm/model_executor/layers/fused_moe/deep_gemm_mega_moe.py
++++ optimized-image/vllm/model_executor/layers/fused_moe/deep_gemm_mega_moe.py
+@@ -148,7 +148,7 @@
+         tuple[torch.Tensor, torch.Tensor],
+         tuple[torch.Tensor, torch.Tensor],
+     ]:
+-        from vllm.utils.deep_gemm import _import_deep_gemm
++        from vllm.distributed.megamoe_serving_backend import _import_deep_gemm
+ 
+         deep_gemm = _import_deep_gemm()
+ 
+@@ -207,7 +207,7 @@
+         ]
+         | None
+     ):
+-        from vllm.utils.deep_gemm import _import_deep_gemm
++        from vllm.distributed.megamoe_serving_backend import _import_deep_gemm
+ 
+         deep_gemm = _import_deep_gemm()
+ 
+@@ -372,7 +372,7 @@
+         shared_l1_weights: tuple[torch.Tensor, torch.Tensor] | None = None,
+         shared_l2_weights: tuple[torch.Tensor, torch.Tensor] | None = None,
+     ) -> None:
+-        from vllm.utils.deep_gemm import _import_deep_gemm
++        from vllm.distributed.megamoe_serving_backend import _import_deep_gemm
+ 
+         deep_gemm = _import_deep_gemm()
+         kwargs: dict[str, Any] = {
+--- frozen-image/vllm/config/kernel.py
++++ optimized-image/vllm/config/kernel.py
+@@ -323,6 +323,22 @@
+     hierarchical_mega_moe_overlap: bool = True
+     """Pipeline dispatch, native compute and BF16 return with the verbs backend.
+     Disable for a matched serial reference. NCCL always remains stream-ordered."""
++
++    hierarchical_mega_moe_native_overlap: bool = False
++    """Use native input readiness, early BF16 returns and separate Shared output.
++    Requires verbs, direct MXFP8 and the bundled streaming DeepGEMM API.
++    Experimental until matched full-model accuracy and throughput pass."""
++
++    hierarchical_mega_moe_native_chunk_size: int = Field(default=256, gt=0)
++    """Target source rows per input group. Top-k <= 3 uses half this target;
++    virtual-expert limits bound fragmentation independently of return chunks."""
++
++    hierarchical_mega_moe_dispatch_slots: int = Field(default=2, ge=1, le=8)
++    """Native input storage generations shared by sequential layers."""
++
++    hierarchical_mega_moe_return_slots: int = Field(default=2, ge=1, le=8)
++    """Native return storage generations. Send completion is joined at reuse,
++    allowing the previous layer's TX tail to overlap subsequent computation."""
+ 
+     hierarchical_mega_moe_rdma_hcas: tuple[str, ...] = ()
+     """One HCA name (optionally HCA:port) per host-local EP lane, in lane order.

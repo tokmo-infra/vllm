@@ -1,0 +1,1315 @@
+diff --git a/csrc/apis/mega_moe.hpp b/csrc/apis/mega_moe.hpp
+index d8c77ec..a3cee52 100644
+--- a/csrc/apis/mega_moe.hpp
++++ b/csrc/apis/mega_moe.hpp
+@@ -313,7 +313,16 @@ static void fp8_fp4_mega_moe(
+     const std::optional<float>& activation_clamp_opt,
+     const bool& fast_math,
+     const float& activation_alpha,
+-    const float& activation_beta
++    const float& activation_beta,
++    const std::optional<torch::stable::Tensor>& scheduler_workspace,
++    const int routing_groups,
++    const std::optional<torch::stable::Tensor>& shared_output,
++    const bool early_combine,
++    const std::optional<torch::stable::Tensor>& return_descriptors,
++    const int return_chunk_size,
++    const std::optional<torch::stable::Tensor>& input_descriptors,
++    const int input_chunk_size,
++    const std::optional<torch::stable::Tensor>& streaming_diagnostics
+ ) {
+     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
+     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
+@@ -394,7 +403,9 @@ static void fp8_fp4_mega_moe(
+ 
+     // Check buffer bytes
+     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+-    const auto num_experts_ = num_experts_per_rank * num_ranks;
++    DG_HOST_ASSERT(routing_groups >= 1 and routing_groups <= 32);
++    DG_HOST_ASSERT(routing_groups == 1 or activation != "situ");
++    const auto num_experts_ = num_experts_per_rank * num_ranks * routing_groups;
+     const auto layout_info = build_symm_buffer_layout(
+         num_ranks, num_experts,
+         num_max_tokens_per_rank, num_topk,
+@@ -405,6 +416,60 @@ static void fp8_fp4_mega_moe(
+     DG_HOST_ASSERT(torch_compat::nbytes(sym_buffer) >= static_cast<size_t>(layout_info.num_bytes));
+     DG_HOST_ASSERT(num_experts == num_experts_);
+ 
++    if (shared_output.has_value()) {
++        const auto& shared = shared_output.value();
++        DG_HOST_ASSERT(num_shared_experts > 0 and activation != "situ");
++        DG_HOST_ASSERT(shared.is_cuda() and shared.get_device_index() == y.get_device_index());
++        DG_HOST_ASSERT(shared.scalar_type() == torch::headeronly::ScalarType::BFloat16);
++        DG_HOST_ASSERT(shared.is_contiguous() and shared.dim() == 2);
++        DG_HOST_ASSERT(shared.size(0) <= num_tokens and shared.size(1) == hidden);
++        const auto begin = reinterpret_cast<uint64_t>(shared.mutable_data_ptr());
++        const auto output_begin = reinterpret_cast<uint64_t>(y.mutable_data_ptr());
++        DG_HOST_ASSERT(begin + torch_compat::nbytes(shared) <= output_begin or
++                       output_begin + torch_compat::nbytes(y) <= begin or shared.numel() == 0);
++    }
++
++    DG_HOST_ASSERT(not early_combine or activation != "situ");
++    if (return_descriptors.has_value()) {
++        const auto& descriptors = return_descriptors.value();
++        DG_HOST_ASSERT(early_combine and return_chunk_size > 0);
++        DG_HOST_ASSERT(descriptors.is_cuda() and descriptors.get_device_index() == y.get_device_index());
++        DG_HOST_ASSERT(descriptors.scalar_type() == torch::headeronly::ScalarType::Long);
++        DG_HOST_ASSERT(descriptors.is_contiguous() and descriptors.dim() == 2);
++        DG_HOST_ASSERT(descriptors.size(0) == ceil_div(num_tokens, return_chunk_size) and descriptors.size(1) == 4);
++    }
++
++    if (input_descriptors.has_value()) {
++        const auto& descriptors = input_descriptors.value();
++        DG_HOST_ASSERT(scheduler_workspace.has_value() and early_combine);
++        DG_HOST_ASSERT(input_chunk_size > 0 and static_cast<int64_t>(input_chunk_size) * routing_groups >= num_tokens);
++        DG_HOST_ASSERT(descriptors.is_cuda() and descriptors.get_device_index() == y.get_device_index());
++        DG_HOST_ASSERT(descriptors.scalar_type() == torch::headeronly::ScalarType::Long);
++        DG_HOST_ASSERT(descriptors.is_contiguous() and descriptors.dim() == 3);
++        DG_HOST_ASSERT(descriptors.size(0) == num_ranks and descriptors.size(1) == routing_groups and descriptors.size(2) == 3);
++        DG_HOST_ASSERT(not shared_l1_weights_tuple_opt.has_value() or shared_output.has_value());
++    }
++
++    if (streaming_diagnostics.has_value()) {
++        const auto& t = streaming_diagnostics.value();
++        DG_HOST_ASSERT(input_descriptors.has_value());
++        DG_HOST_ASSERT(t.is_cuda() and t.get_device_index() == y.get_device_index());
++        DG_HOST_ASSERT(t.scalar_type() == torch::headeronly::ScalarType::Long);
++        DG_HOST_ASSERT(t.is_contiguous() and t.dim() == 2 and t.size(0) == routing_groups and t.size(1) == 4);
++    }
++
++    if (scheduler_workspace.has_value()) {
++        const auto& scratch = scheduler_workspace.value();
++        const int64_t max_blocks = ceil_div(num_max_tokens_per_rank * num_ranks * std::min(num_topk, num_experts_per_rank * routing_groups), 8) + num_experts_per_rank * routing_groups;
++        DG_HOST_ASSERT(activation != "situ");
++        DG_HOST_ASSERT(intermediate_hidden * 2 / 256 <= 64 and hidden / 256 <= 64);
++        DG_HOST_ASSERT(shared_intermediate_hidden * 2 / 256 <= 64);
++        DG_HOST_ASSERT(scratch.is_cuda() and scratch.get_device_index() == y.get_device_index());
++        DG_HOST_ASSERT(scratch.scalar_type() == torch::headeronly::ScalarType::Long);
++        DG_HOST_ASSERT(scratch.is_contiguous() and scratch.dim() == 2);
++        DG_HOST_ASSERT(scratch.size(0) == 4 and scratch.size(1) >= max_blocks + 1);
++    }
++
+     // Already registered tensors
+     const auto [x, x_sf, topk_idx, topk_weights,
+                 shared_l1_acts, shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf,
+@@ -438,7 +503,7 @@ static void fp8_fp4_mega_moe(
+                    activation_alpha, activation_beta, fast_math);
+         } else {
+             launch(sm100_fp8_fp4_mega_moe,
+-                   activation_clamp, activation == "swiglustep", activation_alpha, activation_beta, fast_math);
++                   activation_clamp, activation == "swiglustep", activation_alpha, activation_beta, fast_math, scheduler_workspace, routing_groups, shared_output, early_combine, return_descriptors, return_chunk_size, input_descriptors, input_chunk_size, streaming_diagnostics);
+         }
+     } else {
+         DG_HOST_UNREACHABLE("Unsupported architecture");
+@@ -837,7 +902,16 @@ static void fp8_fp4_mega_moe(
+     const std::optional<double>& activation_clamp_opt,
+     const bool& fast_math,
+     const double& activation_alpha,
+-    const double& activation_beta) {
++    const double& activation_beta,
++    const std::optional<torch::stable::Tensor>& scheduler_workspace,
++    const int64_t routing_groups,
++    const std::optional<torch::stable::Tensor>& shared_output,
++    const bool early_combine,
++    const std::optional<torch::stable::Tensor>& return_descriptors,
++    const int64_t return_chunk_size,
++    const std::optional<torch::stable::Tensor>& input_descriptors,
++    const int64_t input_chunk_size,
++    const std::optional<torch::stable::Tensor>& streaming_diagnostics) {
+     mega::fp8_fp4_mega_moe(
+         y, {l1_weights_tuple, l1_weights_tuple_sf}, {l2_weights_tuple, l2_weights_tuple_sf},
+         make_optional_tensor_pair(shared_l1_weights_tuple_opt, shared_l1_weights_tuple_opt_sf),
+@@ -846,7 +920,7 @@ static void fp8_fp4_mega_moe(
+         mega::checked_int(rank_idx), mega::checked_int(num_max_tokens_per_rank),
+         mega::checked_int(num_experts), mega::checked_int(num_topk), checked_recipe(recipe),
+         activation, activation_clamp_opt, fast_math,
+-        static_cast<float>(activation_alpha), static_cast<float>(activation_beta));
++        static_cast<float>(activation_alpha), static_cast<float>(activation_beta), scheduler_workspace, mega::checked_int(routing_groups), shared_output, early_combine, return_descriptors, mega::checked_int(return_chunk_size), input_descriptors, mega::checked_int(input_chunk_size), streaming_diagnostics);
+ }
+ 
+ static void bf16_mega_moe(
+@@ -941,7 +1015,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(deep_gemm, m) {
+     m.def("get_symm_buffer_size_for_mega_moe(int num_ranks, int num_experts, int num_max_tokens_per_rank, int num_topk, int hidden, int intermediate_hidden, str mma_type, str activation, int num_shared_experts) -> (int, int[])");
+     m.def("_slice_symm_buffer_for_mega_moe(Tensor(a) buffer, int[] layout_info) -> (Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a), Tensor(a))");
+ 
+-    m.def("fp8_fp4_mega_moe(Tensor(a!) y, Tensor l1_weights_tuple, Tensor l1_weights_tuple_sf, Tensor l2_weights_tuple, Tensor l2_weights_tuple_sf, Tensor? shared_l1_weights_tuple_opt, Tensor? shared_l1_weights_tuple_opt_sf, Tensor? shared_l2_weights_tuple_opt, Tensor? shared_l2_weights_tuple_opt_sf, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, int[3] recipe, str activation, float? activation_clamp_opt, bool fast_math, float activation_alpha, float activation_beta) -> ()");
++    m.def("fp8_fp4_mega_moe(Tensor(a!) y, Tensor l1_weights_tuple, Tensor l1_weights_tuple_sf, Tensor l2_weights_tuple, Tensor l2_weights_tuple_sf, Tensor? shared_l1_weights_tuple_opt, Tensor? shared_l1_weights_tuple_opt_sf, Tensor? shared_l2_weights_tuple_opt, Tensor? shared_l2_weights_tuple_opt_sf, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, int[3] recipe, str activation, float? activation_clamp_opt, bool fast_math, float activation_alpha, float activation_beta, Tensor(d!)? scheduler_workspace=None, int routing_groups=1, Tensor(e!)? shared_output=None, bool early_combine=False, Tensor(f!)? return_descriptors=None, int return_chunk_size=0, Tensor? input_descriptors=None, int input_chunk_size=0, Tensor(g!)? streaming_diagnostics=None) -> ()");
+     m.def("bf16_mega_moe(Tensor(a!) y, Tensor l1_weights, Tensor l2_weights, Tensor? shared_l1_weights_opt, Tensor? shared_l2_weights_opt, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, str activation, float? activation_clamp_opt, bool fast_math, float activation_alpha, float activation_beta, Tensor? post_expert_norm_gamma_opt, float post_expert_norm_eps) -> ()");
+     m.def("fp4_fp4_mega_moe(Tensor(a!) y, Tensor l1_weights_tuple, Tensor l1_weights_tuple_sf, Tensor l2_weights_tuple, Tensor l2_weights_tuple_sf, Tensor? shared_l1_weights_opt, Tensor? shared_l2_weights_opt, Tensor? x_bf16_opt, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, int[3] recipe, str activation, float? activation_clamp_opt, bool fast_math, Tensor? l1_alphas_opt, Tensor? l2_alphas_opt, Tensor? a2_scales_opt, Tensor? post_expert_norm_gamma_opt, float post_expert_norm_eps) -> ()");
+     m.def("fp4_fp4_mega_moe_trtllm(Tensor(a!) y, Tensor l1_weights_tuple, Tensor l1_weights_tuple_sf, Tensor l2_weights_tuple, Tensor l2_weights_tuple_sf, Tensor? shared_l1_weights_opt, Tensor? shared_l2_weights_opt, Tensor? x_bf16_opt, Tensor(b!)? cumulative_local_expert_recv_stats, Tensor(c!) sym_buffer, int[] sym_buffer_ptrs, int rank_idx, int num_max_tokens_per_rank, int num_experts, int num_topk, int[3] recipe, str activation, float? activation_clamp_opt, bool fast_math, Tensor? l1_alphas_opt, Tensor? l2_alphas_opt, Tensor? a2_scales_opt, Tensor? post_expert_norm_gamma_opt, float post_expert_norm_eps) -> ()");
+diff --git a/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp b/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
+index 3d25cbb..32efec4 100644
+--- a/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
++++ b/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
+@@ -36,17 +36,26 @@ static void sm100_fp8_fp4_mega_moe(
+     const bool& clamp_after_silu,
+     const float& activation_alpha,
+     const float& activation_beta,
+-    const bool& fast_math
++    const bool& fast_math,
++    const std::optional<torch::stable::Tensor>& scheduler_workspace,
++    const int routing_groups,
++    const std::optional<torch::stable::Tensor>& shared_output,
++    const bool early_combine,
++    const std::optional<torch::stable::Tensor>& return_descriptors,
++    const int return_chunk_size,
++    const std::optional<torch::stable::Tensor>& input_descriptors,
++    const int input_chunk_size,
++    const std::optional<torch::stable::Tensor>& streaming_diagnostics
+ ) {
+     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+-    const auto num_experts = num_experts_per_rank * num_ranks;
++    const auto num_experts = num_experts_per_rank * num_ranks * routing_groups;
+     const auto num_ring_tokens = static_cast<int>(l1_acts.size(0));
+     const auto num_sf_ring_tokens = static_cast<int>(l1_acts_sf.size(0));
+     const auto shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
+ 
+     // Heuristics
+     const auto config = get_mega_moe_config(
+-        num_ranks, num_experts, num_experts_per_rank,
++        num_ranks, num_experts, num_experts_per_rank * routing_groups,
+         num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden,
+         num_ring_tokens, num_sf_ring_tokens,
+         MmaKind::MXFP8FP4);
+@@ -175,7 +184,7 @@ static void __instantiate_kernel() {{
+         {},
+         {},
+         {},
+-        {}
++        {}, {}, {}, {}, {}, {}
+     >);
+ }};
+ )", num_max_tokens_per_rank,
+@@ -196,7 +205,9 @@ static void __instantiate_kernel() {{
+         to_string(activation_alpha),
+         to_string(activation_beta),
+         fast_math ? "true" : "false",
+-        to_string(l1_weights.scalar_type())));
++        to_string(l1_weights.scalar_type()),
++        scheduler_workspace.has_value() ? "true" : "false", routing_groups,
++        shared_output.has_value() ? "true" : "false", early_combine ? "true" : "false", input_descriptors.has_value() ? "true" : "false"));
+ 
+     // Launch
+     jit->launch(
+@@ -228,7 +239,16 @@ static void __instantiate_kernel() {{
+         tensor_map_shared_l2_acts_sf,
+         tensor_map_shared_l2_weights,
+         tensor_map_shared_l2_weights_sf,
+-        sm_locality_domains.mutable_data_ptr<uint8_t>());
++        sm_locality_domains.mutable_data_ptr<uint8_t>(),
++        scheduler_workspace.has_value() ? scheduler_workspace->mutable_data_ptr<int64_t>() : nullptr,
++        scheduler_workspace.has_value() ? static_cast<uint32_t>(scheduler_workspace->size(1)) : 0u,
++        shared_output.has_value() ? shared_output->mutable_data_ptr() : nullptr,
++        shared_output.has_value() ? static_cast<uint32_t>(shared_output->size(0)) : static_cast<uint32_t>(num_tokens),
++        return_descriptors.has_value() ? return_descriptors->mutable_data_ptr<int64_t>() : nullptr,
++        static_cast<uint32_t>(return_chunk_size),
++        input_descriptors.has_value() ? input_descriptors->const_data_ptr<int64_t>() : nullptr,
++        static_cast<uint32_t>(input_chunk_size),
++        streaming_diagnostics.has_value() ? streaming_diagnostics->mutable_data_ptr<int64_t>() : nullptr);
+ }
+ 
+ } // namespace deep_gemm
+diff --git a/deep_gemm/_C.py b/deep_gemm/_C.py
+index d0d21f5..6e0c86a 100644
+--- a/deep_gemm/_C.py
++++ b/deep_gemm/_C.py
+@@ -510,6 +510,15 @@ def fp8_fp4_mega_moe(
+     fast_math,
+     activation_alpha,
+     activation_beta,
++    scheduler_workspace=None,
++    routing_groups=1,
++    shared_output=None,
++    early_combine=False,
++    return_descriptors=None,
++    return_chunk_size=0,
++    input_descriptors=None,
++    input_chunk_size=0,
++    streaming_diagnostics=None,
+ ):
+     return _torch_ops.fp8_fp4_mega_moe(
+         y,
+@@ -534,6 +543,15 @@ def fp8_fp4_mega_moe(
+         fast_math,
+         activation_alpha,
+         activation_beta,
++        scheduler_workspace,
++        routing_groups,
++        shared_output,
++        early_combine,
++        return_descriptors,
++        return_chunk_size,
++        input_descriptors,
++        input_chunk_size,
++        streaming_diagnostics,
+     )
+ 
+ 
+diff --git a/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh b/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh
+index 05d8502..bade131 100644
+--- a/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh
++++ b/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh
+@@ -39,6 +39,11 @@ template <
+     float kActivationBeta,
+     bool kFastMath,
+     typename weight_dtype_t,
++    bool kReadyScheduling = false,
++    uint32_t kRoutingGroups = 1,
++    bool kSeparateShared = false,
++    bool kEarlyCombine = false,
++    bool kStreamingInput = false,
+     bool kHasShared = (kNumSharedExperts > 0),
+     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
+     uint32_t L1_SHAPE_K = kHidden,
+@@ -79,7 +84,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_acts_sf,
+                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights,
+                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights_sf,
+-                            const uint8_t* sm_locality_domains) {
++                            const uint8_t* sm_locality_domains,
++                            int64_t* scheduler_workspace,
++                            const uint32_t scheduler_stride,
++                            void* shared_output,
++                            const uint32_t shared_num_tokens,
++                            int64_t* return_descriptors,
++                            const uint32_t return_chunk_size,
++                            const int64_t* input_descriptors,
++                            const uint32_t input_chunk_size,
++                            int64_t* streaming_diagnostics) {
+ #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
+     using Barrier = cutlass::arch::ClusterTransactionBarrier;
+     using Allocator = cute::TMEM::Allocator2Sm;
+@@ -299,7 +313,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+         kNumExpertsPerRank,
+         kNumSMs, kNumRanks,
+         kNumRingBlocks, kNumLocalityDomains,
+-        kNumSharedExperts>(
++        kNumSharedExperts, false, kStreamingInput, kRoutingGroups>(
+             workspace,
+             shared_storage.task_info_full_barriers,
+             shared_storage.task_info_empty_barriers,
+@@ -347,6 +361,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+         cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
+ 
+         // Dispatch warps
++        if (sm_idx == 0 and thread_idx == 0)
++            ptx::atomic_add(workspace.get_launch_epoch_ptr(), uint64_t{1});
++        if constexpr (kEarlyCombine) {
++            for (uint32_t i = sm_idx * kNumDispatchThreads + thread_idx;
++                 i < workspace.get_num_completion_uint32(); i += kNumSMs * kNumDispatchThreads)
++                workspace.get_token_completion_ptr()[i] = 0;
++        }
+         DG_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of topk");
+         constexpr uint32_t kNumActivateLanes = kNumTokensPerWarp * kNumTopk;
+         const auto read_topk_idx = [&](const auto& process) {
+@@ -368,6 +389,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+             }
+         };
+ 
++        if constexpr (not kStreamingInput) {
+         // Count experts' tokens
+         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
+            atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
+@@ -392,6 +414,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+             *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
+         });
+ 
++        }
++
+         // Grid sync
+         comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
+             workspace, sm_idx, thread_idx,
+@@ -400,12 +424,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+ 
+         // Write expert count
+         if (sm_idx == 0) {
+-            // Push this launch's grid index to every peer for tagging combine readiness; +1 differs from a zeroed workspace
++            // The preceding grid sync publishes this invocation's epoch.
+             DG_STATIC_ASSERT(kNumRanks <= kNumDispatchThreads, "Insufficient threads for the grid index push");
+             if (thread_idx < kNumRanks)
+-                *sym_buffer.map(workspace.get_peer_grid_idx_ptr(sym_buffer.rank_idx), thread_idx) = ptx::get_grid_idx() + 1;
++                *sym_buffer.map(workspace.get_peer_grid_idx_ptr(sym_buffer.rank_idx), thread_idx) =
++                    ptx::ld_acq_gpu(workspace.get_launch_epoch_ptr());
+             __syncwarp();
+ 
++            if constexpr (not kStreamingInput) {
+             #pragma unroll
+             for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
+                 const auto dst_rank_idx = i / kNumExpertsPerRank;
+@@ -418,6 +444,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                     sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
+                     expert_status);
+             }
++            }
+         }
+         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+ 
+@@ -445,32 +472,241 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+         uint32_t expert_start_idx = 0, expert_end_idx = 0;
+         uint32_t expert_pool_block_offset = 0;
+ 
+-        // Wait token data arrival
+-        scheduler.fetch_expert_recv_count();
++        // One dispatch warp per SM produces source metadata; SM 0 seals
++        // destination groups while the other warps pull already sealed work.
++        const bool metadata_warp = kStreamingInput and warp_idx == 0;
++        const bool control_warp = metadata_warp and sm_idx == 0;
++        if constexpr (kStreamingInput) {
++            if (metadata_warp) {
++                constexpr uint32_t kPhysicalExperts = kNumExpertsPerRank / kRoutingGroups;
++                constexpr uint32_t kAllGroups = static_cast<uint32_t>((1ull << kRoutingGroups) - 1);
++                uint32_t source_ready = 0, destination_ready = 0, pool_blocks = 0, cursor = sm_idx % kRoutingGroups;
++                comm::wait_until([&]() {
++                    const uint32_t group = cursor++ % kRoutingGroups;
++                    const uint32_t bit = 1u << group;
++                    source_ready = ptx::ld_acq(workspace.get_input_ready_groups_ptr());
++                    const auto* descriptor = input_descriptors + (sym_buffer.rank_idx * kRoutingGroups + group) * 3;
++                    uint32_t arrived = 1;
++                    if (lane_idx == 0 and descriptor[0])
++                        asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(arrived) : "l"(descriptor[0]) : "memory");
++                    arrived = ptx::exchange(arrived, 0);
++                    if (not (source_ready & bit) and arrived) {
++                        if (streaming_diagnostics != nullptr and lane_idx == 0) {
++                            uint64_t timestamp;
++                            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(timestamp));
++                            atomicCAS(reinterpret_cast<unsigned long long*>(streaming_diagnostics + group * 4), 0ull, timestamp);
++                        }
++                        const uint32_t begin = group * input_chunk_size;
++                        const uint32_t end = cute::min(begin + input_chunk_size, num_tokens);
++                        const uint32_t jobs = cute::max(1u, math::ceil_div((end > begin ? end - begin : 0u) * kNumTopk, 32u));
++                        uint32_t job = jobs;
++                        if (lane_idx == 0 and ptx::ld_acq(workspace.signals->input_claims + group) < jobs)
++                            job = ptx::atomic_add(workspace.signals->input_claims + group, 1u);
++                        job = ptx::exchange(job, 0);
++                        if (job < jobs) {
++                        const uint32_t token_topk = begin * kNumTopk + job * 32 + lane_idx;
++                        if (token_topk < end * kNumTopk) {
++                            const uint32_t token = token_topk / kNumTopk;
++                            const uint32_t topk = token_topk % kNumTopk;
++                            const auto* row = reinterpret_cast<const uint8_t*>(descriptor[1]) +
++                                static_cast<uint64_t>(token - begin) * descriptor[2];
++                            const int physical = reinterpret_cast<const int*>(row + kHidden + kHidden / 32 + kNumTopk * 4)[topk];
++                            const int expert = physical < 0 ? -1 :
++                                (physical / kPhysicalExperts) * kNumExpertsPerRank + group * kPhysicalExperts + physical % kPhysicalExperts;
++                            buffer.input_topk_idx_buffer.get_base_ptr<int64_t>()[token_topk] = expert;
++                            buffer.input_topk_weights_buffer.get_base_ptr<float>()[token_topk] =
++                                reinterpret_cast<const float*>(row + kHidden + kHidden / 32)[topk];
++                            if (expert >= 0) {
++                                const auto slot = static_cast<uint32_t>(ptx::atomic_add(workspace.get_expert_send_count_ptr(expert), uint64_t{1}));
++                                *sym_buffer.map(workspace.get_src_token_topk_idx_ptr(expert % kNumExpertsPerRank, sym_buffer.rank_idx, slot), expert / kNumExpertsPerRank) = token_topk;
++                            }
++                        }
++                        asm volatile("fence.acq_rel.sys;" ::: "memory");
++                        __syncwarp();
++                        uint32_t completed = 0;
++                        if (lane_idx == 0)
++                            asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;" : "=r"(completed) : "l"(workspace.signals->input_completed + group) : "memory");
++                        completed = ptx::exchange(completed, 0);
++                        if (completed + 1 == jobs) {
++                        for (uint32_t e = lane_idx; e < kNumRanks * kPhysicalExperts; e += 32) {
++                            const uint32_t rank = e / kPhysicalExperts;
++                            const uint32_t expert = group * kPhysicalExperts + e % kPhysicalExperts;
++                            const uint64_t count = *workspace.get_expert_send_count_ptr(rank * kNumExpertsPerRank + expert);
++                            *sym_buffer.map(workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, expert), rank) = count;
++                            asm volatile("fence.acq_rel.sys;" ::: "memory");
++                            ptx::atomic_add_sys(sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(expert), rank), (uint64_t{kNumSMs} << 32) | count);
++                        }
++                        __syncwarp();
++                        if (lane_idx == 0)
++                            asm volatile("red.release.gpu.global.or.b32 [%0], %1;" :: "l"(workspace.get_input_ready_groups_ptr()), "r"(bit) : "memory");
++                        }
++                        }
++                    }
++                    if (control_warp and not (destination_ready & bit)) {
++                        bool sealed = true;
++                        for (uint32_t e = lane_idx; e < kPhysicalExperts; e += 32)
++                            sealed &= (ptx::ld_acq_sys(workspace.get_expert_recv_count_sum_ptr(group * kPhysicalExperts + e)) >> 32) == kNumSMs * kNumRanks;
++                        if (__all_sync(0xffffffff, sealed)) {
++                            if (streaming_diagnostics != nullptr and lane_idx == 0) {
++                                uint64_t timestamp;
++                                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(timestamp));
++                                streaming_diagnostics[group * 4 + 1] = timestamp;
++                            }
++                            for (uint32_t base = 0; base < kPhysicalExperts; base += 32) {
++                                const uint32_t e = base + lane_idx;
++                                const uint32_t expert = group * kPhysicalExperts + e;
++                                const uint32_t count = e < kPhysicalExperts ? static_cast<uint32_t>(*workspace.get_expert_recv_count_sum_ptr(expert)) : 0u;
++                                const uint32_t blocks = math::ceil_div(count, BLOCK_M);
++                                const uint32_t inclusive = math::warp_inclusive_sum(blocks, lane_idx);
++                                if (e < kPhysicalExperts)
++                                    workspace.get_expert_pool_offsets_ptr()[expert] = pool_blocks + inclusive - blocks;
++                                pool_blocks += ptx::exchange(inclusive, 31);
++                            }
++                            asm volatile("fence.acq_rel.gpu;" ::: "memory");
++                            __syncwarp();
++                            destination_ready |= bit;
++                            if (lane_idx == 0)
++                                ptx::st_rel(workspace.get_streaming_status_ptr(), (uint64_t{destination_ready} << 32) | pool_blocks);
++                        }
++                    }
++                    return source_ready == kAllGroups and (not control_warp or destination_ready == kAllGroups);
++                }, [&]() { printf("DeepGEMM input timeout: rank=%u source=%x destination=%x\n", sym_buffer.rank_idx, source_ready, destination_ready); });
++                scheduler.fetch_expert_recv_count();
++            }
++        } else {
++            scheduler.fetch_expert_recv_count();
++        }
+ 
++        constexpr uint32_t kCombineBlockN = kHidden;
++        constexpr uint32_t kNumCombineBlocks = kHidden / kCombineBlockN;
+         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
+-        for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
+-            // Advance expert until within the range
+-            int old_expert_idx = current_expert_idx;
+-            while (token_idx >= expert_end_idx) {
+-                if (++ current_expert_idx >= kNumExpertsPerRank)
++        constexpr uint32_t kNumPullWarps = kNumGlobalWarps - (kStreamingInput ? kNumSMs : 0);
++        const uint32_t pull_warp = kStreamingInput ? sm_idx * (kNumDispatchWarps - 1) + warp_idx - 1 : sm_idx * kNumDispatchWarps + warp_idx;
++        const uint32_t first_combine_token = metadata_warp ? num_tokens * kNumCombineBlocks : pull_warp;
++        uint32_t next_combine_token = first_combine_token;
++        uint32_t pending_combine_tokens = first_combine_token < num_tokens * kNumCombineBlocks ?
++            math::ceil_div(num_tokens * kNumCombineBlocks - first_combine_token, kNumPullWarps) : 0;
++        const auto try_combine = [&]() {
++            if constexpr (kEarlyCombine) {
++                if (pending_combine_tokens == 0)
++                    return;
++                const uint32_t token = next_combine_token / kNumCombineBlocks;
++                const uint32_t output_block = next_combine_token % kNumCombineBlocks;
++                next_combine_token += kNumPullWarps;
++                if (next_combine_token >= num_tokens * kNumCombineBlocks)
++                    next_combine_token = first_combine_token;
++                if constexpr (kStreamingInput) {
++                    if (not (ptx::ld_acq(workspace.get_input_ready_groups_ptr()) & (1u << (token / input_chunk_size))))
++                        return;
++                }
++                if (*workspace.get_token_completion_ptr(token, kNumTopk + 1, output_block))
++                    return;
++                const bool active = lane_idx < kNumTopk ?
++                    buffer.input_topk_idx_buffer.get_base_ptr<int64_t>()[token * kNumTopk + lane_idx] >= 0 :
++                    (kHasShared and not kSeparateShared and lane_idx == kNumTopk);
++                const uint32_t mask = __ballot_sync(0xffffffff, active);
++                uint64_t stored_mapping = 0;
++                if (active and lane_idx < kNumTopk)
++                    stored_mapping = ptx::ld_acq_sys(workspace.get_token_output_map_ptr(token, lane_idx));
++                bool ready = true;
++                if (active) {
++                    const bool shared = lane_idx == kNumTopk;
++                    const uint32_t block = shared ? token / BLOCK_M : static_cast<uint32_t>(stored_mapping >> 8) - 1;
++                    const uint32_t rank = shared ? sym_buffer.rank_idx : static_cast<uint32_t>(stored_mapping & 255);
++                    ready = shared or stored_mapping != 0;
++                    if (ready)
++                        ready = ptx::ld_acq_sys(workspace.get_l2_output_ready_ptr(block, 0, shared, rank)) == kHidden / BLOCK_N;
++                }
++                if (not __all_sync(0xffffffff, ready)) {
++                    __nanosleep(64);
++                    return;
++                }
++                // Keep the original Shared-first, then top-k FP32 accumulation order.
++                for (uint32_t col = output_block * kCombineBlockN + lane_idx * 8; col < (output_block + 1) * kCombineBlockN; col += 32 * 8) {
++                    float2 sums[4] = {};
++                    uint32_t remaining = mask;
++                    while (remaining) {
++                        const uint32_t slot = (remaining >> kNumTopk) ? kNumTopk : __ffs(remaining) - 1;
++                        remaining ^= 1u << slot;
++                        const auto* ptr = buffer.combine_token_buffer.get_rank_buffer(slot)
++                            .get_data_buffer(token).get_base_ptr<nv_bfloat16>() + col;
++                        const auto packed = *reinterpret_cast<const uint4*>(ptr);
++                        const auto* values = reinterpret_cast<const nv_bfloat162*>(&packed);
++                        #pragma unroll
++                        for (uint32_t j = 0; j < 4; ++j)
++                            ptx::accumulate(sums[j], values[j]);
++                    }
++                    uint4 packed;
++                    auto* values = reinterpret_cast<nv_bfloat162*>(&packed);
++                    #pragma unroll
++                    for (uint32_t j = 0; j < 4; ++j)
++                        values[j] = __float22bfloat162_rn(sums[j]);
++                    *reinterpret_cast<uint4*>(static_cast<nv_bfloat16*>(y) + static_cast<uint64_t>(token) * kHidden + col) = packed;
++                }
++                // Every output writer participates; an elected thread alone cannot
++                // publish the other lanes' stores to the GPUDirect reader.
++                asm volatile("fence.acq_rel.sys;" ::: "memory");
++                __syncwarp();
++                if (lane_idx == 0) {
++                    *workspace.get_token_completion_ptr(token, kNumTopk + 1, output_block) = 1;
++                    if (return_descriptors != nullptr) {
++                        const uint32_t chunk = token / return_chunk_size;
++                        const uint32_t rows = cute::min(return_chunk_size, num_tokens - chunk * return_chunk_size);
++                        uint32_t old;
++                        auto* join = workspace.get_token_completion_ptr(chunk, kNumTopk + 2);
++                        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;" : "=r"(old) : "l"(join) : "memory");
++                        if (old + 1 == rows * kNumCombineBlocks) {
++                            uint64_t timestamp;
++                            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(timestamp));
++                            return_descriptors[chunk * 4 + 2] = timestamp;
++                            const auto request = return_descriptors[chunk * 4];
++                            const auto send_rows = return_descriptors[chunk * 4 + 1];
++                            if (request) {
++                                asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(send_rows), "r"(rows) : "memory");
++                                asm volatile("st.release.sys.global.u32 [%0], 1;" :: "l"(request) : "memory");
++                            }
++                        }
++                    }
++                }
++                __syncwarp();
++                --pending_combine_tokens;
++            }
++        };
++        for (uint32_t token_idx = pull_warp; not metadata_warp; token_idx += kNumPullWarps) {
++            try_combine();
++            const int old_expert_idx = current_expert_idx;
++            uint32_t token_idx_in_expert = 0;
++            if constexpr (kStreamingInput) {
++                bool complete = false;
++                while (true) {
++                    complete = scheduler.try_fetch_expert_recv_count();
++                    if (token_idx < scheduler.num_total_m_blocks * BLOCK_M or complete)
++                        break;
++                    try_combine();
++                }
++                if (token_idx >= scheduler.num_total_m_blocks * BLOCK_M)
+                     break;
+-
+-                // Update pool block offset for the new expert
+-                expert_pool_block_offset += math::ceil_div(expert_end_idx - expert_start_idx, BLOCK_M);
+-
+-                // Move start and end to the next expert
+-                expert_start_idx = expert_end_idx;
+-                expert_end_idx += scheduler.get_num_tokens(current_expert_idx);
++                const auto task = scheduler.create_task(sched::BlockPhase::Linear1, token_idx / BLOCK_M, 0, L1_SHAPE_N, L1_SHAPE_K);
++                if (token_idx % BLOCK_M >= task.valid_m)
++                    continue;
++                current_expert_idx = task.local_expert_idx;
++                expert_pool_block_offset = scheduler.get_pool_block_offset(current_expert_idx);
++                token_idx_in_expert = task.m_block_idx * BLOCK_M + token_idx % BLOCK_M;
++            } else {
++                while (token_idx >= expert_end_idx) {
++                    if (++current_expert_idx >= kNumExpertsPerRank)
++                        break;
++                    expert_pool_block_offset += math::ceil_div(expert_end_idx - expert_start_idx, BLOCK_M);
++                    expert_start_idx = expert_end_idx;
++                    expert_end_idx += scheduler.get_num_tokens(current_expert_idx);
++                }
++                if (current_expert_idx >= kNumExpertsPerRank)
++                    break;
++                token_idx_in_expert = token_idx - expert_start_idx;
+             }
+ 
+-            // Finish all tokens
+-            if (current_expert_idx >= kNumExpertsPerRank)
+-                break;
+-
+             // Load per-rank counts when expert changes
+             if (old_expert_idx != current_expert_idx) {
+-                old_expert_idx = current_expert_idx;
+                 #pragma unroll
+                 for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
+                     const uint32_t j = i * 32 + lane_idx;
+@@ -487,7 +723,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+             for (uint32_t i = 0; i < kNumRanksPerLane; ++ i)
+                 remaining[i] = stored_rank_count[i];
+             uint32_t offset = 0;
+-            uint32_t token_idx_in_expert = token_idx - expert_start_idx;
+             uint32_t slot_idx = token_idx_in_expert;
+             uint32_t token_idx_in_rank;
+             while (true) {
+@@ -552,7 +787,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                 while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
+             }
+ 
+-            const auto src_base_ptr = sym_buffer.map(
++            const auto* input_descriptor = kStreamingInput ? input_descriptors +
++                (current_rank_in_expert_idx * kRoutingGroups + src_token_idx / input_chunk_size) * 3 : nullptr;
++            const auto* wire_row = kStreamingInput ? reinterpret_cast<const uint8_t*>(input_descriptor[1]) +
++                static_cast<uint64_t>(src_token_idx % input_chunk_size) * input_descriptor[2] : nullptr;
++            const auto src_base_ptr = kStreamingInput ? wire_row : sym_buffer.map(
+                 buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
+             const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
+             const auto issue_and_wait_pull_store = [&](const uint32_t& i) {
+@@ -569,7 +808,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                 for (uint32_t i = 0; i < kNumChunks; ++ i) {
+                     ptx::tma_load_1d(
+                         pull_buffer.get_base_ptr(),
+-                        math::advance_ptr(src_base_ptr, i * kNumBytesPerPull),
++                        static_cast<const uint8_t*>(src_base_ptr) + i * kNumBytesPerPull,
+                         pull_mbarrier, kNumBytesPerPull
+                     );
+                     ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kNumBytesPerPull);
+@@ -586,7 +825,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+             // Load and store SF (overlaps with last chunk's TMA load from remote)
+             constexpr uint32_t kNumSFUint32 = kHidden / 128;
+             DG_STATIC_ASSERT(kNumSFUint32 > 0 and kHidden % 128 == 0, "Invalid SF");
+-            const auto remote_sf_ptr = sym_buffer.map(
++            const auto remote_sf_ptr = kStreamingInput ? reinterpret_cast<const uint32_t*>(wire_row + kHidden) : sym_buffer.map(
+                 buffer.input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<uint32_t>(),
+                 current_rank_in_expert_idx);
+             const auto local_sf_ptr = buffer.l1_sf_buffer.get_base_ptr<uint32_t>();
+@@ -603,6 +842,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+             __syncwarp();
+ 
+             // Store weights and metadata
++            const bool is_last_token = token_idx_in_expert + 1 == scheduler.get_num_tokens(current_expert_idx);
+             if (cute::elect_one_sync()) {
+                 *buffer.l1_topk_weights_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).template get_base_ptr<float>() = weight;
+ 
+@@ -610,9 +850,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                 *workspace.get_token_src_metadata_ptr(pool_token_idx) =
+                     {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
+ 
++                if constexpr (kEarlyCombine) {
++                    ptx::st_rel_sys(sym_buffer.map(workspace.get_token_output_map_ptr(src_token_idx, src_topk_idx), current_rank_in_expert_idx),
++                                    (static_cast<uint64_t>(pool_block_idx + 1) << 8) | sym_buffer.rank_idx);
++                }
++
+                 // Complete last chunk's store
+                 issue_and_wait_pull_store(kNumChunks - 1);
+-                const bool is_last_token = (token_idx == expert_end_idx - 1);
+                 ptx::red_add_rel(
+                     workspace.get_l1_full_count_ptr(pool_block_idx % kNumRingBlocks), 
+                     is_last_token ? BLOCK_M - (token_idx_in_expert % BLOCK_M) : 1u
+@@ -621,6 +865,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+             __syncwarp();
+         }
+ 
++        if constexpr (kEarlyCombine) {
++            comm::wait_until([&]() { try_combine(); return pending_combine_tokens == 0; },
++                [&]() { printf("DeepGEMM early combine timeout: rank=%u sm=%u warp=%u pending=%u\n",
++                               sym_buffer.rank_idx, sm_idx, warp_idx, pending_combine_tokens); });
++        }
++
+         // Clean workspace for the next usage, and also do cumulative stats
+         // NOTES: it is overlapped with combine reduction epilogue
+         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+@@ -662,7 +912,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                     *workspace.get_expert_recv_count_sum_ptr(i) = 0;
+                 } else if (warp_idx == 1) {
+                     if (cute::elect_one_sync() and cumulative_local_expert_recv_stats != nullptr)
+-                        ptx::red_add(cumulative_local_expert_recv_stats + i, static_cast<int>(num_recv_tokens));
++                        ptx::red_add(cumulative_local_expert_recv_stats + i % (kNumExpertsPerRank / kRoutingGroups), static_cast<int>(num_recv_tokens));
+                     __syncwarp();
+                 }
+ 
+@@ -682,7 +932,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+             }
+         }
+ 
+-        // Wait for all ranks to finish cleaning
++        // A peer may reuse its combine slots as soon as this barrier finishes.
++        // Join local readers as well as cleanup before granting that reuse.
++        ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
++
++        // Wait for all ranks to finish cleaning and consuming combine slots.
+         comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+                              kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
+             workspace, sym_buffer, sm_idx, thread_idx,
+@@ -690,6 +944,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+             /* Before the NVLink barrier, there is a grid sync */ true,
+             /* At the end of kernel does not need to sync */ false
+         );
++        if constexpr (kStreamingInput) {
++            if (sm_idx == 0 and thread_idx == 0) {
++                *workspace.get_streaming_status_ptr() = 0;
++                *workspace.get_input_ready_groups_ptr() = 0;
++                for (uint32_t group = 0; group < kRoutingGroups; ++group) {
++                    workspace.signals->input_claims[group] = 0;
++                    workspace.signals->input_completed[group] = 0;
++                }
++            }
++        }
+     } else if (warp_idx == kNumDispatchWarps) {
+         // Adjust registers
+         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
+@@ -779,7 +1043,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+             const auto num_k_blocks = math::ceil_div(shape_k, BLOCK_K);
+ 
+             const uint32_t half_n = shape_n / 2, n_idx = n_block_idx * BLOCK_N, half_idx = n_idx >= half_n;
+-            const uint32_t half_n_idx = n_idx - half_idx * half_n, expert_idx = task_info.is_shared() ? 0 : task_info.local_expert_idx;
++            const uint32_t half_n_idx = n_idx - half_idx * half_n, expert_idx = task_info.is_shared() ? 0 : task_info.local_expert_idx % (kNumExpertsPerRank / kRoutingGroups);
+ 
+             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                 // Wait consumer release
+@@ -788,7 +1052,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                 // Compute weight offset
+                 uint32_t k_idx = k_block_idx * BLOCK_K;
+                 uint32_t sfb_n_idx = n_block_idx * BLOCK_N;
+-                uint32_t sfb_k_idx = task_info.is_shared() ? k_block_idx * (BLOCK_K / 128) : task_info.local_expert_idx * shape_sfb_k + k_block_idx * (BLOCK_K / 128);
++                uint32_t sfb_k_idx = expert_idx * shape_sfb_k + k_block_idx * (BLOCK_K / 128);
+ 
+                 // TMA copy weights with SF
+                 if (cute::elect_one_sync()) {
+@@ -944,8 +1208,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
+ 
+         // Do mainloop by the leader CTA
+-        if (is_leader_cta)
+-            scheduler.mainloop(num_tokens, sm_locality_domains);
++        if (is_leader_cta) {
++            if constexpr (kReadyScheduling)
++                scheduler.mainloop(shared_num_tokens, sm_locality_domains, reinterpret_cast<uint64_t*>(scheduler_workspace), scheduler_stride);
++            else
++                scheduler.mainloop(shared_num_tokens, sm_locality_domains);
++        }
+     } else if (warp_idx >= kNumDispatchWarps + kNumMMANonEpilogueWarps) {
+         // Adjust registers
+         cutlass::arch::warpgroup_reg_alloc<kNumEpilogueRegisters>();
+@@ -1258,6 +1526,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                         ptx::red_add_rel(
+                             workspace.get_shared_l2_full_count_ptr(pool_block_idx), 1u);
+                     } else {
++                        if constexpr (kStreamingInput) {
++                            if (streaming_diagnostics != nullptr) {
++                                uint64_t timestamp;
++                                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(timestamp));
++                                atomicCAS(reinterpret_cast<unsigned long long*>(streaming_diagnostics +
++                                    (task_info.local_expert_idx / (kNumExpertsPerRank / kRoutingGroups)) * 4 + 2), 0ull, timestamp);
++                            }
++                        }
+                         L2KBlockDependency::arrive(workspace.get_l2_full_mask_ptr(ring_block_idx), n_block_idx);
+ 
+                         // Increment L1 empty count for this physical slot (one per N block)
+@@ -1363,7 +1639,43 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                         const auto dst_ptr = math::advance_ptr<float4>(
+                             dst_token.get_base_ptr(),
+                             n_idx * static_cast<uint32_t>(sizeof(nv_bfloat16)) + (lane_idx % 16) * static_cast<uint32_t>(sizeof(float4)));
+-                        *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
++                        if (kSeparateShared and task_info.is_shared()) {
++                            auto* shared_dst = math::advance_ptr<float4>(shared_output,
++                                (static_cast<uint64_t>(dst_token_idx) * kHidden + n_idx) * sizeof(nv_bfloat16) +
++                                (lane_idx % 16) * sizeof(float4));
++                            *shared_dst = packed;
++                        } else {
++                            *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
++
++                        }
++                    }
++                }
++
++                if constexpr (kEarlyCombine) {
++                    // Join every writer before one CTA publishes its N tile.
++                    // Consumers read one producer flag per tile, avoiding one
++                    // contended NVLink notification for every token/N pair.
++                    asm volatile("fence.acq_rel.sys;" ::: "memory");
++                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
++                    if (not (kSeparateShared and task_info.is_shared())) {
++                        if constexpr (kStreamingInput) {
++                            if (streaming_diagnostics != nullptr and not task_info.is_shared() and epilogue_thread_idx == 0) {
++                                uint64_t timestamp;
++                                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(timestamp));
++                                atomicCAS(reinterpret_cast<unsigned long long*>(streaming_diagnostics +
++                                    (task_info.local_expert_idx / (kNumExpertsPerRank / kRoutingGroups)) * 4 + 3), 0ull, timestamp);
++                            }
++                        }
++                        auto* done = workspace.get_l2_output_ready_ptr(task_info.pool_block_idx, 0, task_info.is_shared(), sym_buffer.rank_idx);
++                        const bool publish = task_info.is_shared() ? epilogue_thread_idx == 0 : epilogue_thread_idx < kNumRanks;
++                        if (publish) {
++                            if (not task_info.is_shared())
++                                done = sym_buffer.map(done, epilogue_thread_idx);
++                            uint32_t previous;
++                            // Join all N-tile releases into one full-row readiness
++                            // count; the final acquire observes every BF16 writer.
++                            asm volatile("atom.acq_rel.sys.global.add.u32 %0, [%1], 1;" : "=r"(previous) : "l"(done) : "memory");
++                        }
+                     }
+                 }
+ 
+@@ -1429,6 +1741,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+             [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
+         );
+ 
++        if constexpr (kEarlyCombine) {
++            if (return_descriptors != nullptr and sm_idx == 0) {
++                uint64_t timestamp;
++                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(timestamp));
++                for (uint32_t i = epilogue_thread_idx; i < math::ceil_div(num_tokens, return_chunk_size); i += kNumEpilogueThreads)
++                    return_descriptors[i * 4 + 3] = timestamp;
++            }
++            ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
++            ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
++            return;
++        }
++
+         // Notify remote ranks; ordered before the cleanup barrier by the dispatch/epilogue sync below
+         if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
+             ptx::st_rel_sys(sym_buffer.map(workspace.get_combine_ready_grid_idx_ptr(sym_buffer.rank_idx), epilogue_thread_idx), peer_grid_idx);
+@@ -1437,7 +1761,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+ 
+         // Iterate over all token chunks, 1 token 1 topk latency: ~3 us
+-        const auto grid_idx = ptx::get_grid_idx() + 1;
++        const auto grid_idx = ptx::ld_acq_gpu(workspace.get_launch_epoch_ptr());
+         for (uint32_t token_chunk_idx = epilogue_warp_idx * kNumSMs + sm_idx; token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += kNumSMs * kNumEpilogueWarps) {
+             const uint32_t token_idx = token_chunk_idx / kNumChunks;
+             const uint32_t chunk_idx = token_chunk_idx % kNumChunks;
+@@ -1445,7 +1769,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+             // Read top-k slot indices: each lane reads one slot, then broadcast via exchange
+             const int stored_topk_slot_idx = lane_idx < kNumTopk ?
+                 static_cast<int>(buffer.input_topk_idx_buffer.get_base_ptr<int64_t>()[token_idx * kNumTopk + lane_idx]) :
+-                (kNumSharedExperts > 0 and lane_idx == kNumTopk ? static_cast<int>(kNumTopk) : -1);
++                (kNumSharedExperts > 0 and not kSeparateShared and lane_idx == kNumTopk ? static_cast<int>(kNumTopk) : -1);
+             const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
+ 
+             // Wait for the ranks of the selected experts to finish their L2 writes
+@@ -1533,6 +1857,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+             }
+             __syncwarp();
+         }
++        ptx::tma_store_wait<0>();
++        ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+     }
+ #else
+     if (blockIdx.x == 0 and threadIdx.x == 0)
+diff --git a/deep_gemm/include/deep_gemm/layout/mega_moe.cuh b/deep_gemm/include/deep_gemm/layout/mega_moe.cuh
+index bc541c5..5fde701 100644
+--- a/deep_gemm/include/deep_gemm/layout/mega_moe.cuh
++++ b/deep_gemm/include/deep_gemm/layout/mega_moe.cuh
+@@ -69,8 +69,12 @@ struct alignas(128) MegaMoESignals {
+     uint32_t shared_l1_task_count[kNumDeviceLocalityDomains];
+     uint32_t shared_l2_task_count[kNumDeviceLocalityDomains];
+ 
+-    // Combine readiness: `combine_ready_grid_idx[peer] == own grid index` means the peer's L2 writes into this
+-    // rank are done; grid indices are unique per launch, so no reset is needed. Peers push theirs during dispatch.
++    // CUDA Graph replay preserves %gridid. Advance a workspace-local epoch
++    // inside each invocation before publishing any completion descriptors.
++    uint64_t launch_epoch;
++
++    // Per-invocation combine tags pushed during dispatch. MXFP8 uses launch_epoch:
++    // %gridid alone is not a valid generation tag under CUDA Graph replay.
+     alignas(128) uint64_t combine_ready_grid_idx[kNumMaxRanks];
+     alignas(128) uint64_t peer_grid_idx[kNumMaxRanks];
+ 
+@@ -79,6 +83,14 @@ struct alignas(128) MegaMoESignals {
+     uint64_t expert_recv_count[kNumMaxExperts];
+     uint64_t expert_recv_count_sum[kNumMaxExpertsPerRank];
+ 
++    // Streaming groups append to the pool in arrival order. The status packs
++    // the sealed group mask in its upper half and the available M blocks below.
++    alignas(128) uint64_t streaming_status;
++    uint32_t input_ready_groups;
++    uint32_t input_claims[32];
++    uint32_t input_completed[32];
++    uint32_t expert_pool_offsets[kNumMaxExpertsPerRank];
++
+     // Routed-expert ring signals, `l2_full_mask` has one bit per L1 N block
+     uint32_t l1_full_count[kNumMaxRingBlocks];
+     uint32_t l1_empty_count[kNumMaxRingBlocks];
+@@ -94,7 +106,7 @@ struct Workspace {
+     MegaMoESignals* signals;
+     uint32_t num_ranks, num_experts;
+     uint32_t num_experts_per_rank;
+-    uint32_t num_max_tokens_per_rank;
++    uint32_t num_max_tokens_per_rank, num_topk, num_output_blocks;
+     uint32_t num_shared_l2_pool_blocks;
+ 
+     // Full-pool span used by non-ring token metadata
+@@ -108,10 +120,10 @@ struct Workspace {
+               const uint32_t& num_experts,
+               const uint32_t& num_max_tokens_per_rank,
+               const uint32_t& num_topk,
+-              const uint32_t& num_ring_tokens):
++              const uint32_t& num_ring_tokens, const uint32_t& hidden = 0):
+         signals(static_cast<MegaMoESignals*>(base)),
+         num_ranks(num_ranks), num_experts(num_experts),
+-        num_max_tokens_per_rank(num_max_tokens_per_rank) {
++        num_max_tokens_per_rank(num_max_tokens_per_rank), num_topk(num_topk), num_output_blocks(hidden / 128) {
+         num_experts_per_rank = num_experts / num_ranks;
+         num_max_pool_tokens = get_num_max_pool_tokens(num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
+         num_shared_l2_pool_blocks = math::ceil_div<uint32_t>(num_max_tokens_per_rank, kMinCandidateBlockM);
+@@ -138,6 +150,9 @@ struct Workspace {
+         // Combine push source indices (full)
+         num_bytes += num_max_pool_tokens * sizeof(TokenSrcMetadata);
+ 
++        // Per-token FC2 completion, reduction ownership, and return chunk joins.
++        num_bytes += get_num_completion_uint32() * sizeof(uint32_t);
++
+         // Align to TMA descriptor requirements
+         num_bytes = math::align<uint64_t>(num_bytes, 16);
+         return num_bytes;
+@@ -176,6 +191,11 @@ struct Workspace {
+         return signals->peer_grid_idx + peer_rank_idx;
+     }
+ 
++    CUTLASS_DEVICE
++    uint64_t* get_launch_epoch_ptr() const {
++        return &signals->launch_epoch;
++    }
++
+     CUTLASS_DEVICE
+     uint32_t* get_l1_task_count_ptr() const {
+         return signals->l1_task_count;
+@@ -237,6 +257,10 @@ struct Workspace {
+         return signals->shared_l2_full_count + block_idx;
+     }
+ 
++    CUTLASS_DEVICE uint64_t* get_streaming_status_ptr() const { return &signals->streaming_status; }
++    CUTLASS_DEVICE uint32_t* get_input_ready_groups_ptr() const { return &signals->input_ready_groups; }
++    CUTLASS_DEVICE uint32_t* get_expert_pool_offsets_ptr() const { return signals->expert_pool_offsets; }
++
+     // For dispatch pulling
+     CUTLASS_DEVICE
+     uint32_t* get_src_token_topk_idx_ptr(
+@@ -251,6 +275,28 @@ struct Workspace {
+         const auto base = reinterpret_cast<TokenSrcMetadata*>(get_src_token_topk_idx_ptr(num_experts_per_rank));
+         return base + pool_token_idx;
+     }
++
++    CUTLASS_DEVICE
++    uint32_t* get_token_completion_ptr(uint32_t token = 0, uint32_t slot = 0, uint32_t block = 0) const {
++        const auto base = reinterpret_cast<uint32_t*>(get_token_src_metadata_ptr(num_max_pool_tokens));
++        return base + (token * (num_topk + 3) + slot) * num_output_blocks + block;
++    }
++
++    CUTLASS_HOST_DEVICE uint64_t get_num_completion_uint32() const {
++        return static_cast<uint64_t>(num_max_tokens_per_rank) * (num_topk + 3) * num_output_blocks +
++               static_cast<uint64_t>(num_max_tokens_per_rank) * num_topk * 2 +
++               static_cast<uint64_t>(num_max_pool_tokens / kMinCandidateBlockM + num_shared_l2_pool_blocks) * num_output_blocks * num_ranks;
++    }
++
++    CUTLASS_DEVICE uint64_t* get_token_output_map_ptr(uint32_t token = 0, uint32_t slot = 0) const {
++        return reinterpret_cast<uint64_t*>(get_token_completion_ptr(num_max_tokens_per_rank)) + token * num_topk + slot;
++    }
++
++    CUTLASS_DEVICE uint32_t* get_l2_output_ready_ptr(uint32_t block, uint32_t n, bool shared = false, uint32_t rank = 0) const {
++        const auto base = reinterpret_cast<uint32_t*>(get_token_output_map_ptr(num_max_tokens_per_rank));
++        return base + (rank * (num_max_pool_tokens / kMinCandidateBlockM + num_shared_l2_pool_blocks) +
++                       (shared ? num_max_pool_tokens / kMinCandidateBlockM : 0) + block) * num_output_blocks + n;
++    }
+ };
+ 
+ struct Data {
+@@ -382,7 +428,7 @@ struct MegaMoEBuffer {
+                   const uint32_t& shared_num_mma_elem_bits_opt = 0) {
+         // Workspace
+         workspace = Workspace(base, num_ranks, num_experts,
+-                              num_max_tokens_per_rank, num_topk, num_ring_tokens);
++                              num_max_tokens_per_rank, num_topk, num_ring_tokens, hidden);
+ 
+         // Layouts
+         // NOTES: element sizes are in bits to support sub-byte packed NVFP4 (4 bits);
+diff --git a/deep_gemm/include/deep_gemm/scheduler/mega_moe.cuh b/deep_gemm/include/deep_gemm/scheduler/mega_moe.cuh
+index fe58601..4684b51 100644
+--- a/deep_gemm/include/deep_gemm/scheduler/mega_moe.cuh
++++ b/deep_gemm/include/deep_gemm/scheduler/mega_moe.cuh
+@@ -173,6 +173,8 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
+           uint32_t kNumRingBlocks, uint32_t kNumLocalityDomains,
+           uint32_t kNumSharedExperts = 0,
+           bool kDecodeShaped = false,
++          bool kStreamingInput = false,
++          uint32_t kRoutingGroups = 1,
+           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
+           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
+           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
+@@ -216,6 +218,8 @@ struct MegaMoEScheduler {
+     // Layout: `stored_num_tokens_per_expert[i]` holds expert (i * 32 + lane_idx)'s count.
+     uint32_t stored_num_tokens_per_expert[kNumExpertsPerLane] = {};
+     uint32_t num_total_m_blocks = 0;
++    uint32_t sealed_groups = 0;
++    uint32_t stored_pool_offsets[kNumExpertsPerLane] = {};
+ 
+     // Per-scheduler warmup waves; all CTA-pair schedulers together form one global wave.
+     static constexpr uint32_t kNumSchedL1WavesDone = 0xffffffffu;
+@@ -271,6 +275,16 @@ struct MegaMoEScheduler {
+ 
+     // Get pool block offset for a given expert index from a per-lane token count array.
+     CUTLASS_DEVICE uint32_t get_pool_block_offset(const uint32_t& expert_idx) const {
++        if constexpr (kStreamingInput) {
++            if (expert_idx == kNumExpertsPerRank)
++                return num_total_m_blocks;
++            uint32_t value = 0;
++            #pragma unroll
++            for (uint32_t i = 0; i < kNumExpertsPerLane; ++i)
++                if (expert_idx == i * 32 + ptx::get_lane_idx())
++                    value = stored_pool_offsets[i];
++            return ptx::exchange(value, expert_idx % 32);
++        }
+         uint32_t num_blocks = 0;
+         #pragma unroll
+         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
+@@ -285,6 +299,10 @@ struct MegaMoEScheduler {
+     }
+ 
+     CUTLASS_DEVICE void fetch_expert_recv_count() {
++        if constexpr (kStreamingInput) {
++            while (not try_fetch_expert_recv_count()) {}
++            return;
++        }
+         // NOTES: each lane caches experts at indices (i * 32 + lane_idx)
+         #pragma unroll
+         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
+@@ -323,7 +341,8 @@ struct MegaMoEScheduler {
+             const uint32_t num_tokens = stored_num_tokens_per_expert[i];
+             const uint32_t num_m_blocks = math::ceil_div(num_tokens, BLOCK_M);
+             const uint32_t inclusive_num_m_blocks = math::warp_inclusive_sum(num_m_blocks, lane_idx);
+-            const uint32_t lane_pool_block_offset = block_offset + inclusive_num_m_blocks - num_m_blocks;
++            const uint32_t lane_pool_block_offset = kStreamingInput ? stored_pool_offsets[i] :
++                block_offset + inclusive_num_m_blocks - num_m_blocks;
+             const bool is_owner = expert_idx < kNumExpertsPerRank and
+                 m_block_idx >= lane_pool_block_offset and m_block_idx < lane_pool_block_offset + num_m_blocks;
+             const uint32_t owner_mask = __ballot_sync(0xffffffff, is_owner);
+@@ -445,10 +464,184 @@ struct MegaMoEScheduler {
+         }
+     }
+ 
+-    CUTLASS_DEVICE void mainloop(const uint32_t& num_tokens, const uint8_t* sm_locality_domains) {
++    CUTLASS_DEVICE bool try_fetch_expert_recv_count() {
++        if constexpr (kStreamingInput) {
++            const auto status = ptx::ld_acq_gpu(workspace.get_streaming_status_ptr());
++            const uint32_t mask = status >> 32;
++            const uint32_t added = mask & ~sealed_groups;
++            #pragma unroll
++            for (uint32_t i = 0; i < kNumExpertsPerLane; ++i) {
++                const uint32_t expert = i * 32 + ptx::get_lane_idx();
++                if (expert < kNumExpertsPerRank and (added & (1u << (expert / (kNumExpertsPerRank / kRoutingGroups))))) {
++                    stored_num_tokens_per_expert[i] = static_cast<uint32_t>(*workspace.get_expert_recv_count_sum_ptr(expert));
++                    stored_pool_offsets[i] = workspace.get_expert_pool_offsets_ptr()[expert];
++                }
++            }
++            __syncwarp();
++            sealed_groups = mask;
++            num_total_m_blocks = static_cast<uint32_t>(status);
++            return mask == static_cast<uint32_t>((1ull << kRoutingGroups) - 1);
++        }
++        bool ready = true;
++        #pragma unroll
++        for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
++            const auto expert = i * 32 + ptx::get_lane_idx();
++            if (expert < kNumExpertsPerRank) {
++                const auto value = ptx::ld_acq_gpu(workspace.get_expert_recv_count_sum_ptr(expert));
++                ready &= static_cast<uint32_t>(value >> 32) == kNumSMs * kNumRanks;
++                stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
++            }
++        }
++        if (not __all_sync(0xffffffff, ready))
++            return false;
++        num_total_m_blocks = get_num_total_pool_blocks();
++        return true;
++    }
++
++    template <uint32_t kBits>
++    static CUTLASS_DEVICE constexpr uint64_t full_mask() {
++        if constexpr (kBits >= 64)
++            return ~0ull;
++        else
++            return (1ull << kBits) - 1;
++    }
++
++    template <BlockPhase kPhase, uint32_t kShapeN, uint32_t kShapeK>
++    CUTLASS_DEVICE bool try_ready_task(uint64_t* scratch, const uint32_t stride,
++                                     const uint32_t num_tokens, const uint32_t blocks,
++                                     uint32_t& cursor, task_info_t& result) {
++        constexpr uint32_t kPhaseIndex = static_cast<uint32_t>(kPhase) - 1;
++        constexpr uint32_t kClusters = kShapeN / BLOCK_N / 2;
++        constexpr uint32_t kLocalClusters = kClusters / kNumLocalityDomains;
++        constexpr bool kShared = kPhase > BlockPhase::Linear2;
++        const auto lane = ptx::get_lane_idx();
++        if (blocks == 0)
++            return false;
++        uint64_t* claims = scratch + kPhaseIndex * stride + 1;
++        const auto groups = math::ceil_div(blocks, 32u);
++        const bool steal = kNumLocalityDomains > 1 and blocks * kClusters >= kNumMinStealWaves * (kNumSMs / 2);
++        for (uint32_t domain_pass = 0; domain_pass < (steal ? 2u : 1u); ++ domain_pass) {
++            const auto domain = sm_locality_domain_idx ^ domain_pass;
++            for (uint32_t step = 0; step < groups; ++ step) {
++                const auto group = (cursor + step) % groups;
++                const auto m = group * 32 + lane;
++                uint64_t claimed = 0;
++                bool ready = m < blocks;
++                if (ready) {
++                    claimed = ptx::ld_acq_gpu(claims + m);
++                    ready = static_cast<uint32_t>(claimed >> (domain * 32)) < kLocalClusters;
++                }
++                if (ready) {
++                    if constexpr (kPhase == BlockPhase::Linear1) {
++                        const auto ring = m % kNumRingBlocks;
++                        const auto generation = m / kNumRingBlocks;
++                        ready = ptx::ld_acq(workspace.get_l1_full_count_ptr(ring)) == BLOCK_M * (generation + 1) and
++                                ptx::ld_acq(workspace.get_l2_empty_count_ptr(ring)) == kNumL2BlockNs * generation;
++                    } else if constexpr (kPhase == BlockPhase::Linear2) {
++                        const auto ring = m % kNumRingBlocks;
++                        const auto generation = m / kNumRingBlocks;
++                        // A parity mask alone can alias an unstarted future generation.
++                        // Claiming every current L1 tile first prevents that alias.
++                        const auto l1_claimed = ptx::ld_acq_gpu(scratch + 1 + m);
++                        constexpr uint32_t kLocalL1 = kNumL1Clusters / kNumLocalityDomains;
++                        ready = static_cast<uint32_t>(l1_claimed) >= kLocalL1 and
++                                (kNumLocalityDomains == 1 or static_cast<uint32_t>(l1_claimed >> 32) >= kLocalL1) and
++                                ptx::ld_acq_gpu(workspace.get_l2_full_mask_ptr(ring)) ==
++                                    (generation & 1 ? 0ull : full_mask<kNumL1BlockNs>());
++                    } else if constexpr (kPhase == BlockPhase::SharedLinear2) {
++                        ready = ptx::ld_acq(workspace.get_shared_l2_full_count_ptr(m)) == SHARED_L1_SHAPE_N / BLOCK_N;
++                    }
++                }
++                const auto candidates = __ballot_sync(0xffffffff, ready);
++                if (not candidates)
++                    continue;
++                const uint32_t bias = (ptx::get_sm_idx() / 2 / kLocalClusters) % 32;
++                const uint32_t rotated = __funnelshift_r(candidates, candidates, bias);
++                const uint32_t owner = (__ffs(rotated) - 1 + bias) % 32;
++                uint32_t local_n = kLocalClusters;
++                if (lane == owner)
++                    local_n = ptx::atomic_add(reinterpret_cast<uint32_t*>(claims + m) + domain, 1u);
++                local_n = ptx::exchange(local_n, owner);
++                if (local_n >= kLocalClusters)
++                    continue;
++                const auto chosen_m = ptx::exchange(m, owner);
++                const auto chosen_n = domain * kLocalClusters + local_n;
++                if (lane == 0)
++                    ptx::atomic_add(scratch + kPhaseIndex * stride, uint64_t{1});
++                cursor = group;
++                if constexpr (kShared) {
++                    const auto valid_m = cute::min(num_tokens - chosen_m * BLOCK_M, BLOCK_M);
++                    result = task_info_t(kPhase, 0, chosen_m, chosen_n, chosen_m, valid_m, kShapeN, kShapeK);
++                } else {
++                    result = create_task(kPhase, chosen_m, chosen_n, kShapeN, kShapeK);
++                }
++                return true;
++            }
++        }
++        return false;
++    }
++
++    CUTLASS_DEVICE void ready_mainloop(const uint32_t num_tokens, uint64_t* scratch, const uint32_t stride) {
++        const auto lane = ptx::get_lane_idx();
++        const auto shared_blocks = kHasShared ? math::ceil_div(num_tokens, BLOCK_M) : 0u;
++        const auto starting_group = ptx::get_sm_idx() / 64;
++        uint32_t cursors[4] = {starting_group, starting_group, starting_group, starting_group};
++        uint32_t phase = 0;
++        bool counts_ready = false;
++        while (true) {
++            task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);
++            task_info_t task;
++            while (not task.is_valid()) {
++                if (not counts_ready)
++                    counts_ready = try_fetch_expert_recv_count();
++                for (uint32_t probe = 0; probe < 4 and not task.is_valid(); ++ probe) {
++                    const auto candidate = (phase + probe) % 4;
++                    if (candidate == 0 and (counts_ready or kStreamingInput))
++                        try_ready_task<BlockPhase::Linear2, L2_SHAPE_N, L2_SHAPE_K>(
++                            scratch, stride, num_tokens, num_total_m_blocks, cursors[1], task);
++                    if (candidate == 1 and (counts_ready or kStreamingInput))
++                        try_ready_task<BlockPhase::Linear1, L1_SHAPE_N, L1_SHAPE_K>(
++                            scratch, stride, num_tokens, num_total_m_blocks, cursors[0], task);
++                    if constexpr (kHasShared) {
++                        if (candidate == 2)
++                            try_ready_task<BlockPhase::SharedLinear2, SHARED_L2_SHAPE_N, SHARED_L2_SHAPE_K>(
++                                scratch, stride, num_tokens, shared_blocks, cursors[3], task);
++                        if (candidate == 3)
++                            try_ready_task<BlockPhase::SharedLinear1, SHARED_L1_SHAPE_N, SHARED_L1_SHAPE_K>(
++                                scratch, stride, num_tokens, shared_blocks, cursors[2], task);
++                    }
++                    if (task.is_valid())
++                        phase = (candidate + 1) % 4;
++                }
++                if (task.is_valid())
++                    break;
++                bool finished = counts_ready;
++                if (lane < 4) {
++                    const uint64_t expected = lane == 0 ? num_total_m_blocks * kNumL1Clusters :
++                                              lane == 1 ? num_total_m_blocks * kNumL2Clusters :
++                                              lane == 2 ? shared_blocks * (SHARED_L1_SHAPE_N / BLOCK_N / 2) :
++                                                          shared_blocks * (SHARED_L2_SHAPE_N / BLOCK_N / 2);
++                    finished &= ptx::ld_acq_gpu(scratch + lane * stride) == expected;
++                }
++                if (__all_sync(0xffffffff, finished)) {
++                    publish_task(task_info_t(), lane);
++                    return;
++                }
++            }
++            publish_task(task, lane);
++        }
++    }
++
++    CUTLASS_DEVICE void mainloop(const uint32_t& num_tokens, const uint8_t* sm_locality_domains,
++                                uint64_t* ready_workspace = nullptr, const uint32_t ready_stride = 0) {
+         const auto lane_idx = ptx::get_lane_idx();
+         sm_locality_domain_idx = kNumLocalityDomains == 1 ? 0u : sm_locality_domains[ptx::get_sm_idx()];
+ 
++        if (ready_workspace != nullptr) {
++            ready_mainloop(num_tokens, ready_workspace, ready_stride);
++            return;
++        }
++
+         // Shared L2 tasks go before the routed tasks if one wave fits the dispatch gap, else at the tail
+         constexpr uint32_t kNumSharedL2Clusters = SHARED_L2_SHAPE_N / BLOCK_N / 2;
+         const bool is_shared_l2_early = math::ceil_div(num_tokens, BLOCK_M) * kNumSharedL2Clusters <= kNumSMs / 2;
+diff --git a/deep_gemm/mega/__init__.py b/deep_gemm/mega/__init__.py
+index 2863757..d1f439f 100644
+--- a/deep_gemm/mega/__init__.py
++++ b/deep_gemm/mega/__init__.py
+@@ -31,13 +31,19 @@ class SymmBuffer:
+                  num_shared_experts: int = 0,
+                  mma_type: str = 'fp8xfp4',
+                  activation: str = 'swiglu',
+-                 base: Optional['SymmBuffer'] = None):
++                 base: Optional['SymmBuffer'] = None,
++                 routing_groups: int = 1):
+         # Align token count
+         num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
+ 
+         # Init
+         _validate_activation(activation)
+         self.group = group
++        if routing_groups < 1 or (routing_groups != 1 and mma_type not in ('fp8xfp4', 'fp8xfp8')):
++            raise ValueError('Routing groups require MXFP8 MegaMoE')
++        self.routing_groups = routing_groups
++        self.physical_num_experts = num_experts
++        num_experts *= routing_groups
+         self.num_experts = num_experts
+         self.num_max_tokens_per_rank = num_max_tokens_per_rank
+         self.num_topk = num_topk
+@@ -99,7 +105,8 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
+                                  num_shared_experts: int = 0,
+                                  use_fp8_dispatch: Union[bool, None] = None,
+                                  mma_type: str = 'fp8xfp4',
+-                                 activation: str = 'swiglu') -> SymmBuffer:
++                                 activation: str = 'swiglu',
++                                 routing_groups: int = 1) -> SymmBuffer:
+     # Backward compat: derive `mma_type` from `use_fp8_dispatch` if provided
+     if use_fp8_dispatch is not None:
+         assert use_fp8_dispatch == (mma_type.split('x')[0] == 'fp8')
+@@ -113,7 +120,7 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
+         num_max_tokens_per_rank, num_topk,
+         hidden, intermediate_hidden,
+         num_shared_experts,
+-        mma_type=mma_type, activation=activation
++        mma_type=mma_type, activation=activation, routing_groups=routing_groups
+     )
+ 
+ 
+@@ -185,8 +192,25 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
+                      activation_clamp: Optional[float] = None,
+                      fast_math: bool = True,
+                      activation_alpha: float = 1.0,
+-                     activation_beta: float = 0.0):
++                     activation_beta: float = 0.0,
++                     scheduler_workspace: Optional[torch.Tensor] = None,
++                     shared_output: Optional[torch.Tensor] = None,
++                     early_combine: bool = False,
++                     return_descriptors: Optional[torch.Tensor] = None,
++                     return_chunk_size: int = 0,
++                     input_descriptors: Optional[torch.Tensor] = None,
++                     input_chunk_size: int = 0,
++                     streaming_diagnostics: Optional[torch.Tensor] = None):
++    """Optionally write Shared independently for the first shared_output.size(0) rows.
++
++    In that mode y contains only the routed BF16 result; shared_output receives
++    BF16 Shared without combining or changing its rounding boundary.
++    """
+     _validate_activation(activation)
++    if scheduler_workspace is not None:
++        scheduler_workspace.zero_()
++    if streaming_diagnostics is not None:
++        streaming_diagnostics.zero_()
+     _C.fp8_fp4_mega_moe(
+         y,
+         l1_weights, l2_weights,
+@@ -199,7 +223,9 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
+         recipe,
+         activation, activation_clamp,
+         fast_math,
+-        activation_alpha, activation_beta
++        activation_alpha, activation_beta, scheduler_workspace, sym_buffer.routing_groups,
++        shared_output, early_combine, return_descriptors, return_chunk_size,
++        input_descriptors, input_chunk_size, streaming_diagnostics
+     )
+ 
+ def fp4_fp4_mega_moe(y: torch.Tensor,

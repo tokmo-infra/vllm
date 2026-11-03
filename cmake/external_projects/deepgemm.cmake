@@ -38,14 +38,20 @@ else()
   # (vllm-project/DeepGEMM#43).
   # Uses the PyTorch 2.11 stable ABI and CPython 3.10 limited API.
   set(_DEEPGEMM_UPSTREAM_TAG "5cdb145704ec4672ecf4b61441599521ce635df6")
+  set(_deepgemm_patch "${CMAKE_CURRENT_LIST_DIR}/../patches/deepgemm-roce-overlap.patch")
+  file(SHA256 "${_deepgemm_patch}" _deepgemm_patch_hash)
+  string(SUBSTRING "${_deepgemm_patch_hash}" 0 16 _deepgemm_patch_id)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_deepgemm_patch}")
 
   set(_deepgemm_fc_root "${FETCHCONTENT_BASE_DIR}")
   if(NOT _deepgemm_fc_root)
     set(_deepgemm_fc_root "${CMAKE_BINARY_DIR}/_deps")
   endif()
-  set(_deepgemm_src "${_deepgemm_fc_root}/deepgemm-src")
-  set(_deepgemm_bin "${_deepgemm_fc_root}/deepgemm-build")
-  set(_deepgemm_sub "${_deepgemm_fc_root}/deepgemm-subbuild")
+  # Keep each patch revision isolated; never reverse or overwrite edits in a
+  # previously configured checkout. Local DEEPGEMM_SRC_DIR remains user-owned.
+  set(_deepgemm_src "${_deepgemm_fc_root}/deepgemm-${_deepgemm_patch_id}-src")
+  set(_deepgemm_bin "${_deepgemm_fc_root}/deepgemm-${_deepgemm_patch_id}-build")
+  set(_deepgemm_sub "${_deepgemm_fc_root}/deepgemm-${_deepgemm_patch_id}-subbuild")
 
   if(EXISTS "${_deepgemm_src}/deep_gemm/_C.py")
     set(deepgemm_SOURCE_DIR "${_deepgemm_src}")
@@ -61,6 +67,22 @@ else()
       GIT_SUBMODULES "third-party/cutlass" "third-party/deep_jit"
       GIT_PROGRESS TRUE
     )
+  endif()
+  find_package(Git REQUIRED)
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" -C "${deepgemm_SOURCE_DIR}"
+            apply --reverse --check "${_deepgemm_patch}"
+    RESULT_VARIABLE _deepgemm_already_patched
+    OUTPUT_QUIET ERROR_QUIET)
+  if(NOT _deepgemm_already_patched EQUAL 0)
+    execute_process(
+      COMMAND "${GIT_EXECUTABLE}" -C "${deepgemm_SOURCE_DIR}"
+              apply --check "${_deepgemm_patch}"
+      COMMAND_ERROR_IS_FATAL ANY)
+    execute_process(
+      COMMAND "${GIT_EXECUTABLE}" -C "${deepgemm_SOURCE_DIR}"
+              apply "${_deepgemm_patch}"
+      COMMAND_ERROR_IS_FATAL ANY)
   endif()
   message(STATUS "DeepGEMM is available at ${deepgemm_SOURCE_DIR}")
 endif()

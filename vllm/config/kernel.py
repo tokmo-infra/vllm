@@ -342,6 +342,22 @@ class KernelConfig:
     """Pipeline dispatch, native compute and BF16 return with the verbs backend.
     Disable for a matched serial reference. NCCL always remains stream-ordered."""
 
+    hierarchical_mega_moe_native_overlap: bool = False
+    """Use native input readiness, early BF16 returns and separate Shared output.
+    Requires verbs, direct MXFP8 and the bundled streaming DeepGEMM API.
+    Experimental until matched full-model accuracy and throughput pass."""
+
+    hierarchical_mega_moe_native_chunk_size: int = Field(default=256, gt=0)
+    """Target source rows per input group. Top-k <= 3 uses half this target;
+    virtual-expert limits bound fragmentation independently of return chunks."""
+
+    hierarchical_mega_moe_dispatch_slots: int = Field(default=2, ge=1, le=8)
+    """Native input storage generations shared by sequential layers."""
+
+    hierarchical_mega_moe_return_slots: int = Field(default=2, ge=1, le=8)
+    """Native return storage generations. Send completion is joined at reuse,
+    allowing the previous layer's TX tail to overlap subsequent computation."""
+
     hierarchical_mega_moe_rdma_hcas: tuple[str, ...] = ()
     """One HCA name (optionally HCA:port) per host-local EP lane, in lane order.
     Required for verbs; GPU/NIC affinity must be verified for the deployment."""

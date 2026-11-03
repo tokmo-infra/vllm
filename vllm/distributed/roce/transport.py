@@ -30,10 +30,16 @@ class _Endpoint(Protocol):
         allocation_bytes: int,
         peer_bytes: int,
         row_bytes: int,
+        copy_self: bool = True,
+        acquire_before_send: bool = False,
     ) -> dict[str, Any]: ...
     def connect_job(self, id: int, remote: dict[str, Any]) -> None: ...
     def submit(self, id: int, stream: int, rows: int) -> None: ...
+    def reserve(self, id: int, stream: int) -> None: ...
+    def publish(self, id: int, stream: int, rows: int) -> None: ...
     def wait(self, id: int, stream: int, rows: int) -> None: ...
+    def wait_receive(self, id: int, stream: int, rows: int) -> None: ...
+    def wait_send(self, id: int, stream: int) -> None: ...
     def set_tracing(self, enabled: bool) -> None: ...
     def trace_snapshot(self) -> list[dict[str, Any]]: ...
     def close(self) -> None: ...
@@ -53,10 +59,25 @@ class _PeerEndpoints:
         for peer, endpoint in self.peers.items():
             endpoint.connect(remote[peer][self.rank])
 
-    def register_job(self, send, receive, allocation_bytes, peer_bytes, row_bytes):
+    def register_job(
+        self,
+        send,
+        receive,
+        allocation_bytes,
+        peer_bytes,
+        row_bytes,
+        copy_self=True,
+        acquire_before_send=False,
+    ):
         metadata = {
             peer: endpoint.register_job(
-                send, receive, allocation_bytes, peer_bytes, row_bytes
+                send,
+                receive,
+                allocation_bytes,
+                peer_bytes,
+                row_bytes,
+                copy_self,
+                acquire_before_send,
             )
             for peer, endpoint in self.peers.items()
         }
@@ -76,11 +97,27 @@ class _PeerEndpoints:
 
     def submit(self, id, stream, rows):
         for peer, endpoint in self.peers.items():
-            endpoint.submit(id, stream, rows + peer * 4)
+            endpoint.submit(id, stream, rows + peer * 4 if rows else 0)
+
+    def reserve(self, id, stream):
+        for endpoint in self.peers.values():
+            endpoint.reserve(id, stream)
+
+    def publish(self, id, stream, rows):
+        for peer, endpoint in self.peers.items():
+            endpoint.publish(id, stream, rows + peer * 4 if rows else 0)
 
     def wait(self, id, stream, rows):
         for peer, endpoint in self.peers.items():
-            endpoint.wait(id, stream, rows + peer * 4)
+            endpoint.wait(id, stream, rows + peer * 4 if rows else 0)
+
+    def wait_receive(self, id, stream, rows):
+        for peer, endpoint in self.peers.items():
+            endpoint.wait_receive(id, stream, rows + peer * 4 if rows else 0)
+
+    def wait_send(self, id, stream):
+        for endpoint in self.peers.values():
+            endpoint.wait_send(id, stream)
 
     def set_tracing(self, enabled):
         for endpoint in self.peers.values():
@@ -133,6 +170,47 @@ def _aligned_tensor(shape, dtype, device):
 
 
 @dataclass
+class PeerSignals:
+    """Mapped device addresses for one peer's stream/device handshake.
+
+    A producer publishes send_rows before request with a system release fence.
+    Consumers acquire receive_done before reading, then clear it before granting
+    receive_request again. Send storage stays immutable until send_done is
+    acquired and cleared. Each flag has one GPU writer and one CPU proxy writer.
+    """
+
+    request: int
+    send_done: int
+    receive_request: int
+    receive_done: int
+    send_rows: int
+    receive_rows: int
+
+
+class PeerBuffer:
+    """Aligned RDMA storage with CUDA IPC views on every local EP rank.
+
+    Allocate collectively before graph capture. Users must join all local
+    readers before reusing or releasing the storage. Tensor views retain the
+    underlying allocation and peer mappings.
+    """
+
+    def __init__(self, group, size_bytes):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Allocate peer buffers before CUDA capture")
+        size_bytes = (size_bytes + _ALIGNMENT - 1) // _ALIGNMENT * _ALIGNMENT
+        allocation = _extension().PeerAllocation(size_bytes)
+        peers = [None] * dist.get_world_size(group)
+        dist.all_gather_object(peers, allocation.info(), group=group)
+        allocation.connect(peers, dist.get_rank(group))
+        self.region = torch.from_dlpack(allocation.view())
+        self.peers = tuple(
+            torch.from_dlpack(allocation.view(peer)) for peer in range(len(peers))
+        )
+        self.buffer_ptrs = tuple(allocation.addresses())
+
+
+@dataclass
 class Transfer:
     endpoint: _Endpoint
     id: int
@@ -142,8 +220,37 @@ class Transfer:
     send_counts: torch.Tensor
     receive_counts: torch.Tensor
     capacity: int
+    peer_signals: dict[int, PeerSignals]
 
-    def submit(self, counts=None):
+    def reserve(self):
+        """Grant a receive credit after the preceding consumer on this stream."""
+        self.endpoint.reserve(self.id, torch.cuda.current_stream().cuda_stream)
+
+    def publish_fixed(self):
+        """Publish produced bytes after an earlier reserve, without counts."""
+        self.endpoint.publish(self.id, torch.cuda.current_stream().cuda_stream, 0)
+
+    def wait_receive(self, *, fixed=False):
+        """Make received bytes visible without waiting for outgoing sends."""
+        self.endpoint.wait_receive(
+            self.id,
+            torch.cuda.current_stream().cuda_stream,
+            0 if fixed else self.receive_counts.data_ptr(),
+        )
+
+    def wait_send(self):
+        """Release the send allocation only after the NIC has stopped reading."""
+        self.endpoint.wait_send(self.id, torch.cuda.current_stream().cuda_stream)
+
+    def submit_fixed(self):
+        """Publish the registered capacity without a device-to-host count copy."""
+        self.endpoint.submit(self.id, torch.cuda.current_stream().cuda_stream, 0)
+
+    def wait_fixed(self):
+        """Join a fixed-length exchange without copying its known row count."""
+        self.endpoint.wait(self.id, torch.cuda.current_stream().cuda_stream, 0)
+
+    def _prepare_counts(self, counts):
         if counts is None:
             self.send_counts.fill_(self.capacity)
         else:
@@ -155,6 +262,18 @@ class Transfer:
                 raise ValueError("Expected one CUDA int32 row count per host")
             self.send_counts.copy_(counts)
         self.receive_counts.copy_(self.send_counts)
+
+    def publish(self, counts=None):
+        """Publish produced data for a separately reserved receive epoch."""
+        self._prepare_counts(counts)
+        self.endpoint.publish(
+            self.id,
+            torch.cuda.current_stream().cuda_stream,
+            self.send_counts.data_ptr(),
+        )
+
+    def submit(self, counts=None):
+        self._prepare_counts(counts)
         self.endpoint.submit(
             self.id,
             torch.cuda.current_stream().cuda_stream,
@@ -205,6 +324,7 @@ class VerbsTransport:
         traffic_class: int = 0,
         timeout_seconds: int = 120,
         host_staging: bool = False,
+        peer_reads: bool = False,
     ):
         topology = groups.topology
         if len(topology.nodes) < 2:
@@ -223,6 +343,10 @@ class VerbsTransport:
         self.rank = dist.get_rank(groups.lane_group)
         self.size = len(topology.nodes)
         self.plans: dict[tuple, tuple[PipelineSlot, ...]] = {}
+        self.native_plans: dict[tuple, object] = {}
+        self.native_inputs: dict[tuple, object] = {}
+        self.native_outputs: dict[tuple, object] = {}
+        self.registered_transfers: list[Transfer] = []
         self.labels: dict[int, dict] = {}
         self.closed = False
         self.endpoint = _PeerEndpoints(self.rank)
@@ -254,6 +378,7 @@ class VerbsTransport:
                     peer,
                     self.size,
                     peer == peers[0],
+                    peer_reads,
                 )
             remote = self._peers(self.endpoint.info())
             self.endpoint.connect(remote)
@@ -270,9 +395,62 @@ class VerbsTransport:
         return peers
 
     def _transfer(self, shape, dtype, label):
-        assert self.endpoint is not None
         send, send_region = _aligned_tensor(shape, dtype, self.device)
         receive, receive_region = _aligned_tensor(shape, dtype, self.device)
+        return self.register_transfer(send, receive, send_region, receive_region, label)
+
+    def register_transfer(
+        self,
+        send,
+        receive,
+        send_region,
+        receive_region,
+        label,
+        *,
+        copy_self=True,
+        acquire_before_send=False,
+    ):
+        """Register existing aligned storage, including native symmetric buffers.
+
+        Regions include owned alignment padding. Logical tensors must start at
+        their respective region's base and have equal, contiguous peer-major
+        layouts. The returned transfer retains both regions until deregistration.
+        Set copy_self=False when the caller consumes the local partial directly,
+        including chunk views whose peer stride is larger than the payload.
+        With acquire_before_send, call wait_send before every producer, including
+        its first use. This permits deferring TX completion to slot reuse.
+        """
+        if self.closed or torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Register live RDMA storage before CUDA capture")
+        for tensor, region in ((send, send_region), (receive, receive_region)):
+            if (
+                tensor.ndim != 2
+                or tensor.shape[0] == 0
+                or tensor.shape[1] == 0
+                or tensor.shape[0] % self.size
+                or not tensor.is_contiguous()
+                or tensor.device != self.device
+                or region.dtype != torch.uint8
+                or region.device != self.device
+                or not region.is_contiguous()
+                or region.data_ptr() % _ALIGNMENT
+                or region.numel() % _ALIGNMENT
+                or tensor.data_ptr() != region.data_ptr()
+                or tensor.nbytes > region.nbytes
+            ):
+                raise ValueError("Invalid aligned peer-major RDMA storage")
+        if (
+            send.shape != receive.shape
+            or send.dtype != receive.dtype
+            or send_region.nbytes != receive_region.nbytes
+        ):
+            raise ValueError("RDMA send and receive layouts must match")
+        if (
+            send_region.data_ptr() < receive_region.data_ptr() + receive_region.nbytes
+            and receive_region.data_ptr() < send_region.data_ptr() + send_region.nbytes
+        ):
+            raise ValueError("RDMA send and receive regions must not overlap")
+        assert self.endpoint is not None
         try:
             metadata = self.endpoint.register_job(
                 send.data_ptr(),
@@ -280,6 +458,8 @@ class VerbsTransport:
                 send_region.numel(),
                 send.numel() * send.element_size() // self.size,
                 send[0].numel() * send.element_size(),
+                copy_self,
+                acquire_before_send,
             )
             self.endpoint.connect_job(metadata["id"], self._peers(metadata))
         except BaseException:
@@ -290,7 +470,7 @@ class VerbsTransport:
             "relaxed_ordering": metadata["relaxed_ordering"],
             "host_staging": metadata["host_staging"],
         }
-        return Transfer(
+        transfer = Transfer(
             self.endpoint,
             metadata["id"],
             send,
@@ -298,8 +478,21 @@ class VerbsTransport:
             (send_region, receive_region),
             torch.empty(self.size, dtype=torch.int32, device=self.device),
             torch.empty(self.size, dtype=torch.int32, device=self.device),
-            shape[0] // self.size,
+            send.shape[0] // self.size,
+            {
+                peer: PeerSignals(
+                    **{
+                        name: entry[f"{name}_address"]
+                        for name in PeerSignals.__dataclass_fields__
+                    }
+                )
+                for peer, entry in metadata["peers"].items()
+            },
         )
+        # The MR outlives a caller dropping its transfer or graph. Deregister
+        # before releasing storage, including externally allocated buffers.
+        self.registered_transfers.append(transfer)
+        return transfer
 
     def plan(self, capacity, width, row_bytes, dtype, return_dtype="bfloat16"):
         if self.closed:
@@ -362,6 +555,10 @@ class VerbsTransport:
         torch.accelerator.synchronize(self.device.index)
         self.endpoint.close()
         self.plans.clear()
+        self.native_plans.clear()
+        self.native_inputs.clear()
+        self.native_outputs.clear()
+        self.registered_transfers.clear()
         self.labels.clear()
         dist.destroy_process_group(self.bootstrap)
         self.closed = True

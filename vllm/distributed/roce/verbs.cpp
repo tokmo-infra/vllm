@@ -4,6 +4,7 @@
 // Multi-host GPUDirect transport. CUDA stream memory operations drive a CPU
 // verbs proxy; no communication kernel competes with native MegaMoE's grid.
 #include <cuda.h>
+#include <ATen/dlpack.h>
 #include <infiniband/verbs.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -16,6 +17,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -29,6 +31,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "protocol.h"
 
 namespace py = pybind11;
 using namespace pybind11::literals;
@@ -58,6 +62,90 @@ uint32_t load(const uint32_t* address) {
 void store(uint32_t* address, uint32_t value) {
   __atomic_store_n(address, value, __ATOMIC_RELEASE);
 }
+
+// CUDA IPC provides peer mappings for the cuMemAlloc storage required by this
+// DMA-BUF path. PyTorch's VMM symmetric allocator does not request RDMA-capable
+// allocations; do not silently ignore its unsupported SYNC_MEMOPS attribute.
+class PeerAllocation : public std::enable_shared_from_this<PeerAllocation> {
+ public:
+  explicit PeerAllocation(int64_t bytes) : bytes_(bytes) {
+    require(bytes > 0 && bytes % kPage == 0 && bytes < (int64_t{1} << 32),
+            "Peer storage must have a positive 64-KiB-padded size below 4 GiB");
+    cuda_check(cuCtxGetCurrent(&context_), "get peer-storage context");
+    require(context_ != nullptr, "Initialize CUDA before peer allocation");
+    cuda_check(cuCtxGetDevice(&device_), "get peer-storage device");
+    cuda_check(cuMemAlloc(&base_, bytes + kPage), "allocate peer RDMA storage");
+    address_ = (base_ + kPage - 1) / kPage * kPage;
+  }
+  ~PeerAllocation() {
+    if (cuCtxPushCurrent(context_) != CUDA_SUCCESS) return;
+    cuCtxSynchronize();
+    for (auto ptr : imported_) cuIpcCloseMemHandle(ptr);
+    if (base_) cuMemFree(base_);
+    CUcontext previous;
+    cuCtxPopCurrent(&previous);
+  }
+  py::dict info() const {
+    CUipcMemHandle handle;
+    cuda_check(cuIpcGetMemHandle(&handle, base_), "export peer RDMA storage");
+    return py::dict("handle"_a = py::bytes(reinterpret_cast<char*>(&handle), sizeof(handle)),
+                    "offset"_a = address_ - base_, "bytes"_a = bytes_);
+  }
+  void connect(const py::list& peers, uint32_t rank) {
+    require(addresses_.empty() && rank < peers.size(), "Invalid peer-storage rendezvous");
+    for (uint32_t peer = 0; peer < peers.size(); ++peer) {
+      auto metadata = peers[peer].cast<py::dict>();
+      auto raw = metadata["handle"].cast<std::string>();
+      auto offset = metadata["offset"].cast<uint64_t>();
+      require(raw.size() == sizeof(CUipcMemHandle) && offset < kPage &&
+                  metadata["bytes"].cast<int64_t>() == bytes_,
+              "Peer-storage layouts differ");
+      if (peer == rank) {
+        addresses_.push_back(address_);
+      } else {
+        CUipcMemHandle handle;
+        std::memcpy(&handle, raw.data(), sizeof(handle));
+        CUdeviceptr mapped;
+        cuda_check(cuIpcOpenMemHandle(&mapped, handle, CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS),
+                   "import peer RDMA storage");
+        imported_.push_back(mapped);
+        addresses_.push_back(mapped + offset);
+      }
+    }
+  }
+  std::vector<uint64_t> addresses() const { return addresses_; }
+  py::capsule view(int peer) {
+    struct View {
+      DLManagedTensor tensor{};
+      std::shared_ptr<PeerAllocation> owner;
+      int64_t shape;
+    };
+    auto address = peer < 0 ? address_ : addresses_.at(peer);
+    auto* view = new View;
+    view->owner = shared_from_this();
+    view->shape = bytes_;
+    view->tensor.manager_ctx = view;
+    view->tensor.dl_tensor = {reinterpret_cast<void*>(address), {kDLCUDA, device_},
+                              1, {kDLUInt, 8, 1}, &view->shape, nullptr, 0};
+    view->tensor.deleter = [](DLManagedTensor* tensor) {
+      delete static_cast<View*>(tensor->manager_ctx);
+    };
+    return py::capsule(&view->tensor, "dltensor", [](PyObject* capsule) {
+      if (PyCapsule_IsValid(capsule, "dltensor")) {
+        auto* tensor = static_cast<DLManagedTensor*>(PyCapsule_GetPointer(capsule, "dltensor"));
+        tensor->deleter(tensor);
+      }
+    });
+  }
+
+ private:
+  CUcontext context_ = nullptr;
+  CUdevice device_ = 0;
+  CUdeviceptr base_ = 0, address_ = 0;
+  int64_t bytes_;
+  std::vector<uint64_t> addresses_;
+  std::vector<CUdeviceptr> imported_;
+};
 
 struct Region {
   ibv_mr* mr = nullptr;
@@ -118,31 +206,41 @@ struct HostSend {
 struct alignas(64) Flags {
   alignas(64) uint32_t request;
   alignas(64) uint32_t done;
+  alignas(64) uint32_t receive_request;
+  alignas(64) uint32_t receive_done;
   alignas(64) uint32_t send_rows;
   alignas(64) uint32_t receive_rows;
 };
+enum class MessageKind : uint32_t { Credit = 1, Payload = 2 };
 struct Credit {
   uint64_t epoch;
   uint32_t job;
   uint32_t bytes;
+  MessageKind kind;
+  uint32_t reserved = 0;
 };
 struct Trace {
   uint64_t epoch, request_ns, post_ns, complete_ns, bytes;
   uint32_t job;
+  bool receive;
+  uint64_t cq_ns = 0, visibility_begin_ns = 0, visibility_end_ns = 0;
 };
 struct Job {
+  Job(uint32_t capacity, uint32_t row, uint32_t qps)
+      : bytes(capacity), row_bytes(row), state(capacity, row, qps) {}
   std::unique_ptr<Region> send_region, receive_region;
   std::unique_ptr<HostSend> host_send;
   CUevent produced = nullptr, staged = nullptr;
   uint64_t send, receive, remote_receive = 0;
   uint32_t remote_key = 0;
-  size_t bytes, row_bytes, active_bytes = 0, receive_bytes = 0;
-  std::array<size_t, 2> peer_bytes{};
+  size_t bytes, row_bytes;
+  vllm::roce::ExchangeState state;
   Flags* flags = nullptr;
   CUdeviceptr device_flags = 0;
-  bool connected = false, active = false, posted = false;
-  uint64_t epoch = 0, peer_epoch = 0, request_ns = 0, post_ns = 0;
-  uint32_t sent_mask = 0, received_mask = 0;
+  bool connected = false, copy_self = true, visibility_pending = false;
+  std::atomic<bool> visibility_ready{false};
+  uint64_t receive_cq_ns = 0, visibility_begin_ns = 0, visibility_end_ns = 0;
+  uint64_t request_ns = 0, receive_request_ns = 0, post_ns = 0;
   ~Job() {
     if (produced) cuEventDestroy(produced);
     if (staged) cuEventDestroy(staged);
@@ -154,7 +252,8 @@ class Endpoint {
  public:
   Endpoint(const std::string& hca, int port, int gid_index, int qps,
            int traffic_class, int timeout_seconds, int self, bool host_staging,
-           int peer = -1, int world = 2, bool copy_self = true)
+           int peer = -1, int world = 2, bool copy_self = true,
+           bool peer_reads = false)
       : port_(port),
         gid_index_(gid_index),
         count_(qps),
@@ -190,7 +289,11 @@ class Endpoint {
               &flush, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_FLUSH_WRITES_OPTIONS,
               device),
           "query GPUDirect flush support");
-      flush_ = ordering < CU_GPU_DIRECT_RDMA_WRITES_ORDERING_OWNER;
+      flush_scope_ = peer_reads
+                         ? CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TO_ALL_DEVICES
+                         : CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TO_OWNER;
+      flush_ = ordering < (peer_reads ? CU_GPU_DIRECT_RDMA_WRITES_ORDERING_ALL_DEVICES
+                                    : CU_GPU_DIRECT_RDMA_WRITES_ORDERING_OWNER);
       require(!flush_ || (flush & CU_FLUSH_GPU_DIRECT_RDMA_WRITES_OPTION_HOST),
               "GPU cannot make RDMA receives visible to the compute context");
       int devices = 0;
@@ -211,15 +314,17 @@ class Endpoint {
       pd_ = ibv_alloc_pd(context_);
       require(pd_ != nullptr, "Cannot allocate protection domain");
       cq_ =
-          ibv_create_cq(context_, count_ * kReceives * 2, nullptr, nullptr, 0);
+          ibv_create_cq(context_, (count_ + 1) * kReceives * 2, nullptr, nullptr, 0);
       require(cq_ != nullptr, "Cannot create completion queue");
-      credits_.resize(count_ * kReceives);
+      credits_.resize((count_ + 1) * kReceives);
       credit_mr_ =
           ibv_reg_mr(pd_, credits_.data(), credits_.size() * sizeof(Credit),
                      IBV_ACCESS_LOCAL_WRITE);
       require(credit_mr_ != nullptr, "Cannot register control receive memory");
       std::random_device random;
-      for (int q = 0; q < count_; ++q) {
+      // The last QP carries only credits/descriptors, so payload WRs cannot
+      // delay the control traffic needed by the opposite direction.
+      for (int q = 0; q <= count_; ++q) {
         ibv_qp_init_attr init{};
         init.send_cq = init.recv_cq = cq_;
         init.qp_type = IBV_QPT_RC;
@@ -254,7 +359,7 @@ class Endpoint {
     std::vector<uint32_t> numbers;
     for (auto* qp : qps_) numbers.push_back(qp->qp_num);
     return py::dict(
-        "protocol"_a = 2,
+        "protocol"_a = 4,
         "gid"_a = py::bytes(reinterpret_cast<const char*>(&gid_), 16),
         "qps"_a = numbers, "psns"_a = psns_,
         "mtu"_a = static_cast<int>(port_attr_.active_mtu));
@@ -262,7 +367,7 @@ class Endpoint {
 
   void connect(const py::dict& remote) {
     require(!connected_ && !closed_, "Endpoint already connected or closed");
-    require(remote["protocol"].cast<int>() == 2,
+    require(remote["protocol"].cast<int>() == 4,
             "Peer uses an incompatible MegaMoE RDMA protocol");
     std::string gid = remote["gid"].cast<std::string>();
     auto numbers = remote["qps"].cast<std::vector<uint32_t>>();
@@ -270,7 +375,7 @@ class Endpoint {
     require(gid.size() == 16 && numbers.size() == qps_.size() &&
                 psns.size() == qps_.size(),
             "Peer queue-pair configuration differs");
-    for (int q = 0; q < count_; ++q) {
+    for (int q = 0; q <= count_; ++q) {
       ibv_qp_attr attr{};
       attr.qp_state = IBV_QPS_RTR;
       attr.path_mtu = static_cast<ibv_mtu>(std::min(
@@ -305,12 +410,14 @@ class Endpoint {
               "Cannot move RC queue pair to RTS");
     }
     connected_ = true;
+    if (flush_) visibility_worker_ = std::thread([this] { make_visible(); });
     worker_ = std::thread([this] { progress(); });
   }
 
   py::dict register_job(uint64_t send, uint64_t receive,
                         size_t allocation_bytes, size_t peer_bytes,
-                        size_t row_bytes) {
+                        size_t row_bytes, bool copy_self = true,
+                        bool acquire_before_send = false) {
     require(connected_ && !closed_,
             "Connect endpoint before registering buffers");
     require(peer_bytes >= static_cast<size_t>(count_) &&
@@ -318,11 +425,12 @@ class Endpoint {
                 allocation_bytes >= world_ * peer_bytes && row_bytes > 0 &&
                 peer_bytes % row_bytes == 0,
             "Invalid peer-major buffer capacity");
-    auto job = std::make_unique<Job>();
+    auto job = std::make_unique<Job>(peer_bytes, row_bytes, count_);
     job->send = send;
     job->receive = receive;
     job->bytes = peer_bytes;
     job->row_bytes = row_bytes;
+    job->copy_self = copy_self;
     if (staging_stream_) {
       job->host_send = std::make_unique<HostSend>(pd_, peer_bytes);
       cuda_check(cuEventCreate(&job->produced, CU_EVENT_DISABLE_TIMING),
@@ -339,9 +447,12 @@ class Endpoint {
                        CU_MEMHOSTALLOC_PORTABLE | CU_MEMHOSTALLOC_DEVICEMAP),
         "allocate stream handshake flags");
     std::memset(job->flags, 0, sizeof(Flags));
+    // Pooled producers acquire even the first generation. Later acquisitions
+    // consume the preceding NIC completion before overwriting this slot.
+    job->flags->done = acquire_before_send ? 1 : 0;
     cuda_check(cuMemHostGetDevicePointer(&job->device_flags, job->flags, 0),
                "map stream handshake flags");
-    std::lock_guard<std::mutex> lock(mutex_);
+    auto lock = lock_api();
     require(connected_ && !closed_,
             "Connect endpoint before registering buffers");
     require(jobs_.size() < (1u << 24), "Too many registered transfers");
@@ -350,6 +461,12 @@ class Endpoint {
         py::dict("id"_a = id, "address"_a = receive,
                  "key"_a = job->receive_region->mr->rkey,
                  "bytes"_a = peer_bytes, "row_bytes"_a = row_bytes,
+                 "request_address"_a = job->device_flags + offsetof(Flags, request),
+                 "send_done_address"_a = job->device_flags + offsetof(Flags, done),
+                 "receive_request_address"_a = job->device_flags + offsetof(Flags, receive_request),
+                 "receive_done_address"_a = job->device_flags + offsetof(Flags, receive_done),
+                 "send_rows_address"_a = job->device_flags + offsetof(Flags, send_rows),
+                 "receive_rows_address"_a = job->device_flags + offsetof(Flags, receive_rows),
                  "relaxed_ordering"_a = job->receive_region->relaxed_ordering,
                  "host_staging"_a = staging_stream_ != nullptr);
     jobs_.push_back(std::move(job));
@@ -357,7 +474,7 @@ class Endpoint {
   }
 
   void connect_job(uint32_t id, const py::dict& remote) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    auto lock = lock_api();
     auto& job = *jobs_.at(id);
     require(!job.connected && remote["id"].cast<uint32_t>() == id &&
                 remote["bytes"].cast<size_t>() == job.bytes &&
@@ -369,19 +486,39 @@ class Endpoint {
   }
 
   void submit(uint32_t id, uint64_t stream_pointer, uint64_t rows_pointer) {
+    reserve(id, stream_pointer);
+    publish(id, stream_pointer, rows_pointer);
+  }
+
+  void reserve(uint32_t id, uint64_t stream_pointer) {
+    CUdeviceptr request;
+    {
+      auto lock = lock_api();
+      const auto& job = *jobs_.at(id);
+      require(job.connected && !closed_, "Transfer is not connected");
+      request = job.device_flags + offsetof(Flags, receive_request);
+    }
+    cuda_check(cuStreamWriteValue32(reinterpret_cast<CUstream>(stream_pointer),
+                                    request, 1, CU_STREAM_WRITE_VALUE_DEFAULT),
+               "grant receive storage");
+  }
+
+  void publish(uint32_t id, uint64_t stream_pointer, uint64_t rows_pointer) {
     uint64_t send, receive, request, rows_device;
     uint32_t* rows_host;
     size_t bytes, row_bytes;
+    bool copy_self;
     void* host_send = nullptr;
     CUevent produced = nullptr, staged = nullptr;
     {
-      std::lock_guard<std::mutex> lock(mutex_);
+      auto lock = lock_api();
       const auto& job = *jobs_.at(id);
       require(job.connected && !closed_, "Transfer is not connected");
       send = job.send;
       receive = job.receive;
       bytes = job.bytes;
       row_bytes = job.row_bytes;
+      copy_self = copy_self_ && job.copy_self;
       request = job.device_flags + offsetof(Flags, request);
       rows_device = job.device_flags + offsetof(Flags, send_rows);
       rows_host = &job.flags->send_rows;
@@ -394,7 +531,7 @@ class Endpoint {
     // CUDA enqueue calls can block when the stream command queue is full.
     // The proxy must still drain RDMA while the GPU waits for a completion.
     auto stream = reinterpret_cast<CUstream>(stream_pointer);
-    if (copy_self_)
+    if (copy_self)
       cuda_check(cuMemcpyDtoDAsync(receive + self_ * bytes,
                                    send + self_ * bytes, bytes, stream),
                  "copy self contribution");
@@ -426,23 +563,42 @@ class Endpoint {
   }
 
   void wait(uint32_t id, uint64_t stream_pointer, uint64_t rows_pointer) {
+    wait_receive(id, stream_pointer, rows_pointer);
+    wait_send(id, stream_pointer);
+  }
+
+  void wait_send(uint32_t id, uint64_t stream_pointer) {
     CUdeviceptr done;
     CUevent staged;
-    const uint32_t* rows_host;
     {
-      std::lock_guard<std::mutex> lock(mutex_);
+      auto lock = lock_api();
       const auto& job = *jobs_.at(id);
       require(job.connected && !closed_, "Transfer is not connected");
       done = job.device_flags + offsetof(Flags, done);
       staged = job.staged;
-      rows_host = &job.flags->receive_rows;
     }
     auto stream = reinterpret_cast<CUstream>(stream_pointer);
-    // The memory wait alone does not join a forked CUDA graph capture stream.
     if (staged)
       cuda_check(cuStreamWaitEvent(stream, staged, 0), "join send staging");
     cuda_check(cuStreamWaitValue32(stream, done, 1, CU_STREAM_WAIT_VALUE_EQ),
-               "wait for RDMA completion");
+               "wait for RDMA send completion");
+    cuda_check(cuStreamWriteValue32(stream, done, 0, CU_STREAM_WRITE_VALUE_DEFAULT),
+               "release RDMA send completion");
+  }
+
+  void wait_receive(uint32_t id, uint64_t stream_pointer, uint64_t rows_pointer) {
+    CUdeviceptr done;
+    const uint32_t* rows_host;
+    {
+      auto lock = lock_api();
+      const auto& job = *jobs_.at(id);
+      require(job.connected && !closed_, "Transfer is not connected");
+      done = job.device_flags + offsetof(Flags, receive_done);
+      rows_host = &job.flags->receive_rows;
+    }
+    auto stream = reinterpret_cast<CUstream>(stream_pointer);
+    cuda_check(cuStreamWaitValue32(stream, done, 1, CU_STREAM_WAIT_VALUE_EQ),
+               "wait for RDMA receive completion");
     if (rows_pointer)
       cuda_check(
           cuMemcpyHtoDAsync(rows_pointer, rows_host, sizeof(uint32_t), stream),
@@ -453,18 +609,22 @@ class Endpoint {
   }
 
   void set_tracing(bool enabled) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    auto lock = lock_api();
     tracing_ = enabled;
     traces_.clear();
   }
   py::list trace_snapshot() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    auto lock = lock_api();
     py::list result;
     for (const auto& t : traces_)
       result.append(
           py::dict("job"_a = t.job, "epoch"_a = t.epoch,
                    "request_ns"_a = t.request_ns, "post_ns"_a = t.post_ns,
-                   "complete_ns"_a = t.complete_ns, "bytes"_a = t.bytes));
+                   "complete_ns"_a = t.complete_ns, "bytes"_a = t.bytes,
+                   "direction"_a = t.receive ? "receive" : "send",
+                   "cq_ns"_a = t.cq_ns,
+                   "visibility_begin_ns"_a = t.visibility_begin_ns,
+                   "visibility_end_ns"_a = t.visibility_end_ns));
     return result;
   }
 
@@ -474,11 +634,32 @@ class Endpoint {
     if (closed_) return;
     stopping_.store(true);
     if (worker_.joinable()) worker_.join();
+    {
+      std::lock_guard<std::mutex> lock(visibility_mutex_);
+      visibility_stopping_ = true;
+    }
+    visibility_changed_.notify_one();
+    if (visibility_worker_.joinable()) visibility_worker_.join();
     release();
     closed_ = true;
   }
 
  private:
+  std::unique_lock<std::mutex> lock_api() {
+    // std::mutex is not fair. A busy proxy must not repeatedly reacquire it
+    // while the model thread is trying to enqueue the next rank's GPU work.
+    // Otherwise peer resident kernels can wait for a rank starved on this lock.
+    api_waiters_.fetch_add(1, std::memory_order_acq_rel);
+    try {
+      std::unique_lock<std::mutex> lock(mutex_);
+      api_waiters_.fetch_sub(1, std::memory_order_release);
+      return lock;
+    } catch (...) {
+      api_waiters_.fetch_sub(1, std::memory_order_release);
+      throw;
+    }
+  }
+
   void post_receive(size_t index) {
     ibv_sge sge{};
     sge.addr = reinterpret_cast<uint64_t>(&credits_[index]);
@@ -491,8 +672,9 @@ class Endpoint {
     require(ibv_post_recv(qps_[index / kReceives], &wr, &bad) == 0,
             "Cannot post receive credit");
   }
-  void advertise(uint32_t id, Job& job) {
-    Credit credit{job.epoch, id, static_cast<uint32_t>(job.active_bytes)};
+  void advertise(uint32_t id, uint64_t epoch, MessageKind kind,
+                 uint32_t bytes = 0) {
+    Credit credit{epoch, id, bytes, kind};
     ibv_sge sge{};
     sge.addr = reinterpret_cast<uint64_t>(&credit);
     sge.length = sizeof(credit);
@@ -502,23 +684,16 @@ class Endpoint {
     wr.send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
     wr.sg_list = &sge;
     wr.num_sge = 1;
-    require(ibv_post_send(qps_[0], &wr, &bad) == 0,
+    require(ibv_post_send(qps_.back(), &wr, &bad) == 0,
             "Cannot advertise receive credit");
   }
   void post_data(uint32_t id, Job& job) {
     job.post_ns = now_ns();
-    job.posted = true;
-    job.receive_bytes = job.peer_bytes[job.epoch % 2];
+    job.state.mark_posted();
     for (int q = 0; q < count_; ++q) {
-      if (job.receive_bytes * q / count_ ==
-          job.receive_bytes * (q + 1) / count_)
-        job.received_mask |= 1u << q;
-      size_t begin = job.active_bytes * q / count_;
-      size_t end = job.active_bytes * (q + 1) / count_;
-      if (begin == end) {
-        job.sent_mask |= 1u << q;
-        continue;
-      }
+      size_t begin = uint64_t(job.state.send_bytes) * q / count_;
+      size_t end = uint64_t(job.state.send_bytes) * (q + 1) / count_;
+      if (begin == end) continue;
       ibv_sge sge{};
       sge.addr =
           job.host_send
@@ -554,85 +729,149 @@ class Endpoint {
         require(wc.byte_len == sizeof(Credit), "Invalid receive-credit length");
         auto credit = credits_.at(wc.wr_id);
         auto& job = *jobs_.at(credit.job);
-        require(credit.epoch == job.peer_epoch + 1,
-                "Duplicate or out-of-order receive credit");
-        require(credit.epoch <= job.epoch + 1,
-                "Receive credit is more than one epoch ahead");
-        job.peer_epoch = credit.epoch;
-        require(credit.bytes <= job.bytes && credit.bytes % job.row_bytes == 0,
-                "Peer row count exceeds registered capacity");
-        // An empty receive can let the peer finish before our proxy posts.
-        // Retain the current length when its next credit arrives early.
-        job.peer_bytes[credit.epoch % 2] = credit.bytes;
+        if (credit.kind == MessageKind::Credit) {
+          require(credit.bytes == 0, "Receive credit carries a payload length");
+          job.state.accept_credit(credit.epoch);
+        } else {
+          require(credit.kind == MessageKind::Payload, "Unknown control message");
+          job.state.accept_descriptor(credit.epoch, credit.bytes);
+        }
         post_receive(wc.wr_id);
       } else if (wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
         auto tag = ntohl(wc.imm_data);
         auto& job = *jobs_.at(tag >> 8);
         unsigned int q = tag & 255;
-        require(job.active && q < static_cast<unsigned>(count_) &&
-                    !(job.received_mask & (1u << q)),
-                "Unexpected or duplicate RDMA receive");
-        job.received_mask |= 1u << q;
+        job.state.complete_receive_stripe(q);
         post_receive(wc.wr_id);
       } else if (!(wc.wr_id & kControlSend)) {
         auto& job = *jobs_.at(wc.wr_id >> 8);
         unsigned int q = wc.wr_id & 255;
-        require(job.active && q < static_cast<unsigned>(count_) &&
-                    !(job.sent_mask & (1u << q)),
-                "Unexpected or duplicate RDMA send completion");
-        job.sent_mask |= 1u << q;
+        job.state.complete_send_stripe(q);
       }
+    }
+  }
+  // A peer-visible flush may block in the CUDA driver. It must not hold the
+  // verbs lock or prevent posting unrelated sends and receive credits.
+  void make_visible() noexcept {
+    try {
+      cuda_check(cuCtxSetCurrent(cuda_context_), "set visibility CUDA context");
+      std::vector<Job*> batch;
+      while (true) {
+        {
+          std::unique_lock<std::mutex> lock(visibility_mutex_);
+          visibility_changed_.wait(lock, [this] {
+            return visibility_stopping_ || !visibility_queue_.empty();
+          });
+          if (visibility_queue_.empty() && visibility_stopping_) return;
+          batch.swap(visibility_queue_);
+        }
+        const auto begin = now_ns();
+        cuda_check(cuFlushGPUDirectRDMAWrites(
+                       CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TARGET_CURRENT_CTX,
+                       flush_scope_),
+                   "flush GPUDirect receives");
+        const auto end = now_ns();
+        for (auto* job : batch) {
+          job->visibility_begin_ns = begin;
+          job->visibility_end_ns = end;
+          job->visibility_ready.store(true, std::memory_order_release);
+        }
+        batch.clear();
+      }
+    } catch (const std::exception& error) {
+      std::fprintf(stderr, "MegaMoE RDMA visibility failed: %s\n", error.what());
+      std::fflush(stderr);
+      std::_Exit(EXIT_FAILURE);
     }
   }
   void progress() noexcept {
     try {
       cuda_check(cuCtxSetCurrent(cuda_context_), "set proxy CUDA context");
       while (!stopping_.load(std::memory_order_relaxed)) {
+        if (api_waiters_.load(std::memory_order_acquire)) {
+          std::this_thread::yield();
+          continue;
+        }
         {
           std::lock_guard<std::mutex> lock(mutex_);
           poll();
-          for (uint32_t id = 0; id < jobs_.size(); ++id) {
+          const uint32_t size = jobs_.size();
+          uint32_t next_send = size;
+          for (uint32_t step = 0; step < size; ++step) {
+            const uint32_t id = (scan_start_ + step) % size;
             auto& job = *jobs_[id];
             if (!job.connected) continue;
-            if (!job.active && load(&job.flags->request)) {
-              require(!load(&job.flags->done),
-                      "Transfer reused before GPU acknowledgement");
-              require(job.epoch != std::numeric_limits<uint64_t>::max(),
-                      "RDMA epoch overflow");
-              ++job.epoch;
-              job.active_bytes =
-                  size_t(load(&job.flags->send_rows)) * job.row_bytes;
-              require(job.active_bytes <= job.bytes,
-                      "Outgoing row count exceeds registered capacity");
-              job.active = true;
-              job.request_ns = now_ns();
-              advertise(id, job);
+            auto& state = job.state;
+            if (!state.receiving && load(&job.flags->receive_request)) {
+              require(!load(&job.flags->receive_done),
+                      "Receive reused before GPU acknowledgement");
+              state.begin_receive();
+              job.receive_request_ns = now_ns();
+              advertise(id, state.receive_epoch, MessageKind::Credit);
             }
-            if (!job.active) continue;
-            require(now_ns() - job.request_ns <= timeout_ns_,
-                    "RDMA timeout at job " + std::to_string(id) + ", epoch " +
-                        std::to_string(job.epoch) + ", peer epoch " +
-                        std::to_string(job.peer_epoch) + ", send mask " +
-                        std::to_string(job.sent_mask) + ", receive mask " +
-                        std::to_string(job.received_mask));
-            // Both endpoints grant a credit only after their GPU consumed the
-            // previous receive and finished producing the next send.
-            if (!job.posted && job.peer_epoch >= job.epoch) post_data(id, job);
-            unsigned int all = (1u << count_) - 1;
-            if (job.sent_mask != all || job.received_mask != all) continue;
-            if (flush_)
-              cuda_check(cuFlushGPUDirectRDMAWrites(
-                             CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TARGET_CURRENT_CTX,
-                             CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TO_OWNER),
-                         "flush GPUDirect receives");
-            if (tracing_ && traces_.size() < 100000)
-              traces_.push_back({job.epoch, job.request_ns, job.post_ns,
-                                 now_ns(), job.active_bytes, id});
-            job.active = job.posted = false;
-            job.sent_mask = job.received_mask = 0;
-            store(&job.flags->request, 0);
-            store(&job.flags->receive_rows, job.receive_bytes / job.row_bytes);
-            store(&job.flags->done, 1);
+            if (!state.sending && load(&job.flags->request)) {
+              require(!load(&job.flags->done),
+                      "Send reused before GPU acknowledgement");
+              const uint64_t bytes =
+                  uint64_t(load(&job.flags->send_rows)) * job.row_bytes;
+              require(bytes <= job.bytes,
+                      "Outgoing row count exceeds registered capacity");
+              state.begin_send(bytes);
+              job.request_ns = now_ns();
+              advertise(id, state.send_epoch, MessageKind::Payload, bytes);
+            }
+            // Idle graph shapes need no clock read or error-string allocation.
+            const uint64_t now = (state.sending || state.receiving) ? now_ns() : 0;
+            if (state.sending && now - job.request_ns > timeout_ns_)
+              throw std::runtime_error(
+                  "RDMA send timeout at job " + std::to_string(id) +
+                  ", epoch " + std::to_string(state.send_epoch));
+            if (state.receiving && now - job.receive_request_ns > timeout_ns_)
+              throw std::runtime_error(
+                  "RDMA receive timeout at job " + std::to_string(id) +
+                  ", epoch " + std::to_string(state.receive_epoch));
+            if (state.can_post() && next_send == size) next_send = id;
+            if (state.send_complete()) {
+              if (tracing_ && traces_.size() < 100000)
+                traces_.push_back({state.send_epoch, job.request_ns, job.post_ns,
+                                   now_ns(), state.send_bytes, id, false});
+              state.finish_send();
+              store(&job.flags->request, 0);
+              store(&job.flags->done, 1);
+            }
+            if (state.receive_complete() && !job.visibility_pending) {
+              job.receive_cq_ns = now_ns();
+              job.visibility_pending = true;
+              job.visibility_begin_ns = job.visibility_end_ns = 0;
+              job.visibility_ready.store(!flush_, std::memory_order_relaxed);
+              if (flush_) {
+                {
+                  std::lock_guard<std::mutex> visibility_lock(visibility_mutex_);
+                  visibility_queue_.push_back(&job);
+                }
+                visibility_changed_.notify_one();
+              }
+            }
+            if (job.visibility_pending &&
+                job.visibility_ready.load(std::memory_order_acquire)) {
+              const uint32_t bytes = state.receive_bytes();
+              if (tracing_ && traces_.size() < 100000)
+                traces_.push_back({state.receive_epoch, job.receive_request_ns, 0,
+                                   now_ns(), bytes, id, true, job.receive_cq_ns,
+                                   job.visibility_begin_ns, job.visibility_end_ns});
+              state.finish_receive();
+              job.visibility_pending = false;
+              store(&job.flags->receive_rows, bytes / job.row_bytes);
+              store(&job.flags->receive_request, 0);
+              store(&job.flags->receive_done, 1);
+            }
+          }
+          // Visit every completion and credit before posting another payload.
+          // Rotate the first candidate so ready returns and later input groups
+          // receive service even while an earlier slot is repeatedly reused.
+          if (next_send != size) {
+            post_data(next_send, *jobs_[next_send]);
+            scan_start_ = (next_send + 1) % size;
           }
         }
         std::this_thread::yield();
@@ -677,28 +916,50 @@ class Endpoint {
   std::vector<uint32_t> psns_;
   std::vector<Credit> credits_;
   std::vector<std::unique_ptr<Job>> jobs_;
+  uint32_t scan_start_ = 0;
   std::vector<Trace> traces_;
   std::mutex mutex_;
-  std::thread worker_;
+  std::atomic<uint32_t> api_waiters_{0};
+  std::thread worker_, visibility_worker_;
+  std::mutex visibility_mutex_;
+  std::condition_variable visibility_changed_;
+  std::vector<Job*> visibility_queue_;
+  bool visibility_stopping_ = false;
   std::atomic<bool> stopping_{false};
   bool connected_ = false, closed_ = false, flush_ = false, tracing_ = false;
+  CUflushGPUDirectRDMAWritesScope flush_scope_ =
+      CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TO_OWNER;
 };
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  py::class_<PeerAllocation, std::shared_ptr<PeerAllocation>>(module, "PeerAllocation")
+      .def(py::init<int64_t>())
+      .def("info", &PeerAllocation::info)
+      .def("connect", &PeerAllocation::connect)
+      .def("addresses", &PeerAllocation::addresses)
+      .def("view", &PeerAllocation::view, py::arg("peer") = -1);
   py::class_<Endpoint>(module, "Endpoint")
       .def(py::init<const std::string&, int, int, int, int, int, int, bool, int,
-                    int, bool>(),
+                    int, bool, bool>(),
            py::arg("hca"), py::arg("port"), py::arg("gid_index"),
            py::arg("qps"), py::arg("traffic_class"), py::arg("timeout_seconds"),
            py::arg("self"), py::arg("host_staging"), py::arg("peer") = -1,
-           py::arg("world") = 2, py::arg("copy_self") = true)
+           py::arg("world") = 2, py::arg("copy_self") = true,
+           py::arg("peer_reads") = false)
       .def("info", &Endpoint::info)
       .def("connect", &Endpoint::connect)
-      .def("register_job", &Endpoint::register_job)
+      .def("register_job", &Endpoint::register_job,
+           py::arg("send"), py::arg("receive"), py::arg("allocation_bytes"),
+           py::arg("peer_bytes"), py::arg("row_bytes"), py::arg("copy_self") = true,
+           py::arg("acquire_before_send") = false)
       .def("connect_job", &Endpoint::connect_job)
       .def("submit", &Endpoint::submit)
+      .def("reserve", &Endpoint::reserve)
+      .def("publish", &Endpoint::publish)
       .def("wait", &Endpoint::wait)
+      .def("wait_receive", &Endpoint::wait_receive)
+      .def("wait_send", &Endpoint::wait_send)
       .def("set_tracing", &Endpoint::set_tracing)
       .def("trace_snapshot", &Endpoint::trace_snapshot)
       .def("close", &Endpoint::close, py::call_guard<py::gil_scoped_release>());

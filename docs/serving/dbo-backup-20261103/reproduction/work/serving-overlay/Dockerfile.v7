@@ -1,0 +1,5 @@
+FROM xinhao-vllm-roce-megamoe:4110f55-donly
+COPY vllm/ /usr/local/lib/python3.12/dist-packages/vllm/
+COPY deep_gemm_overlap/ /opt/dbo-isolated/deep_gemm_overlap/
+COPY manifest.json /opt/dbo-isolated/manifest.json
+ENV PYTHONPATH=/opt/dbo-isolated

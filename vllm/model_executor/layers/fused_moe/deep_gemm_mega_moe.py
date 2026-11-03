@@ -322,6 +322,23 @@ class DeepGemmMegaMoEExperts(nn.Module):
         # The first of each expert's w1/w3 weight_scale_2 until the other loads.
         self._pending_l1_scales: dict[int, tuple[str, float]] = {}
 
+        self._native_overlap = (
+            vllm_config.kernel_config.hierarchical_mega_moe_native_overlap
+        )
+        self._native_chunk_size = (
+            vllm_config.kernel_config.hierarchical_mega_moe_native_chunk_size
+        )
+        self._native_dispatch_slot = (
+            self.layer_id
+            % vllm_config.kernel_config.hierarchical_mega_moe_dispatch_slots
+            if self._native_overlap
+            else 0
+        )
+        self._native_return_slot = (
+            self.layer_id % vllm_config.kernel_config.hierarchical_mega_moe_return_slots
+            if self._native_overlap
+            else 0
+        )
         self.num_shared_experts, self.shared_spec = self._fusable_shared_experts(
             shared_experts
         )
@@ -337,13 +354,26 @@ class DeepGemmMegaMoEExperts(nn.Module):
 
             if get_tensor_model_parallel_world_size() != 1:
                 raise ValueError("RDMA MegaMoE currently requires TP1")
-            if weight_format != MEGA_MOE_MXFP4 or self.has_fused_shared_experts:
-                raise ValueError("RDMA MegaMoE requires MXFP4 and unfused shared MLP")
+            if weight_format != MEGA_MOE_MXFP4 or (
+                self.has_fused_shared_experts and not self._native_overlap
+            ):
+                raise ValueError(
+                    "RDMA MegaMoE requires MXFP4; Shared fusion requires native overlap"
+                )
             if vllm_config.parallel_config.use_ubatching:
                 raise ValueError(
                     "Hierarchical MegaMoE does not support DBO or ubatching"
                 )
             config = vllm_config.kernel_config
+            if self._native_overlap and (
+                config.hierarchical_mega_moe_transport != "verbs"
+                or config.hierarchical_mega_moe_wire_dtype != "mxfp8"
+                or config.hierarchical_mega_moe_return_dtype != "bfloat16"
+                or config.hierarchical_mega_moe_rdma_host_staging
+            ):
+                raise ValueError(
+                    "Native overlap requires direct verbs MXFP8/BF16 storage"
+                )
             ep = get_ep_group()
             groups = get_hierarchical_groups(ep.device_group, ep.cpu_group)
             if len(groups.topology.nodes) < 2:
@@ -367,6 +397,7 @@ class DeepGemmMegaMoEExperts(nn.Module):
                     traffic_class=config.hierarchical_mega_moe_rdma_traffic_class,
                     timeout_seconds=config.hierarchical_mega_moe_rdma_timeout_seconds,
                     host_staging=config.hierarchical_mega_moe_rdma_host_staging,
+                    peer_reads=self._native_overlap,
                 )
             self.hierarchy = HierarchicalMegaMoE(
                 groups,
@@ -682,16 +713,18 @@ class DeepGemmMegaMoEExperts(nn.Module):
         dst = dst.view(-1, 2, 2, 8, 4, k)[:, :, half].permute(0, 3, 1, 2, 4)
         return dst, src.reshape(-1, 4, 2, 8, k)
 
-    def get_symm_buffer(self):
+    def get_symm_buffer(self, *, routing_groups=1, token_capacity=None):
         from vllm.utils.deep_gemm import _import_deep_gemm
 
         deep_gemm = _import_deep_gemm()
         group = self._mega_group or get_ep_group().device_group
+        token_capacity = token_capacity or self.max_num_tokens
         key = (
             id(group),
             torch.accelerator.current_device_index(),
             self._kernel_num_experts,
-            self.max_num_tokens,
+            token_capacity,
+            routing_groups,
             self.top_k,
             self.hidden_size,
             self.intermediate_size,
@@ -705,7 +738,7 @@ class DeepGemmMegaMoEExperts(nn.Module):
             args = (
                 group,
                 self._kernel_num_experts,
-                self.max_num_tokens,
+                token_capacity,
                 self.top_k,
                 self.hidden_size,
                 self.intermediate_size,
@@ -724,6 +757,11 @@ class DeepGemmMegaMoEExperts(nn.Module):
                     num_shared_experts=self.num_shared_experts,
                     mma_type=self.weight_format.mma_type,
                     activation=self.activation.name,
+                    **(
+                        {"routing_groups": routing_groups}
+                        if routing_groups != 1
+                        else {}
+                    ),
                 )
             self._symm_buffers[key] = symm_buffer
         return symm_buffer
@@ -911,7 +949,63 @@ class DeepGemmMegaMoEExperts(nn.Module):
             ),
             fixed_capacity=fixed_capacity,
             local_moe_mxfp8=self._forward_mxfp8 if self._direct_mxfp8 else None,
+            native_moe=self._forward_streaming if self._native_overlap else None,
+            native_chunk_size=max(
+                1, self._native_chunk_size // (2 if self.top_k <= 3 else 1)
+            ),
+            native_dispatch_slot=self._native_dispatch_slot,
+            native_return_slot=self._native_return_slot,
         )
+
+    def _forward_streaming(self, plan, hidden, weights, ids):
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        dg = _import_deep_gemm()
+        groups = plan.nodes * plan.chunks
+        buffer = self.get_symm_buffer(
+            routing_groups=groups,
+            token_capacity=math.ceil(self.max_num_tokens / 1024) * 1024 * plan.nodes,
+        )
+        kwargs = dict(self._kernel_kwargs)
+        shared = None
+        if self.has_fused_shared_experts:
+            block_m = dg.get_block_m_for_mega_moe(
+                plan.groups.topology.local_size,
+                buffer.num_experts,
+                buffer.num_max_tokens_per_rank,
+                plan.nodes * plan.tokens,
+                self.top_k,
+                self.weight_format.mma_type,
+            )
+            # Shared owns only this rank's source rows. Routed input is pulled
+            # from wire descriptors, independently of this local x prefix.
+            prepare_megamoe_inputs(
+                hidden,
+                weights,
+                ids,
+                buffer.x[: plan.tokens],
+                buffer.x_sf[: plan.tokens],
+                buffer.topk_idx[: plan.tokens],
+                buffer.topk_weights[: plan.tokens],
+                shared_x_sf=buffer.shared_l1_acts_sf,
+                shared_block_m=block_m,
+            )
+            shared = plan.shared_output
+            kwargs.update(
+                shared_l1_weights=self._kernel_weights("shared_l1"),
+                shared_l2_weights=self._kernel_weights("shared_l2"),
+                shared_output=shared,
+            )
+        kwargs.update(
+            scheduler_workspace=plan.scheduler_workspace(buffer),
+            early_combine=True,
+            input_descriptors=plan.input_descriptors,
+            input_chunk_size=plan.capacity,
+            return_descriptors=plan.return_descriptors,
+            return_chunk_size=plan.return_chunk,
+        )
+        self._launch_mega_moe(dg, plan.partial, buffer, kwargs)
+        return shared
 
     def _launch_mega_moe(self, deep_gemm, output, buffer, kwargs):
         getattr(deep_gemm, self.weight_format.kernel)(
