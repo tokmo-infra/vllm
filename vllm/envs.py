@@ -285,6 +285,8 @@ if TYPE_CHECKING:
     VLLM_ENABLE_STARTUP_PLAN: bool = False
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
     VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT: bool = False
+    VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION: bool = False
+    VLLM_HOT_TAIL_ADMISSION_DIAGNOSTICS: bool = False
     VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS: bool = False
     VLLM_SYSTEM_START_DATE: str | None = None
     VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY: bool = False
@@ -1996,6 +1998,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(
         int(os.getenv("VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", "0"))
     ),
+    # Experimental P-side admission budget for virgin async Mooncake loads
+    # whose Mamba tail will require copy-on-write. Exact string "1" opts in;
+    # unset/0 preserves native scheduling. Not a throughput optimization.
+    "VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION": lambda: (
+        os.getenv("VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION", "0") == "1"
+    ),
+    # Optional first enrolled/deferred/spent events (max three per scheduler).
+    # Does not enable admission budgeting; fault logs remain on regardless.
+    "VLLM_HOT_TAIL_ADMISSION_DIAGNOSTICS": lambda: (
+        os.getenv("VLLM_HOT_TAIL_ADMISSION_DIAGNOSTICS", "0") == "1"
+    ),
     # User override folder for tuned Triton-kernel configs. Shared by MoE,
     # Mamba SSU, and LoRA. Filenames are distinct so one folder can hold all.
     # Each component first checks this folder, then the configs shipped with
@@ -2425,6 +2438,9 @@ def compile_factors() -> dict[str, object]:
         "VLLM_LOGGING_CONFIG_PATH",
         "VLLM_LOGGING_COLOR",
         "VLLM_LOG_STATS_INTERVAL",
+        # Scheduler-only experiment/observability; no compiled GPU behavior.
+        "VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION",
+        "VLLM_HOT_TAIL_ADMISSION_DIAGNOSTICS",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",

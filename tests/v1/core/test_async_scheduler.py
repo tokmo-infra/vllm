@@ -18,6 +18,30 @@ from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 pytestmark = pytest.mark.cpu_test
 
 
+@pytest.mark.parametrize("admission", [None, "0", "1"])
+def test_hot_tail_opt_in_preserves_unsupported_async_scheduler(
+    monkeypatch: pytest.MonkeyPatch, admission: str | None
+):
+    """An ordinary async scheduler must keep native scheduling in all modes."""
+    if admission is None:
+        monkeypatch.delenv("VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION", admission)
+    monkeypatch.setenv("VLLM_HOT_TAIL_ADMISSION_DIAGNOSTICS", "1")
+    scheduler = create_scheduler(async_scheduling=True)
+    assert scheduler._hot_tail_budget is None
+    (request,) = create_requests(num_requests=1, num_tokens=4, max_tokens=1)
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {request.request_id: 4}
+    scheduler.update_from_output(output, _make_model_runner_output(output))
+
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert request.num_preemptions == 0
+    assert scheduler.get_num_unfinished_requests() == 0
+
+
 def _make_model_runner_output(
     scheduler_output: SchedulerOutput,
 ) -> ModelRunnerOutput:

@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
@@ -499,6 +500,12 @@ class Scheduler(SchedulerInterface):
         )
         self._kv_fetch_counts: dict[str, int] = dict.fromkeys(KV_FETCH_STAGES, 0)
 
+        self._hot_tail_budget = None
+        if envs.VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION:
+            from vllm.v1.core.sched.hot_tail_budget import HotTailBudget
+
+            self._hot_tail_budget = HotTailBudget.create(self)
+
     def _drafts_unused(
         self, request: Request, num_computed_tokens: int, num_new_tokens: int
     ) -> bool:
@@ -908,10 +915,11 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            producer_budget_rejected = False
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
-                    new_blocks = self.kv_cache_manager.allocate_slots(
+                    new_blocks = self._allocate_slots_with_hot_tail(
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
@@ -919,6 +927,13 @@ class Scheduler(SchedulerInterface):
 
                     if new_blocks is not None:
                         # The request can be scheduled.
+                        break
+
+                    producer_budget_rejected = (
+                        self.kv_cache_manager.is_producer_budget_rejection(request)
+                    )
+                    if producer_budget_rejected:
+                        # No victim/free/fence work for an additional-budget veto.
                         break
 
                     if (
@@ -980,6 +995,10 @@ class Scheduler(SchedulerInterface):
                         break
 
             if new_blocks is None:
+                if producer_budget_rejected:
+                    # Leave budgets/encoder plans uncommitted, like other skips.
+                    req_index += 1
+                    continue
                 if (
                     self.policy == SchedulingPolicy.PRIORITY
                     and request.status == RequestStatus.PREEMPTED
@@ -1432,7 +1451,7 @@ class Scheduler(SchedulerInterface):
                 # Replayed tokens are already counted in the adopted hit; a
                 # chunk that ends inside the replayed range needs no new slots.
                 num_tokens_past_hit = max(num_new_tokens - num_replay_tokens, 0)
-                new_blocks = self.kv_cache_manager.allocate_slots(
+                new_blocks = self._allocate_slots_with_hot_tail(
                     request,
                     num_tokens_past_hit,
                     num_new_computed_tokens=num_new_local_computed_tokens,
@@ -1458,6 +1477,10 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    if self.kv_cache_manager.is_producer_budget_rejection(request):
+                        # Original end-of-pass requeue keeps this pass finite.
+                        skip_request(request_queue)
+                        continue
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -3030,6 +3053,7 @@ class Scheduler(SchedulerInterface):
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
+        self._forget_hot_tail(request)
 
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
@@ -3083,6 +3107,7 @@ class Scheduler(SchedulerInterface):
         """Free the request's KV blocks, deferring the return to the block
         pool when an in-flight GPU step may still write them.
         """
+        self._forget_hot_tail(request)
         if self._request_blocks_can_be_freed(request):
             self.kv_cache_manager.free(request)
             return
@@ -3399,6 +3424,34 @@ class Scheduler(SchedulerInterface):
             )
         return delay_free or partial_tail_delay, kv_xfer_params
 
+    def _allocate_slots_with_hot_tail(self, request, num_new_tokens, **kwargs):
+        budget = getattr(self, "_hot_tail_budget", None)
+        plan = None
+        if budget is not None:
+            try:
+                plan, extra = budget.before(self, request, num_new_tokens, kwargs)
+                kwargs.update(extra)
+            except Exception as exc:
+                budget.fault("before_" + type(exc).__name__, request.request_id)
+        # Native call and its exceptions are NEVER inside a metadata try block.
+        result = self.kv_cache_manager.allocate_slots(request, num_new_tokens, **kwargs)
+        if result is not None and budget is not None:
+            try:
+                budget.success(self, request, plan)
+            except Exception as exc:
+                budget.fault("success_" + type(exc).__name__, request.request_id)
+        elif result is None and budget is not None:
+            budget.record_deferred(self.kv_cache_manager, request)
+        return result
+
+    def _forget_hot_tail(self, request):
+        budget = getattr(self, "_hot_tail_budget", None)
+        if budget is not None:
+            try:
+                budget.forget(request)
+            except Exception as exc:
+                budget.fault("forget_" + type(exc).__name__, request.request_id)
+
     def _request_remaining_blocks(self, request: Request) -> int:
         """Blocks `request` still needs to hold its full sequence and be promoted."""
         full_num_tokens = min(request.num_tokens, self.max_model_len)
@@ -3429,9 +3482,24 @@ class Scheduler(SchedulerInterface):
 
     def _inflight_prefill_reserved_blocks(self) -> int:
         """Num blocks in-flight prefills still need to finish (their reservation)."""
-        return sum(
-            self._request_remaining_blocks(req) for req in self._inflight_prefills
-        )
+        budget = getattr(self, "_hot_tail_budget", None)
+        if budget is None or budget.failed:
+            return sum(
+                self._request_remaining_blocks(req) for req in self._inflight_prefills
+            )
+        try:
+            budget.begin_legacy()
+        except Exception as exc:
+            budget.fault("legacy_begin_" + type(exc).__name__)
+        total = 0
+        for req in self._inflight_prefills:
+            amount = self._request_remaining_blocks(req)
+            total += amount
+            try:
+                budget.record_legacy(req, amount)
+            except Exception as exc:
+                budget.fault("legacy_" + type(exc).__name__, req.request_id)
+        return total
 
     def _load_restores_replay_window(self, request: Request) -> bool:
         """Whether the KV connector's load for ``request`` restores every DSV41
@@ -3473,6 +3541,7 @@ class Scheduler(SchedulerInterface):
 
         load_failed = request.request_id in self.failed_recving_kv_req_ids
         if load_failed:
+            self._forget_hot_tail(request)
             # Request had KV load failures; num_computed_tokens was already
             # updated in _update_requests_with_invalid_blocks
             if request.num_computed_tokens:
@@ -3693,6 +3762,7 @@ class Scheduler(SchedulerInterface):
                 and request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
             ):
                 affected_req_ids.add(req_id)
+                self._forget_hot_tail(request)
                 if self.recompute_kv_load_failures:
                     request.num_computed_tokens = 0
                     self.failed_recving_kv_req_ids.add(req_id)

@@ -9,6 +9,7 @@ import torch
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
@@ -16,6 +17,7 @@ from vllm.v1.core.kv_cache_utils import (
     init_none_hash,
     make_block_hash_with_group_id,
 )
+from vllm.v1.core.sched.hot_tail_budget import Ledger, prepare
 from vllm.v1.core.single_type_kv_cache_manager import (
     ChunkedLocalAttentionManager,
     CircularBufferManager,
@@ -28,11 +30,13 @@ from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     CircularBufferSpec,
     FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
     MambaSpec,
     RSWASpec,
     SlidingWindowSpec,
 )
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 pytestmark = pytest.mark.cpu_test
 
@@ -304,6 +308,176 @@ def test_mamba_checkpoint_hash_maps_only_to_checkpoint_block(
     )
     block_hash = request.block_hashes[checkpoint_position // block_size - 1]
     assert pool.get_cached_block(block_hash, [0]) == [checkpoint_block]
+
+
+def _make_hot_tail_budget_case(num_blocks):
+    init_none_hash(sha256)
+    cache = KVCacheManager(
+        KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["attention"],
+                    FullAttentionSpec(
+                        block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+                    ),
+                ),
+                KVCacheGroupSpec(
+                    ["mamba"],
+                    MambaSpec(
+                        block_size=16,
+                        shapes=((1, 1),),
+                        dtypes=(torch.float32,),
+                        mamba_cache_mode="align",
+                    ),
+                ),
+            ],
+            prefix_cache_retention_interval=0,
+        ),
+        max_model_len=32,
+        scheduler_block_size=16,
+        hash_block_size=4,
+    )
+    request = Request(
+        request_id="producer",
+        prompt_token_ids=list(range(15)),
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(4, sha256),
+    )
+    return cache, request
+
+
+@pytest.mark.parametrize("budget_name", ["future_blocks", "producer_reserved_blocks"])
+@pytest.mark.parametrize("full_sequence_must_fit", [False, True])
+def test_hot_tail_budget_gate_separates_native_and_reserve_only_failures(
+    budget_name, full_sequence_must_fit
+):
+    """Two physical blocks fit; a third budget block alone must defer the load."""
+    cache, request = _make_hot_tail_budget_case(num_blocks=3)
+    pool = cache.block_pool
+    kwargs = dict(
+        num_new_tokens=0,
+        num_external_computed_tokens=12,
+        delay_cache_blocks=True,
+        full_sequence_must_fit=full_sequence_must_fit,
+    )
+    assert pool.get_num_free_blocks() == 2
+    assert cache.allocate_slots(request, **kwargs, **{budget_name: 1}) is None
+    assert cache.is_producer_budget_rejection(request)
+    assert pool.get_num_free_blocks() == 2
+    assert all(not group for group in cache.get_blocks(request.request_id).blocks)
+
+    # Native legacy reservations and actual physical shortage take precedence,
+    # and must clear the preceding budget-only rejection reason.
+    assert (
+        cache.allocate_slots(request, **kwargs, reserved_blocks=1, **{budget_name: 1})
+        is None
+    )
+    assert not cache.is_producer_budget_rejection(request)
+    held = pool.get_new_blocks(1)
+    assert cache.allocate_slots(request, **kwargs, **{budget_name: 1}) is None
+    assert not cache.is_producer_budget_rejection(request)
+    assert pool.get_num_free_blocks() == 1
+    pool.free_blocks(held)
+
+    # Omitting both experimental budgets preserves native admission.
+    assert cache.allocate_slots(request, **kwargs) is not None
+    assert not cache.is_producer_budget_rejection(request)
+    assert pool.get_num_free_blocks() == 0
+    cache.free(request)
+    assert pool.get_num_free_blocks() == 2
+
+
+def test_hot_tail_future_budget_is_spent_once_by_real_partial_tail_cow():
+    """A virgin async load needs one future block, not a second pending CoW."""
+    cache, request = _make_hot_tail_budget_case(num_blocks=4)
+    pool = cache.block_pool
+    mamba = cache.coordinator.single_type_managers[1]
+    assert isinstance(mamba, MambaManager)
+    managers = (mamba,)
+    prepare_kwargs = dict(is_producer=True, other_layout=(("full_attention", 16),))
+    assert prepare(request, managers, 12, async_load=False, **prepare_kwargs) is None
+    assert prepare(request, managers, 16, async_load=True, **prepare_kwargs) is None
+    plan = prepare(request, managers, 12, async_load=True, **prepare_kwargs)
+    assert plan is not None
+    assert plan.groups == ((1, 12),)
+    assert pool.get_num_free_blocks() == 3
+    assert not mamba.req_to_blocks.get(request.request_id)
+
+    ledger = Ledger()
+    assert (
+        cache.allocate_slots(
+            request,
+            num_new_tokens=0,
+            num_external_computed_tokens=12,
+            delay_cache_blocks=True,
+            future_blocks=len(plan.groups),
+        )
+        is not None
+    )
+    assert prepare(request, managers, 12, async_load=True, **prepare_kwargs) is None
+    ledger.commit_successful_load(plan, request, managers)
+    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    other = Request(
+        request_id="other",
+        prompt_token_ids=[0],
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+    )
+    ledger.observe(request, managers)
+    assert ledger.budgets(request) == (0, 1)
+    assert ledger.budgets(other, legacy_covered_ids=(request.request_id,)) == (1, 0)
+    assert pool.get_num_free_blocks() == 1
+
+    # Reproduce successful receive publication, not manually inserted markers.
+    request.num_computed_tokens = 12
+    request.status = RequestStatus.RUNNING
+    cache.cache_blocks(request, 12)
+    source = cache.get_blocks(request.request_id).blocks[1][0]
+    assert mamba._producer_partial_tail_reqs[request.request_id] == (source, 12)
+    ledger.observe(request, managers)
+    assert ledger.budgets(other) == (1, 0)
+    assert ledger.budgets(other, legacy_covered_ids=(request.request_id,)) == (0, 0)
+    reserved, future = ledger.budgets(request)
+    assert (reserved, future) == (0, 0)
+
+    assert (
+        cache.allocate_slots(
+            request,
+            num_new_tokens=3,
+            producer_reserved_blocks=reserved,
+            future_blocks=future,
+        )
+        is not None
+    )
+    assert pool.get_num_free_blocks() == 0
+    copies, retained = cache.take_kv_cache_block_copies()
+    assert len(copies) == 1
+    assert len(retained) == 2
+    assert retained[0] is source
+    cow = retained[1]
+    assert cow is not source
+    assert (copies[0].src_block_id, copies[0].dst_block_id) == (
+        source.block_id,
+        cow.block_id,
+    )
+    assert cache.get_blocks(request.request_id).blocks[1][0] is source
+    assert pool.get_cached_block(request.block_hashes[2], [1]) == [cow]
+    assert cache.take_boundary_state_offloads() == {
+        request.request_id: [(1, cow.block_id, 12)]
+    }
+
+    for _ in range(2):
+        ledger.allocation_succeeded(request, managers)
+        ledger.observe(request, managers)
+        assert ledger.entries[request.request_id]["phases"] == {1: "spent"}
+        assert ledger.budgets(request) == ledger.budgets(other) == (0, 0)
+    assert not ledger.violations
+    pool.free_blocks(retained)
+    cache.free(request)
+    assert pool.get_num_free_blocks() == 3
 
 
 def get_sliding_window_manager(
