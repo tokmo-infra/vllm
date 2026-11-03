@@ -18,7 +18,8 @@ export NVSHMEM_HOME=/path/to/nvshmem
 ```
 
 Use the normal vLLM source-build workflow with those variables. NVSHMEM must
-provide `nvshmemx_collective_launch_attr` for MegaMoE's 2-SM clusters. Consult
+provide `nvshmemx_collective_launch_attr` for MegaMoE's 2-SM clusters and
+`nvshmemx_quiet_warp` for collective RMA completion. Consult
 the paired DeepGEMM tree's `docs/mega_moe_rdma.md` for the inspected API revision,
 linking requirements, protocol and validation commands. CMake records the
 transport build options so switching them invalidates an earlier native build.
@@ -71,8 +72,31 @@ not establish a serving TPOT or throughput improvement.
 
 IBGDA configuration also needs runtime verification. In the tested environment,
 `NVSHMEM_IB_ENABLE_IBGDA=1` enabled the transport, but a requested GPU NIC handler
-fell back to CPU host memory after an I/O-memory mapping error. Inspect the
-actual handler in NVSHMEM logs before attributing results to GPU-only progress.
+initially fell back to CPU host memory after an I/O-memory mapping error.
+Adding `CAP_SYS_ADMIN` to the isolated validation containers resolved the mapping
+failure on both nodes; adding `SYS_RAWIO` alone had not. The tested NVIDIA driver
+uses `CAP_SYS_ADMIN` for its administrator check. No host driver reload was needed.
+Use `NVSHMEM_IB_ENABLE_IBGDA=1`, `NVSHMEM_IBGDA_NIC_HANDLER=gpu` and
+`NVSHMEM_DEBUG=INFO`, then require `NIC handler will be GPU` in every worker's
+log. The handler request alone does not prevent this NVSHMEM build from falling
+back. Follow the deployment's approved driver/container configuration for GPU
+peer mappings; this experiment does not require a fully privileged container.
+
+Select a GPU-local HCA for each worker with `NVSHMEM_HCA_PE_MAPPING`,
+`NVSHMEM_ENABLE_NIC_PE_MAPPING=1` and `NVSHMEM_MAX_NICS_PER_PE=1`; unset
+`NVSHMEM_HCA_LIST` when using an explicit mapping. Set
+`NVSHMEM_IB_TRAFFIC_CLASS` to the fabric's configured class (106 in the tested
+environment) and choose its RoCE GID (index 3 here). HCA names and traffic class
+are deployment-specific. The paired DeepGEMM document records both hosts'
+tested mappings. This validation did not change host NIC or driver settings.
+
+With live-token input transfers, parallel return rows and collective completion
+in the paired DeepGEMM branch, plus the runtime corrections above, cross-node
+EP8 layer latency fell from 11.719 to 1.072 ms at 128 tokens/rank, and from
+16.398 to 2.800 ms at 512 tokens/rank. Both final cases passed 100 changing-route
+replays and exact checks after each timed batch, using the baseline input
+hashes. These improvements include both kernel and runtime changes; they are
+synthetic layer results and do not measure full-model TPOT.
 
 This transport extends the MoE EP path only. Keep TP/GEMM-RS and Engram sharing
 within their supported NVLink domains. Both main and draft physical expert
