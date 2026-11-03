@@ -1,111 +1,36 @@
-<!-- markdownlint-disable MD001 MD041 -->
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
-    <img alt="vLLM" src="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-light.png" width=55%>
-  </picture>
-</p>
+# GLM5.3 Flash 1103
 
-<h3 align="center">
-Easy, fast, and cheap LLM serving for everyone
-</h3>
+本分支提供GLM-5.3 Flash推理、共享Tokenizer、Mooncake缓存恢复和HCA部署配置。源码基于实际运行版本5df63a720，功能按提交说明，启动命令统一见[DEPLOYMENT.md](DEPLOYMENT.md)。
 
-<p align="center">
-| <a href="https://docs.vllm.ai"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2309.06180"><b>Paper</b></a> | <a href="https://x.com/vllm_project"><b>Twitter/X</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
-</p>
+## 1. b1872978 · 原生推理与共享分词
 
-🔥 We have built a vLLM website to help you get started with vLLM. Please visit [vllm.ai](https://vllm.ai) to learn more.
-For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
+| 功能 | 解决的问题 | 实现和作用 | 通用复用范围 / 配置 |
+| --- | --- | --- | --- |
+| ① GLM推理与KV传输 | 混合Mamba / MLA缓存需要正确分组、传输和恢复状态。 | 对接原生MTP3、FP8 KV、CUDA graph及异步调度，按完整逻辑块保存和交接。 | GLM推理适配；缓存分组与传输思路可复用。 |
+| ② 同机共享精确分词 | 多API会重复分词、重复保存同一段文本。 | 同机共享分段结果，每个API保留64MiB私有L1；用Tokenizer指纹、命名空间和epoch隔离。 | 共享池通用；分段规则适配固定GLM Tokenizer，路径和容量见部署配置。 |
+| ③ GET租约刷新 | 读取排队期间副本租约可能到期。 | 对返回-707的key重新查询副本并完整读取一次，其他结果交给原生失败处理。 | Mooncake读取保护，随connector路径生效。 |
+| ④ 相邻checkpoint回退 | 最近的Mamba checkpoint可能缺失或group尚未齐全。 | 按完整group与TP命名空间匹配相邻可用边界，并补齐采样所需checkpoint。 | 混合缓存复用；沿用Store查询和保存路径。 |
+| ⑤ FlashInfer自动调优 | 不同rank重复搜索会增加启动开销。 | 复用匹配的调优配置并保留原生预热流程。 | 兼容的硬件、库版本与形状之间复用。 |
 
----
+## 2. b68a1d20 · 缓存保存恢复与大块空间回收
 
-## About
+| 功能 | 解决的问题 | 实现和作用 | 通用复用范围 / 配置 |
+| --- | --- | --- | --- |
+| ① PUT压力恢复 | CPU缓存曾经分配失败后，发送线程可能一直跳过后续保存。 | 每发送线程最多每秒用一个当前有效job探测，成功后恢复保存。 | Mooncake Store通用恢复逻辑，随代码生效。 |
+| ② Master实际占用计账 | 分配器向上取整，导致有效字节看似未满、实际空间已不足。 | 将bin实际占用计入淘汰水位，保留payload指标和快照含义。 | offset allocator通用修复，使用配套Master。 |
+| ③ Master大块空间回收 | CPU缓存有空闲，但碎片放不下新的大块KV。 | 定期检查目标大块可分配槽数，提前触发原生淘汰，为保存腾出空间。 | 大对象缓存通用；MC_EVICTION_FIT_REQUEST_BYTES默认0，配套命令给出目标大小。 |
 
-vLLM is a fast and easy-to-use library for LLM inference and serving.
+## 3. 3619d13a · 可选末段准入预算
 
-Originally developed in the [Sky Computing Lab](https://sky.cs.berkeley.edu) at UC Berkeley, vLLM has grown into one of the most active open-source AI projects built and maintained by a diverse community of many dozens of academic institutions and companies from over 2000 contributors.
+| 功能 | 解决的问题 | 实现和作用 | 默认值 / 配置 |
+| --- | --- | --- | --- |
+| ① CoW状态块预算 | producer异步加载后，prefill末段需要额外状态块，竞争请求可能先用光余量。 | 为已识别的同末物理块请求登记义务，并在准入时保护余量，减少抢占重算。 | VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION默认0；P端精确设1开启。 |
+| ② 有限事件观测 | 需要确认预算何时登记、延后请求和被消耗。 | 每个scheduler记录三类首事件，便于检查实际路径。 | VLLM_HOT_TAIL_ADMISSION_DIAGNOSTICS默认0，设1记录。 |
 
-vLLM is fast with:
+该预算适用于首次、纯外部异步加载、同一物理末块的GLM/Mamba producer请求。启用时保留原生异步、块引用、Store交接和GPU栅栏流程；按实际业务对照吞吐与延迟后选择使用。
 
-- State-of-the-art serving throughput
-- Efficient management of attention key and value memory with [**PagedAttention**](https://blog.vllm.ai/2023/06/20/vllm.html)
-- Continuous batching of incoming requests, chunked prefill, prefix caching
-- Fast and flexible model execution with piecewise and full CUDA/HIP graphs
-- Quantization: FP8, MXFP8/MXFP4, NVFP4, INT8, INT4, GPTQ/AWQ, GGUF, compressed-tensors, ModelOpt, TorchAO, and [more](https://docs.vllm.ai/en/latest/features/quantization/index.html)
-- Optimized attention kernels including FlashAttention, FlashInfer, TRTLLM-GEN, FlashMLA, and Triton
-- Optimized GEMM/MoE kernels for various precisions using CUTLASS, TRTLLM-GEN, CuTeDSL
-- Speculative decoding including n-gram, suffix, EAGLE, DFlash
-- Automatic kernel generation and graph-level transformations using torch.compile
-- Disaggregated prefill, decode, and encode
+## 4. 目的网卡亲和与部署
 
-vLLM is flexible and easy to use with:
+P启动时设置MC_ENABLE_DEST_DEVICE_AFFINITY=1，为SDK选择目的端HCA提供亲和提示；GPU到本地HCA的绑定继续按对应GPU分组填写。推理示例使用TP1、P双EP4 / D各EP8，P每DP seq24/batch2048、D每DP seq16/batch1024、每台750GiB Store，原生MTP3与异步调度，Tokenizer共享池加L1为16GiB/台。
 
-- Seamless integration with popular Hugging Face models
-- High-throughput serving with various decoding algorithms, including *parallel sampling*, *beam search*, and more
-- Tensor, pipeline, data, expert, and context parallelism for distributed inference
-- Streaming outputs
-- Generation of structured outputs using xgrammar or guidance
-- Tool calling and reasoning parsers
-- OpenAI-compatible API server, plus Anthropic Messages API and gRPC support
-- Efficient multi-LoRA support for dense and MoE layers
-- Support for NVIDIA GPUs, AMD GPUs, Intel GPUs, and x86/ARM/PowerPC CPUs. Additionally, diverse hardware plugins such as Google TPUs, Intel Gaudi, IBM Spyre, Huawei Ascend, Rebellions NPU, Apple Silicon, MetaX GPU, and more.
-
-vLLM seamlessly supports 200+ model architectures on Hugging Face, including:
-
-- Decoder-only LLMs (e.g., Llama, Qwen, Gemma)
-- Mixture-of-Expert LLMs (e.g., Mixtral, DeepSeek-V3, Qwen-MoE, GPT-OSS)
-- Hybrid attention and state-space models (e.g., Mamba, Qwen3.5)
-- Multi-modal models (e.g., LLaVA, Qwen-VL, Pixtral)
-- Embedding and retrieval models (e.g., E5-Mistral, GTE, ColBERT)
-- Reward and classification models (e.g., Qwen-Math)
-
-Find the full list of supported models [here](https://docs.vllm.ai/en/latest/models/supported_models.html).
-
-## Getting Started
-
-Install vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`:
-
-```bash
-uv pip install vllm
-vllm download-kernels  # precompiled kernels for faster startup
-```
-
-Or [build from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source) for development.
-
-Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
-
-- [Installation](https://docs.vllm.ai/en/latest/getting_started/installation.html)
-- [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
-- [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
-
-## Contributing
-
-We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM](https://docs.vllm.ai/en/latest/contributing/index.html) for how to get involved.
-
-## Citation
-
-If you use vLLM for your research, please cite our [paper](https://arxiv.org/abs/2309.06180):
-
-```bibtex
-@inproceedings{kwon2023efficient,
-  title={Efficient Memory Management for Large Language Model Serving with PagedAttention},
-  author={Woosuk Kwon and Zhuohan Li and Siyuan Zhuang and Ying Sheng and Lianmin Zheng and Cody Hao Yu and Joseph E. Gonzalez and Hao Zhang and Ion Stoica},
-  booktitle={Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles},
-  year={2023}
-}
-```
-
-## Contact Us
-
-<!-- --8<-- [start:contact-us] -->
-- For technical questions and feature requests, please use GitHub [Issues](https://github.com/vllm-project/vllm/issues)
-- For discussing with fellow users, please use the [vLLM Forum](https://discuss.vllm.ai)
-- For coordinating contributions and development, please use [Slack](https://slack.vllm.ai)
-- For security disclosures, please use GitHub's [Security Advisories](https://github.com/vllm-project/vllm/security/advisories) feature
-- For collaborations and partnerships, please contact us at [collaboration@vllm.ai](mailto:collaboration@vllm.ai)
-<!-- --8<-- [end:contact-us] -->
-
-## Media Kit
-
-- If you wish to use vLLM's logo, please refer to [our media kit repo](https://github.com/vllm-project/media-kit)
+源码与镜像指纹集中在integrations/glm53flash/release.json；镜像构建、启动命令和可选配置集中在DEPLOYMENT.md。
