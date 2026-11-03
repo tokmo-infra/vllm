@@ -1,0 +1,72 @@
+{
+  "node": 91,
+  "containers": [
+    "xinhao-dbo-opt-d16-91-v7",
+    "xinhao-dbo-opt-d16-91-v6",
+    "xinhao-dbo-opt-d16-91-v5",
+    "xinhao-dbo-opt-d16-91-v4",
+    "xinhao-dbo-opt-d16-91-v3",
+    "xinhao-dbo-opt-d16-91-v2",
+    "xinhao-dbo-preopt-d16-91",
+    "xinhao-dbo-dev91"
+  ],
+  "images": [
+    {
+      "tag": "xinhao-vllm-roce-megamoe:dbo-stream-v7",
+      "result": "Untagged: xinhao-vllm-roce-megamoe:dbo-stream-v7\nDeleted: sha256:095c2a1d4ef59c6816292dacff10d0eb7147533c5b7af6f31109a72288e386e6\nDeleted: sha256:04aa0568761d0de9c68c07863daec9458758a63309b19cef519c93dc967368d1\nDeleted: sha256:e78b8f2195129b70baddcd9dbef54ae8ca08ce238b664a28a637c560975d1a58\nDeleted: sha256:e3bc3241d346f5d58cbb3044b8fb2ff23288b875fb786c4db3182b3a4bcc2bbc\nDeleted: sha256:075140ef2262cf0b0803b552f9480324117b9ea889dfb7b5c13c0857419522f8\nDeleted: sha256:1efb11292a4c9352e31c4073f5e9b12cb9c9a1308b64472b1705be626d35fbd6\nDeleted: sha256:feeb0e565a78823b061a46b01426f25d7e43948d2f425554aef9b463c1f857fc\n"
+    },
+    {
+      "tag": "xinhao-vllm-roce-megamoe:dbo-stream-v6",
+      "result": "Untagged: xinhao-vllm-roce-megamoe:dbo-stream-v6\nDeleted: sha256:ff6e31f2ea4da9535b8384380faf7d1983f787cbb9563066bda5b05b076db804\nDeleted: sha256:e73a5737999505ac26602b9a116e4a513d1316165c2bdbc6f2cee69a3a8c0b59\nDeleted: sha256:ab4111656b15ee6369ea015d667bfc8f0dab46c1d1e062daf94425a96d36f956\nDeleted: sha256:6cf2c2712e4dfc3f22da3e81ec1004ec671d706959e562b0ed3481b34a03b812\n"
+    },
+    {
+      "tag": "xinhao-vllm-roce-megamoe:dbo-stream-v5",
+      "result": "Untagged: xinhao-vllm-roce-megamoe:dbo-stream-v5\nDeleted: sha256:f6fb111d86c5a046369ad17dbe7c5195841cf388d20278ae975d2b803868e176\nDeleted: sha256:32a1bc8df7fc6ad05732850fdea27580d61590038ac2fc9d98d5be4470e02ab1\nDeleted: sha256:ede9343467e8722762960ba34f14ab8b583e80e870098cf855e78cf66208f05b\nDeleted: sha256:f6b5277a1dc8a0ecf5a97f6898a3f2d57d05446c89dfdc18d3dcc31df01ae6c9\n"
+    },
+    {
+      "tag": "xinhao-vllm-roce-megamoe:dbo-stream-v4",
+      "result": "Untagged: xinhao-vllm-roce-megamoe:dbo-stream-v4\nDeleted: sha256:671f65e39a36857f86cd8a3dda476729cf34027b1de99c721b553978a364f9b1\nDeleted: sha256:c2d0303bd0c37b30aec1d57dae7469cecb08e40559858300bd24aad24c0d7318\nDeleted: sha256:0c287bbb1e6bb3ac2c56ec6f41cf642e9e9b88a07df0f8724f26b6a9e28ddccd\nDeleted: sha256:d5cfad6a1ec6f061b83e3141bbc7cb9ce91d5a9449129a9e3bb502d97d6accda\n"
+    },
+    {
+      "tag": "xinhao-vllm-roce-megamoe:dbo-diagnostic-v3",
+      "result": "Untagged: xinhao-vllm-roce-megamoe:dbo-diagnostic-v3\nDeleted: sha256:ced9861ecf7a3bfa47d2d1317688ebf711ca81725de0069caf1615d803e9571d\nDeleted: sha256:7c82a624553378c96c801fce84417d37ecd0787b9354366134a9d26a03f85707\nDeleted: sha256:81b2ff876a396b704fea3560f381130e5671301a029d8f4c03db3c69670bd66f\nDeleted: sha256:ab54b1b3cdf99687ee358a1e462fe1c7f9c3dae42dbbbbc2d95826fe558311a9\nDeleted: sha256:9f5783456209ed127f23e200ea85e9f2c34ee3ca75f3fc53360a39379248f158\nDeleted: sha256:f1e813322182fcd91fb7ae6da89d6c8e279a0bbb96042cca153b958bdc008c19\n"
+    },
+    {
+      "tag": "xinhao-vllm-roce-megamoe:dbo-stream-v2",
+      "result": "Untagged: xinhao-vllm-roce-megamoe:dbo-stream-v2\nDeleted: sha256:fb90dcf3db337230e938b662e76a32b9dfe70f9f6ed368f23c4749cef580a0cf\nDeleted: sha256:5eb6ea0094568e4ced80b6a3a600c959c0ffc1219bfe469894f93eaaec299798\nDeleted: sha256:573eaae8106a2bb1a7b440f7bdd4ecf577a7f082c1461056f42696fbb7099708\nDeleted: sha256:7a57a0c7a1a863d3e0da62271e8f74b527dbc8ac6aff7f7b827ac75350f08385\nDeleted: sha256:77c32beb291934f4dff9b1cdcb926e9aa1e2ea2011c59f1111467852f11a0d90\n"
+    },
+    {
+      "tag": "xinhao-vllm-roce-megamoe:dbo-stream-v1",
+      "result": "Untagged: xinhao-vllm-roce-megamoe:dbo-stream-v1\nDeleted: sha256:cae6a9a3a703cb8dc985f70a3fbf1aab2b4e9291921a49fc7d25dde2f9eda277\nDeleted: sha256:d47a0517c1002af961e70fac7478db502d83c9bc88b1b67160e36e623882e238\nDeleted: sha256:4e0ef0e23acffad2bcb58b0ef35709236a0f22f8429bcb9c821ef605b9b1b474\nDeleted: sha256:ff26590d9b69365506d2e33b2394b678365d9527a572c7f8db96e6b77b68d0b1\nDeleted: sha256:3d58fd544480d74e9c3d2b9de628113e309bcd53273ad703b3aaed9a308873a9\nDeleted: sha256:db2726d093213ae3fa41fc645b8dcdb656e4cacc41e8154d2e02effe07bed265\nDeleted: sha256:a339a8638a62b53de92e39d581e5391a246351cfcbc3d9c020e0398a3cb89882\nDeleted: sha256:6d3b0f5b70400eef40699a42102431e411af1448a1fb8850d9eafee9f3f68167\nDeleted: sha256:8024778575d4cbbb0d9b6ebd08a397ae093512cc913045df349a69d8219103ac\n"
+    }
+  ],
+  "cache": {
+    "removed": [
+      "/work/DeepGEMM/build",
+      "/work/DeepGEMM/dist",
+      "/work/DeepGEMM/deep_gemm.egg-info",
+      "/work/DeepGEMM-isolated",
+      "/work/DeepGEMM-isolated-failed-dotfiles",
+      "/work/serving-overlay",
+      "/work/build-deps",
+      "/work/pyspy-linux",
+      "/work/DeepGEMM/deep_gemm/_C_extension.abi3.so",
+      "/work/DeepGEMM/scripts/__pycache__",
+      "/work/DeepGEMM/deep_gemm/__pycache__",
+      "/work/DeepGEMM/deep_gemm/mega/__pycache__",
+      "/work/DeepGEMM/deep_gemm/utils/__pycache__",
+      "/work/DeepGEMM/deep_gemm/legacy/__pycache__",
+      "/work/DeepGEMM/deep_gemm/testing/__pycache__",
+      "/work/source/tests/distributed/__pycache__",
+      "/work/source/benchmarks/kernels/__pycache__",
+      "/cache/vllm",
+      "/cache/flashinfer",
+      "/cache/torch",
+      "/cache/torch_extensions"
+    ],
+    "cache_empty": true
+  },
+  "remaining_experiment_containers": [],
+  "remaining_experiment_images": [],
+  "gpu_processes": ""
+}

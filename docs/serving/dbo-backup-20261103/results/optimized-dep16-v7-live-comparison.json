@@ -1,5 +1,5 @@
 {
-  "status": "Partial results; final performance and accuracy acceptance remain incomplete",
+  "status": "Stopped at user request; no further testing. Seven first-repetition points completed; C1024 interrupted. Performance acceptance failed/incomplete.",
   "configuration": "Existing P90 DEP2/P5; DEP8 baseline versus overlap DEP16/D5 on89+91;1024input/1024output tokens;16warmups;4Cmeasured requests with minimum16;seed42;temperature0;ignoreEOS",
   "baseline_statistic": "Median of three repetitions, including any failed sample",
   "candidate_statistic": "Individual completed repetitions; not replaced by warmup or kernel measurements",
@@ -106,5 +106,6 @@
       "expected": 2048,
       "zero_error_pass": true
     }
-  ]
+  ],
+  "cancelled_remaining_samples": 23
 }

@@ -3,7 +3,7 @@
   "base_commit": "4110f556848f4cb592b113187b25b87f2b03857f",
   "branch": "backup/dbo-overlap-p5d5-20261103",
   "deepgemm_base_commit": "5cdb145704ec4672ecf4b61441599521ce635df6",
-  "native_patch_matches_cmake_patch": false,
+  "native_patch_matches_cmake_patch": true,
   "snapshot_scope": "All current tracked and untracked non-ignored vLLM changes, including pre-existing local edits. Canonical DeepGEMM diff plus exact frozen-image source overlay and reproduction scripts are included.",
   "validation": "v7 startup and4-request end-to-end smoke passed. First performance repetition completedC1..512with0errors but only~13-16%ofDEP8throughput. C1024interrupted by user; C2048/C4096, remainingrepetitions, fulloptimizedGSM8K, originalDEP16performance andsame-image-offcomparison not completed.",
   "known_incomplete": [
@@ -14,7 +14,7 @@
   "reproduction": "Use the frozen base image and included actual serving-overlay sources. Rebuild isolated deep_gemm_overlap from the pinned DeepGEMM revision and patch using the included preparation scripts. Binary images, weights, credentials and large raw measurements are not committed.",
   "ai_assistance": "Code and diagnostics were assisted by Codex. This is a backup branch, not a reviewed PR.",
   "additional_files_sha256": {
-    "deepgemm-current.patch": "d9f81ae3e2e3c29bf009140b31d65bb06537338b483b352c6321018f55cbb5df",
+    "deepgemm-current.patch": "cb2bdafcc94e6f06a0285987ac5913ec08b4f181783f5c059a4f8a51a59072cf",
     "deepgemm-LICENSE": "6c73a30c14a2938abaa6afe98ebb19e6d81dac5bd4ace0cb05c61c20afa37b85",
     "reproduction/work/prepare-serving-overlay.py": "a192a4cd00b3eda7a59c572a94eb16b92a0d1b3d1b130061813e72534f9791cf",
     "reproduction/work/prepare-isolated-native.py": "909af870d8cf91174d0c5a9083bd60bb012b82d7784d306e342e4bc6133aed91",
@@ -62,9 +62,14 @@
     "reproduction/work/serving-overlay/vllm/models/deepseek_v4/nvidia/model.py": "504799b18271eed7bc9779ad12823471b211ec71c54dbbdb7c002272504c432c",
     "reproduction/work/serving-overlay/Dockerfile.v7": "0760d0440e78e5ffd656d79404100c24df77fffe9f775ee686ca0244ba9700e8",
     "reproduction/work/serving-overlay/manifest.json": "c9d6b59337fc64b6beb87d20122150a606ff4388a0e3465e184f3b0bb5a9a9c9",
-    "results/optimized-dep16-v7-live-comparison.json": "171c1d28540bb86eaa429395053e3c26db704933002f54b39c1ab898d3099677",
+    "results/optimized-dep16-v7-live-comparison.json": "10f522becf6e765df7ae0763fd2545334eea3b54ee8353b0705812b4acb813d7",
     "results/baseline-dep8-p5d5-001-summary.json": "f987042cf3e58267951f6ad22ca21391761548c1d17a69d24ee185563f5cb206",
     "results/preopt-dep16-vs-dep8-accuracy.json": "6b6ce1fdcc6e5f510507a3f167961da1fe781d7bc454177f9ff60e022f393812",
-    "implementation-plan.md": "09984439f5e7a154344b8e2db4caee84ee381ef6770f6e5ffa83f8b72008bfe0"
-  }
+    "implementation-plan.md": "09984439f5e7a154344b8e2db4caee84ee381ef6770f6e5ffa83f8b72008bfe0",
+    "cleanup/node89.json": "fe56a06853b6936724f3bc55871f601f72caa72f44a0d986e9a9c1f665a1f30f",
+    "cleanup/node91.json": "31afe8b0ebff885d2419b5216e6c1f850112ca382f556062f009bdb92493c372"
+  },
+  "native_patch_content_matches_cmake_patch": true,
+  "native_patch_note": "Patch hunks and file paths are identical; only Git index object identifiers differ.",
+  "cleanup": "Bothhosts89and91:20experimentcontainersand14dboimagestagsremoved;listednativebuild/servicecachescleared;noGPUprocessesremaining. P90serviceandsharedbaseimagespreserved. Sourceandrawresultsretained."
 }
