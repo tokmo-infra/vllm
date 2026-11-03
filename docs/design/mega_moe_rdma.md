@@ -3,8 +3,10 @@
 `VLLM_MEGAMOE_TRANSPORT=nvshmem` selects the experimental native RDMA transport
 for DeepGEMM MegaMoE. The default is `nvlink`. This first implementation is
 limited to SM100-family GPUs, FP8 activations, MXFP4 routed weights and SwiGLU,
-including the existing FP8 fused shared-expert path. CUDA compilation, GPU
-correctness, model evaluation and performance validation are still pending.
+including the existing FP8 fused shared-expert path. Both DeepGEMM build modes
+and single-node B300 kernel correctness have been validated with CUDA 13.0,
+including forced remote staging with P2P disabled. Multi-node correctness,
+model evaluation and performance validation are still pending.
 
 Build vLLM against the matching DeepGEMM development tree:
 
@@ -21,6 +23,15 @@ linking requirements, protocol and validation commands. CMake records the
 transport build options so switching them invalidates an earlier native build.
 The upstream DeepGEMM pin is unchanged; enabling the build option without the
 matching local source produces an error.
+
+Load the NVSHMEM runtime that matches the build before importing PyTorch.
+The B300 validation image required explicit selection because its bundled
+NVSHMEM was too old for cluster launch attributes:
+
+```sh
+export LD_LIBRARY_PATH="$NVSHMEM_HOME/lib:${LD_LIBRARY_PATH:-}"
+export LD_PRELOAD="$NVSHMEM_HOME/lib/libnvshmem_host.so${LD_PRELOAD:+:$LD_PRELOAD}"
+```
 
 Set `VLLM_MEGAMOE_TRANSPORT=nvshmem` on every worker when using the native
 MegaMoE backend. vLLM passes its EP device and Gloo groups to DeepGEMM, includes
@@ -40,6 +51,15 @@ DBO and overlapping microbatches are rejected. One EP ordering and GPU per
 process are supported, and the process must not already host another NVSHMEM
 world. Prepare and warm up before CUDA Graph capture. Kernel launches use the
 NVSHMEM collective launch with cluster attributes and PDL disabled.
+Use the paired DeepGEMM revision with the per-buffer GPU epoch fix: CUDA Graph
+replays can reuse `%gridid`, which cannot safely tag a fresh RDMA return.
+
+Single-node validation on 2026-11-04 also exercised the real vLLM expert wrapper
+at EP1: MXFP4 weight loading, default unclamped activation, distinct transport
+buffers, eager output and 20 changing-route CUDA Graph replays. NVSHMEM output
+matched NVLink exactly. This used branch Python sources with the validation
+image's existing vLLM binary extensions and newly built DeepGEMM; a full vLLM
+source build and model serving were not exercised.
 
 This transport extends the MoE EP path only. Keep TP/GEMM-RS and Engram sharing
 within their supported NVLink domains. Both main and draft physical expert
