@@ -221,6 +221,8 @@ if TYPE_CHECKING:
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
+    VLLM_GLM53_TOKENIZER_CACHE_GIB: float = 0
+    VLLM_GLM53_TOKENIZER_CACHE_EPOCH_FILE: str | None = None
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
@@ -1806,6 +1808,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "MOONCAKE_REQUESTER_LOCAL_HOSTNAME"
     ),
     # Override the directory for the FlashInfer autotune config cache.
+    "VLLM_GLM53_TOKENIZER_CACHE_GIB": lambda: float(os.getenv("VLLM_GLM53_TOKENIZER_CACHE_GIB", "0")),
+    "VLLM_GLM53_TOKENIZER_CACHE_EPOCH_FILE": lambda: os.getenv("VLLM_GLM53_TOKENIZER_CACHE_EPOCH_FILE", None),
     "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": lambda: os.getenv(
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR", None
     ),

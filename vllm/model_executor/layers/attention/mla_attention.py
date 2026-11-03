@@ -563,6 +563,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
         # Sparse MLA reads top-k indices from a shared buffer. Pass it
         # explicitly so backbone "skip" layers (indexer=None) still find it.
+        self.topk_buffer_width = (
+            topk_indices_buffer.shape[-1] if topk_indices_buffer is not None else None
+        )
         if use_sparse:
             extra_impl_args["topk_indices_buffer"] = topk_indices_buffer
             if index_group_builder is not None:
@@ -1361,9 +1364,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
             # ds_mla layouts pack NoPE + RoPE + scales into one opaque per-token
             # blob, so the size is not derivable from head_size.
-            # See flashmla_sparse.py.
-            state_content_bytes={"fp8_ds_mla": 656, "nvfp4_ds_mla": 352}.get(
-                self.kv_cache_dtype
+            state_content_bytes=(
+                cast(MLAAttentionImpl, self.impl).get_fp8_ds_mla_row_bytes()
+                if self.kv_cache_dtype == "fp8_ds_mla"
+                else {"nvfp4_ds_mla": 352}.get(self.kv_cache_dtype)
             ),
         )
         if self.sliding_window is not None:
@@ -1373,6 +1377,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
         spec = MLAAttentionSpec(
             **common_kwargs,
+            topk_buffer_width=self.topk_buffer_width,
             is_index_group_leader=self.indexer is not None,
             non_causal_multi_token_decode=self.non_causal_multi_token_decode,
         )

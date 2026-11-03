@@ -497,6 +497,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       )
     endif()
     FetchContent_MakeAvailable(cutlass)
+    # The image ships the complete headers but no CUTLASS CMake project.
+    set(CUTLASS_DIR "${VLLM_CUTLASS_SRC_DIR}")
+    include_directories("${CUTLASS_DIR}/include" "${CUTLASS_DIR}/tools/util/include")
 
     list(APPEND VLLM_STABLE_EXT_SRC
       "csrc/quantization/w8a8/cutlass/scaled_mm_entry.cu"
@@ -1200,6 +1203,19 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     endif()
   endif()
 
+  # Preserve two original fat-binary schemas without changing SM120 dispatch.
+  if(VLLM_GPU_LANG STREQUAL "CUDA")
+    set(PRESERVED_FATBIN_SRCS
+      "csrc/kimi_k3/attn_res_kernel.cu"
+      "csrc/quantization/fp4/mxfp4_experts_quant.cu")
+    set_gencode_flags_for_srcs(SRCS "${PRESERVED_FATBIN_SRCS}" CUDA_ARCHS "10.0f")
+    set_property(SOURCE ${PRESERVED_FATBIN_SRCS} APPEND PROPERTY
+      COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--expt-extended-lambda;--use_fast_math>")
+    list(APPEND VLLM_STABLE_EXT_SRC ${PRESERVED_FATBIN_SRCS})
+    set_property(SOURCE "csrc/torch_bindings.cpp" APPEND PROPERTY
+      COMPILE_DEFINITIONS VLLM_ENABLE_KIMI_K3_ATTN_RES=1)
+  endif()
+
   message(STATUS "Enabling C_stable extension.")
   list(REMOVE_DUPLICATES VLLM_STABLE_EXT_SRC)
   define_extension_target(
@@ -1275,6 +1291,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
 endif()
 
 #
+# Standalone rebuild: retain existing MoE and external extensions from image.
+return()
 # _moe_C_stable_libtorch extension
 #
 

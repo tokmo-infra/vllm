@@ -502,3 +502,35 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
     # the file). FlashInfer gates its own autotune(cache=...) save the same way.
     if tuner._dirty:
         tuner.save_configs(str(cache_path))
+
+
+_native_kernel_warmup = kernel_warmup
+
+def kernel_warmup(worker, *, process_local_only=False):
+    """Optionally load saved FlashInfer tactics before ordinary warmup."""
+    import os
+
+    if os.environ.get("GLM_FLASHINFER_PRETUNED_ONLY") == "1":
+        if worker.vllm_config.kernel_config.enable_flashinfer_autotune is not False:
+            raise RuntimeError(
+                "GLM_FLASHINFER_PRETUNED_ONLY requires "
+                "enable_flashinfer_autotune=false"
+            )
+        from flashinfer.autotuner import AutoTuner
+
+        from vllm.distributed.parallel_state import get_world_group
+
+        runner = worker.model_runner
+        world = get_world_group()
+        dp = runner.vllm_config.parallel_config.data_parallel_rank
+        path = resolve_flashinfer_autotune_file(runner)
+        path = path.with_name(
+            f"{path.stem}_dp{dp}_rank{world.rank_in_group}{path.suffix}"
+        )
+        if not AutoTuner.get().load_configs(str(path)):
+            raise RuntimeError("pre-tuned FlashInfer cache environment mismatch")
+        logger.info(
+            "GLM_PRETUNED_LOAD_ONLY dp=%s rank=%s file=%s",
+            dp, world.rank_in_group, path,
+        )
+    return _native_kernel_warmup(worker, process_local_only=process_local_only)

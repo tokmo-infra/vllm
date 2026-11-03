@@ -25,6 +25,7 @@ from vllm.utils.mem_utils import get_max_shared_memory_bytes
 from vllm.utils.torch_utils import async_tensor_h2d, current_stream
 from vllm.v1.attention.backend import max_decode_query_len
 from vllm.v1.hisparse.types import SparseKVResidencyUpdate
+from vllm.v1.hisparse.residency_chunked import query_chunk_size, required_shared_bytes, resolve_residency
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
 
@@ -36,8 +37,6 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
-# fp8_ds_mla KV row: 512 B quantized NoPE + 16 B scales + 128 B RoPE.
-FP8_DS_MLA_ROW_BYTES = 656
 HiSparseTopKResult: TypeAlias = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
 
 
@@ -164,29 +163,20 @@ class ResolvedHiSparseConfig:
 
 def _check_residency_shared_memory(
     device: torch.device, config: ResolvedHiSparseConfig
-) -> None:
-    """Reject a config whose residency resolver exceeds per-block shared memory."""
-    # Mirrors hisparse_resolve_residency's layout: union hash keys and values
-    # (plus an empty slot), per-chunk offsets, five counters, done bits, and
-    # the int16 compacted LRU.
-    hot_size = config.device_buffer_size
-    num_chunks = cdiv(hot_size, 32)
-    required = 4 * (2 * (config.max_union_rows + 1) + 3 * num_chunks + 7) + 2 * hot_size
-    device_index = (
-        device.index
-        if device.index is not None
-        else torch.accelerator.current_device_index()
-    )
+) -> int:
+    """Select a fitting resolver chunk, preserving the complete hot capacity."""
+    device_index = device.index if device.index is not None else torch.accelerator.current_device_index()
     available = get_max_shared_memory_bytes(device_index)
-    if required > available:
-        raise ValueError(
-            "HiSparse residency resolution needs "
-            f"{required} B of shared memory per block for "
-            f"device_buffer_size={config.device_buffer_size} and "
-            f"{config.max_union_rows} rows per request "
-            "(decode query length x index_topk), but the device allows "
-            f"{available} B. Lower device_buffer_size or num_speculative_tokens."
+    chunk = query_chunk_size(config.device_buffer_size, config.top_k, config.max_union_rows, available)
+    full = required_shared_bytes(config.device_buffer_size, config.max_union_rows)
+    if full > available:
+        logger.warning(
+            "HiSparse resolver uses verification chunks of %d queries: %d B per CTA "
+            "instead of %d B (device limit %d B). Full top-k union %d and hot buffer %d remain unchanged.",
+            chunk, required_shared_bytes(config.device_buffer_size, chunk * config.top_k),
+            full, available, config.max_union_rows, config.device_buffer_size,
         )
+    return chunk
 
 
 def check_hisparse_host_memory(pool_bytes: int) -> None:
@@ -722,8 +712,9 @@ class HiSparseRuntime:
         # block table and need not be contiguous in the shared slab.
         self.region_stride = config.device_buffer_size
         self.max_union_rows = config.max_union_rows
+        self.residency_max_queries_per_chunk = math.ceil(config.max_union_rows / config.top_k)
         if self.device.type == "cuda":
-            _check_residency_shared_memory(self.device, config)
+            self.residency_max_queries_per_chunk = _check_residency_shared_memory(self.device, config)
 
         row_bytes = row_width * kv_dtype.itemsize
         if row_bytes % 16 != 0:
@@ -959,7 +950,7 @@ class HiSparseRuntime:
 
         # Padded rows are skipped by the kernel (request_state_indices) and must
         # come out as -1 so the attention kernel masks them.
-        torch.ops._C_cache_ops.hisparse_resolve_residency(
+        resolve_residency(
             host_cache,
             hot.cache,
             self.hot_block_table,
@@ -987,6 +978,7 @@ class HiSparseRuntime:
             if resident is not None and resident.view is not None
             else 0,
             0,
+            max_queries_per_chunk=self.residency_max_queries_per_chunk,
         )
 
     def _swap_rows(self, shared_rows: slice) -> None:
@@ -1123,13 +1115,13 @@ def update_hisparse_residency(
 ) -> None:
     """Apply scheduled requests' residency changes.
 
-    ``residency`` is ``[state rows, resident groups, pages]``: the GPU block of
+    ``residency`` is ``[resident groups, state rows, pages]``: the GPU block of
     each page, or block 0 when the page is read from the host.
     """
     if not updates:
         return
     batch_rows = {request_id: row for row, request_id in enumerate(request_ids)}
-    num_groups = residency.shape[1]
+    num_groups = residency.shape[0]
     rows: list[int] = []
     pages: list[int] = []
     block_ids: list[list[int]] = [[] for _ in range(num_groups)]
@@ -1150,7 +1142,7 @@ def update_hisparse_residency(
         host_values, device=request_state_indices.device, dtype=torch.int32
     )
     state_rows = request_state_indices[values[:, 0]]
-    residency[state_rows, :, values[:, 1]] = values[:, 2:]
+    residency[:, state_rows, values[:, 1]] = values[:, 2:].T
 
 
 class HiSparseCacheHandle:
@@ -1175,7 +1167,6 @@ class HiSparseCacheHandle:
         # Speculator layers write their rows after the target forward.
         self.draft_layer = False
         self.index_group_caches: list[HiSparseCacheHandle] = [self]
-        self._batch_block_table: torch.Tensor | None = None
 
     def prepare_group_for_batch(self, attn_metadata: Any | None) -> None:
         assert self.runtime.is_group_leader
@@ -1184,7 +1175,6 @@ class HiSparseCacheHandle:
 
     def _prepare_for_batch(self, attn_metadata: Any | None) -> None:
         self.dummy_batch = attn_metadata is None
-        self._batch_block_table = None
         self.runtime.begin_forward()
         self.num_actual_tokens = (
             attn_metadata.num_actual_tokens if attn_metadata is not None else 0
@@ -1199,17 +1189,6 @@ class HiSparseCacheHandle:
         self.host_mirror_required = attn_metadata is not None and (
             not self.decode_batch or self.runtime.eager_host_mirror
         )
-
-    def batch_block_table(self) -> torch.Tensor:
-        """Resident rows by this step's batch row, for the prefill paths."""
-        if self._batch_block_table is None:
-            assert self.block_table is not None
-            indices = self.runtime.request_state_indices
-            assert indices is not None
-            self._batch_block_table = self.block_table.index_select(
-                0, indices.clamp(min=0)
-            )
-        return self._batch_block_table
 
     def write_target(
         self, num_input_rows: int, num_slot_rows: int

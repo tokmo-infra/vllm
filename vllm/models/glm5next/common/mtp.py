@@ -23,7 +23,10 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.deepseek_mtp import SharedHead
-from vllm.model_executor.models.deepseek_v2 import DeepseekV2MixtureOfExperts
+from vllm.model_executor.models.deepseek_v2 import (
+    DeepseekV2MixtureOfExperts,
+    DeepseekV32IndexerCache,
+)
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.models.glm5next.nvidia.ops.fused_eh_norm import fused_eh_norm
 from vllm.platforms import current_platform
@@ -37,6 +40,7 @@ from .model import (
     _num_fused_shared_experts,
     _try_load_fp8_attn_proj,
     _try_load_fp8_indexer_wk,
+    get_sparse_topk_buffer_width,
     get_spec_layer_idx_from_weight_name,
 )
 
@@ -52,20 +56,9 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
 
-        # Reserve room for the incomplete pool tail and align the sparse MLA
-        # buffer width to BLOCK_N=128.
-        topk_tokens = config.index_topk
-        assert topk_tokens is not None
-        kpool = config.index_kpool
-        assert kpool is not None
-        buffer_width = topk_tokens + (kpool - 1 if kpool > 1 else 0)
-        sparse_topk_block_n = 128
-        buffer_width = (
-            (buffer_width + sparse_topk_block_n - 1) // sparse_topk_block_n
-        ) * sparse_topk_block_n
         topk_indices_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
-            buffer_width,
+            get_sparse_topk_buffer_width(config),
             dtype=torch.int32,
             device=current_platform.device_type,
         )
@@ -152,6 +145,16 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         # index_share_for_mtp_iteration: step 0 computes top-k, steps 1+ reuse.
         for mla_attn in self._mtp_mla_attns:
             mla_attn.skip_topk = skip
+
+    def topk_cache_layers(self) -> set[str]:
+        """Indexer cache layers, which no step that reuses the top-k reads."""
+        return {
+            module.prefix
+            for mla_attn in self._mtp_mla_attns
+            if mla_attn.indexer is not None
+            for module in mla_attn.indexer.modules()
+            if isinstance(module, DeepseekV32IndexerCache)
+        }
 
     def compact_topk_indices(self, slot_ids: torch.Tensor):
         """Gather the top-k index rows at ``slot_ids`` to the front of the buffer."""

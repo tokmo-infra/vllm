@@ -7,6 +7,7 @@
 
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from itertools import product
 from typing import NamedTuple, cast
 
 import numpy as np
@@ -346,6 +347,282 @@ class RankLocalStoreLayout(StoreLayout):
                 for index in range(len(self.kv_caches_base_addr))
             ],
         )
+
+
+class CompactGroupStoreLayout(RankLocalStoreLayout):
+    """Opt-in logical-view payload for one KV-cache group.
+
+    Unlike the historical layout, this stores only the tensors registered for
+    this group and serializes their logical elements in C order. Stride gaps
+    and padded page tails are omitted. ``tail_shape`` is supplied only for a
+    verified MLA page shaped logically as ``(heads, states, content_bytes)``;
+    when that shape matches every registered view, partial final blocks can
+    omit unused token states. Other cache kinds (notably Mamba/KDA) retain the
+    complete logical state.
+    """
+
+    def __init__(
+        self,
+        metadata: KeyMetadata,
+        block_size: int,
+        hash_block_size: int,
+        *,
+        tail_shape: tuple[int, int, int] | None = None,
+    ) -> None:
+        super().__init__(metadata, block_size, hash_block_size)
+        self.tail_shape = tail_shape
+        self._views: list[
+            tuple[
+                int,
+                int,
+                tuple[int, ...],
+                tuple[int, ...],
+                int,
+                tuple[tuple[int, int], ...],
+            ]
+        ] = []
+        self._num_blocks = 0
+        # Keep a complete logical page until the runtime MLA (including
+        # quantized/indexer) view-to-token mapping has been verified. Group and
+        # stride-gap compaction is independent of tail trimming.
+        self.tail_trim_supported = False
+        self.tail_trim_reason = "disabled; retain full logical pages"
+        self.compact_block_bytes = 0
+        self.compact_segment_count = 0
+
+    @staticmethod
+    def _logical_runs(
+        shape: tuple[int, ...],
+        strides_bytes: tuple[int, ...],
+        element_size: int,
+    ) -> list[tuple[int, int]]:
+        """Return active byte runs in logical row-major order.
+
+        Non-contiguous inner dimensions are enumerated element-by-element (and
+        adjacent addresses are coalesced), so stride gaps are never serialized
+        as values.
+        """
+        if not shape or any(size <= 0 for size in shape):
+            return []
+        suffix_start = len(shape)
+        run_size = element_size
+        for axis in range(len(shape) - 1, -1, -1):
+            if shape[axis] != 1 and strides_bytes[axis] != run_size:
+                break
+            run_size *= shape[axis]
+            suffix_start = axis
+
+        outer_ranges = [range(size) for size in shape[:suffix_start]]
+        runs: list[tuple[int, int]] = []
+
+        def append_run(offset: int) -> None:
+            if runs and runs[-1][0] + runs[-1][1] == offset:
+                previous_offset, previous_size = runs[-1]
+                runs[-1] = (previous_offset, previous_size + run_size)
+            else:
+                runs.append((offset, run_size))
+
+        for index in product(*outer_ranges):
+            offset = sum(
+                coordinate * strides_bytes[axis]
+                for axis, coordinate in enumerate(index)
+            )
+            append_run(offset)
+        return runs
+
+    @staticmethod
+    def _has_proven_non_overlapping_layout(
+        shape: tuple[int, ...], strides_bytes: tuple[int, ...], element_size: int
+    ) -> bool:
+        """Conservatively prove a positive-stride view has no aliases.
+
+        Sorting dimensions by stride accepts ordinary permuted/interleaved
+        layouts (including a head stride that crosses block-stride boundaries)
+        while rejecting layouts whose non-overlap cannot be established.
+        """
+        span = element_size
+        dimensions = (
+            (size, stride)
+            for size, stride in zip(shape, strides_bytes, strict=True)
+            if size > 1
+        )
+        for size, stride in sorted(dimensions, key=lambda item: item[1]):
+            if stride < span:
+                return False
+            span += (size - 1) * stride
+        return True
+
+    def register_kv_caches(
+        self,
+        kv_caches: Sequence[torch.Tensor],
+        num_blocks: int,
+    ) -> None:
+        if not kv_caches:
+            raise ValueError("Compact Store group has no KV-cache views")
+        self._num_blocks = num_blocks
+        self._views = []
+        self.compact_block_bytes = 0
+        self.compact_segment_count = 0
+        tail_shape_matches = self.tail_shape is not None
+
+        for cache in kv_caches:
+            if cache.ndim < 2 or cache.shape[0] != num_blocks:
+                raise ValueError(
+                    "Compact Store views must have manager blocks on dimension 0; "
+                    f"got shape={tuple(cache.shape)}, num_blocks={num_blocks}"
+                )
+            element_size = cache.element_size()
+            block_stride = cache.stride(0) * element_size
+            inner_shape = tuple(cache.shape[1:])
+            inner_strides = tuple(
+                stride * element_size for stride in cache.stride()[1:]
+            )
+            if block_stride <= 0 or any(stride <= 0 for stride in inner_strides):
+                raise ValueError(
+                    "Compact Store does not support zero or negative cache strides: "
+                    f"shape={tuple(cache.shape)}, strides={tuple(cache.stride())}"
+                )
+            runs = self._logical_runs(inner_shape, inner_strides, element_size)
+            if not runs:
+                raise ValueError("Compact Store view has no active elements")
+            max_end = max(offset + length for offset, length in runs)
+            if not self._has_proven_non_overlapping_layout(
+                tuple(cache.shape),
+                tuple(stride * element_size for stride in cache.stride()),
+                element_size,
+            ):
+                raise ValueError(
+                    "Compact Store cannot prove cache view is non-overlapping: "
+                    f"shape={tuple(cache.shape)}, strides={tuple(cache.stride())}"
+                )
+            storage = cache.untyped_storage()
+            storage_offset = cache.data_ptr() - storage.data_ptr()
+            last_block_end = (num_blocks - 1) * block_stride + max_end
+            if storage_offset < 0 or (
+                storage_offset + last_block_end > storage.nbytes()
+            ):
+                raise ValueError(
+                    "Compact Store view exceeds its backing storage: "
+                    f"segments (shape={tuple(cache.shape)}, "
+                    f"strides={tuple(cache.stride())}, block_stride={block_stride}, "
+                    f"active_end={max_end}, storage_bytes={storage.nbytes()})"
+                )
+
+            cache_tail_shape = None
+            if cache.ndim == 4:
+                cache_tail_shape = (
+                    cache.shape[1],
+                    cache.shape[2],
+                    cache.shape[3] * element_size,
+                )
+            if cache_tail_shape != self.tail_shape:
+                tail_shape_matches = False
+
+            self._views.append(
+                (
+                    cache.data_ptr(),
+                    block_stride,
+                    inner_shape,
+                    inner_strides,
+                    element_size,
+                    tuple(runs),
+                )
+            )
+            self.compact_block_bytes += sum(length for _, length in runs)
+            self.compact_segment_count += len(runs)
+
+        self.tail_trim_supported = False
+        self.tail_trim_reason = (
+            "disabled; retain full logical pages"
+            if tail_shape_matches
+            else "disabled; retain full logical pages (MLA shape unverified)"
+        )
+
+    def _runs_for_tokens(
+        self,
+        view: tuple[
+            int,
+            int,
+            tuple[int, ...],
+            tuple[int, ...],
+            int,
+            tuple[tuple[int, int], ...],
+        ],
+        valid_tokens: int,
+    ) -> list[tuple[int, int]]:
+        _, _, inner_shape, inner_strides, element_size, full_runs = view
+        shape = inner_shape
+        if (
+            valid_tokens < self.block_size
+            and self.tail_trim_supported
+            and self.tail_shape is not None
+        ):
+            heads, full_states, content_bytes = self.tail_shape
+            state_numerator = valid_tokens * full_states
+            if state_numerator % self.block_size == 0:
+                valid_states = state_numerator // self.block_size
+                if valid_states > 0:
+                    shape = (heads, valid_states, content_bytes // element_size)
+                    return self._logical_runs(shape, inner_strides, element_size)
+        # MLA tail trimming is disabled until a runtime tensor-to-token mapping
+        # is verified. Reuse registered runs so large KDA views are not
+        # re-enumerated for every stored or received chunk.
+        return list(full_runs)
+
+    def _block_values(
+        self, block_id: int, valid_tokens: int
+    ) -> tuple[list[int], list[int]]:
+        addrs: list[int] = []
+        sizes: list[int] = []
+        for view in self._views:
+            base_addr, block_stride, _, _, _, _ = view
+            for offset, length in self._runs_for_tokens(view, valid_tokens):
+                addrs.append(base_addr + block_id * block_stride + offset)
+                sizes.append(length)
+        return addrs, sizes
+
+    def prepare_values(
+        self,
+        chunks: Sequence[tuple[int, int]],
+        block_ids: list[int],
+        shard_ids: Sequence[StoreShardId],
+    ) -> tuple[list[list[int]], list[list[int]], list[int]]:
+        if not chunks:
+            return [], [], []
+        if len(chunks) != len(shard_ids) or any(shard_id != 0 for shard_id in shard_ids):
+            raise ValueError("Compact rank-local Store chunks require shard 0")
+
+        all_addrs: list[list[int]] = []
+        all_sizes: list[list[int]] = []
+        selected_block_ids: list[int] = []
+        for start, end in chunks:
+            if start < 0 or end <= start or start % self.block_size != 0:
+                raise ValueError(
+                    f"Compact Store chunks must start on a block boundary: {(start, end)}"
+                )
+            first_block = start // self.block_size
+            last_block = (end - 1) // self.block_size
+            if last_block >= len(block_ids):
+                raise IndexError("Compact Store chunk exceeds block ID table")
+
+            chunk_addrs: list[int] = []
+            chunk_sizes: list[int] = []
+            for chunk_block in range(first_block, last_block + 1):
+                page_start = chunk_block * self.block_size
+                valid_tokens = min(end, page_start + self.block_size) - page_start
+                block_addrs, block_sizes = self._block_values(
+                    block_ids[chunk_block], valid_tokens
+                )
+                chunk_addrs.extend(block_addrs)
+                chunk_sizes.extend(block_sizes)
+            all_addrs.append(chunk_addrs)
+            all_sizes.append(chunk_sizes)
+            selected_block_ids.append(block_ids[first_block])
+
+        return all_addrs, all_sizes, selected_block_ids
+
+    def prepare_value_for_block(self, block_id: int) -> tuple[list[int], list[int]]:
+        return self._block_values(block_id, self.block_size)
 
 
 class TPShardedStoreLayout(StoreLayout):

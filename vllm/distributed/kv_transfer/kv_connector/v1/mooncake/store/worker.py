@@ -45,6 +45,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator imp
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  # noqa: E501
     BlobBlockHashes,
     ChunkedTokenDatabase,
+    CompactGroupStoreLayout,
     KeyMetadata,
     LBHNCStoreLayout,
     LBNHCStoreLayout,
@@ -56,6 +57,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
     StoreShardId,
     TailKeyBoundary,
     TPShardedStoreLayout,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.lease import (  # noqa: E501
+    LEASE_EXPIRED,
+    retry_expired_get_once,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.protocol import (  # noqa: E501
     LOOKUP_MSG,
@@ -89,6 +94,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from .metrics import MooncakeStoreConnectorStats
+from .staged_lookup import LookupCandidate, staged_lookup_exists
 
 logger = init_logger(__name__)
 
@@ -110,6 +116,33 @@ def resolve_store_tp_size(extra_config: dict[str, Any]) -> int | None:
 
     store_tp_size = extra_config.get("store_tp_size")
     return store_tp_size if type(store_tp_size) is int and store_tp_size > 0 else None
+
+
+def _compact_group_cache_tensors(
+    group: Any,
+    kv_caches: dict[str, torch.Tensor | Sequence[torch.Tensor]],
+    num_blocks: int,
+) -> list[torch.Tensor]:
+    """Return every registered state view for exactly one KV-cache group."""
+    missing_layers = [name for name in group.layer_names if name not in kv_caches]
+    if missing_layers:
+        raise ValueError(
+            f"Missing transferable KV caches for layers: {missing_layers}"
+        )
+
+    result: list[torch.Tensor] = []
+    for layer_name in group.layer_names:
+        value = kv_caches[layer_name]
+        states = (value,) if isinstance(value, torch.Tensor) else value
+        if not isinstance(states, Sequence) or not states or not all(
+            isinstance(state, torch.Tensor) for state in states
+        ):
+            raise TypeError(
+                f"KV cache for {layer_name} must be a tensor or a non-empty "
+                "sequence of state tensors"
+            )
+        result.extend(group_kernel_blocks(state, num_blocks) for state in states)
+    return result
 
 
 def _rotate_list(values: list[_T], offset: int) -> list[_T]:
@@ -1243,6 +1276,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         current_batch_keys: list[str] = key_list_c
         current_batch_block_ids: list[int] = block_id_list_c
         batch_bytes = 0
+        load_get_recorded = False
         try:
             for (
                 batch_keys,
@@ -1252,6 +1286,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             ) in load_batches:
                 current_batch_keys = batch_keys
                 current_batch_block_ids = batch_block_ids
+                load_get_recorded = False
                 batch_bytes = _sum_batch_bytes(batch_sizes)
                 tiers_by_key: dict[str, str] | None = None
                 if envs.VLLM_MOONCAKE_STORE_TIER_LOG:
@@ -1280,6 +1315,48 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     status="partial_failure" if failed else "ok",
                     num_failed_keys=len(failed),
                 )
+                load_get_recorded = True
+                expired = [i for i, value in enumerate(res) if value == LEASE_EXPIRED]
+                if expired:
+                    logger.warning(
+                        "Refreshing expired Mooncake read leases once for "
+                        "%d/%d keys of request %s",
+                        len(expired),
+                        len(batch_keys),
+                        req_id,
+                    )
+                    retry_start = time.perf_counter()
+                    retry_bytes = _sum_batch_bytes([batch_sizes[i] for i in expired])
+                    try:
+                        res = retry_expired_get_once(
+                            self.store, batch_keys, batch_addrs, batch_sizes, res
+                        )
+                    except Exception:
+                        self._record_operation(
+                            "load_get_retry",
+                            retry_start,
+                            len(expired),
+                            num_bytes=retry_bytes,
+                            status="error",
+                            num_failed_keys=len(expired),
+                        )
+                        raise
+                    remaining = sum(res[i] < 0 for i in expired)
+                    self._record_operation(
+                        "load_get_retry",
+                        retry_start,
+                        len(expired),
+                        num_bytes=retry_bytes,
+                        status="partial_failure" if remaining else "ok",
+                        num_failed_keys=remaining,
+                    )
+                    failed = [
+                        (key, value, block_id)
+                        for key, value, block_id in zip(
+                            batch_keys, res, batch_block_ids, strict=True
+                        )
+                        if value < 0
+                    ]
                 if failed:
                     self._report_load_error(
                         req_id, [block_id for _, _, block_id in failed]
@@ -1294,14 +1371,15 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     break
         except Exception as e:
             self._report_load_error(req_id, current_batch_block_ids)
-            self._record_operation(
-                "load_get",
-                load_get_start,
-                len(current_batch_keys),
-                num_bytes=batch_bytes,
-                status="error",
-                num_failed_keys=len(current_batch_keys),
-            )
+            if not load_get_recorded:
+                self._record_operation(
+                    "load_get",
+                    load_get_start,
+                    len(current_batch_keys),
+                    num_bytes=batch_bytes,
+                    status="error",
+                    num_failed_keys=len(current_batch_keys),
+                )
             logger.warning(
                 "Failed to get Mooncake sub-batch %s, error: %s",
                 current_batch_keys[:3],
@@ -1391,6 +1469,10 @@ class MooncakeStoreWorker:
         assert kv_role is not None
         self.kv_role = kv_role
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+        compact_payload_option = extra_config.get("store_compact_group_payloads", False)
+        if type(compact_payload_option) is not bool:
+            raise ValueError("store_compact_group_payloads must be a boolean")
+        self._store_compact_group_payloads = compact_payload_option
         self.can_put = self.kv_role in ("kv_producer", "kv_both") or (
             extra_config.get("save_decode_cache", False)
         )
@@ -1558,12 +1640,20 @@ class MooncakeStoreWorker:
         self, extra_config: dict[str, Any]
     ) -> tuple[int | None, str, type[TPShardedStoreLayout] | None]:
         """Select the opt-in TP layout and its Store namespace."""
+        compact_payloads = extra_config.get("store_compact_group_payloads", False)
+
+        def compact_namespace(namespace: str) -> str:
+            if not compact_payloads:
+                return namespace
+            marker = "@store_format:compact_group_views_v1"
+            return f"{namespace}@payload:compact_group_views_v1" if namespace else marker
+
         lcm_store_tp_enabled = extra_config.get("enable_store_tp_lcm") is True
         store_tp_requested = (
             lcm_store_tp_enabled or extra_config.get("store_tp_size") is not None
         )
         if not store_tp_requested:
-            return None, "", None
+            return None, compact_namespace(""), None
 
         requested_store_tp_size = resolve_store_tp_size(extra_config)
         cache_layout = self.cache_config.get_resolved_kv_cache_layout()
@@ -1589,7 +1679,11 @@ class MooncakeStoreWorker:
                     )
                 return (
                     requested_store_tp_size,
-                    layout_cls.shared_namespace(requested_store_tp_size, self.pp_size),
+                    compact_namespace(
+                        layout_cls.shared_namespace(
+                            requested_store_tp_size, self.pp_size
+                        )
+                    ),
                     layout_cls,
                 )
             if self.num_kv_head == 1:
@@ -1600,11 +1694,13 @@ class MooncakeStoreWorker:
                 )
                 return (
                     None,
-                    f"@store_pp:{self.pp_size}@store_format:tp_shared_mqa",
+                    compact_namespace(
+                        f"@store_pp:{self.pp_size}@store_format:tp_shared_mqa"
+                    ),
                     None,
                 )
 
-        store_namespace = (
+        store_namespace = compact_namespace(
             f"@store_pp:{self.pp_size}@store_format:"
             f"rank_local_tp{self.tp_size}_layout_{cache_layout.name}"
         )
@@ -1644,7 +1740,35 @@ class MooncakeStoreWorker:
                 tp_rank=group_tp_rank,
             )
             store_layout: TPShardedStoreLayout | None = None
-            if layout_cls is not None:
+            if (
+                getattr(self, "_store_compact_group_payloads", False)
+                and layout_cls is None
+            ):
+                inner_specs = (
+                    tuple(group.kv_cache_spec.kv_cache_specs.values())
+                    if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+                    else (group.kv_cache_spec,)
+                )
+                tail_shape = None
+                if inner_specs and all(
+                    isinstance(
+                        inner_spec, (MLAAttentionSpec, SlidingWindowMLASpec)
+                    )
+                    for inner_spec in inner_specs
+                ):
+                    spec = inner_specs[0]
+                    tail_shape = (
+                        spec.num_heads,
+                        spec.num_states,
+                        spec.state_content_size_bytes,
+                    )
+                store_layout = CompactGroupStoreLayout(
+                    group_metadata,
+                    group.kv_cache_spec.block_size,
+                    hash_block_size,
+                    tail_shape=tail_shape,
+                )
+            elif layout_cls is not None:
                 assert self.store_tp_size is not None
                 store_layout = layout_cls(
                     group_metadata,
@@ -1728,7 +1852,7 @@ class MooncakeStoreWorker:
 
     def register_kv_caches(
         self,
-        kv_caches: dict[str, torch.Tensor],
+        kv_caches: dict[str, torch.Tensor | Sequence[torch.Tensor]],
     ) -> None:
         """Register KV cache tensors and start transfer threads."""
         if self._capacity_only:
@@ -1748,8 +1872,54 @@ class MooncakeStoreWorker:
         assert self.cache_config.num_gpu_blocks is not None
         self.num_blocks = self.cache_config.num_gpu_blocks
         use_group_regions = self._kv_cache_config.hisparse_host_num_blocks is not None
+        compact_payloads = getattr(self, "_store_compact_group_payloads", False)
+        if compact_payloads and use_group_regions:
+            raise ValueError(
+                "store_compact_group_payloads currently requires the standard "
+                "non-HiSparse cache registration path"
+            )
 
-        if not use_group_regions:
+        if compact_payloads:
+            registered_buffers: dict[int, int] = {}
+            for group_idx, (group, db) in enumerate(
+                zip(self._kv_cache_groups, self.token_dbs, strict=True)
+            ):
+                group_tensors = _compact_group_cache_tensors(
+                    group, kv_caches, self.num_blocks
+                )
+                for cache in group_tensors:
+                    storage = cache.untyped_storage()
+                    base_addr = storage.data_ptr()
+                    region_len = storage.nbytes()
+                    registered_len = registered_buffers.get(base_addr)
+                    if registered_len is None:
+                        ret = self.store.register_buffer(base_addr, region_len)
+                        if ret != 0:
+                            raise RuntimeError(
+                                "Mooncake register_buffer failed for addr "
+                                f"{base_addr:#x} len {region_len}: {ret}"
+                            )
+                        registered_buffers[base_addr] = region_len
+                    elif registered_len != region_len:
+                        raise ValueError(
+                            f"KV cache views at {base_addr:#x} expose inconsistent "
+                            f"region sizes: {registered_len} and {region_len}."
+                        )
+                db.store_layout.register_kv_caches(group_tensors, self.num_blocks)
+                if isinstance(db.store_layout, CompactGroupStoreLayout):
+                    logger.info(
+                        "Compact Store group %d: layers=%d state_views=%d "
+                        "active_bytes_per_block=%d segments_per_block=%d "
+                        "mla_tail_trim=%s (%s)",
+                        group_idx,
+                        len(group.layer_names),
+                        len(group_tensors),
+                        db.store_layout.compact_block_bytes,
+                        db.store_layout.compact_segment_count,
+                        db.store_layout.tail_trim_supported,
+                        db.store_layout.tail_trim_reason,
+                    )
+        elif not use_group_regions:
             store_layer_names = {
                 layer_name
                 for group in self._kv_cache_groups
@@ -2112,6 +2282,7 @@ class MooncakeStoreWorker:
         # candidate_meta stores the (group, hash_bytes) for key slice.
         candidate_keys: list[str] = []
         candidate_meta: list[tuple[int, bytes]] = []
+        candidate_boundaries: list[int] = []
         fine_grained = self.coord.enable_partial_hash_hits
         lookup_masks = None if fine_grained else self.coord.lookup_mask(token_len)
         for g_idx, db in enumerate(self.token_dbs):
@@ -2147,39 +2318,79 @@ class MooncakeStoreWorker:
                         PoolKey.build_key_string(key_prefix, hash_hex)
                     )
                 candidate_meta.append((g_idx, bytes(h)))
+                candidate_boundaries.append(
+                    (chunk_id + 1) * (self.hash_block_size if fine_grained else spec_block_size)
+                )
 
         if not candidate_keys:
             return MooncakeLookupResult(0)
 
         lookup_start = time.perf_counter()
+        checked_key_count = 0
         try:
-            res = self.store.batch_is_exist(candidate_keys)
+            if (
+                getattr(self, "_store_compact_group_payloads", False)
+                and fine_grained
+                and self.coord.mamba_group_ids
+            ):
+                candidates = []
+                pos = 0
+                for (g_idx, hash_bytes), boundary in zip(
+                    candidate_meta, candidate_boundaries, strict=True
+                ):
+                    count = len(self._lookup_key_prefixes[g_idx])
+                    candidates.append(LookupCandidate(
+                        g_idx, hash_bytes, tuple(candidate_keys[pos:pos+count]), boundary
+                    ))
+                    pos += count
+
+                def check_keys(keys):
+                    nonlocal checked_key_count
+                    checked_key_count += len(keys)
+                    return self.store.batch_is_exist(keys)
+
+                def usable_hit(exists, length):
+                    pool = ExternalCachedBlockPool(self.hash_block_size, exists)
+                    _, hit = self.coord.find_longest_cache_hit(block_hashes, length, pool)
+                    # Preserve the existing sampling-token recomputation: an
+                    # all-hit lookup may need the preceding KDA checkpoint.
+                    if hit >= num_tokens:
+                        bound = self.coord.align_lookup_length(num_tokens - 1)
+                        if bound <= 0:
+                            return 0
+                        _, hit = self.coord.find_longest_cache_hit(block_hashes, bound, pool)
+                    return hit
+
+                exists_set = staged_lookup_exists(
+                    candidates, token_len=token_len,
+                    mamba_group_ids=self.coord.mamba_group_ids,
+                    batch_is_exist=check_keys, find_hit_length=usable_hit,
+                )
+            else:
+                checked_key_count = len(candidate_keys)
+                res = self.store.batch_is_exist(candidate_keys)
+                exists_set = set()
+                pos = 0
+                for g_idx, hash_bytes in candidate_meta:
+                    count = len(self._lookup_key_prefixes[g_idx])
+                    if all(res[pos + j] == 1 for j in range(count)):
+                        exists_set.add((g_idx, hash_bytes))
+                    pos += count
             self._record_kv_connector_operation(
                 "lookup_exists",
                 time.perf_counter() - lookup_start,
-                len(candidate_keys),
+                checked_key_count,
             )
         except Exception as e:
             self._record_kv_connector_operation(
                 "lookup_exists",
                 time.perf_counter() - lookup_start,
-                len(candidate_keys),
+                checked_key_count,
                 status="error",
-                num_failed_keys=len(candidate_keys),
+                num_failed_keys=checked_key_count,
             )
             logger.error("Remote connection failed in lookup: %s", e)
             return MooncakeLookupResult(0)
-
-        # A (group, hash) is "present" only when every namespace that will be
-        # loaded has it (per-group count: sharded groups need every rank's
-        # shard, replicated groups one namespace per unique KV head).
-        exists_set = set()
-        pos = 0
-        for g_idx, hash_bytes in candidate_meta:
-            count = len(self._lookup_key_prefixes[g_idx])
-            if all(res[pos + j] == 1 for j in range(count)):
-                exists_set.add((g_idx, hash_bytes))
-            pos += count
 
         cached_block_pool = ExternalCachedBlockPool(
             self.hash_block_size,

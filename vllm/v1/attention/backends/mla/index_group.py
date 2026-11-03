@@ -17,7 +17,6 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
 )
 from vllm.v1.hisparse.runtime import (
-    FP8_DS_MLA_ROW_BYTES,
     HiSparseCacheHandle,
     HiSparsePrefillStagingPlan,
     create_hisparse_cache_handle,
@@ -49,7 +48,7 @@ class SparseMLAIndexGroup:
         self,
         vllm_config: VllmConfig | None = None,
         *,
-        head_size: int | None = None,
+        row_width: int | None = None,
         kv_cache_dtype: str | None = None,
     ) -> int:
         layer_index = self.num_layers
@@ -121,6 +120,7 @@ class SparseMLAIndexGroup:
         *,
         block_stride_rows: int | None,
         return_valid_counts: bool,
+        idx_mapping: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         num_tokens = logical_topk_indices.shape[0]
         if num_tokens > self.physical_topk_indices.shape[0]:
@@ -132,6 +132,7 @@ class SparseMLAIndexGroup:
                 BLOCK_STRIDE_ROWS=block_stride_rows,
                 NUM_TOPK_TOKENS=logical_topk_indices.shape[1],
                 return_valid_counts=return_valid_counts,
+                idx_mapping=idx_mapping,
             )
 
         physical_topk_indices = self.physical_topk_indices[:num_tokens]
@@ -155,6 +156,7 @@ class SparseMLAIndexGroup:
                     valid_counts_out=(
                         valid_topk_counts if return_valid_counts else None
                     ),
+                    idx_mapping=idx_mapping,
                 )
                 self.physical_topk_ready.record(self.side_stream)
         compute_stream.wait_event(self.physical_topk_ready)
@@ -177,22 +179,20 @@ class HiSparseMLAIndexGroup(SparseMLAIndexGroup):
         self,
         vllm_config: VllmConfig | None = None,
         *,
-        head_size: int | None = None,
+        row_width: int | None = None,
         kv_cache_dtype: str | None = None,
     ) -> int:
         assert vllm_config is not None
-        assert head_size is not None
+        assert row_width is not None
         assert kv_cache_dtype is not None
         layer_index = super().register_layer()
         if self.prefill_stream is None:
             self.prefill_stream = _create_side_stream(self.logical_topk_indices.device)
         if kv_cache_dtype == "fp8_ds_mla":
-            row_width = FP8_DS_MLA_ROW_BYTES
             kv_dtype = torch.uint8
         else:
             from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 
-            row_width = head_size
             kv_dtype = kv_cache_dtype_str_to_dtype(
                 kv_cache_dtype, vllm_config.model_config
             )
@@ -233,7 +233,10 @@ class HiSparseMLAIndexGroup(SparseMLAIndexGroup):
         cache = self.cache(layer_index)
         num_tokens = logical_topk_indices.shape[0]
         req_id_per_token = attn_metadata.req_id_per_token[:num_tokens]
-        if num_tokens > cache.runtime.max_swap_rows:
+        if num_tokens > cache.runtime.max_swap_rows or (
+            cache.all_context_pages_resident
+            and cache.num_decode_tokens < cache.num_actual_tokens
+        ):
             # Prefill-sized batches do not fit the decode residency workspace.
             # Non-resident prefills are staged before reaching this path.
             assert cache.all_context_pages_resident
@@ -243,10 +246,11 @@ class HiSparseMLAIndexGroup(SparseMLAIndexGroup):
                 layer_index,
                 logical_topk_indices,
                 req_id_per_token,
-                leader.batch_block_table(),
+                leader.block_table,
                 leader.view.block_size,
                 block_stride_rows=leader.view.attention_block_stride,
                 return_valid_counts=return_valid_counts,
+                idx_mapping=leader.runtime.request_state_indices,
             )
         source_block_table = cache.source_block_table
         assert source_block_table is not None
@@ -358,7 +362,7 @@ class SparseMLAIndexGroupBuilder:
         is_index_producing_layer: bool,
         vllm_config: VllmConfig | None = None,
         *,
-        head_size: int | None = None,
+        row_width: int | None = None,
         kv_cache_dtype: str | None = None,
     ) -> tuple[SparseMLAIndexGroup, int]:
         if is_index_producing_layer or self.current_group is None:
@@ -390,7 +394,7 @@ class SparseMLAIndexGroupBuilder:
         group = self.current_group
         group_index = group.register_layer(
             vllm_config,
-            head_size=head_size,
+            row_width=row_width,
             kv_cache_dtype=kv_cache_dtype,
         )
         return group, group_index
