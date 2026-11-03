@@ -23,6 +23,25 @@ def test_object_storage_shm_default_name():
     assert len(envs._generate_shm_name()) <= 30
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION",
+        "VLLM_HOT_TAIL_ADMISSION_DIAGNOSTICS",
+    ],
+)
+def test_hot_tail_flags_require_explicit_opt_in(monkeypatch, name):
+    """An unset or non-1 value must never activate the research path."""
+    monkeypatch.delenv(name, raising=False)
+    assert environment_variables[name]() is False
+    for value in ("0", "", "true", "2"):
+        monkeypatch.setenv(name, value)
+        assert environment_variables[name]() is False
+    monkeypatch.setenv(name, "1")
+    assert environment_variables[name]() is True
+    assert name not in envs.compile_factors()
+
+
 def test_getattr_without_cache(monkeypatch: pytest.MonkeyPatch):
     assert envs.VLLM_HOST_IP == ""
     assert envs.VLLM_PORT is None
