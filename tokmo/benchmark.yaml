@@ -1,0 +1,88 @@
+{
+  "name": "xinhao-roce4c711-dspark5-c7480-a12000-20261103-001",
+  "case": "Production DSpark P5/D5,8DEP2 P plus global EP16 D,verbs/MXFP8/direct staging/overlap tile2048,QP4/GID3/TC106. MC_ENABLE_DEST_DEVICE_AFFINITY=1 onP/D/Store. C7480/A12000,600s deadline,zero retries; HTTP500 recorded and load continues. Image4c711ac feature backport; fullD5 validation pending.",
+  "seed": 42,
+  "logging": {
+    "level": "INFO",
+    "progress_interval_seconds": 10
+  },
+  "pipeline": {
+    "loader": {
+      "plugin": "hf-datasets",
+      "settings": {
+        "dataset": "json",
+        "data_files": "/data2/bench/eng-xinhao/vllm-pd/dsv41-flash-1017/b300-12p2-d16-l2-l3/datasets/swe-maxtpm-130k-candidate.jsonl",
+        "split": "train[:12000]"
+      }
+    },
+    "normalization": {
+      "plugin": "open-swe-traces",
+      "settings": {
+        "missing_tool_call_id": "empty"
+      }
+    },
+    "selector": {
+      "plugin": "all",
+      "settings": {}
+    },
+    "executor": {
+      "plugin": "openai-chat",
+      "settings": {
+        "base_url": "http://127.0.0.1:28080",
+        "model": "deepseek-v4.1-flash-1017",
+        "stream": true,
+        "timeout_seconds": 600,
+        "max_tokens": 4096,
+        "cache_salt_enabled": true,
+        "extra_body": {
+          "temperature": 0,
+          "reasoning_effort": null
+        },
+        "connection_scope": "trial"
+      }
+    },
+    "scheduler": {
+      "plugin": "multi-turn-closed-loop",
+      "settings": {
+        "max_active_sessions": 12000,
+        "max_concurrency": 7480,
+        "retry": {
+          "probability": 0,
+          "max_attempts": 1
+        }
+      }
+    },
+    "metrics": {
+      "plugin": "standard",
+      "settings": {
+        "maxtpm": true,
+        "memory_limit": "4GB",
+        "maxtpm_start_percent": 40,
+        "pricing": {
+          "input_price": 0.4,
+          "cached_input_price": 0.008,
+          "output_price": 1.6,
+          "currency": "CNY",
+          "per_tokens": 1000000,
+          "source": "DeepSeek-V4.1-Flash-1017 official CNY peak 2/0.04/8, x0.2; verified 2026-11-02 https://api-docs.deepseek.com/zh-cn/quick_start/pricing/"
+        }
+      }
+    },
+    "saver": {
+      "plugin": "sqlite",
+      "settings": {
+        "path": "/data2/bench/eng-xinhao/vllm-pd/dsv41-flash-1017/b300-8p2-d16-rdma-megamoe-main/results/dspark5-c7480-a12000-20261103-001/results.db",
+        "summary_only": true
+      }
+    },
+    "exporter": {}
+  },
+  "observation": {
+    "enabled": true,
+    "trace_mode": "benchmark",
+    "trace_export": false,
+    "host": "127.0.0.1",
+    "port": 28188,
+    "poll_seconds": 5
+  }
+}
