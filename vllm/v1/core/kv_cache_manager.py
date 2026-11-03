@@ -368,6 +368,10 @@ class KVCacheManager:
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
         return blocks, num_local, 0, min(per_group_hits) < num_local
 
+    def is_producer_budget_rejection(self, request: Request) -> bool:
+        request_id = getattr(self, "_producer_budget_rejection_request_id", None)
+        return request_id is not None and request_id == request.request_id
+
     def allocate_slots(
         self,
         request: Request,
@@ -382,6 +386,8 @@ class KVCacheManager:
         reserved_blocks: int = 0,
         has_scheduled_reqs: bool = True,
         skip_zeroing_group_ids: tuple[int, ...] = (),
+        producer_reserved_blocks: int = 0,
+        future_blocks: int = 0,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -416,6 +422,13 @@ class KVCacheManager:
                 this step, controls whether watermark is applied.
             skip_zeroing_group_ids: Groups whose external-token blocks will be
                 written by an async load and must not be zeroed concurrently.
+
+            producer_reserved_blocks: Additional capacity for other producers.
+                Defaults to zero; caller must exclude native/legacy-covered needs.
+            future_blocks: Additional capacity for this request's future producer
+                work, not already covered by native need. Defaults to zero.
+                These two budgets are checked only after native full/step checks.
+                They do NOT change the native fullISL/legacy arithmetic.
 
         Blocks layout:
         ```
@@ -468,6 +481,10 @@ class KVCacheManager:
             A list of new allocated blocks.
 
         """
+        # Valid only for this most recent call and request identity. Clear even
+        # before original argument validation and native exceptions.
+        self._producer_budget_rejection_request_id = None
+
         # A step may need no slots of its own while still adopting computed
         # tokens: an async KV load, or a chunk that ends inside the replayed
         # range of a hit (SWA bounded replay).
@@ -480,6 +497,9 @@ class KVCacheManager:
                 "num_new_tokens must be greater than 0 when there are no "
                 "computed tokens to adopt"
             )
+
+        if producer_reserved_blocks < 0 or future_blocks < 0:
+            raise ValueError("producer budgets must be non-negative")
 
         if new_computed_blocks is not None:
             new_computed_block_list = new_computed_blocks.blocks
@@ -576,6 +596,16 @@ class KVCacheManager:
         required_blocks = num_blocks_to_allocate + watermark_blocks
         if required_blocks > available_blocks:
             # Cannot allocate new blocks
+            return None
+
+        # Native physical/legacy/watermark checks have already passed. Reuse
+        # the original step demand/free; never repeat predictors or guards.
+        additional_blocks = producer_reserved_blocks + future_blocks
+        if additional_blocks and (
+            max(num_blocks_to_allocate, 0) + watermark_blocks + additional_blocks
+            > available_blocks
+        ):
+            self._producer_budget_rejection_request_id = request.request_id
             return None
 
         if (

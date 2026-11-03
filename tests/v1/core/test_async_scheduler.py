@@ -18,6 +18,30 @@ from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 pytestmark = pytest.mark.cpu_test
 
 
+@pytest.mark.parametrize("admission", [None, "0", "", "true", "2", "01", "1"])
+def test_hot_tail_opt_in_preserves_unsupported_async_scheduler(
+    monkeypatch: pytest.MonkeyPatch, admission: str | None
+):
+    """An ordinary async scheduler must keep native scheduling in all modes."""
+    if admission is None:
+        monkeypatch.delenv("VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION", admission)
+    monkeypatch.setenv("VLLM_HOT_TAIL_ADMISSION_DIAGNOSTICS", "1")
+    scheduler = create_scheduler(async_scheduling=True)
+    assert scheduler._hot_tail_budget is None
+    (request,) = create_requests(num_requests=1, num_tokens=4, max_tokens=1)
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {request.request_id: 4}
+    scheduler.update_from_output(output, _make_model_runner_output(output))
+
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert request.num_preemptions == 0
+    assert scheduler.get_num_unfinished_requests() == 0
+
+
 def _make_model_runner_output(
     scheduler_output: SchedulerOutput,
 ) -> ModelRunnerOutput:
@@ -810,3 +834,71 @@ def test_resumable_request_handoff():
 
     engine._process_oldest_step()
     assert len(request.output_token_ids) == 1
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("queue", ["running", "waiting"])
+def test_hot_tail_full_schedule_defers_spender_without_preempting_owner(
+    monkeypatch, enabled, queue
+):
+    """Exercise the actual scheduling loop with real mixed allocator state."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    import vllm.platforms
+    from vllm.platforms.cpu import CpuPlatform
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.request import Request
+
+    from .test_hot_tail_budget_cpu import Fixture
+
+    monkeypatch.setattr(vllm.platforms, "_current_platform", CpuPlatform())
+    scheduler = create_scheduler(async_scheduling=True, max_num_batched_tokens=2048)
+    case = Fixture(free=33, enabled=enabled)
+    assert case.load() is not None
+    case.complete_load()
+    scheduler.__dict__.update(case.s.__dict__)
+    scheduler.vllm_config.speculative_config = SimpleNamespace(
+        max_num_new_slots_for_drafting=3
+    )
+    scheduler.scheduler_config.max_num_batched_tokens = 2048
+    scheduler.scheduler_config.enable_chunked_prefill = True
+    scheduler.need_mamba_block_aligned_split = True
+    owner = case.r
+    owner.status = RequestStatus.RUNNING
+    spender = Request("spender", [1] * 4, SamplingParams(max_tokens=1), None)
+    scheduler.requests[spender.request_id] = spender
+    if queue == "running":
+        spender.status = RequestStatus.RUNNING
+        scheduler.running = [spender, owner]
+    else:
+        owner.next_decode_eligible_step = 999
+        scheduler.running = [owner]
+        scheduler.waiting.add_request(spender)
+
+    with patch.object(
+        scheduler, "_preempt_request", wraps=scheduler._preempt_request
+    ) as preempt:
+        if not enabled:
+            monkeypatch.setattr(
+                scheduler.kv_cache_manager,
+                "is_producer_budget_rejection",
+                Mock(side_effect=AssertionError("disabled budget predicate")),
+            )
+        result = scheduler.schedule()
+        if enabled:
+            assert owner.num_preemptions == spender.num_preemptions == 0
+            assert preempt.call_count == 0
+            if queue == "running":
+                assert result.num_scheduled_tokens == {owner.request_id: 365}
+            else:
+                assert result.num_scheduled_tokens == {}
+                assert list(scheduler.waiting) == [spender]
+                owner.next_decode_eligible_step = 0
+                result = scheduler.schedule()
+                assert result.num_scheduled_tokens == {owner.request_id: 365}
+                assert preempt.call_count == 0
+            assert not scheduler._hot_tail_budget.failed
+        else:
+            assert result.num_scheduled_tokens == {spender.request_id: 4}
+            assert preempt.call_count == (1 if queue == "running" else 0)
