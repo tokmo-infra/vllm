@@ -116,6 +116,28 @@ The paired native NVLink controls passed 20 changing-route replays and every
 timed-batch check, measuring 0.191 / 0.225 ms versus the previous 0.192 / 0.225 ms.
 The cross-node path remains about 4.4 / 8.8 times slower in these layer tests.
 
+The next DeepGEMM optimization is an **opt-in queued-return prototype that has
+not been GPU validated**. The measured results above apply to the preceding
+streaming baseline (`67f08c5`). After rebuilding the matching DeepGEMM extension,
+set `DG_MEGAMOE_RDMA_RETURN_SENDERS=16` on every worker before buffer allocation
+and graph warmup to enable it. `0` is the default and retains direct streaming;
+`1..32` selects the number of sender warps, capped by the kernel's CTA count.
+Restart workers when changing the setting. Native NVLink ignores this option.
+
+Selected dispatch warps submit queued rows only after completing their original
+input pulls. Epilogue warps publish row readiness and continue computing; they
+do not wait for network submission. This retains the original GEMM/TMA
+scheduling, ring credits, shared-expert math, reduction order and compute CTA
+count. Full-launch queue capacity prevents queue-full backpressure on producers.
+The queues reuse the completed route slab, preserving allocation sizes and ABI 1;
+insufficient storage falls back to the preceding paths. Sender completion is
+joined before the existing quiet/signals, with cleanup/combine overlap retained.
+
+Use the paired DeepGEMM document's correctness and performance matrix before
+enabling this for a deployment. CPU protocol tests and offline CUDA compilation
+do not establish GPU correctness, an overlap improvement or a serving benefit.
+No vLLM execution-path change or new vLLM option is needed for this experiment.
+
 This transport extends the MoE EP path only. Keep TP/GEMM-RS and Engram sharing
 within their supported NVLink domains. Both main and draft physical expert
 counts must be divisible by their actual EP sizes; 256 experts cannot run EP24
