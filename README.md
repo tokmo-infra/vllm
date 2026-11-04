@@ -1,6 +1,6 @@
 # GLM5.3 Flash 1103
 
-本分支提供GLM-5.3 Flash推理、共享Tokenizer、Mooncake缓存恢复和HCA部署配置。源码基于实际运行版本5df63a720，功能按提交说明，启动命令统一见[DEPLOYMENT.md](DEPLOYMENT.md)。
+本分支用于 GLM-5.3 Flash 的 Prefill / Decode 分离部署，提供原生推理、同机共享分词、Mooncake 缓存恢复和 RDMA 网卡亲和配置。已跑通的 4P4D 拓扑、镜像要求和完整启动命令统一见 [deployment4p4d.md](deployment4p4d.md)。
 
 ## 1. b1872978 · 原生推理与共享分词
 
@@ -29,8 +29,26 @@
 
 该预算适用于首次、纯外部异步加载、同一物理末块的GLM/Mamba producer请求。启用时保留原生异步、块引用、Store交接和GPU栅栏流程；按实际业务对照吞吐与延迟后选择使用。
 
-## 4. 目的网卡亲和与部署
+## 4. 5aeb9bd9 · 目的网卡亲和与部署
 
-P启动时设置MC_ENABLE_DEST_DEVICE_AFFINITY=1，为SDK选择目的端HCA提供亲和提示；GPU到本地HCA的绑定继续按对应GPU分组填写。推理示例使用TP1、P双EP4 / D各EP8，P每DP seq24/batch2048、D每DP seq16/batch1024、每台750GiB Store，原生MTP3与异步调度，Tokenizer共享池加L1为16GiB/台。
+| 功能 | 解决的问题 | 实现和作用 | 通用复用范围 / 配置 |
+| --- | --- | --- | --- |
+| 目的 HCA 亲和 | 跨机交接 KV 时，需要让 SDK 配合 GPU 与 RDMA 网卡的实际拓扑选择目的设备。 | 设置 MC_ENABLE_DEST_DEVICE_AFFINITY=1，结合每个 GPU 分组的本地 HCA 绑定使用。 | 支持该提示的 Mooncake RDMA 路径；网卡映射按硬件配置。 |
 
-源码与镜像指纹集中在integrations/glm53flash/release.json；镜像构建、启动命令和可选配置集中在DEPLOYMENT.md。
+Router 的 prompt ID 复用让 D 侧复用 P 侧已有的分词结果，减少重复处理长 prompt。它要求 Router、P、D 使用相同模型的 tokenizer 和 chat template。复用实现移植自 `08d7195`，默认开启；部署仍显式设置 `VLLM_ROUTER_PD_REUSE_PROMPT_IDS=1`。
+
+## 5. 已跑通的 4P4D 部署
+
+这里的 4P4D 按主机计数：81–84 每台两个 DEP/EP4 Prefill 实例，共 **8P / 32 rank**；85–88 每台一个 DEP/EP8 Decode 实例，共 **4D / 32 rank**，合计 **64 rank**，TP 均为 1。
+
+| 角色 | 参数 |
+| --- | --- |
+| P | 每 DP seq24 / batch2048；native auto graph 上限 192；4 API/实例；KV recv4。 |
+| D | 每 DP seq32 / batch1024；FULL_DECODE_ONLY graph 上限 128；1 API/实例。 |
+| 公共 | 原生 async、FP8 KV、MTP3、fullISL、水位 0；目的 HCA 亲和设 1。 |
+| 缓存 | 每台 Store 750 GiB；Tokenizer 总预算 2 GiB/GPU，即 16 GiB/台，**已含**每 API 64 MiB 私有 L1。 |
+| Router | 16 CPU / 16 GiB，同模型 tokenizer/template，登记全部 8P + 4D。 |
+
+P 抢占优化的**引擎代码默认值仍为 0**，本 4P4D 部署命令在 P 端显式设置 `VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION=1`；诊断开关保持 0。这与 Router 复用默认 ON 是两个独立配置。
+
+按 [deployment4p4d.md](deployment4p4d.md) 准备镜像、IP、路径和凭据，再依次启动 Master、Store、模型实例与 Router。该文档是本分支的主部署入口。
