@@ -93,10 +93,28 @@ tested mappings. This validation did not change host NIC or driver settings.
 With live-token input transfers, parallel return rows and collective completion
 in the paired DeepGEMM branch, plus the runtime corrections above, cross-node
 EP8 layer latency fell from 11.719 to 1.072 ms at 128 tokens/rank, and from
-16.398 to 2.800 ms at 512 tokens/rank. Both final cases passed 100 changing-route
+16.398 to 2.800 ms at 512 tokens/rank. Both cases passed 100 changing-route
 replays and exact checks after each timed batch, using the baseline input
 hashes. These improvements include both kernel and runtime changes; they are
 synthetic layer results and do not measure full-model TPOT.
+
+The matching DeepGEMM branch now shares each fetched remote input within its
+NVLink-accessible NVSHMEM team and sends a result row as soon as its final GEMM2
+tile is stored. It preserves native GEMM/TMA scheduling, ring credits, reduction
+order and native NVLink synchronization. Return completion uses one elected
+warp after the existing grid rendezvous; cleanup can overlap receive waits and
+combine. Counters reuse the completed dispatch slab, with a fallback when the
+slab is too small, so the staging budget and RDMA ABI remain unchanged.
+
+Under the same test configuration, cross-node medians are now **0.846 / 1.986 ms**
+at 128 / 512 tokens/rank, reducing latency by **21% / 29%** versus the preceding
+1.072 / 2.800 ms. Each passed 100 changing-route replays plus exact checks after
+seven timed batches, with matching baseline input hashes. These are DeepGEMM
+layer results; this update does not establish full-model serving performance.
+Use both matching feature branches when building; no new vLLM option is needed.
+The paired native NVLink controls passed 20 changing-route replays and every
+timed-batch check, measuring 0.191 / 0.225 ms versus the previous 0.192 / 0.225 ms.
+The cross-node path remains about 4.4 / 8.8 times slower in these layer tests.
 
 This transport extends the MoE EP path only. Keep TP/GEMM-RS and Engram sharing
 within their supported NVLink domains. Both main and draft physical expert
