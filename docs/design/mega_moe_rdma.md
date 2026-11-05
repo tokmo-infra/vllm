@@ -116,9 +116,9 @@ The paired native NVLink controls passed 20 changing-route replays and every
 timed-batch check, measuring 0.191 / 0.225 ms versus the previous 0.192 / 0.225 ms.
 The cross-node path remains about 4.4 / 8.8 times slower in these layer tests.
 
-The next DeepGEMM optimization is an **opt-in queued-return prototype that has
-not been GPU validated**. The measured results above apply to the preceding
-streaming baseline (`67f08c5`). After rebuilding the matching DeepGEMM extension,
+DeepGEMM also provides an **opt-in queued-return experiment**. The measured
+results above apply to the preceding streaming baseline (`67f08c5`); newer
+results are recorded below. After rebuilding the matching DeepGEMM extension,
 set `DG_MEGAMOE_RDMA_RETURN_SENDERS=16` on every worker before buffer allocation
 and graph warmup to enable it. `0` is the default and retains direct streaming;
 `1..32` selects the number of sender warps, capped by the kernel's CTA count.
@@ -137,6 +137,38 @@ Use the paired DeepGEMM document's correctness and performance matrix before
 enabling this for a deployment. CPU protocol tests and offline CUDA compilation
 do not establish GPU correctness, an overlap improvement or a serving benefit.
 No vLLM execution-path change or new vLLM option is needed for this experiment.
+
+On 2026-11-05, the paired DeepGEMM `8e5b4be` passed the main EP8/EP24 matrix
+with exact checks and 100 changing-route replays. EP8 on nodes 55/89 measured
+direct/queue8 medians of 0.658/0.619 ms at 128 tokens and 0.979/0.956 ms at 512.
+The latter was noisy; queue16/32 regressed the larger case. EP24 on 55/89/91
+measured 2.065/2.044 ms and 8.353/9.859 ms, also noisy. Native EP8 on node 91
+measured 0.195/0.227 ms with matching EP8 input hashes. These different-host
+layer controls are not serving results; queue8 still took about 3.17/4.22x as
+long as native. `DG_MEGAMOE_RDMA_RETURN_SENDERS=0` remains the default.
+
+The next candidate is `DG_MEGAMOE_RDMA_OVERLAP=1` in
+[DeepGEMM `2fbc8f1`](https://github.com/tokmo-infra/DeepGEMM/commit/2fbc8f13298633cd73bf8288dc4d8c9c46a25e6a).
+It is **CPU checked only; CUDA compilation, GPU correctness and
+performance are pending**. The default `0` preserves the preceding protocol.
+Rebuild DeepGEMM, set the same value on all workers before allocation and
+warmup, and restart workers when changing it. Native NVLink ignores this
+option; the vLLM transport and ABI requirements above stay unchanged.
+
+The candidate publishes expert counts and releases shared epilogues before
+bulk input prefetch. Dispatch still waits for completed input caches before
+producing ring rows. Local output readiness is signaled before remote quiet;
+combine waits only for peers selected by the current token. A GPU-wide cache
+shares one successful NVSHMEM target-consistency probe per required remote
+peer per launch, then per-warp register caches avoid repeated checks.
+The cache uses reserved staging-header space, with explicit per-launch reset.
+
+Scheduler, GEMM/TMA computation, ring credits, shared-expert math and reduction
+order are retained. Bulk input gating of routed ring pulls, per-row return
+atomics, PE-wide remote quiet and the cleanup world barrier remain; preserving
+the compute code alone does not preserve all of its overlap. This candidate
+adds a dispatch-only rendezvous and needs the paired DeepGEMM document's A/B
+matrix before any performance conclusion. No model evaluation has run for it.
 
 This transport extends the MoE EP path only. Keep TP/GEMM-RS and Engram sharing
 within their supported NVLink domains. Both main and draft physical expert
