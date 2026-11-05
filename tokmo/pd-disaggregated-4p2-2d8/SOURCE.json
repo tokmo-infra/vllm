@@ -1,0 +1,31 @@
+{
+  "base_revision": "e0d00e4b8eb0c89ec30921d0695cfdd409e9c211",
+  "base_image": "vllm/vllm-openai:nightly-e0d00e4b8eb0c89ec30921d0695cfdd409e9c211",
+  "image_id": "sha256:749210a8fa8cac5b13c9d7c8b5f04bc85ad91ffa5fac7381a10399e264c3495e",
+  "previous_branch_revision": "4870d09e658610e14533b4f18f5541c08f85d409",
+  "image_source_archive_sha256": "8811b3a7114e13e344c0e4b74d17809f942d612324d2317e75b6de713a92b954",
+  "source_file_count": 5943,
+  "full_upstream_source": true,
+  "runtime_overlays": [
+    {
+      "path": "vllm/renderers/base.py",
+      "live_sha256": "40d974f369ae130a7d885c579baf0b16d55f0992b714dc0c64a43a89e6e09e1c",
+      "published_sha256": "37ba4187548f06b692ff3643bceba51e8c0c6868a1196fac0ebd8bda55ce2538",
+      "formatting": "ruff/import sorting, SPDX comments and type annotations; executable bodies verified equivalent"
+    },
+    {
+      "path": "vllm/tokenizers/dsv41_native_cache.py",
+      "live_sha256": "b9dc5a2a22bc61848e0ee86d4178fa53194b9f0a73c969da88c450605d835672",
+      "published_sha256": "96c51f11190bff8510c8b201343c93801e109d6c9bcca2153753ed5e7b917cc2",
+      "formatting": "ruff/import sorting, SPDX comments and type annotations; executable bodies verified equivalent"
+    },
+    {
+      "path": "vllm/tokenizers/dsv41_segment_cache_core.py",
+      "live_sha256": "8013f483c2d548b54eb16782ff9ac42edde684944b03bff75ec7c77eb278449e",
+      "published_sha256": "3b8fdc1827b2b497483ff5ed46348381ff18648bab428b28165bd556d3ab6e96",
+      "formatting": "ruff/import sorting, SPDX comments and type annotations; executable bodies verified equivalent"
+    }
+  ],
+  "validation": "All exported image source/resource files verified; three tokenizer overlay executable bodies match the deployed tokenizer cache after formatting/type annotations; original input_batch.py restored byte-for-byte from pinned image revision",
+  "adaptive_profile_patch": "No custom adaptive-profile patch; input_batch.py is the original pinned-image source"
+}

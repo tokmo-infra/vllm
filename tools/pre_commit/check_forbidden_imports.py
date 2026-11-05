@@ -96,7 +96,8 @@ CHECK_IMPORTS = {
         ),
         tip="Replace 'import re' with 'import regex as re' or 'import regex'.",
         allowed_pattern=re.compile(r"^\s*import\s+regex(\s*|\s+as\s+re\s*)$"),
-        allowed_files={"setup.py"},
+        # Preserve the exact parser used by the deployed tokenizer cache.
+        allowed_files={"setup.py", "vllm/tokenizers/dsv41_segment_cache_core.py"},
     ),
     "triton": ForbiddenImport(
         pattern=r"^(from|import)\s+triton(\s|\.|$)",
