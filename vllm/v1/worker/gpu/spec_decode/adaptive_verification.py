@@ -224,7 +224,43 @@ class AdmittedDraftCounts:
         return self._cpu.numpy()
 
 
+def select_verification_step(
+    survival_probability: np.ndarray,
+    scheduled_drafts: np.ndarray,
+    candidate_steps: tuple[int, ...],
+    num_non_draft_tokens: int,
+    num_sampling_requests: int,
+    draft_cost_ms: float,
+    verify_cost_ms: np.ndarray,
+    max_draft_budget: int,
+) -> int:
+    """Choose a uniform prefix by expected output per profiled round cost.
+
+    Zero is a capacity fallback only: no configured prefix fits the sampler's
+    single-chunk limit. Short scheduled drafts are never extended.
+    """
+    candidates = np.asarray(candidate_steps, dtype=np.int32)
+    budgets = np.minimum(scheduled_drafts[:, None], candidates).sum(axis=0)
+    eligible = budgets <= max_draft_budget
+    if not eligible.any():
+        return 0
+    candidates, budgets = candidates[eligible], budgets[eligible]
+    positions = np.arange(survival_probability.shape[1])
+    accepted = np.cumsum(
+        np.where(
+            positions[None, :] < scheduled_drafts[:, None],
+            survival_probability,
+            0.0,
+        ).sum(axis=0)
+    )
+    expected_output = num_sampling_requests + accepted[candidates - 1]
+    costs = draft_cost_ms + verify_cost_ms[num_non_draft_tokens + budgets]
+    return int(candidates[np.argmax(expected_output / costs)])
+
+
 class AdaptiveVerificationManager:
+    candidate_steps: tuple[int, ...] | None = None
+
     def __init__(
         self,
         req_states: "RequestState",
@@ -232,9 +268,12 @@ class AdaptiveVerificationManager:
         num_bonus_tokens: int,
         max_total_logits: int,
         copy_admitted_drafts_to_host: bool = False,
+        candidate_steps: tuple[int, ...] | None = None,
     ):
         self.req_states = req_states
         self.num_speculative_steps = req_states.num_speculative_steps
+        self.candidate_steps = candidate_steps
+        self.last_candidate_step: int | None = None
         device = req_states.device
         self._copy_stream = torch.cuda.Stream(device)
 
@@ -425,6 +464,32 @@ class AdaptiveVerificationManager:
         )
         stale_confidences = self._stale_confidences[self._stale_idx].np[slots]
         survival_probability = np.cumprod(stale_confidences.astype(np.float64), axis=1)
+        if self.candidate_steps is not None:
+            num_non_draft_tokens_total = int(num_non_draft_tokens.sum())
+            num_sampling_requests = int(
+                np.count_nonzero(
+                    self.req_states.num_computed_tokens_np[slots] + num_non_draft_tokens
+                    >= self.req_states.prefill_len.np[slots]
+                )
+            )
+            draft_cost_ms, verify_cost_ms = self.cost_tables
+            self.last_candidate_step = select_verification_step(
+                survival_probability,
+                scheduled_drafts,
+                self.candidate_steps,
+                num_non_draft_tokens_total,
+                num_sampling_requests,
+                float(draft_cost_ms[num_reqs]),
+                verify_cost_ms,
+                max(0, self._max_total_logits - num_reqs * self.num_bonus_tokens),
+            )
+            budget = int(np.minimum(scheduled_drafts, self.last_candidate_step).sum())
+            self._batch_budget = (
+                dict(zip(req_ids, scheduled_drafts.tolist(), strict=True)),
+                dict(zip(req_ids, num_non_draft_tokens.tolist(), strict=True)),
+                budget,
+            )
+            return num_non_draft_tokens_total + budget
         steps = np.arange(self.num_speculative_steps)
         valid = steps[None, :] < scheduled_drafts[:, None]
         scores = np.sort(survival_probability[valid])[::-1]
@@ -486,6 +551,13 @@ class AdaptiveVerificationManager:
             return num_scheduled_tokens, cu_num_logits_np
 
         num_non_draft_tokens = num_scheduled_tokens - num_draft_tokens_per_req
+        if self.candidate_steps is not None:
+            assert self.last_candidate_step is not None
+            admitted = np.minimum(num_draft_tokens_per_req, self.last_candidate_step)
+            cu_num_logits_np = np.empty_like(cu_num_logits_np)
+            cu_num_logits_np[0] = 0
+            np.cumsum(admitted + self.num_bonus_tokens, out=cu_num_logits_np[1:])
+            return num_non_draft_tokens + admitted, cu_num_logits_np
         if draft_budget == 0:
             # The draft budget is 0, so we can know cu_num_logits_np exactly. This helps
             # when we would exceed the sampler logit chunk size.
@@ -521,6 +593,10 @@ class AdaptiveVerificationManager:
             dtype=np.int32,
             count=num_reqs,
         )
+        original_draft_count = int(scheduled_drafts.sum())
+        if self.candidate_steps is not None:
+            assert self.last_candidate_step is not None
+            scheduled_drafts = np.minimum(scheduled_drafts, self.last_candidate_step)
         num_non_draft_tokens = np.fromiter(
             (num_non_draft_tokens_per_req[req_id] for req_id in req_ids),
             dtype=np.int32,
@@ -563,7 +639,7 @@ class AdaptiveVerificationManager:
 
         admitted_drafts = None
         if self._copy_admitted_drafts_to_host and (
-            0 < draft_budget < int(scheduled_drafts.sum())
+            0 < draft_budget < original_draft_count
         ):
             admitted_cpu = self._admitted_drafts_cpu[:num_reqs]
             current_stream = torch.cuda.current_stream(self.req_states.device)
@@ -643,4 +719,12 @@ def maybe_create_adaptive_verification_manager(
         num_bonus_tokens,
         max_total_logits=max_total_logits,
         copy_admitted_drafts_to_host=copy_admitted_drafts_to_host,
+        candidate_steps=(
+            tuple(vllm_config.speculative_config.adaptive_verification_candidate_steps)
+            if vllm_config is not None
+            and vllm_config.speculative_config is not None
+            and vllm_config.speculative_config.adaptive_verification_candidate_steps
+            is not None
+            else None
+        ),
     )

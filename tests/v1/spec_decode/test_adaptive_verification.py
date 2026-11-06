@@ -363,3 +363,124 @@ def test_draft_budget_kernel_admits_exact_budget_on_ties():
     survival = torch.empty(num_reqs * num_steps, dtype=torch.int32, device="cuda")
     assign_draft_token_budget(confidence_probs, idx_mapping, capacities, 800, survival)
     assert capacities.tolist() == [3] * 266 + [2] + [0] * 33
+
+
+@pytest.mark.parametrize("expected", [1, 3, 5, 7])
+def test_candidate_steps_choose_best_profiled_prefix(expected):
+    """A compute-cost cliff changes the selected prefix, not the draft width."""
+    from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
+        select_verification_step,
+    )
+
+    costs = np.ones(33)
+    costs[2 * (expected + 1) + 1 :] = 1000.0
+    selected = select_verification_step(
+        np.ones((2, 7)), np.array([7, 7]), (1, 3, 5, 7), 2, 2, 1.0, costs, 14
+    )
+    assert selected == expected
+
+
+def test_candidate_steps_account_for_acceptance_and_sampler_capacity():
+    from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
+        select_verification_step,
+    )
+
+    survival = np.array([[0.9, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0]])
+    assert (
+        select_verification_step(
+            survival, np.array([7]), (1, 3, 5, 7), 1, 1, 1.0, np.arange(16) + 1.0, 7
+        )
+        == 1
+    )
+    # All candidates equally cheap: take the longest eligible prefix.
+    assert (
+        select_verification_step(
+            np.ones((2, 7)), np.array([7, 2]), (1, 3, 5, 7), 2, 2, 1.0, np.ones(32), 7
+        )
+        == 5
+    )
+    # Never silently select a partial, non-candidate length to fit the sampler.
+    assert (
+        select_verification_step(
+            np.ones((2, 7)), np.array([7, 7]), (1, 3, 5, 7), 2, 2, 1.0, np.ones(32), 1
+        )
+        == 0
+    )
+
+
+def test_candidate_steps_compact_real_manager_across_switches(
+    tmp_path, default_vllm_config
+):
+    """Real CUDA buffers preserve CPU/GPU offsets for tails and mixed prefill."""
+    from vllm.distributed import (
+        cleanup_dist_env_and_memory,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm.v1.worker.gpu.states import RequestState
+
+    init_distributed_environment(
+        world_size=1,
+        rank=0,
+        local_rank=0,
+        distributed_init_method=f"file://{tmp_path / 'dist'}",
+    )
+    initialize_model_parallel(tensor_model_parallel_size=1)
+    try:
+        device = torch.device("cuda:0")
+        states = RequestState(4, 64, 64, 7, 128, device)
+        for req in ("a", "b", "prefill"):
+            states.add_request(req, 16, [1] * 16, 0 if req == "prefill" else 16, 32)
+        states.apply_staged_writes()
+        manager = AdaptiveVerificationManager(
+            states,
+            torch.empty(5, dtype=torch.int32, device=device),
+            1,
+            64,
+            copy_admitted_drafts_to_host=True,
+            candidate_steps=(1, 3, 5, 7),
+        )
+        for req in states.req_id_to_index:
+            manager.add_request(states.req_id_to_index[req])
+        for k in (5, 1, 7, 3, 5):
+            boundary = 11 + k + min(k, 2)
+            manager.set_cost_curves(
+                [(i, 1.0) for i in range(5)],
+                [(i, 1.0 if i <= boundary else 1000.0) for i in range(65)],
+            )
+            total = manager.get_num_tokens(
+                {"a": 8, "b": 3, "prefill": 9},
+                {"a": [1] * 7, "b": [1] * 2},
+            )
+            assert manager.last_candidate_step == k
+            # Exercise a different request order from the scheduling dictionaries.
+            drafts = np.array([2, 7, 0], dtype=np.int32)
+            scheduled = np.array([3, 8, 9], dtype=np.int32)
+            compact, cpu_logits = manager.compact_batch(
+                drafts, scheduled, np.array([0, 3, 11, 12], dtype=np.int32)
+            )
+            admitted = np.array([min(k, 2), k, 0], dtype=np.int32)
+            expected_queries = admitted + np.array([1, 1, 9], dtype=np.int32)
+            np.testing.assert_array_equal(compact, expected_queries)
+            np.testing.assert_array_equal(cpu_logits, np.r_[0, np.cumsum(admitted + 1)])
+            assert int(compact.sum()) == total
+            ids = ["b", "a", "prefill"]
+            mapping = torch.tensor(
+                [states.req_id_to_index[x] for x in ids], device=device
+            )
+            gpu_logits, gpu_query, budget, copied = manager.reallocate_drafts(
+                ids, mapping
+            )
+            np.testing.assert_array_equal(gpu_logits.cpu().numpy(), cpu_logits)
+            np.testing.assert_array_equal(
+                gpu_query[:4].cpu().numpy(), np.r_[0, np.cumsum(compact)]
+            )
+            assert budget == int(admitted.sum())
+            if k < 7:
+                assert copied is not None
+                np.testing.assert_array_equal(copied.wait(), admitted)
+            else:
+                assert copied is None
+            assert states.draft_tokens.shape == (4, 7)
+    finally:
+        cleanup_dist_env_and_memory()

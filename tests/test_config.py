@@ -3957,6 +3957,33 @@ def test_draft_sample_method_probabilistic_is_accepted():
     assert speculative_config.draft_sample_method == "probabilistic"
 
 
+@pytest.mark.parametrize("steps", [[], [3, 1], [1, 1], [0, 3], [1, 8]])
+def test_adaptive_verification_rejects_invalid_candidate_steps(steps):
+    with pytest.raises(ValueError, match="adaptive_verification_candidate_steps"):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=7,
+            enable_adaptive_verification=True,
+            adaptive_verification_candidate_steps=steps,
+        )
+
+
+def test_adaptive_verification_candidate_steps_require_enablement():
+    with pytest.raises(ValueError, match="requires enable_adaptive_verification"):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=7,
+            adaptive_verification_candidate_steps=[1, 3, 5, 7],
+        )
+    config = SpeculativeConfig(
+        method="ngram",
+        num_speculative_tokens=7,
+        enable_adaptive_verification=True,
+        adaptive_verification_candidate_steps=[1, 3, 5, 7],
+    )
+    assert config.adaptive_verification_candidate_steps == [1, 3, 5, 7]
+
+
 @pytest.mark.parametrize(
     ("method", "drops_block"),
     [("eagle3", True), ("mtp", True), ("dflash", False), ("dspark", False)],

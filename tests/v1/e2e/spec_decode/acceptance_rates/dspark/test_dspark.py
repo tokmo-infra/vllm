@@ -6,10 +6,50 @@ from dataclasses import dataclass
 import pytest
 
 from tests.evals.gsm8k.gsm8k_eval import evaluate_gsm8k_offline
+from tests.models.utils import check_logprobs_close
 from vllm.config import CompilationConfig
 from vllm.platforms import current_platform
 
 from ...utils import compute_acceptance_len, compute_acceptance_rate
+
+
+def test_dspark_discrete_verification_preserves_greedy_output(vllm_runner, monkeypatch):
+    """Exercise fixed-width drafting with trimmed and adaptive verification."""
+    config = QWEN3_DSPARK_DEEPSPEC
+    monkeypatch.setenv("VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN", "512")
+    prompts = [
+        "The first ten positive integers in order are: 1, 2,",
+        "Compute 17 + 25. The answer is",
+        "Write the alphabet in order: A, B, C,",
+    ]
+    outputs = []
+    for candidates in (None, [1], [1, 3, 5, 7]):
+        spec = dict(
+            method="dspark",
+            model=config.draft_model,
+            num_speculative_tokens=7,
+            enable_adaptive_verification=candidates is not None,
+            adaptive_verification_candidate_steps=candidates,
+        )
+        if current_platform.is_cuda():
+            spec["attention_backend"] = config.attention_backend
+        with vllm_runner(
+            config.model,
+            speculative_config=spec,
+            max_model_len=1024,
+            max_num_seqs=8,
+            enable_prefix_caching=False,
+            compilation_config=CompilationConfig(cudagraph_mode="FULL_DECODE_ONLY"),
+        ) as runner:
+            outputs.append(runner.generate_greedy_logprobs(prompts, 64, 5))
+    for candidate, output in zip(([1], [1, 3, 5, 7]), outputs[1:], strict=True):
+        check_logprobs_close(
+            outputs_0_lst=outputs[0],
+            outputs_1_lst=output,
+            name_0="fixed7",
+            name_1=f"verify{candidate}",
+        )
+
 
 REGRESSION_TOLERANCE = 0.95
 
