@@ -50,34 +50,6 @@ vllm serve MiMo-V2.5-Pro-FP4-DFlash \
 
 Set `enable_adaptive_verification: false` to verify the full block for every request.
 
-### Discrete verification lengths
-
-To choose a verification prefix from a small set while keeping the draft width
-fixed, set `adaptive_verification_candidate_steps`:
-
-```json
-{
-  "method": "dspark",
-  "num_speculative_tokens": 7,
-  "enable_adaptive_verification": true,
-  "adaptive_verification_candidate_steps": [1, 3, 5, 7]
-}
-```
-
-Each worker batch selects one prefix length that maximizes expected output tokens
-divided by the profiled draft-plus-verification cost. It verifies that prefix for
-every request with sufficient scheduled drafts; shorter drafts are not extended.
-The drafter still computes all seven candidates. Graph capture and KV capacity
-remain sized for the maximum, and DP continues to synchronize padded token counts.
-This does not enable the DP-incompatible dynamic drafting schedule.
-
-The list must be nonempty, strictly increasing, and contain lengths from 1 through
-`num_speculative_tokens`. If even the smallest prefix exceeds the rejection
-sampler's single-chunk capacity, verification falls back to zero drafts for that
-batch. Omitting the list retains the unrestricted per-request budget policy.
-The cost model is an estimate; measure end-to-end performance against a fixed
-length on the deployment workload before treating the policy as an optimization.
-
 ## Requirements and limitations
 
 - The attention backend must tolerate device-decided query lengths, since the CPU lengths only bound them from above. Backends that plan off the CPU lengths are excluded by the attention selector, and rejected at startup for models that hard-wire their backend.

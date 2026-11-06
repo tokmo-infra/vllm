@@ -640,12 +640,6 @@ class SpeculativeConfig:
     """Whether to adaptively size the draft-verification budget from per-request
     confidence. Currently only supported for method="dspark"."""
 
-    adaptive_verification_candidate_steps: list[int] | None = None
-    """Optional ascending verification lengths, for example [1, 3, 5, 7].
-    Select one prefix length per batch using the adaptive cost model. The
-    drafter still generates num_speculative_tokens candidates each round.
-    None preserves the unrestricted per-request verification budget."""
-
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
         """Mean acceptance length to unconditional per-position rates, using
@@ -1674,24 +1668,6 @@ class SpeculativeConfig:
                 "Expected num_speculative_tokens to be greater "
                 f"than zero ({self.num_speculative_tokens})."
             )
-
-        candidates = self.adaptive_verification_candidate_steps
-        if candidates is not None:
-            if not self.enable_adaptive_verification:
-                raise ValueError(
-                    "adaptive_verification_candidate_steps requires "
-                    "enable_adaptive_verification=true."
-                )
-            if (
-                not candidates
-                or candidates != sorted(set(candidates))
-                or candidates[0] < 1
-                or candidates[-1] > self.num_speculative_tokens
-            ):
-                raise ValueError(
-                    "adaptive_verification_candidate_steps must be nonempty, "
-                    "strictly increasing, and between 1 and num_speculative_tokens."
-                )
 
         if self.rejection_sample_method == "synthetic":
             # Consolidate to per-position rates
