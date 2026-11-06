@@ -149,8 +149,8 @@ long as native. `DG_MEGAMOE_RDMA_RETURN_SENDERS=0` remains the default.
 
 The next candidate is `DG_MEGAMOE_RDMA_OVERLAP=1` in
 [DeepGEMM `2fbc8f1`](https://github.com/tokmo-infra/DeepGEMM/commit/2fbc8f13298633cd73bf8288dc4d8c9c46a25e6a).
-It is **CPU checked only; CUDA compilation, GPU correctness and
-performance are pending**. The default `0` preserves the preceding protocol.
+Its EP8 CUDA/GPU validation is recorded below; full-model evaluation remains
+pending. The default `0` preserves the preceding protocol.
 Rebuild DeepGEMM, set the same value on all workers before allocation and
 warmup, and restart workers when changing it. Native NVLink ignores this
 option; the vLLM transport and ABI requirements above stay unchanged.
@@ -167,8 +167,39 @@ Scheduler, GEMM/TMA computation, ring credits, shared-expert math and reduction
 order are retained. Bulk input gating of routed ring pulls, per-row return
 atomics, PE-wide remote quiet and the cleanup world barrier remain; preserving
 the compute code alone does not preserve all of its overlap. This candidate
-adds a dispatch-only rendezvous and needs the paired DeepGEMM document's A/B
-matrix before any performance conclusion. No model evaluation has run for it.
+adds a dispatch-only rendezvous. No model evaluation has run for it.
+
+On 2026-11-06, the same kernel source was rebuilt and tested on B300 nodes
+55/89/91. Cross-node EP8 (55/89, four GPUs each) passed all eight combinations
+of 128/512 tokens, overlap0/1 and sender0/8, each with 100 changing-route
+replays and exact output/count checks after every timed batch. Native controls
+on 55 and 91, local NVSHMEM controls, and boundary cases also passed; see the
+paired DeepGEMM document for the complete scope and remaining validation.
+
+| Single-layer mode | 128 tokens/rank, us | 512 tokens/rank, us |
+| --- | ---: | ---: |
+| Native NVLink on node 55 | 190.432 | 224.557 |
+| Cross-node default (overlap0, sender0) | 657.683 | 977.282 |
+| Cross-node overlap1, sender0 | 652.493 | 976.245 |
+| Cross-node overlap0, sender8 | 619.618 | 959.754 |
+| Cross-node overlap1, sender8 | 607.706 | 924.978 |
+
+Inputs matched by hash. Overlap alone gave no material layer improvement
+(0.79%/0.11%). The 512-token sender8 pair repeated at 943.160/923.198 us for
+overlap0/1; it remains noisy. The best combination still takes about 3.19/4.12x
+the node-55 NVLink time. Both experiment defaults stay disabled.
+
+Device timestamps confirmed that the first shared epilogue tile became ready
+185–194 us earlier, during input prefetch. Whole-prefix input preparation,
+the routed pipeline and the cleanup tail still determine total latency.
+Selected-peer waiting moves into combine, so removal of a dedicated receive
+barrier must not be reported as removal of all network waiting. These results
+validate the tested layer paths, not serving TPOT or full-model correctness.
+
+DeepGEMM's RDC build also emits ptxas C7504 (`setmaxnreg` ignored across
+compilation units). Source-level preservation of register budgets is therefore
+insufficient to claim preservation of native register redistribution. Its
+runtime contribution remains unmeasured; see the paired DeepGEMM document.
 
 This transport extends the MoE EP path only. Keep TP/GEMM-RS and Engram sharing
 within their supported NVLink domains. Both main and draft physical expert
