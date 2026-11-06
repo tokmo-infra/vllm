@@ -263,7 +263,7 @@ def dispatch_cg_and_sync_dp(
         dp_size: Data-parallel world size. 1 skips all cross-rank work.
         dp_rank: This rank's index in the DP group.
         max_query_len: Upper bound on per-request query length, for selecting
-            varlen decode graphs. None, as for a batch with a prefill, keeps
+            varlen decode graphs. None, for a batch requiring prefill, keeps
             the batch out of graphs that constrain it. Reusing a sync replaces
             this with `dp_sync_state.max_query_len`, including when it is None.
         need_eager: Force `CUDAGraphMode.NONE` instead of dispatching.

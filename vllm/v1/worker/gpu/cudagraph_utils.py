@@ -78,7 +78,7 @@ class BatchExecutionDescriptor:
     uniform_token_count: int | None = None
     # Upper bound on per-request query length. Varlen decode graphs leave
     # uniform_token_count unset, so this is what keeps a prefill batch out of one:
-    # the runner passes None for any batch with a prefill.
+    # the runner passes None when the batch is not decode-eligible.
     max_query_len: int | None = None
     num_active_loras: int = 0
     # Number of microbatches the batch is split into (DBO). 1 means no splitting.
