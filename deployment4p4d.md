@@ -9,7 +9,7 @@
 | 81–84（11.8.0.81–84） | 每台 p0、p1，共 8P | p0：GPU0–3，p1：GPU4–7；每实例 TP1 / DP4 / EP4 | p0：18483 / 19083 / 19550；p1：18493 / 19093 / 19650 |
 | 85–88（11.8.0.85–88） | 每台 d0，共 4D | GPU0–7；每实例 TP1 / DP8 / EP8 | 18483 / 19083 / 19550 |
 | 81–88 | 每台一个 Store | 每台共享 750 GiB，合计 6000 GiB | RPC 61244；HTTP 61245 |
-| 86 | patched Master、Router | Router 16 CPU / 16 GiB | Master RPC / metadata / metrics：61241 / 61242 / 61243；Router API / metrics：18300 / 18301 |
+| 86 | patched Master、Router | Router 不设 CPU quota；64 GiB RAM / 96 GiB RAM+swap，NUMA memory node 0 | Master RPC / metadata / metrics：61241 / 61242 / 61243；Router API / metrics：18300 / 18301 |
 
 | 项目 | P | D |
 | --- | --- | --- |
@@ -38,13 +38,13 @@ Tokenizer 的 `CACHE_GIB` 参数 P=2、D=16 是兼容参数；共享模式的整
 | D87 | `sha256:e0bf46ee70ecb588e2c3daab8b451b91cfa42046a700b7db4cdd97568bb14a29`；通过 `D87_IMAGE` 指定。 |
 | Store | `sha256:bd6c77d709b8225ebf7b4a9a3890509a4e2df87af846fcc7230b65a7a57d16f7` |
 | patched Master | `sha256:8c7b3faf37167405712c29da0cef1cc330f62a704db5ebd11f175d6646a6a27a` |
-| Router | `sha256:c07f71ef603b3c28c2f2b48e0657c4c96fcee285428dcd64747ed53a3d3aeec5`；二进制 SHA256：`6c51e70abc6a668a716b4738f448b5c2034559d63c3fe2c18d73352a95f99448`。 |
+| Router | `router:vllm-yyf`；image ID：`sha256:4322e704665f87ef92204d63af35a92c02baecc8f522a8f3803bf6d17dffe687`；二进制 SHA256：`b366ce030714f6a95c5b30ffc93f5287bf611fd6d5161c20beb84c0ea73b04de`。 |
 
 在各目标主机预先导入或构建所需镜像，设置对应的 `P_IMAGE`、`D_IMAGE`、`D87_IMAGE`、`STORE_IMAGE`、`MASTER_IMAGE`、`ROUTER_IMAGE`。变量可使用已导入的完整 image ID 或本机可用的镜像名。下面的 `--pull=never` 要求镜像先就绪；跨主机分发时应在各节点核对 image ID。
 
 引擎增量构建封装为 `integrations/glm53flash/Dockerfile`，通过 `BASE_IMAGE` 传入匹配的原生基底；其校验清单见 `integrations/glm53flash/release.json`。Master 使用 `integrations/glm53flash/build-mooncake-master.sh` 和 `Dockerfile.mooncake-master`，基于 Mooncake `719735896c86b56fabec6cf3e825fb2ea640597a`，包含实际占用计账与大块空间回收两个补丁。Store SDK 保持配套版本。
 
-Router prompt ID 复用实现移植自 `08d7195`，默认开启，本文仍显式传 `VLLM_ROUTER_PD_REUSE_PROMPT_IDS=1`。它与 P 末段准入预算是两个独立开关。
+Router 采用 2026-11-07 六策略冷测中的轮询方案：P 固定 `cache_aware`，D 固定 `round_robin`；显式设置 `VLLM_ROUTER_PD_REUSE_PROMPT_IDS=1` 和 `VLLM_ROUTER_PD_PREFILL_FORCE_LENGTH_CAP=1`。关闭 TokenBalancer、program scheduling 及关联分词槽位分配。这里使用已验收的独立镜像，不再使用旧的 16 CPU / 16 GiB 容量路由部署。
 
 ### 可选：在构建机生成镜像
 
@@ -83,7 +83,7 @@ Master 构建脚本的前三个位置参数依次为源码目录、构建目录�
 
 需要 Docker、NVIDIA Container Toolkit、RDMA 驱动，以及 Bash、curl、jq。以下会话变量需在各目标主机设置；`NODE_ID` 分别填 81–88，服务 IP、网卡和路径按实际环境覆盖。P/D/Router 使用同一份 API key，通过交互输入或受控环境注入，不写入文档或版本库。
 
-所有节点的 `MODEL_DIR` 应指向同一版本模型文件，包括 tokenizer 配置、tokenizer.json 和 chat template。Router 也挂载该目录；如业务覆盖 template，必须对齐 Router 与两端的渲染和分词语义。
+所有模型节点的 `MODEL_DIR` 应指向同一版本模型文件，包括 tokenizer 配置、tokenizer.json 和 chat template；P/D 的渲染和分词语义保持一致。本方案 Router 不加载估算 Tokenizer，不挂载模型目录或 token-balance JSON；D 通过 prompt ID 复用直接使用 P 的分词结果。
 
 ~~~bash
 test "$(id -u)" -eq 0
@@ -201,6 +201,59 @@ docker run -d --pull=never --name "$SERVICE_PREFIX-store$NODE_ID" \
 curl -fsS "http://$NODE_IP:61245/health"
 ~~~
 
+### 5.1. L2 容量建议：服务预热后剩余内存的 85%
+
+本文的 KV 缓存层级是：L1 为 GPU KV，L2 为 Mooncake Store 的主机 DRAM，L3 为可选 SSD；与 Tokenizer 的 64 MiB 私有 L1 是两套缓存。上面的 750 GiB/台是本轮实测值，不是所有机器必须使用的固定容量。
+
+**建议模型、Router、共享分词等服务启动并预热后，将剩余可用内存的 85% 用于 L2，留下 15% 给运行波动和额外开销。** 各主机分别计算；Router 所在主机也要计入其内存使用。读取 `MemAvailable`，不用 `MemFree`。
+
+如果已经启动 L2，应先加回当前 L2 实际划出的池容量，再算新的总预算；不要在原池之外再额外分配剩余内存的 85%。以下只计算，不调整运行中的服务：
+
+~~~bash
+# 尚未划 L2 池时填 0；若当前就是上面的 750 GiB 池，填 805306368000。
+: "${L2_CURRENT_BYTES:?填写当前已划出的 L2 池字节数，未划池填 0}"
+MEM_AVAILABLE_KIB=$(awk '$1 == "MemAvailable:" {print $2}' /proc/meminfo)
+L2_BUDGET_BYTES=$(( (MEM_AVAILABLE_KIB * 1024 + L2_CURRENT_BYTES) * 85 / 100 ))
+printf '建议 L2 总池容量：%s bytes\n' "$L2_BUDGET_BYTES"
+~~~
+
+采用该预算时，将 Store 命令中的 `--global_segment_size=805306368000` 替换为本机计算值，同时调整 Store 容器的 `--memory` / `--memory-swap`，给池之外的 SDK、RDMA 注册元数据及可选 SSD staging 留余量，宿主仍至少保留 16 GiB 可用内存。已有池的扩缩容在停用相关请求后重建 Store，不清理正在使用的池。第 8 节的 Master 总容量检查也改为各机 L2 池容量之和，不再固定为 6000 GiB。
+
+L2 使用配套 Master 的高水位淘汰与大块空间回收；本方案保留 `eviction_high_watermark_ratio=0.98` 及 `MC_EVICTION_FIT_*` 参数。85% 是主机内存分配建议，0.98 是已分配池内的淘汰水位，两者分别配置。
+
+### 5.2. L3 SSD 缓存（可选，本轮未启用）
+
+L3 由 Mooncake Store 的 SSD offload 管理，Router 不管理 KV 落盘。本轮 Master、Store 和模型配置均未开启 L3，报告数据不包含 SSD 读写。以下是后续使用配套 SSD offload 接口时的配置方法，保持 Router 的轮询方案不变。
+
+1. 每台 Store 主机准备独立的本地 NVMe 目录，并按实际磁盘容量设置字节配额，避开模型、测试 DB 和日志目录。
+2. Master 启动参数增加 `--enable_offload=true --offload_on_evict=true`，使 DRAM 淘汰选中的对象进入 SSD；保留现有 Master 补丁和其他启动参数。
+3. Store 的 `docker run` 在镜像名前增加下列目录挂载与环境变量，并把 `mooncake_client` 的 `--enable_offload=false` **替换**为 `--enable_offload=true`：
+
+~~~bash
+export L3_DIR="${L3_DIR:-/nvme/mooncake-ssd}"
+: "${L3_MAX_BYTES:?按本机 SSD 余量填写 L3 配额，单位 bytes}"
+install -d -m 0700 "$L3_DIR"
+
+# 追加到第 5 节 docker run 的镜像名前，不是单独执行的命令。
+L3_DOCKER_ARGS=(
+  -v "$L3_DIR:/mooncake-ssd"
+  -e MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/mooncake-ssd
+  -e MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
+  -e MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY=lru
+  -e MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE="$L3_MAX_BYTES"
+  -e MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES="$L3_MAX_BYTES"
+)
+# 在原命令中、--entrypoint 之前展开：
+#   "${L3_DOCKER_ARGS[@]}"
+# 原 mooncake_client 参数改为：--enable_offload=true
+~~~
+
+**模型侧：** P/D 使用的 Mooncake JSON 中将 `enable_offload` 设为 `true`，启用连接器的 SSD 读回分块预算；继续使用完整 KV group、compact payload 和原生异步加载。SDK 需与 Store 的 `LOCAL_DISK` 副本发现及 SSD 读取接口配套。
+
+**验收：** 启用后验证 DRAM 未命中时出现 SSD 命中和真实磁盘读写，检查恢复输出与磁盘配额，再单独记录该方案的 TTFT/TPOT。SSD 缓存目录通过 `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` 配置，不使用 Master 的旧 `--root_fs_dir` 参数。
+
+参数依据 Mooncake 官方 [SSD offload 部署文档](https://kvcache-ai.github.io/Mooncake/deployment/ssd/ssd-offload.html)；L3 需要配套版本支持，本轮仅保留可选部署说明，没有开启或新增 L3 性能成绩。
+
 ## 6. 模型实例：81–84 启动 p0/p1，85–88 启动 d0
 
 先在各主机定义同一个启动函数，再按节点角色调用。所有节点使用相同的 `CACHE_NAMESPACE`；每实例每次启动生成独立 engine ID。P 用 Mooncake producer 加 Store kv_both，D 用 Mooncake consumer 加 Store consumer；Store 异步 lookup/load 与 compact group payload 保持开启。
@@ -311,59 +364,55 @@ fi
 
 ## 7. Router：在 Router 主机执行
 
-等待全部 12 个模型实例完成启动，读取各实例**实际** GPU KV 容量生成路由配置；P max_seqs=24，D max_seqs=32，kv_fraction=0.85。Router 使用同模型 `/model/tokenizer.json` 及一致的 chat template，直接连接原生 vLLM HTTP API。复用 prompt IDs 的部署开关显式设为 1，资源固定 16 CPU / 16 GiB。
+等待全部 12 个模型实例完成启动，登记 8 个 EP4 P 和 4 个 EP8 D，直接连接原生 vLLM HTTP API。P 使用 `cache_aware`，D 使用 `round_robin`。不生成 token-balance JSON，不传 `VLLM_ROUTER_PD_TOKEN_BALANCE_CONFIG`，不启用 program scheduling 或分词槽位分配。`--max-concurrent-requests 4096` 是 Router 总请求并发上限，不是分词槽位数。
+
+Router 使用 `router:vllm-yyf`，不设 CPU quota；内存限制 64 GiB，RAM+swap 总上限 96 GiB，`cpuset-mems=0`。保留 prompt ID 复用、P 单 token length-capped 交接和 listener backlog 4096；模型参数、共享分词缓存与 Mooncake 配置不变。镜像已包含 `/usr/local/lib/router-listener.so`。
 
 ~~~bash
 if [ "$NODE_IP" = "$ROUTER_IP" ]; then
-  : "${ROUTER_IMAGE:?设置含 prompt ID 复用功能的 Router 镜像}"
+  export ROUTER_IMAGE="${ROUTER_IMAGE:-router:vllm-yyf}"
   read -r -a p_hosts <<< "$P_HOSTS"
   read -r -a d_hosts <<< "$D_HOSTS"
   test "${#p_hosts[@]}" -eq 4
   test "${#d_hosts[@]}" -eq 4
-  workers='{}'
   routes=()
-  add_worker() {
-    local url="$1" max_seqs="$2" kv_tokens
-    kv_tokens=$(curl -fsS -H "Authorization: Bearer $API_KEY" \
-      "$url/server_info?config_format=json" |
-      jq -er '.vllm_config.cache_config.kv_cache_size_tokens | numbers | select(. > 0)')
-    workers=$(jq -c --arg url "$url" --argjson kv "$kv_tokens" \
-      --argjson seq "$max_seqs" \
-      '. + {($url): {kv_tokens: $kv, max_seqs: $seq}}' <<< "$workers")
-  }
   for ip in "${p_hosts[@]}"; do
-    add_worker "http://$ip:18483" 24
-    add_worker "http://$ip:18493" 24
     routes+=(--prefill "http://$ip:18483" 19083 --prefill "http://$ip:18493" 19093)
   done
   for ip in "${d_hosts[@]}"; do
-    add_worker "http://$ip:18483" 32
     routes+=(--decode "http://$ip:18483")
   done
-  test "$(jq 'length' <<< "$workers")" -eq 12
-  jq -n --argjson workers "$workers" \
-    '{tokenizer_path:"/model/tokenizer.json",kv_fraction:0.85,workers:$workers}' \
-    > "$BASE_WORK/token-balance.json"
 
   docker run -d --pull=never --name "$SERVICE_PREFIX-router" \
-    --runtime=runc --network host --cpus 16 --memory 16g --memory-swap 16g \
-    -v "$MODEL_DIR:/model:ro" \
-    -v "$BASE_WORK/token-balance.json:/run/token-balance.json:ro" \
-    -e VLLM_ROUTER_PD_TOKEN_BALANCE_CONFIG=/run/token-balance.json \
+    --runtime=runc --network host --restart no \
+    --memory 64g --memory-swap 96g --cpuset-mems 0 \
+    --ipc private --shm-size 64m --ulimit nofile=1048576:1048576 \
+    --log-driver local --log-opt max-size=128m --log-opt max-file=5 \
+    -e OPENAI_API_KEY="$API_KEY" -e NVIDIA_VISIBLE_DEVICES=void \
+    -e NO_PROXY='*' -e no_proxy='*' \
     -e VLLM_ROUTER_PD_REUSE_PROMPT_IDS=1 \
-    -e NVIDIA_VISIBLE_DEVICES=void -e OPENAI_API_KEY="$API_KEY" \
-    -e MC_TCP_BIND_ADDRESS="$ROUTER_IP" -e MOONCAKE_REQUESTER_LOCAL_HOSTNAME="$ROUTER_IP" \
+    -e VLLM_ROUTER_PD_PREFILL_FORCE_LENGTH_CAP=1 \
+    -e LD_PRELOAD=/usr/local/lib/router-listener.so \
+    -e AI_INFRA_LISTEN_BACKLOG=4096 \
     --entrypoint /usr/local/bin/vllm-router "$ROUTER_IMAGE" \
+    --host 0.0.0.0 --port 18300 \
+    --prometheus-host 0.0.0.0 --prometheus-port 18301 \
     --vllm-pd-disaggregation --kv-connector mooncake \
     "${routes[@]}" \
-    --prefill-policy cache_aware --decode-policy cache_aware \
-    --balance-abs-threshold 4 --balance-rel-threshold 1.5 \
-    --intra-node-data-parallel-size 1 --host "$ROUTER_IP" --port 18300 \
-    --prometheus-host "$ROUTER_IP" --prometheus-port 18301 \
-    --disable-retries --worker-startup-timeout-secs 600 \
-    --worker-startup-check-interval 5 --log-level info --api-key "$API_KEY"
+    --prefill-policy cache_aware --decode-policy round_robin \
+    --max-tree-size 2147483648 --max-concurrent-requests 4096 \
+    --disable-retries --api-key "$API_KEY" --log-level warn \
+    --request-timeout-secs 600 --worker-startup-timeout-secs 7200
 fi
 ~~~
+
+2026-11-07 的 SWE130k / C550 六策略冷测中，本方案为 16037.53 万 TPM，TTFT Mean / P50 / P90 / P99 为 4.257 / 3.267 / 7.506 / 18.857 秒，TPOT Mean 为 24.946 ms，全程 HTTP500 为 0。统计范围是完成 55% 后至持续欠载起点的完整区间。
+
+### Router 自身的缓存淘汰
+
+`cache_aware` 的前缀树使用后台 LRU，`--eviction-interval` 默认 120 秒；`--max-tree-size 2147483648` 按每个 worker/tenant 的保留字符数计量，不是整个 Router 的 RAM 字节上限。超过阈值的旧前缀在下一轮淘汰，不会把所有请求历史永久保留。
+
+64 GiB 是容器硬内存上限，不是按 RSS 到达该值就自动淘汰的目标。树节点开销、不同 worker 的条目、在途请求和两个淘汰周期之间的新增内容仍占内存，因此仍可能触发 OOM。持续运行观察实际 RSS 和峰值，需要控制占用时调低 `--max-tree-size` 或缩短 `--eviction-interval`，另行对照缓存命中与性能；上面的启动命令保持本次实测值。
 
 ## 8. 启动核验
 
@@ -407,4 +456,6 @@ curl -fsS -H "Authorization: Bearer $API_KEY" "http://$ROUTER_IP:18300/workers" 
   jq -e '.total == 64 and (.workers | length == 64) and all(.workers[]; .is_healthy == true)'
 ~~~
 
-各模型主机再确认宿主 `MemAvailable` 至少 16 GiB，Tokenizer 目录/epoch 的 uid、gid 为 0，p0/p1 的挂载指向同一共享池。P 启动日志应有每个 DP scheduler 的 `P_HOT_TAIL_BUDGET init`，4 条/实例，`enabled=True`、`progress_enabled=False`。Router image、复用开关、CPU/内存限制和模型文件身份应与部署输入一致。
+各模型主机再确认宿主 `MemAvailable` 至少 16 GiB，Tokenizer 目录/epoch 的 uid、gid 为 0，p0/p1 的挂载指向同一共享池。P 启动日志应有每个 DP scheduler 的 `P_HOT_TAIL_BUDGET init`，4 条/实例，`enabled=True`、`progress_enabled=False`。
+
+Router 核对镜像 ID、D 侧轮询、复用及 length-cap 开关、无 CPU quota、64 GiB / 96 GiB 内存配置。容器环境中不应有 `VLLM_ROUTER_PD_TOKEN_BALANCE_CONFIG`，命令中不应有 `--enable-program-scheduling`。模型共享分词缓存继续由 P/D 管理，与已关闭的 Router 估算分词槽位是两回事。

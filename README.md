@@ -35,7 +35,7 @@
 | --- | --- | --- | --- |
 | 目的 HCA 亲和 | 跨机交接 KV 时，需要让 SDK 配合 GPU 与 RDMA 网卡的实际拓扑选择目的设备。 | 设置 MC_ENABLE_DEST_DEVICE_AFFINITY=1，结合每个 GPU 分组的本地 HCA 绑定使用。 | 支持该提示的 Mooncake RDMA 路径；网卡映射按硬件配置。 |
 
-Router 的 prompt ID 复用让 D 侧复用 P 侧已有的分词结果，减少重复处理长 prompt。它要求 Router、P、D 使用相同模型的 tokenizer 和 chat template。复用实现移植自 `08d7195`，默认开启；部署仍显式设置 `VLLM_ROUTER_PD_REUSE_PROMPT_IDS=1`。
+Router 的 prompt ID 复用让 D 侧复用 P 侧已有的分词结果，减少重复处理长 prompt。P/D 使用相同模型的 tokenizer 和 chat template；当前部署显式设置 `VLLM_ROUTER_PD_REUSE_PROMPT_IDS=1`，不依赖镜像的默认值。
 
 ## 5. 已跑通的 4P4D 部署
 
@@ -47,8 +47,12 @@ Router 的 prompt ID 复用让 D 侧复用 P 侧已有的分词结果，减少�
 | D | 每 DP seq32 / batch1024；FULL_DECODE_ONLY graph 上限 128；1 API/实例。 |
 | 公共 | 原生 async、FP8 KV、MTP3、fullISL、水位 0；目的 HCA 亲和设 1。 |
 | 缓存 | 每台 Store 750 GiB；Tokenizer 总预算 2 GiB/GPU，即 16 GiB/台，**已含**每 API 64 MiB 私有 L1。 |
-| Router | 16 CPU / 16 GiB，同模型 tokenizer/template，登记全部 8P + 4D。 |
+| Router | `router:vllm-yyf`；P `cache_aware` / D `round_robin`；不设 CPU quota，64 GiB RAM / 96 GiB RAM+swap、mems0；登记全部 8P + 4D。 |
 
-P 抢占优化的**引擎代码默认值仍为 0**，本 4P4D 部署命令在 P 端显式设置 `VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION=1`；诊断开关保持 0。这与 Router 复用默认 ON 是两个独立配置。
+P 抢占优化的**引擎代码默认值仍为 0**，本 4P4D 部署命令在 P 端显式设置 `VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION=1`；诊断开关保持 0。这与 Router 部署中显式开启 prompt ID 复用是两个独立配置。
 
 按 [deployment4p4d.md](deployment4p4d.md) 准备镜像、IP、路径和凭据，再依次启动 Master、Store、模型实例与 Router。该文档是本分支的主部署入口。
+
+Router 显式开启 P→D prompt ID 复用与 P 单 token length-capped 交接；关闭 TokenBalancer、program scheduling 及关联分词槽位，不加载估算 Tokenizer 或 token-balance JSON。2026-11-07 SWE130k / C550 六种 D 策略冷测选择轮询：16037.53 万 TPM，TTFT Mean / P50 / P99 为 4.257 / 3.267 / 18.857 秒，TPOT Mean 24.946 ms，全程 HTTP500 为 0。旧 Router 容量路由启动段已替换，P/D 与 Mooncake 配置保持不变。
+
+缓存容量建议与可选 L3 SSD 参数见 `deployment4p4d.md` 第 5 节：服务预热后，建议将剩余可用内存的 **85%** 用于 L2；当前 750 GiB/台是实测基线，L3 本轮未启用。Router 自身另有前缀树 LRU，字符预算不等于 64 GiB 容器内存上限。
