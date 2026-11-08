@@ -188,12 +188,27 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
 
         self.tokenizer: Tokenizer = tokenizer._tokenizer
 
+        prompt_ids = request.prompt_token_ids
+        if (
+            prompt_ids
+            and len(prompt_ids) > 8
+            and isinstance(self.tokenizer.decoder, tokenizers.decoders.ByteLevel)
+        ):
+            # ByteLevel only needs a complete UTF-8 suffix to decode new bytes.
+            # Avoid decoding the entire prompt on the first generated token.
+            tail_ids = prompt_ids[-8:]
+            tail_text = self.tokenizer.decode(
+                tail_ids, skip_special_tokens=self.skip_special_tokens
+            )
+            if tail_text and not tail_text.endswith("\ufffd"):
+                prompt_ids = tail_ids
+
         # Use native prefill to prime the decode stream with prompt tokens.
         # Look up DecodeStream on the module so backend patches (e.g. the
         # fastokens shim that replaces ``tokenizers.decoders.DecodeStream``)
         # are honored regardless of import order.
         self.stream = tokenizers.decoders.DecodeStream(
-            ids=request.prompt_token_ids,
+            ids=prompt_ids,
             skip_special_tokens=self.skip_special_tokens,
         )
 

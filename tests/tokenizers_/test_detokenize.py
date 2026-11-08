@@ -5,6 +5,8 @@ from collections.abc import Generator
 from typing import Any, cast
 
 import pytest
+import tokenizers.decoders
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from transformers import AutoTokenizer, PythonBackend, TokenizersBackend
 
 from vllm.sampling_params import SamplingParams
@@ -22,6 +24,87 @@ from vllm.v1.engine.detokenizer import (
     IncrementalDetokenizer,
     SlowIncrementalDetokenizer,
 )
+
+
+@pytest.fixture
+def byte_level_prompt_tokenizer():
+    vocab = {c: i for i, c in enumerate(sorted(pre_tokenizers.ByteLevel.alphabet()))}
+    backend = Tokenizer(models.BPE(vocab, merges=[]))
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    return TokenizersBackend(
+        tokenizer_object=backend,
+        eos_token="</s>",
+        additional_special_tokens=["<special>"],
+    )
+
+
+class FullPromptStreamDetokenizer(FastIncrementalDetokenizer):
+    """Preserve the full-prompt stream initialization replaced by the fast path."""
+
+    def __init__(self, tokenizer, request):
+        super().__init__(tokenizer, request)
+        self.stream = tokenizers.decoders.DecodeStream(
+            ids=request.prompt_token_ids,
+            skip_special_tokens=self.skip_special_tokens,
+        )
+
+
+@pytest.mark.parametrize("skip_special_tokens", [False, True])
+@pytest.mark.parametrize("spaces_between_special_tokens", [False, True])
+@pytest.mark.parametrize("suffix", ["complete", "incomplete", "skipped_specials"])
+@pytest.mark.parametrize("stop", [None, "map"])
+def test_fast_prompt_tail_matches_full_prompt_stream(
+    byte_level_prompt_tokenizer,
+    skip_special_tokens,
+    spaces_between_special_tokens,
+    suffix,
+    stop,
+):
+    tokenizer = byte_level_prompt_tokenizer
+    prompt = tokenizer.encode(
+        "Long context \U0001f642. " * 128, add_special_tokens=False
+    )
+    character = tokenizer.encode("\u6211", add_special_tokens=False)
+    generated = tokenizer.encode(
+        " A map. </s><special><special> done", add_special_tokens=False
+    )
+    assert len(character) > 1
+    if suffix != "complete":
+        prompt += character[:-1]
+        generated = character[-1:] + generated
+    if suffix == "skipped_specials":
+        prompt += [tokenizer.convert_tokens_to_ids("<special>")] * 16
+    request = EngineCoreRequest(
+        request_id="prompt-tail",
+        prompt_token_ids=prompt,
+        mm_features=None,
+        sampling_params=SamplingParams(
+            skip_special_tokens=skip_special_tokens,
+            spaces_between_special_tokens=spaces_between_special_tokens,
+            stop=stop,
+            max_tokens=128,
+        ),
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+    actual = FastIncrementalDetokenizer(tokenizer, request)
+    reference = FullPromptStreamDetokenizer(tokenizer, request)
+    for index, token_id in enumerate(generated):
+        finished = index == len(generated) - 1
+        matched = actual.update([token_id], False)
+        assert matched == reference.update([token_id], False)
+        assert actual.output_text == reference.output_text
+        assert actual.output_token_ids == reference.output_token_ids
+        assert actual.get_next_output_text(finished, True) == (
+            reference.get_next_output_text(finished, True)
+        )
+        if matched is not None:
+            break
+
 
 SPECIAL_TOKS_TRUTH = [
     "Some text with adjacent special tokens                <|padding|><|padding|><fim_prefix><fim_middle><fim_suffix>other text<fim_pad>",  # noqa

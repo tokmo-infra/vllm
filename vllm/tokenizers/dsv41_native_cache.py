@@ -5,6 +5,7 @@
 import asyncio
 import functools
 import os
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -64,6 +65,7 @@ class NativeCache:
         self.epoch_path = os.environ.get("VLLM_DSV41_TOKENIZER_CACHE_EPOCH_FILE", "")
         self.epoch = self._epoch()
         self.last_evictions = 0
+        self._metrics_lock = threading.Lock()
         LIMIT.labels(self.rank).set(self.cache.max_bytes)
         SIZE.labels(self.rank).set(0)
 
@@ -77,11 +79,12 @@ class NativeCache:
         if queued_at is not None:
             TIMING.labels(self.rank, "tokenize_queue").observe(started - queued_at)
         epoch = self._epoch()
-        if epoch != self.epoch:
-            self.cache.reset()
-            self.last_evictions = 0
-            self.epoch = epoch
-            SIZE.labels(self.rank).set(0)
+        with self._metrics_lock:
+            if epoch != self.epoch:
+                self.cache.reset()
+                self.last_evictions = 0
+                self.epoch = epoch
+                SIZE.labels(self.rank).set(0)
         # Keep offsets, multimodal, BOS/EOS and unsupported encoding options on
         # the original tokenizer path. Post-tokenization remains fully native.
         safe = (
@@ -100,11 +103,12 @@ class NativeCache:
         TIMING.labels(self.rank, "cache_encode").observe(time.monotonic() - started)
         for source in ("reused_tokens", "encoded_tokens", "special_tokens"):
             TOKENS.labels(self.rank, source).inc(counts[source])
-        state = self.cache.snapshot()
-        SIZE.labels(self.rank).set(state["cache_bytes"])
-        evicted = state.get("evictions", 0)
-        EVICTIONS.labels(self.rank).inc(evicted - self.last_evictions)
-        self.last_evictions = evicted
+        with self._metrics_lock:
+            state = self.cache.snapshot()
+            SIZE.labels(self.rank).set(state["cache_bytes"])
+            evicted = state.get("evictions", 0)
+            EVICTIONS.labels(self.rank).inc(evicted - self.last_evictions)
+            self.last_evictions = evicted
         # If truncation could change the result, use the original implementation
         # (including its truncation_side semantics), not a hand-written slice.
         if kwargs.get("truncation") and len(ids) > kwargs["max_length"]:

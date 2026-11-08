@@ -99,7 +99,11 @@ class SegmentCache:
             if entry is not None:
                 self.entries.move_to_end(key)
                 return entry[0], True
-        ids = array("I", self.backend.encode(text, add_special_tokens=False).ids)
+        # The single-input binding holds the GIL throughout BPE encoding.
+        # A one-item batch preserves IDs while letting renderer threads run.
+        ids = array(
+            "I", self.backend.encode_batch([text], add_special_tokens=False)[0].ids
+        )
         size = (
             sys.getsizeof(text)
             + sys.getsizeof(ids)
