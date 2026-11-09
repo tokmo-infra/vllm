@@ -1,6 +1,6 @@
 # GLM5.3 Flash 1103 · 4P4D 部署
 
-本文集中给出已实际跑通的 4P4D 启动配置。4P4D 按主机计数：4 台 Prefill 主机、4 台 Decode 主机；实际为 **8P + 4D、64 rank**。所有命令在目标主机的 root Bash 会话执行，适用于已分配给本次部署的 GPU、端口和目录。
+本文集中给出已实际跑通的 4P4D 启动配置。4P4D 按主机计数：4 台 Prefill 主机、4 台 Decode 主机；实际为 **8P + 4D、64 rank**。所有命令在目标主机的 root Bash 会话执行，适用于已分配的 GPU、端口和目录。
 
 ## 1. 拓扑与固定参数
 
@@ -8,7 +8,7 @@
 | --- | --- | --- | --- |
 | 81–84（11.8.0.81–84） | 每台 p0、p1，共 8P | p0：GPU0–3，p1：GPU4–7；每实例 TP1 / DP4 / EP4 | p0：18483 / 19083 / 19550；p1：18493 / 19093 / 19650 |
 | 85–88（11.8.0.85–88） | 每台 d0，共 4D | GPU0–7；每实例 TP1 / DP8 / EP8 | 18483 / 19083 / 19550 |
-| 81–88 | 每台一个 Store | 每台共享 750 GiB，合计 6000 GiB | RPC 61244；HTTP 61245 |
+| 81–88 | 每台一个 Store | 83/84 各 700 GiB，其余各 750 GiB，合计 5900 GiB | RPC 61244；HTTP 61245 |
 | 86 | patched Master、Router | Router 不设 CPU quota；64 GiB RAM / 96 GiB RAM+swap，NUMA memory node 0 | Master RPC / metadata / metrics：61241 / 61242 / 61243；Router API / metrics：18300 / 18301 |
 
 | 项目 | P | D |
@@ -23,51 +23,41 @@
 | 末段准入预算（P 抢占优化） | 部署显式设 1；引擎代码默认仍为 0 | 沿用代码默认 0 |
 | KV 接收线程 | `VLLM_MOONCAKE_LOAD_RECV_THREADS=4` | 沿用原生配置 |
 
-两端保持原生 async、FP8 KV、MTP3、fullISL、scheduler 水位 0、TP1、GPU utilization 0.95、prefix match unit 256、Mamba align、原生 allgather_reducescatter。CLI block size 为 64，GLM 混合缓存实际解析物理页为 8960；max model len 使用 auto。P 保留原生图选择，启动后的上限应为 192。
+两端保持原生 async、FP8 KV、MTP3、fullISL、scheduler 水位 0、TP1、GPU utilization 0.95、prefix match unit 256、Mamba align、原生 allgather_reducescatter。CLI block size 为 64，GLM 混合缓存实际解析物理页为 8960；max model len 使用 auto，启动后核对 1048576 上下文。P 保留原生图选择，启动后的上限应为 192。
+
+NVFP4 融合、FC2 输入 staging 和向量化权重读取在 P/D 均开启；P 额外开启扩展预取和 MTP context-only。融合仅用于 GLM SM120 / EP4、EP8：P 的 dense batch 上限 192，稀疏 batch 最大 256 且总 token 不超过 512；D 上限 128。其余形状走原生后端。共享专家、注意力后端、异步调度与计算通信重叠保持原生路径。
+
+P 保留基础模型全部专家及 MTP 注意力、融合所需的 18 个源权重，不加载只用于草稿生成的 MTP FFN/专家和 head；D 保留完整 MTP3。该模式只适用于专用 EP4 P，不用于 D 或耦合实例。P 完成事件在 MTP KV 写入之后发布，D 使用完整状态继续投机解码。
 
 Tokenizer 的 `CACHE_GIB` 参数 P=2、D=16 是兼容参数；共享模式的整机预算以共享池加全部 API 的 L1 计算，不能再额外加一份 16 GiB。各模型主机应有足够 tmpfs 和内存；Store 新分配前参考可用内存大于 850 GiB，全部服务启动后宿主仍至少保留 16 GiB 可用内存。
 
 ## 2. 源码与镜像
 
-引擎运行源码为 `5aeb9bd97bc09928d6f406fbd20b17b86f2023dd`。以下是跑通产物的**本地 image ID 指纹**，不是 registry manifest digest，也不是公开可 pull 的地址：
+使用本分支源码和 `integrations/glm53flash/Dockerfile` 构建引擎。P/D 使用同一份 GLM 源码，优化开关在镜像中默认关闭，由第 6 节按角色启用。`integrations/glm53flash/release.json` 校验原生基底、覆盖文件和运行源码。
 
-| 角色 | 已核验指纹 / 来源 |
+| 组件 | 镜像要求 |
 | --- | --- |
-| P | `sha256:c27716e4b3c48c745f6a172851b2b8818d03cdfa488e0ae690599c9aa4fde5b2` |
-| D85 / D86 / D88 | `sha256:449fddc45480878a998875eb69d1182c49c833e465c68bf6f0f290df5da2b28f` |
-| D87 | `sha256:e0bf46ee70ecb588e2c3daab8b451b91cfa42046a700b7db4cdd97568bb14a29`；通过 `D87_IMAGE` 指定。 |
-| Store | `sha256:bd6c77d709b8225ebf7b4a9a3890509a4e2df87af846fcc7230b65a7a57d16f7` |
-| patched Master | `sha256:8c7b3faf37167405712c29da0cef1cc330f62a704db5ebd11f175d6646a6a27a` |
-| Router | `router:vllm-yyf`；image ID：`sha256:4322e704665f87ef92204d63af35a92c02baecc8f522a8f3803bf6d17dffe687`；二进制 SHA256：`b366ce030714f6a95c5b30ffc93f5287bf611fd6d5161c20beb84c0ea73b04de`。 |
+| P / D 引擎 | 匹配清单的 GLM 原生基底，包含 CUDA 编译器、FlashInfer 0.7.1 与自动调优补丁；构建后设置 `P_IMAGE`、`D_IMAGE`。 |
+| Store | 配套 Mooncake SDK；本地参考 ID：`sha256:bd6c77d709b8225ebf7b4a9a3890509a4e2df87af846fcc7230b65a7a57d16f7`。 |
+| Master | `Dockerfile.mooncake-master` 构建，包含实际占用计账和大块空间回收。 |
+| Router | `router:vllm-yyf`；image ID `sha256:4322e704665f87ef92204d63af35a92c02baecc8f522a8f3803bf6d17dffe687`。 |
 
-在各目标主机预先导入或构建所需镜像，设置对应的 `P_IMAGE`、`D_IMAGE`、`D87_IMAGE`、`STORE_IMAGE`、`MASTER_IMAGE`、`ROUTER_IMAGE`。变量可使用已导入的完整 image ID 或本机可用的镜像名。下面的 `--pull=never` 要求镜像先就绪；跨主机分发时应在各节点核对 image ID。
+NVFP4 内核在实例初始化时编译为 SM120a。保留挂载的 `/root/.cache` 以复用匹配的编译和调优缓存，不在请求路径编译。P2P 内核使用 FlashInfer 的 JIT 和 FFI 头文件，无需 Cake 后端。不要通过 `FLASHINFER_EXTRA_CUDAFLAGS` 或 NVCC prepend/append flags 覆盖架构目标。
 
-引擎增量构建封装为 `integrations/glm53flash/Dockerfile`，通过 `BASE_IMAGE` 传入匹配的原生基底；其校验清单见 `integrations/glm53flash/release.json`。Master 使用 `integrations/glm53flash/build-mooncake-master.sh` 和 `Dockerfile.mooncake-master`，基于 Mooncake `719735896c86b56fabec6cf3e825fb2ea640597a`，包含实际占用计账与大块空间回收两个补丁。Store SDK 保持配套版本。
+### 在构建机生成镜像
 
-Router 采用 2026-11-07 六策略冷测中的轮询方案：P 固定 `cache_aware`，D 固定 `round_robin`；显式设置 `VLLM_ROUTER_PD_REUSE_PROMPT_IDS=1` 和 `VLLM_ROUTER_PD_PREFILL_FORCE_LENGTH_CAP=1`。关闭 TokenBalancer、program scheduling 及关联分词槽位分配。这里使用已验收的独立镜像，不再使用旧的 16 CPU / 16 GiB 容量路由部署。
-
-### 可选：在构建机生成镜像
-
-已有已验收产物时，直接设置上述运行镜像变量即可。自行构建时在仓库根目录执行：`P_IMAGE`、`D_IMAGE`、`D87_IMAGE`、`MASTER_IMAGE` 此时须填写可供 `docker build -t` 使用的镜像名/tag；各 `*_BASE_IMAGE` 填写构建机已有的匹配原生基底引用。
-
-引擎 Dockerfile 的构建 ARG 名为 `BASE_IMAGE`；它读取 `release.json` 的 `base_validation_files` 校验基底，覆盖 `image_overlay_files` 所列文件，并保留 `runtime_source_files` 供运行源码核验。`historical_images` 记录的是原生历史基底指纹，不是本次 4P4D 的运行镜像指纹。构建结果需重新记录 ID，不能假定与现场产物 ID 相同。
+在仓库根目录执行。构建机应已导入匹配的 GLM 基底，例如 `local/glm53flash-1103:router-policy-fi071-20261107`；它是本地镜像名，不是公开 registry 地址。本地 image ID 不是 registry manifest digest。分发后在各节点核对 ID，`--pull=never` 要求镜像预先就绪。
 
 ~~~bash
-# 在包含 integrations/glm53flash 的仓库根目录执行。
-: "${P_IMAGE:?填写 P 构建目标 tag}" "${P_BASE_IMAGE:?填写匹配 P 原生基底}"
-: "${D_IMAGE:?填写 D 构建目标 tag}" "${D_BASE_IMAGE:?填写匹配 D 原生基底}"
-: "${D87_IMAGE:?填写 D87 构建目标 tag}" "${D87_BASE_IMAGE:?填写匹配 D87 原生基底}"
+: "${ENGINE_BASE_IMAGE:?填写匹配的 GLM 原生基底}"
+: "${ENGINE_IMAGE:?填写引擎目标 tag}"
 docker build -f integrations/glm53flash/Dockerfile \
-  --build-arg BASE_IMAGE="$P_BASE_IMAGE" -t "$P_IMAGE" .
-docker build -f integrations/glm53flash/Dockerfile \
-  --build-arg BASE_IMAGE="$D_BASE_IMAGE" -t "$D_IMAGE" .
-docker build -f integrations/glm53flash/Dockerfile \
-  --build-arg BASE_IMAGE="$D87_BASE_IMAGE" -t "$D87_IMAGE" .
+  --build-arg BASE_IMAGE="$ENGINE_BASE_IMAGE" -t "$ENGINE_IMAGE" .
+export P_IMAGE="$ENGINE_IMAGE" D_IMAGE="$ENGINE_IMAGE" D87_IMAGE="$ENGINE_IMAGE"
 
-# 准备好固定版本的本地 Mooncake 源码及其 CMake/Ninja 构建依赖。
 : "${MOONCAKE_SOURCE:?填写本地 Mooncake 源码绝对路径}"
-: "${MASTER_IMAGE:?填写 patched Master 构建目标 tag}"
-: "${MASTER_BASE_IMAGE:?填写匹配 Store SDK 的 Master 基底引用}"
+: "${MASTER_IMAGE:?填写 Master 目标 tag}"
+: "${MASTER_BASE_IMAGE:?填写匹配 Store SDK 的基底}"
 test "$(git -C "$MOONCAKE_SOURCE" rev-parse HEAD)" = \
   "$(jq -er '.commit' integrations/glm53flash/mooncake-master.json)"
 bash integrations/glm53flash/build-mooncake-master.sh \
@@ -77,7 +67,7 @@ docker build -f integrations/glm53flash/Dockerfile.mooncake-master \
   --build-arg BASE_IMAGE="$MASTER_BASE_IMAGE" -t "$MASTER_IMAGE" .
 ~~~
 
-Master 构建脚本的前三个位置参数依次为源码目录、构建目录、runtime 输出目录；输出必须位于此构建上下文的 `mooncake-master-runtime/`，与 Dockerfile 的 COPY 路径一致。引擎镜像中的 P 末段准入默认仍是 0，由后面的部署命令单独开启。Router 镜像使用包含上述来源功能的独立产物。
+Master 使用 Mooncake `719735896c86b56fabec6cf3e825fb2ea640597a`；构建脚本参数为源码目录、构建目录和 runtime 输出目录。输出应位于构建上下文的 `mooncake-master-runtime/`。Router 使用独立镜像，P `cache_aware`、D `round_robin`，启用 prompt ID 复用和 length-capped 交接，关闭 TokenBalancer、program scheduling 与分词槽位。
 
 ## 3. 每台主机的公共准备
 
@@ -176,10 +166,16 @@ fi
 
 ## 5. Store：81–88 每台执行一次
 
-750 GiB 是每台机器一个共享 Store，不是每 GPU 一份。客户端的 global segment 为 0，只注册 2 GiB 本地传输缓冲；Store 的 local buffer 为 0。
+每台机器一个共享 Store，不是每 GPU 一份。默认 83/84 各 700 GiB，其余各 750 GiB；按本机服务预热后的余量配置。客户端的 global segment 为 0，只注册 2 GiB 本地传输缓冲；Store 的 local buffer 为 0。
 
 ~~~bash
 : "${STORE_IMAGE:?设置已导入的 Store 镜像}"
+if [ "$NODE_ID" = 83 ] || [ "$NODE_ID" = 84 ]; then
+  STORE_GIB=${STORE_GIB:-700}
+else
+  STORE_GIB=${STORE_GIB:-750}
+fi
+STORE_BYTES=$((STORE_GIB * 1024 * 1024 * 1024))
 LIBCUDA_PATH=$(readlink -f /lib/x86_64-linux-gnu/libcuda.so.1)
 test -f "$LIBCUDA_PATH"
 docker run -d --pull=never --name "$SERVICE_PREFIX-store$NODE_ID" \
@@ -195,7 +191,7 @@ docker run -d --pull=never --name "$SERVICE_PREFIX-store$NODE_ID" \
   --master_server_address="$MASTER_IP:61241" \
   --metadata_server="http://$MASTER_IP:61242/metadata" \
   --protocol=rdma --host="$NODE_IP" --port=61244 \
-  --device_names="$HCAS_ALL" --global_segment_size=805306368000 \
+  --device_names="$HCAS_ALL" --global_segment_size="$STORE_BYTES" \
   --local_buffer_size=0 --enable_http_server=true --http_port=61245 \
   --enable_offload=false --logtostderr=true
 curl -fsS "http://$NODE_IP:61245/health"
@@ -203,7 +199,7 @@ curl -fsS "http://$NODE_IP:61245/health"
 
 ### 5.1. L2 容量建议：服务预热后剩余内存的 85%
 
-本文的 KV 缓存层级是：L1 为 GPU KV，L2 为 Mooncake Store 的主机 DRAM，L3 为可选 SSD；与 Tokenizer 的 64 MiB 私有 L1 是两套缓存。上面的 750 GiB/台是本轮实测值，不是所有机器必须使用的固定容量。
+本文的 KV 缓存层级是：L1 为 GPU KV，L2 为 Mooncake Store 的主机 DRAM，L3 为可选 SSD；与 Tokenizer 的 64 MiB 私有 L1 是两套缓存。上述 700 / 750 GiB 是参考容量，按实际余量设置 STORE_GIB。
 
 **建议模型、Router、共享分词等服务启动并预热后，将剩余可用内存的 85% 用于 L2，留下 15% 给运行波动和额外开销。** 各主机分别计算；Router 所在主机也要计入其内存使用。读取 `MemAvailable`，不用 `MemFree`。
 
@@ -217,13 +213,13 @@ L2_BUDGET_BYTES=$(( (MEM_AVAILABLE_KIB * 1024 + L2_CURRENT_BYTES) * 85 / 100 ))
 printf '建议 L2 总池容量：%s bytes\n' "$L2_BUDGET_BYTES"
 ~~~
 
-采用该预算时，将 Store 命令中的 `--global_segment_size=805306368000` 替换为本机计算值，同时调整 Store 容器的 `--memory` / `--memory-swap`，给池之外的 SDK、RDMA 注册元数据及可选 SSD staging 留余量，宿主仍至少保留 16 GiB 可用内存。已有池的扩缩容在停用相关请求后重建 Store，不清理正在使用的池。第 8 节的 Master 总容量检查也改为各机 L2 池容量之和，不再固定为 6000 GiB。
+采用该预算时，将 Store 命令中的 `--global_segment_size="$STORE_BYTES"` 替换为本机计算值，同时调整 Store 容器的 `--memory` / `--memory-swap`，给池之外的 SDK、RDMA 注册元数据及可选 SSD staging 留余量，宿主仍至少保留 16 GiB 可用内存。已有池的扩缩容在停用相关请求后重建 Store，不清理正在使用的池。第 8 节的 Master 总容量检查也改为各机 L2 池容量之和，以实际总容量为准。
 
 L2 使用配套 Master 的高水位淘汰与大块空间回收；本方案保留 `eviction_high_watermark_ratio=0.98` 及 `MC_EVICTION_FIT_*` 参数。85% 是主机内存分配建议，0.98 是已分配池内的淘汰水位，两者分别配置。
 
-### 5.2. L3 SSD 缓存（可选，本轮未启用）
+### 5.2. L3 SSD 缓存（可选，默认关闭）
 
-L3 由 Mooncake Store 的 SSD offload 管理，Router 不管理 KV 落盘。本轮 Master、Store 和模型配置均未开启 L3，报告数据不包含 SSD 读写。以下是后续使用配套 SSD offload 接口时的配置方法，保持 Router 的轮询方案不变。
+L3 由 Mooncake Store 的 SSD offload 管理，Router 不管理 KV 落盘。Master、Store 和模型默认关闭 L3。使用配套 SSD offload 接口时，按下面配置，Router 保持轮询。
 
 1. 每台 Store 主机准备独立的本地 NVMe 目录，并按实际磁盘容量设置字节配额，避开模型、测试 DB 和日志目录。
 2. Master 启动参数增加 `--enable_offload=true --offload_on_evict=true`，使 DRAM 淘汰选中的对象进入 SSD；保留现有 Master 补丁和其他启动参数。
@@ -252,7 +248,7 @@ L3_DOCKER_ARGS=(
 
 **验收：** 启用后验证 DRAM 未命中时出现 SSD 命中和真实磁盘读写，检查恢复输出与磁盘配额，再单独记录该方案的 TTFT/TPOT。SSD 缓存目录通过 `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` 配置，不使用 Master 的旧 `--root_fs_dir` 参数。
 
-参数依据 Mooncake 官方 [SSD offload 部署文档](https://kvcache-ai.github.io/Mooncake/deployment/ssd/ssd-offload.html)；L3 需要配套版本支持，本轮仅保留可选部署说明，没有开启或新增 L3 性能成绩。
+参数依据 Mooncake 官方 [SSD offload 部署文档](https://kvcache-ai.github.io/Mooncake/deployment/ssd/ssd-offload.html)；L3 需要配套版本支持，此部署默认关闭 L3。
 
 ## 6. 模型实例：81–84 启动 p0/p1，85–88 启动 d0
 
@@ -268,7 +264,9 @@ start_model() {
       image="${P_IMAGE:?设置已导入的 P 镜像}"
       dp=4; apis=4; seq=24; batch=2048; shared_gib=15.5; cache_gib=2
       pd_role=kv_producer; store_role=kv_both
-      role_env=(-e VLLM_MOONCAKE_LOAD_RECV_THREADS=4
+      role_env=(-e VLLM_GLM53_P_MTP_CONTEXT_ONLY=1
+                -e VLLM_GLM53_NVFP4_EXTENDED_PREFETCH=1
+                -e VLLM_MOONCAKE_LOAD_RECV_THREADS=4
                 -e VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION=1
                 -e VLLM_HOT_TAIL_ADMISSION_DIAGNOSTICS=0)
       if [ "$slot" = p0 ]; then
@@ -286,6 +284,8 @@ start_model() {
         image="${D_IMAGE:?设置已导入的 D 镜像}"
       fi
       dp=8; apis=1; seq=32; batch=1024; shared_gib=15.9375; cache_gib=16
+      role_env=(-e VLLM_GLM53_P_MTP_CONTEXT_ONLY=0
+                -e VLLM_GLM53_NVFP4_EXTENDED_PREFETCH=0)
       pd_role=kv_consumer; store_role=kv_consumer
       gpu_request='"device=0,1,2,3,4,5,6,7"'; hcas="$HCAS_ALL"
       port=18483; bootstrap=19083; rpc=19550
@@ -331,6 +331,9 @@ EOF
     -e GLOO_SOCKET_IFNAME="$NET_IF" -e NCCL_IB_HCA="$ib_hca" \
     -e NCCL_IB_GID_INDEX="$GID_INDEX" -e MC_GID_INDEX="$GID_INDEX" -e NCCL_DEBUG=INFO \
     -e VLLM_USE_V2_MODEL_RUNNER=1 -e VLLM_SERVER_DEV_MODE=1 \
+    -e VLLM_GLM53_NVFP4_FUSED_MOE=1 \
+    -e VLLM_GLM53_NVFP4_STAGE_FC2_INPUT=1 \
+    -e VLLM_GLM53_NVFP4_VECTOR_WEIGHTS=1 \
     -e MOONCAKE_CONFIG_PATH=/work/mooncake.json \
     -e VLLM_MOONCAKE_BOOTSTRAP_PORT="$bootstrap" -e VLLM_HTTP_TIMEOUT_KEEP_ALIVE=120 \
     ${role_env[@]+"${role_env[@]}"} \
@@ -366,7 +369,7 @@ fi
 
 等待全部 12 个模型实例完成启动，登记 8 个 EP4 P 和 4 个 EP8 D，直接连接原生 vLLM HTTP API。P 使用 `cache_aware`，D 使用 `round_robin`。不生成 token-balance JSON，不传 `VLLM_ROUTER_PD_TOKEN_BALANCE_CONFIG`，不启用 program scheduling 或分词槽位分配。`--max-concurrent-requests 4096` 是 Router 总请求并发上限，不是分词槽位数。
 
-Router 使用 `router:vllm-yyf`，不设 CPU quota；内存限制 64 GiB，RAM+swap 总上限 96 GiB，`cpuset-mems=0`。保留 prompt ID 复用、P 单 token length-capped 交接和 listener backlog 4096；模型参数、共享分词缓存与 Mooncake 配置不变。镜像已包含 `/usr/local/lib/router-listener.so`。
+Router 使用 `router:vllm-yyf`，不设 CPU quota；内存限制 64 GiB，RAM+swap 总上限 96 GiB，`cpuset-mems=0`。保留 prompt ID 复用、P 单 token length-capped 交接和 listener backlog 4096；模型共享分词缓存与 Mooncake 缓存由 P/D 管理。镜像已包含 `/usr/local/lib/router-listener.so`。
 
 ~~~bash
 if [ "$NODE_IP" = "$ROUTER_IP" ]; then
@@ -412,7 +415,7 @@ fi
 
 `cache_aware` 的前缀树使用后台 LRU，`--eviction-interval` 默认 120 秒；`--max-tree-size 2147483648` 按每个 worker/tenant 的保留字符数计量，不是整个 Router 的 RAM 字节上限。超过阈值的旧前缀在下一轮淘汰，不会把所有请求历史永久保留。
 
-64 GiB 是容器硬内存上限，不是按 RSS 到达该值就自动淘汰的目标。树节点开销、不同 worker 的条目、在途请求和两个淘汰周期之间的新增内容仍占内存，因此仍可能触发 OOM。持续运行观察实际 RSS 和峰值，需要控制占用时调低 `--max-tree-size` 或缩短 `--eviction-interval`，另行对照缓存命中与性能；上面的启动命令保持本次实测值。
+64 GiB 是容器硬内存上限，不是按 RSS 到达该值就自动淘汰的目标。树节点开销、不同 worker 的条目、在途请求和两个淘汰周期之间的新增内容仍占内存，因此仍可能触发 OOM。持续运行观察实际 RSS 和峰值，需要控制占用时调低 `--max-tree-size` 或缩短 `--eviction-interval`，另行对照缓存命中与性能；可按缓存命中和内存峰值调整上述参数。
 
 ## 8. 启动核验
 
@@ -425,7 +428,7 @@ for ip in $P_HOSTS $D_HOSTS; do
   curl -fsS "http://$ip:61245/health"
 done
 curl -fsS "http://$MASTER_IP:61243/metrics" |
-  awk '$1 == "master_total_capacity_bytes" {print; ok=($2 == 6442450944000)} END {exit !ok}'
+  awk '$1 == "master_total_capacity_bytes" {print; ok=($2 == 6335076761600)} END {exit !ok}'
 
 check_model() {
   local url="$1" dp="$2" seq="$3" batch="$4" graph="$5"
@@ -459,3 +462,5 @@ curl -fsS -H "Authorization: Bearer $API_KEY" "http://$ROUTER_IP:18300/workers" 
 各模型主机再确认宿主 `MemAvailable` 至少 16 GiB，Tokenizer 目录/epoch 的 uid、gid 为 0，p0/p1 的挂载指向同一共享池。P 启动日志应有每个 DP scheduler 的 `P_HOT_TAIL_BUDGET init`，4 条/实例，`enabled=True`、`progress_enabled=False`。
 
 Router 核对镜像 ID、D 侧轮询、复用及 length-cap 开关、无 CPU quota、64 GiB / 96 GiB 内存配置。容器环境中不应有 `VLLM_ROUTER_PD_TOKEN_BALANCE_CONFIG`，命令中不应有 `--enable-program-scheduling`。模型共享分词缓存继续由 P/D 管理，与已关闭的 Router 估算分词槽位是两回事。
+
+模型日志应出现 `GLM NVFP4 fused MoE bound`，各 rank 的基础模型 42 个 MoE 层均完成绑定。FC2 staging 与 vector weights 为 True，P extended prefetch 为 True，D 为 False。真实请求应有融合分发记录，较大 batch 使用原生后端。核对 P 的 18 个必需 MTP 源键已加载，D 的完整 MTP3、上下文 1048576 和异步调度均生效。

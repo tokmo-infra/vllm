@@ -1740,6 +1740,19 @@ class FusedMoEKernel:
         shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor | UnfinalizedMoEOutput:
         assert isinstance(self.impl, FusedMoEKernelModularImpl)
+        adapter = getattr(self.fused_experts, "_glm53_nvfp4_small", None)
+        if adapter is not None:
+            fused = adapter.try_forward(
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                activation=activation,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                shared_experts=shared_experts,
+                shared_experts_input=shared_experts_input,
+            )
+            if fused is not None:
+                return fused
         return self.impl.apply(
             hidden_states=hidden_states,
             w1=w1,

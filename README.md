@@ -1,58 +1,55 @@
 # GLM5.3 Flash 1103
 
-本分支用于 GLM-5.3 Flash 的 Prefill / Decode 分离部署，提供原生推理、同机共享分词、Mooncake 缓存恢复和 RDMA 网卡亲和配置。已跑通的 4P4D 拓扑、镜像要求和完整启动命令统一见 [deployment4p4d.md](deployment4p4d.md)。
+本分支用于 GLM-5.3 Flash NVFP4 的 Prefill / Decode 分离部署。完整镜像构建、拓扑与启动命令见 [deployment4p4d.md](deployment4p4d.md)。
 
-## 1. b1872978 · 原生推理与共享分词
+## 推理与缓存
 
-| 功能 | 解决的问题 | 实现和作用 | 通用复用范围 / 配置 |
+| 功能 | 配置与作用 |
+| --- | --- |
+| 原生推理 | 原生异步、CUDA graph、MTP3、FP8 KV、fullISL；注意力和大 batch MoE 保持默认后端。 |
+| 同机共享精确分词 | 整机共享分段结果，每个 API 保留 64 MiB 私有 L1；Tokenizer 指纹、命名空间和 root-owned epoch 隔离。总预算 2 GiB/GPU，已含 L1。 |
+| Mooncake PUT 恢复 | 缓存分配失败后，每发送线程最多每秒用一个有效 job 探测，成功后恢复保存。 |
+| Mooncake GET 恢复 | 对 -707 key 刷新副本租约并完整重读；按完整 group 和相邻 checkpoint 恢复混合 Mamba / MLA 状态。 |
+| Master 空间回收 | 按分配器实际占用计账，检查大块可分配槽数并触发原生淘汰；使用配套 patched Master。 |
+| FlashInfer 自动调优 | 复用匹配的调优配置，保留原生预热；编译和调优缓存挂载到持久目录。 |
+| P 末段准入预算 | `VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION=1` 保护特定异步加载请求的 CoW 状态块余量，减少抢占重算；代码默认关闭。 |
+| RDMA 目的网卡亲和 | `MC_ENABLE_DEST_DEVICE_AFFINITY=1`，结合各 GPU 分组的实际 HCA 映射。 |
+
+## SM120 NVFP4 MoE 融合
+
+针对 GLM 的 hidden4096 / intermediate2048 / 288 experts / top8，支持 EP4 和 EP8。内核基于 FlashInfer PR8806 的持久化调度与 P2P 协议，使用 NVFP4 E2M1、E4M3 group16 scales 和原生已校准权重，不改成 MXFP4。
+
+- 路由、FC1、SwiGLU、重数量化、FC2 与 FP32 combine 走融合路径。
+- 共享 workspace，直接引用原生权重和 scale；使用 uint4 向量读取、FC2 输入 staging 和 P 侧专家预取。
+- 初始化完成 JIT、标定检查和 EP rendezvous；请求路径在当前 CUDA stream 上执行，不增加 host 同步或额外 collective。
+- 分发使用各 rank 一致的 DP metadata。P dense batch 最大 192，稀疏 batch 最大 256 且总 token ≤512；D 最大 128。其他形状使用原生后端，保留原生共享专家调度。
+
+| 环境变量 | 默认 | 4P4D P | 4P4D D |
 | --- | --- | --- | --- |
-| ① GLM推理与KV传输 | 混合Mamba / MLA缓存需要正确分组、传输和恢复状态。 | 对接原生MTP3、FP8 KV、CUDA graph及异步调度，按完整逻辑块保存和交接。 | GLM推理适配；缓存分组与传输思路可复用。 |
-| ② 同机共享精确分词 | 多API会重复分词、重复保存同一段文本。 | 同机共享分段结果，每个API保留64MiB私有L1；用Tokenizer指纹、命名空间和epoch隔离。 | 共享池通用；分段规则适配固定GLM Tokenizer，路径和容量见部署配置。 |
-| ③ GET租约刷新 | 读取排队期间副本租约可能到期。 | 对返回-707的key重新查询副本并完整读取一次，其他结果交给原生失败处理。 | Mooncake读取保护，随connector路径生效。 |
-| ④ 相邻checkpoint回退 | 最近的Mamba checkpoint可能缺失或group尚未齐全。 | 按完整group与TP命名空间匹配相邻可用边界，并补齐采样所需checkpoint。 | 混合缓存复用；沿用Store查询和保存路径。 |
-| ⑤ FlashInfer自动调优 | 不同rank重复搜索会增加启动开销。 | 复用匹配的调优配置并保留原生预热流程。 | 兼容的硬件、库版本与形状之间复用。 |
+| `VLLM_GLM53_NVFP4_FUSED_MOE` | 0 | 1 | 1 |
+| `VLLM_GLM53_NVFP4_STAGE_FC2_INPUT` | 0 | 1 | 1 |
+| `VLLM_GLM53_NVFP4_VECTOR_WEIGHTS` | 0 | 1 | 1 |
+| `VLLM_GLM53_NVFP4_EXTENDED_PREFETCH` | 0 | 1 | 0 |
+| `VLLM_GLM53_P_MTP_CONTEXT_ONLY` | 0 | 1 | 0 |
 
-## 2. b68a1d20 · 缓存保存恢复与大块空间回收
+CUDA 源码随 wheel / sdist 安装。P2P 路径依赖 FlashInfer 0.7.1 JIT、CUDA SM120a 编译器和 Torch symmetric memory，无需 Cake 后端。环境变量在实例初始化前设置。
 
-| 功能 | 解决的问题 | 实现和作用 | 通用复用范围 / 配置 |
-| --- | --- | --- | --- |
-| ① PUT压力恢复 | CPU缓存曾经分配失败后，发送线程可能一直跳过后续保存。 | 每发送线程最多每秒用一个当前有效job探测，成功后恢复保存。 | Mooncake Store通用恢复逻辑，随代码生效。 |
-| ② Master实际占用计账 | 分配器向上取整，导致有效字节看似未满、实际空间已不足。 | 将bin实际占用计入淘汰水位，保留payload指标和快照含义。 | offset allocator通用修复，使用配套Master。 |
-| ③ Master大块空间回收 | CPU缓存有空闲，但碎片放不下新的大块KV。 | 定期检查目标大块可分配槽数，提前触发原生淘汰，为保存腾出空间。 | 大对象缓存通用；MC_EVICTION_FIT_REQUEST_BYTES默认0，配套命令给出目标大小。 |
+## P 侧 MTP context-only
 
-## 3. 3619d13a · 可选末段准入预算
+专用 EP4 P 仅加载 MTP 注意力和输入融合必需的 18 个源键，跳过只用于草稿生成的 MTP FFN/专家、head 和独立 embedding。基础模型全部专家保持在 GPU。未知、重复或缺失的必需权重直接报错，并核对构造参数的完整加载覆盖。
 
-| 功能 | 解决的问题 | 实现和作用 | 默认值 / 配置 |
-| --- | --- | --- | --- |
-| ① CoW状态块预算 | producer异步加载后，prefill末段需要额外状态块，竞争请求可能先用光余量。 | 为已识别的同末物理块请求登记义务，并在准入时保护余量，减少抢占重算。 | VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION默认0；P端精确设1开启。 |
-| ② 有限事件观测 | 需要确认预算何时登记、延后请求和被消耗。 | 每个scheduler记录三类首事件，便于检查实际路径。 | VLLM_HOT_TAIL_ADMISSION_DIAGNOSTICS默认0，设1记录。 |
+P 仍完成 MTP 注意力和 KV 写入，在写入完成后通过原生异步事件发布交接；不生成或采样草稿。D 保留完整 MTP3，继续原生投机解码。该模式要求 V2 runner、GLM 固定几何、EP4、TP/PP/PCP/DCP1、Mooncake producer + Store，不用于 D、耦合服务、动态草稿或 EPLB。
 
-该预算适用于首次、纯外部异步加载、同一物理末块的GLM/Mamba producer请求。启用时保留原生异步、块引用、Store交接和GPU栅栏流程；按实际业务对照吞吐与延迟后选择使用。
+## 4P4D 部署
 
-## 4. 5aeb9bd9 · 目的网卡亲和与部署
-
-| 功能 | 解决的问题 | 实现和作用 | 通用复用范围 / 配置 |
-| --- | --- | --- | --- |
-| 目的 HCA 亲和 | 跨机交接 KV 时，需要让 SDK 配合 GPU 与 RDMA 网卡的实际拓扑选择目的设备。 | 设置 MC_ENABLE_DEST_DEVICE_AFFINITY=1，结合每个 GPU 分组的本地 HCA 绑定使用。 | 支持该提示的 Mooncake RDMA 路径；网卡映射按硬件配置。 |
-
-Router 的 prompt ID 复用让 D 侧复用 P 侧已有的分词结果，减少重复处理长 prompt。P/D 使用相同模型的 tokenizer 和 chat template；当前部署显式设置 `VLLM_ROUTER_PD_REUSE_PROMPT_IDS=1`，不依赖镜像的默认值。
-
-## 5. 已跑通的 4P4D 部署
-
-这里的 4P4D 按主机计数：81–84 每台两个 DEP/EP4 Prefill 实例，共 **8P / 32 rank**；85–88 每台一个 DEP/EP8 Decode 实例，共 **4D / 32 rank**，合计 **64 rank**，TP 均为 1。
+4P4D 按主机计数：81–84 每台两个 EP4 P，共 8P / 32 rank；85–88 每台一个 EP8 D，共 4D / 32 rank，合计 64 GPU，TP1。
 
 | 角色 | 参数 |
 | --- | --- |
-| P | 每 DP seq24 / batch2048；native auto graph 上限 192；4 API/实例；KV recv4。 |
-| D | 每 DP seq32 / batch1024；FULL_DECODE_ONLY graph 上限 128；1 API/实例。 |
-| 公共 | 原生 async、FP8 KV、MTP3、fullISL、水位 0；目的 HCA 亲和设 1。 |
-| 缓存 | 每台 Store 750 GiB；Tokenizer 总预算 2 GiB/GPU，即 16 GiB/台，**已含**每 API 64 MiB 私有 L1。 |
-| Router | `router:vllm-yyf`；P `cache_aware` / D `round_robin`；不设 CPU quota，64 GiB RAM / 96 GiB RAM+swap、mems0；登记全部 8P + 4D。 |
+| P | 每 DP seq24 / batch2048；native auto graph 上限192；4 API/实例；KV recv4；MTP context-only。 |
+| D | 每 DP seq32 / batch1024；FULL_DECODE_ONLY graph 上限128；1 API/实例；完整 MTP3。 |
+| 公共 | GPU utilization 0.95，FP8 KV，prefix match256 / block64，1M 上下文，原生 async / fullISL。 |
+| L2 | 83/84 各700 GiB，其余各750 GiB；建议服务预热后按本机剩余可用内存的85%设置总池容量，已有池先加回预算。 |
+| Router | `router:vllm-yyf`；P cache_aware / D round_robin；无 CPU quota，64 GiB RAM / 96 GiB RAM+swap，mems0。 |
 
-P 抢占优化的**引擎代码默认值仍为 0**，本 4P4D 部署命令在 P 端显式设置 `VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION=1`；诊断开关保持 0。这与 Router 部署中显式开启 prompt ID 复用是两个独立配置。
-
-按 [deployment4p4d.md](deployment4p4d.md) 准备镜像、IP、路径和凭据，再依次启动 Master、Store、模型实例与 Router。该文档是本分支的主部署入口。
-
-Router 显式开启 P→D prompt ID 复用与 P 单 token length-capped 交接；关闭 TokenBalancer、program scheduling 及关联分词槽位，不加载估算 Tokenizer 或 token-balance JSON。2026-11-07 SWE130k / C550 六种 D 策略冷测选择轮询：16037.53 万 TPM，TTFT Mean / P50 / P99 为 4.257 / 3.267 / 18.857 秒，TPOT Mean 24.946 ms，全程 HTTP500 为 0。旧 Router 容量路由启动段已替换，P/D 与 Mooncake 配置保持不变。
-
-缓存容量建议与可选 L3 SSD 参数见 `deployment4p4d.md` 第 5 节：服务预热后，建议将剩余可用内存的 **85%** 用于 L2；当前 750 GiB/台是实测基线，L3 本轮未启用。Router 自身另有前缀树 LRU，字符预算不等于 64 GiB 容器内存上限。
+Router 显式开启 prompt ID 复用和 length-capped 交接；关闭 TokenBalancer、program scheduling 和关联分词槽位，不加载估算 Tokenizer。Router 前缀树使用 LRU；字符预算与容器 RAM 上限分别配置。L3 SSD 默认关闭，可选配置见部署文档。

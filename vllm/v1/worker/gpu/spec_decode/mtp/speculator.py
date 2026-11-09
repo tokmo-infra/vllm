@@ -3,6 +3,7 @@
 
 import torch.nn as nn
 
+from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
     TargetDependentARSpeculator,
@@ -11,6 +12,47 @@ from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
 
 class MTPSpeculator(TargetDependentARSpeculator):
     share_mtp_topk_indices: bool = False
+
+    @property
+    def p_mtp_context_only(self) -> bool:
+        return getattr(getattr(self, "model", None), "p_mtp_context_only", False)
+
+    def _configure_decode_metadata_update(self) -> None:
+        if self.p_mtp_context_only:
+            self.supports_decode_metadata_update = False
+            return
+        super()._configure_decode_metadata_update()
+
+    def _prefill(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        attn_metadata,
+        slot_mappings,
+        num_tokens_across_dp,
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+        mm_inputs=None,
+    ) -> None:
+        if not self.p_mtp_context_only:
+            return super()._prefill(
+                num_reqs,
+                num_tokens,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp,
+                cudagraph_runtime_mode,
+                mm_inputs,
+            )
+        self._run_model(
+            num_tokens,
+            attn_metadata,
+            slot_mappings,
+            num_tokens_across_dp,
+            cudagraph_runtime_mode,
+            mm_inputs,
+        )
+        # Shape stays MTP3, but no draft feedback or logits are produced on P.
+        self.draft_tokens[:num_reqs].fill_(-1)
 
     def load_draft_model(
         self,
@@ -54,6 +96,8 @@ class MTPSpeculator(TargetDependentARSpeculator):
             self.model.model.set_skip_topk(False)
 
     def on_prefill_end(self, num_reqs: int) -> None:
+        if self.p_mtp_context_only:
+            return
         # Step 0 (prefill) wrote topk indices for every query token in the
         # multi-token batch. Compact them down to each request's last token so
         # steps 1+ can reuse them from the shared buffer.

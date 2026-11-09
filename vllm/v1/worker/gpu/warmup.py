@@ -420,6 +420,12 @@ def _warmup_kernels(
                 step_num_scheduled_tokens.values()
             )
 
+            if getattr(model_runner.speculator, "p_mtp_context_only", False) and any(
+                spec_flags
+            ):
+                # Synthetic scheduled drafts read this GPU buffer, not the
+                # SchedulerOutput's placeholder IDs. P produces no real drafts.
+                model_runner.req_states.draft_tokens.zero_()
             worker_execute_model(decode_output)
             worker_sample_tokens(None)
 

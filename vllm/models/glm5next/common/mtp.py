@@ -27,7 +27,7 @@ from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2MixtureOfExperts,
     DeepseekV32IndexerCache,
 )
-from vllm.model_executor.models.utils import maybe_prefix
+from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
 from vllm.models.glm5next.nvidia.ops.fused_eh_norm import fused_eh_norm
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -43,6 +43,37 @@ from .model import (
     get_sparse_topk_buffer_width,
     get_spec_layer_idx_from_weight_name,
 )
+from .p_mtp_context import ContextWeightCoverage, p_context_enabled
+
+
+class _PContextBlock(nn.Module):
+    """Original full MTP attention and cache writes; no downstream FFN."""
+
+    def __init__(self, vllm_config, config, prefix, topk_indices_buffer):
+        super().__init__()
+        self.self_attn = Glm5NextMLAAttention(
+            vllm_config=vllm_config,
+            config=config,
+            hidden_size=config.hidden_size,
+            num_heads=config.num_attention_heads,
+            qk_nope_head_dim=config.qk_nope_head_dim,
+            qk_rope_head_dim=config.qk_rope_head_dim,
+            v_head_dim=config.v_head_dim,
+            q_lora_rank=config.q_lora_rank,
+            kv_lora_rank=config.kv_lora_rank,
+            max_position_embeddings=config.max_position_embeddings,
+            cache_config=vllm_config.cache_config,
+            quant_config=None,
+            prefix=f"{prefix}.self_attn",
+            topk_indices_buffer=topk_indices_buffer,
+            skip_rope=config.mla_use_nope,
+        )
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(self, positions, hidden_states):
+        return self.self_attn(
+            hidden_states=self.input_layernorm(hidden_states), positions=positions
+        )
 
 
 class Glm5NextMultiTokenPredictorLayer(nn.Module):
@@ -51,6 +82,7 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
         assert vllm_config.speculative_config is not None
         config = vllm_config.speculative_config.draft_model_config.hf_text_config
         self.config = config
+        self.p_mtp_context_only = p_context_enabled(vllm_config)
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -62,6 +94,12 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
             dtype=torch.int32,
             device=current_platform.device_type,
         )
+        if self.p_mtp_context_only:
+            self.shared_head = None
+            self.mtp_block = _PContextBlock(
+                vllm_config, config, prefix, topk_indices_buffer
+            )
+            return
         self.shared_head = SharedHead(
             config=config,
             prefix=prefix,
@@ -99,12 +137,18 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
             self.enorm.variance_epsilon,
         )
         hidden_states = self.eh_proj(eh_input)
+        if self.p_mtp_context_only:
+            if type(spec_step_index) is not int or spec_step_index != 0:
+                raise ValueError("P context-only cannot execute draft decode")
+            context_output = self.mtp_block(positions, hidden_states)
+            return context_output, context_output
         # Fuse the residual add and final RMSNorm. Glm5NextMoE already performs
         # its all-reduce, so no collective is needed here. The post-norm result
         # feeds both draft logits and the next recycled hidden state.
         hidden_states, residual, _, _ = self.mtp_block(
             positions=positions, hidden_states=hidden_states, residual=None
         )
+        assert self.shared_head is not None
         hidden_states, _ = self.shared_head.norm(hidden_states, residual=residual)
         return hidden_states, hidden_states
 
@@ -113,6 +157,7 @@ class Glm5NextMultiTokenPredictor(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_text_config
+        self.p_mtp_context_only = p_context_enabled(vllm_config)
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = config.num_nextn_predict_layers
         self.layers = torch.nn.ModuleDict(
@@ -126,11 +171,14 @@ class Glm5NextMultiTokenPredictor(nn.Module):
                 )
             }
         )
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            prefix=maybe_prefix(prefix, "embed_tokens"),
-        )
+        if self.p_mtp_context_only:
+            self.embed_tokens = PPMissingLayer()
+        else:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                prefix=maybe_prefix(prefix, "embed_tokens"),
+            )
         # Plain list for the per-propose lookup: ModuleDict[str(...)] builds a
         # string and hashes it on every draft step.
         self._mtp_layers = list(self.layers.values())
@@ -175,6 +223,10 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
+        if self.p_mtp_context_only and (
+            type(spec_step_idx) is not int or spec_step_idx != 0
+        ):
+            raise ValueError("P context-only cannot execute draft decode")
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         current_step_idx = spec_step_idx % self.num_mtp_layers
@@ -191,6 +243,8 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
+        if self.p_mtp_context_only:
+            raise RuntimeError("P context-only output must never be sampled")
         current_step_idx = spec_step_idx % self.num_mtp_layers
         mtp_layer = self._mtp_layers[current_step_idx]
         # hidden_states is already post-final-norm (produced in the layer
@@ -203,6 +257,8 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
+        if self.p_mtp_context_only:
+            raise RuntimeError("P context-only output must never be sampled")
         current_step_idx = spec_step_idx % self.num_mtp_layers
         mtp_layer = self._mtp_layers[current_step_idx]
         # Vocab-parallel argmax for the greedy draft: per-rank head projection
@@ -220,16 +276,27 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_text_config
+        self.p_mtp_context_only = p_context_enabled(vllm_config)
         self.quant_config = vllm_config.quant_config
         self.model = Glm5NextMultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         self.set_moe_parameters()
+        if self.p_mtp_context_only:
+            self.is_fused_shared_expert_enabled = False
+            return
         self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
             self.model.layers.values(), Glm5NextMoE, "mtp_block.mlp"
         )
 
     def set_moe_parameters(self):
+        if self.p_mtp_context_only:
+            self.num_moe_layers = 0
+            self.num_expert_groups = 0
+            self.moe_layers = []
+            self.moe_mlp_layers = []
+            self.extract_moe_parameters(None)
+            return
         self.num_moe_layers = self.config.num_nextn_predict_layers
         self.num_expert_groups = self.config.n_group
         self.moe_layers = []
@@ -312,16 +379,20 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         num_fused_shared = _num_fused_shared_experts(
             self.config.n_shared_experts, self.is_fused_shared_expert_enabled
         )
-        expert_params_mapping = fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts + num_fused_shared,
-            num_redundant_experts=self.num_redundant_experts,
-        )
+        if self.p_mtp_context_only:
+            expert_params_mapping = []
+        else:
+            expert_params_mapping = fused_moe_make_expert_params_mapping(
+                self,
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=self.config.n_routed_experts + num_fused_shared,
+                num_redundant_experts=self.num_redundant_experts,
+            )
 
         params_dict = dict(self.named_parameters())
+        coverage = ContextWeightCoverage() if self.p_mtp_context_only else None
         loaded_params: set[str] = set()
         _pending_wk_fp8: dict = {}
         # GLM-5.3-Flash NoPE checkpoints omit the RoPE rows from
@@ -330,6 +401,8 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         if self.config.mla_use_nope and self.config.qk_rope_head_dim > 0:
             kv_a_pad_size = self.config.qk_rope_head_dim
         for name, loaded_weight in weights:
+            if coverage is not None and coverage.discard(name):
+                continue
             if "rotary_emb.inv_freq" in name:
                 continue
             # Multimodal (Glm5NextForConditionalGeneration) checkpoints prefix
@@ -429,6 +502,14 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        if coverage is not None:
+            coverage.finish(params_dict, loaded_params, _pending_wk_fp8)
+            self.p_context_weight_coverage = {
+                "retained_source_keys": sorted(coverage.retained),
+                "discarded_source_keys": sorted(coverage.dropped),
+                "loaded_parameters": sorted(loaded_params),
+            }
 
         loaded_layers: set[int] = set()
         for param_name in loaded_params:

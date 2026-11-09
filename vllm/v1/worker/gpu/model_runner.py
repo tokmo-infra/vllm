@@ -415,9 +415,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if isinstance(self.speculator, DraftModelSpeculator):
                 with use_workspace_lane(self._draft_workspace_lane):
                     self.speculator.load_model(self.model)
-                    eplb_models_added = self.eplb.maybe_register_speculator(
-                        self.speculator, self.speculative_config, load_dummy_weights
-                    )
+                    if not getattr(self.speculator, "p_mtp_context_only", False):
+                        eplb_models_added = self.eplb.maybe_register_speculator(
+                            self.speculator, self.speculative_config, load_dummy_weights
+                        )
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory
@@ -2262,7 +2263,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.speculator.draft_token_confidence_probs, input_batch
                 )
 
-        if self.num_speculative_steps > 0:
+        if self.num_speculative_steps > 0 and not getattr(
+            self.speculator, "p_mtp_context_only", False
+        ):
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
             self.draft_tokens_handler.set_draft_tokens(
@@ -2273,6 +2276,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.pp_handler.broadcast_drafts(
                     self.req_states.draft_tokens, input_batch
                 )
+
+        if getattr(self.speculator, "p_mtp_context_only", False):
+            # Keep early D2H overlap, but publish P completion only after MTP KV.
+            # GPU-stream dependency only: no host synchronization.
+            self.output_copy_stream.wait_stream(self.main_stream)
+            async_output.copy_event.record(self.output_copy_stream)
 
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)

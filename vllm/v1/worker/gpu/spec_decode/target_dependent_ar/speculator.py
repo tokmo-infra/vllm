@@ -137,7 +137,9 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
         )
         self.on_prefill_end(self.max_num_reqs)
 
-        if self.num_speculative_steps == 1:
+        if self.num_speculative_steps == 1 or getattr(
+            self, "p_mtp_context_only", False
+        ):
             return
 
         self.on_multi_step_decode_begin(self.max_num_reqs)
@@ -191,6 +193,8 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
         num_speculative_tokens: int | None = None,
     ) -> torch.Tensor:
         num_reqs = input_batch.num_reqs
+        if getattr(self, "p_mtp_context_only", False):
+            num_speculative_tokens = 0
         if num_speculative_tokens is None:
             num_speculative_tokens = self.num_speculative_steps
         num_tokens = input_batch.num_tokens

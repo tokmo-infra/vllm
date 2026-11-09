@@ -8,3 +8,4 @@ include tools/build_rust.py
 
 recursive-include cmake *
 recursive-include csrc *
+recursive-include vllm/_glm53_nvfp4 *.cu *.cuh

@@ -180,6 +180,54 @@
   },
   "runtime_source_files": [
     {
+      "path": "vllm/_glm53_nvfp4/__init__.py",
+      "sha256": "e02123bc89b8f4813af5ff39cd7b82fa752d77aa791cc78e91f62007008a09ff"
+    },
+    {
+      "path": "vllm/_glm53_nvfp4/csrc/megamoe_sm120_nvfp4.cu",
+      "sha256": "9a2b38a46fa035e328ae377148452956737ce2a1e111b018d5f31706fd9c160b"
+    },
+    {
+      "path": "vllm/_glm53_nvfp4/csrc/megamoe_sm120_nvfp4_gin_session.cu",
+      "sha256": "cc2fcb09ca002f4984fb4a96f4e732c8ef1723cdb6c209c669104fa2eddaf578"
+    },
+    {
+      "path": "vllm/_glm53_nvfp4/include/flashinfer/megamoe/sm120_nvfp4_mega_moe.cuh",
+      "sha256": "334490ad80d020b39f401306dd06a396148f194c2241a90e452040e4aa010883"
+    },
+    {
+      "path": "vllm/_glm53_nvfp4/nvfp4_ep/__init__.py",
+      "sha256": "8f0b384b2b31d674737a4b6a05eee36633e7486c7da9f946de431209b3854864"
+    },
+    {
+      "path": "vllm/_glm53_nvfp4/nvfp4_ep/combine_reference.py",
+      "sha256": "0a37dc0857948dbc3aed7c3ff182361fa942b394c3ae54c79197f07a51ddc717"
+    },
+    {
+      "path": "vllm/_glm53_nvfp4/nvfp4_ep/contracts.py",
+      "sha256": "981b2ed9b4c3480ed196b74f13af9c2eaca1b27f2c40bc6399419db34c6e3bb3"
+    },
+    {
+      "path": "vllm/_glm53_nvfp4/nvfp4_ep/jit.py",
+      "sha256": "58b0131f9c0c26a69f46964be345625c1d4dc6949a4b731a3c1ef1f073318a86"
+    },
+    {
+      "path": "vllm/_glm53_nvfp4/nvfp4_ep/reference_cpu.py",
+      "sha256": "4cce28861de9fd69ed538e379fb9ce8018921d52924ec3a05f9c8d4a90ada2f7"
+    },
+    {
+      "path": "vllm/_glm53_nvfp4/nvfp4_ep/verification.py",
+      "sha256": "a3dd5dbc5d8d31cff975bdd24dbc9c2fa074c550336077e399eb5ab152956ff0"
+    },
+    {
+      "path": "vllm/_glm53_nvfp4/nvfp4_ep/weights.py",
+      "sha256": "9e11ad429abe6df9af901d48d019ac7faa0e9e90efecb22044498d8764134e93"
+    },
+    {
+      "path": "vllm/_glm53_nvfp4/nvfp4_ep/workspace.py",
+      "sha256": "651d47220a4d3552b96f0a834dfa0dc0010b67e41205b283adc6043402567eae"
+    },
+    {
       "path": "vllm/config/vllm.py",
       "sha256": "d30876a57fff3c7a929e584eb48c2bfa3145a612fe9a950c3072d9b7c8ee88d6"
     },
@@ -224,6 +272,22 @@
       "sha256": "798269daf18317ea9a0acc5b901f8a9a179d65f21144ef4e1bf36185efe9f2ed"
     },
     {
+      "path": "vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py",
+      "sha256": "499ccc2bf33c0ed54281417539fac5d827795dc65df7d39b6993f61c8c4fc5f2"
+    },
+    {
+      "path": "vllm/model_executor/layers/fused_moe/glm53_nvfp4.py",
+      "sha256": "02b675a4abdcee20141f42ac585b45081de3eaedc9a9bfc9ff5e79d190d45440"
+    },
+    {
+      "path": "vllm/model_executor/layers/fused_moe/glm53_nvfp4_policy.py",
+      "sha256": "ad5339a2864c7b284a84fd168e165c95028264f9cd3480b7d7e2afb9a7230aee"
+    },
+    {
+      "path": "vllm/model_executor/layers/fused_moe/modular_kernel.py",
+      "sha256": "26e3f9e44301616a5b79c367d8209433b5fa4e2c401eed6a2a1ab6d59d12bd4d"
+    },
+    {
       "path": "vllm/model_executor/warmup/kernel_warmup.py",
       "sha256": "67cec3830838b63847c6ad7314cca382273e8da96f36aeef97fce6e4ecd95aa6"
     },
@@ -233,7 +297,11 @@
     },
     {
       "path": "vllm/models/glm5next/common/mtp.py",
-      "sha256": "383d1ae302b3c269572c0a10bcb5af9aac99488eedbe629867c1be02a86bfaed"
+      "sha256": "dfb7b0283fd5a81a80268fe0ea96eeccc4a12f04ac4ee83a89df874dd2f2a93d"
+    },
+    {
+      "path": "vllm/models/glm5next/common/p_mtp_context.py",
+      "sha256": "b3fa73fcbc705131e5cf19a6862fd4d3cc22c8a82857ca6ea6ed6d9077eda273"
     },
     {
       "path": "vllm/renderers/base.py",
@@ -329,18 +397,74 @@
     },
     {
       "path": "vllm/v1/worker/gpu/model_runner.py",
-      "sha256": "fcf9add5cb88c27693b8dad95919d99f94101cfbc6c3e9e20af81f0c6966ca55"
+      "sha256": "9fb1ed363d216443bfd9a76eedb96f63af2e64b893d420f6604e08a621e119cc"
     },
     {
       "path": "vllm/v1/worker/gpu/spec_decode/mtp/speculator.py",
-      "sha256": "cc38bb4681ecd9e543002e708118becd3d7ce18960c8f8faf0b183cb71c0eff7"
+      "sha256": "ac767c2aa9589628ef840124896bf322ce6ba60e185064663155ee57f71bcf7d"
     },
     {
       "path": "vllm/v1/worker/gpu/spec_decode/speculator.py",
       "sha256": "51619cbce2f10501128df001c18fa050d16bf580c6fd44feed461ff9397a97af"
+    },
+    {
+      "path": "vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py",
+      "sha256": "ed3dbdb87ca51498d553d30bfef8275ee5d15f06ef1f4731634e50ddf00be6ec"
+    },
+    {
+      "path": "vllm/v1/worker/gpu/warmup.py",
+      "sha256": "be4e97be9c676a56e6e88b9da2683a1addc8cb65f8e22024e0a21610b97f9628"
     }
   ],
   "image_overlay_files": [
+    {
+      "path": "vllm/_glm53_nvfp4/__init__.py",
+      "sha256": "e02123bc89b8f4813af5ff39cd7b82fa752d77aa791cc78e91f62007008a09ff"
+    },
+    {
+      "path": "vllm/_glm53_nvfp4/csrc/megamoe_sm120_nvfp4.cu",
+      "sha256": "9a2b38a46fa035e328ae377148452956737ce2a1e111b018d5f31706fd9c160b"
+    },
+    {
+      "path": "vllm/_glm53_nvfp4/csrc/megamoe_sm120_nvfp4_gin_session.cu",
+      "sha256": "cc2fcb09ca002f4984fb4a96f4e732c8ef1723cdb6c209c669104fa2eddaf578"
+    },
+    {
+      "path": "vllm/_glm53_nvfp4/include/flashinfer/megamoe/sm120_nvfp4_mega_moe.cuh",
+      "sha256": "334490ad80d020b39f401306dd06a396148f194c2241a90e452040e4aa010883"
+    },
+    {
+      "path": "vllm/_glm53_nvfp4/nvfp4_ep/__init__.py",
+      "sha256": "8f0b384b2b31d674737a4b6a05eee36633e7486c7da9f946de431209b3854864"
+    },
+    {
+      "path": "vllm/_glm53_nvfp4/nvfp4_ep/combine_reference.py",
+      "sha256": "0a37dc0857948dbc3aed7c3ff182361fa942b394c3ae54c79197f07a51ddc717"
+    },
+    {
+      "path": "vllm/_glm53_nvfp4/nvfp4_ep/contracts.py",
+      "sha256": "981b2ed9b4c3480ed196b74f13af9c2eaca1b27f2c40bc6399419db34c6e3bb3"
+    },
+    {
+      "path": "vllm/_glm53_nvfp4/nvfp4_ep/jit.py",
+      "sha256": "58b0131f9c0c26a69f46964be345625c1d4dc6949a4b731a3c1ef1f073318a86"
+    },
+    {
+      "path": "vllm/_glm53_nvfp4/nvfp4_ep/reference_cpu.py",
+      "sha256": "4cce28861de9fd69ed538e379fb9ce8018921d52924ec3a05f9c8d4a90ada2f7"
+    },
+    {
+      "path": "vllm/_glm53_nvfp4/nvfp4_ep/verification.py",
+      "sha256": "a3dd5dbc5d8d31cff975bdd24dbc9c2fa074c550336077e399eb5ab152956ff0"
+    },
+    {
+      "path": "vllm/_glm53_nvfp4/nvfp4_ep/weights.py",
+      "sha256": "9e11ad429abe6df9af901d48d019ac7faa0e9e90efecb22044498d8764134e93"
+    },
+    {
+      "path": "vllm/_glm53_nvfp4/nvfp4_ep/workspace.py",
+      "sha256": "651d47220a4d3552b96f0a834dfa0dc0010b67e41205b283adc6043402567eae"
+    },
     {
       "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py",
       "sha256": "c45368c9f15ca4be2baab08f517532bd00b532e7e2fe896a7c6a700815430cce"
@@ -348,6 +472,30 @@
     {
       "path": "vllm/envs.py",
       "sha256": "2ecf77a7552e548885f67b1ad49772e9c506a3c2ea9fd6de3bcf451923d34ae2"
+    },
+    {
+      "path": "vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py",
+      "sha256": "499ccc2bf33c0ed54281417539fac5d827795dc65df7d39b6993f61c8c4fc5f2"
+    },
+    {
+      "path": "vllm/model_executor/layers/fused_moe/glm53_nvfp4.py",
+      "sha256": "02b675a4abdcee20141f42ac585b45081de3eaedc9a9bfc9ff5e79d190d45440"
+    },
+    {
+      "path": "vllm/model_executor/layers/fused_moe/glm53_nvfp4_policy.py",
+      "sha256": "ad5339a2864c7b284a84fd168e165c95028264f9cd3480b7d7e2afb9a7230aee"
+    },
+    {
+      "path": "vllm/model_executor/layers/fused_moe/modular_kernel.py",
+      "sha256": "26e3f9e44301616a5b79c367d8209433b5fa4e2c401eed6a2a1ab6d59d12bd4d"
+    },
+    {
+      "path": "vllm/models/glm5next/common/mtp.py",
+      "sha256": "dfb7b0283fd5a81a80268fe0ea96eeccc4a12f04ac4ee83a89df874dd2f2a93d"
+    },
+    {
+      "path": "vllm/models/glm5next/common/p_mtp_context.py",
+      "sha256": "b3fa73fcbc705131e5cf19a6862fd4d3cc22c8a82857ca6ea6ed6d9077eda273"
     },
     {
       "path": "vllm/v1/core/kv_cache_manager.py",
@@ -360,20 +508,45 @@
     {
       "path": "vllm/v1/core/sched/scheduler.py",
       "sha256": "0ea6f1afeaaf20e1e804f59b2e585d30a8375f2b7d2fed227fabfe5c30f70c50"
+    },
+    {
+      "path": "vllm/v1/worker/gpu/model_runner.py",
+      "sha256": "9fb1ed363d216443bfd9a76eedb96f63af2e64b893d420f6604e08a621e119cc"
+    },
+    {
+      "path": "vllm/v1/worker/gpu/spec_decode/mtp/speculator.py",
+      "sha256": "ac767c2aa9589628ef840124896bf322ce6ba60e185064663155ee57f71bcf7d"
+    },
+    {
+      "path": "vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py",
+      "sha256": "ed3dbdb87ca51498d553d30bfef8275ee5d15f06ef1f4731634e50ddf00be6ec"
+    },
+    {
+      "path": "vllm/v1/worker/gpu/warmup.py",
+      "sha256": "be4e97be9c676a56e6e88b9da2683a1addc8cb65f8e22024e0a21610b97f9628"
     }
   ],
   "base_validation_files": [
     {
       "path": "vllm/envs.py",
-      "sha256": "347adb19effb1976b0dcbece65d595531475017528765d38585292db62378e3d"
+      "sha256": "347adb19effb1976b0dcbece65d595531475017528765d38585292db62378e3d",
+      "compatible_sha256": [
+        "2ecf77a7552e548885f67b1ad49772e9c506a3c2ea9fd6de3bcf451923d34ae2"
+      ]
     },
     {
       "path": "vllm/v1/core/kv_cache_manager.py",
-      "sha256": "d08315437c6b07040d1b7e12d7bd7d6e966c976a286f05a9788098cfdd9754c7"
+      "sha256": "d08315437c6b07040d1b7e12d7bd7d6e966c976a286f05a9788098cfdd9754c7",
+      "compatible_sha256": [
+        "32902cb6403fbab6fcf3c0c17e7ebf1841a5cd14a8c8654bd915a02a610bdbb1"
+      ]
     },
     {
       "path": "vllm/v1/core/sched/scheduler.py",
-      "sha256": "d9a39870286c424cef2fc0730e24092ee3df67e848608e2278944846bab804ae"
+      "sha256": "d9a39870286c424cef2fc0730e24092ee3df67e848608e2278944846bab804ae",
+      "compatible_sha256": [
+        "0ea6f1afeaaf20e1e804f59b2e585d30a8375f2b7d2fed227fabfe5c30f70c50"
+      ]
     },
     {
       "path": "vllm/renderers/base.py",
@@ -393,7 +566,38 @@
     },
     {
       "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py",
-      "sha256": "90a457d10975d132c5883a00ecbfdac855064725eecfa894c36c8d4ffa4bc5b5"
+      "sha256": "90a457d10975d132c5883a00ecbfdac855064725eecfa894c36c8d4ffa4bc5b5",
+      "compatible_sha256": [
+        "c45368c9f15ca4be2baab08f517532bd00b532e7e2fe896a7c6a700815430cce"
+      ]
+    },
+    {
+      "path": "vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py",
+      "sha256": "82e1784f277df2d4e079b61c3af68fa11375e0f71f6cd9a7a95111c885e75963"
+    },
+    {
+      "path": "vllm/model_executor/layers/fused_moe/modular_kernel.py",
+      "sha256": "82a5d100f42d3df3d20baea4a86e5147d4d5c17e3775ed7b5a1ce4bfb433fe0a"
+    },
+    {
+      "path": "vllm/models/glm5next/common/mtp.py",
+      "sha256": "383d1ae302b3c269572c0a10bcb5af9aac99488eedbe629867c1be02a86bfaed"
+    },
+    {
+      "path": "vllm/v1/worker/gpu/model_runner.py",
+      "sha256": "fcf9add5cb88c27693b8dad95919d99f94101cfbc6c3e9e20af81f0c6966ca55"
+    },
+    {
+      "path": "vllm/v1/worker/gpu/spec_decode/mtp/speculator.py",
+      "sha256": "cc38bb4681ecd9e543002e708118becd3d7ce18960c8f8faf0b183cb71c0eff7"
+    },
+    {
+      "path": "vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py",
+      "sha256": "2133fa15bae57b85a5d0fb1a32124b25d32987117fdce58d032c67331cfe8d48"
+    },
+    {
+      "path": "vllm/v1/worker/gpu/warmup.py",
+      "sha256": "daeac5713fb5c7bbc9a2409e5111fba2dba446acddabb77fbaa7705fd5af87a4"
     }
   ],
   "feature_commits": {
@@ -411,5 +615,30 @@
     "default": "0",
     "enabled_value": "1"
   },
-  "mooncake_master": "mooncake-master.json"
+  "mooncake_master": "mooncake-master.json",
+  "nvfp4": {
+    "upstream_repository": "https://github.com/flashinfer-ai/flashinfer",
+    "upstream_pr": 8806,
+    "upstream_commit": "b73ffcf962540820e98c908688a8a0171a71e176",
+    "geometry": {
+      "sm": 120,
+      "hidden": 4096,
+      "intermediate": 2048,
+      "experts": 288,
+      "top_k": 8,
+      "ep": [
+        4,
+        8
+      ]
+    },
+    "transport": "p2p",
+    "defaults": {
+      "VLLM_GLM53_NVFP4_FUSED_MOE": "0",
+      "VLLM_GLM53_NVFP4_STAGE_FC2_INPUT": "0",
+      "VLLM_GLM53_NVFP4_VECTOR_WEIGHTS": "0",
+      "VLLM_GLM53_NVFP4_EXTENDED_PREFETCH": "0",
+      "VLLM_GLM53_P_MTP_CONTEXT_ONLY": "0"
+    },
+    "jit": "CUDA SM120a; FlashInfer 0.7.1 gen_jit_spec and tvm_ffi_utils.h; no Cake/DS4.1 runtime required for P2P."
+  }
 }
