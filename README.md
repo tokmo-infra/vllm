@@ -1,6 +1,6 @@
 # GLM5.3 Flash 1103
 
-本分支用于 GLM-5.3 Flash NVFP4 的 Prefill / Decode 分离部署。完整镜像构建、拓扑与启动命令见 [deployment4p4d.md](deployment4p4d.md)。
+本分支用于 GLM-5.3 Flash NVFP4 的 Prefill / Decode 分离部署。镜像构建、拓扑与启动命令见[1P2D部署](deployment1p2d.md)与[4P4D部署](deployment4p4d.md)，两者开头均有字段说明和使用示例。
 
 ## 推理与缓存
 
@@ -50,6 +50,10 @@ P 仍完成 MTP 注意力和 KV 写入，在写入完成后通过原生异步事
 | D | 每 DP seq32 / batch1024；FULL_DECODE_ONLY graph 上限128；1 API/实例；完整 MTP3。 |
 | 公共 | GPU utilization 0.95，FP8 KV，prefix match256 / block64，1M 上下文，原生 async / fullISL。 |
 | L2 | 83/84 各700 GiB，其余各750 GiB；建议服务预热后按本机剩余可用内存的85%设置总池容量，已有池先加回预算。 |
-| Router | `router:vllm-yyf`；P cache_aware / D round_robin；无 CPU quota，64 GiB RAM / 96 GiB RAM+swap，mems0。 |
+| Router | `router:glm53flash-1103`；P cache_aware / D round_robin；无 CPU quota，64 GiB RAM / 96 GiB RAM+swap，mems0。 |
 
-Router 显式开启 prompt ID 复用和 length-capped 交接；关闭 TokenBalancer、program scheduling 和关联分词槽位，不加载估算 Tokenizer。Router 前缀树使用 LRU；字符预算与容器 RAM 上限分别配置。L3 SSD 默认关闭，可选配置见部署文档。
+Router 显式开启 prompt ID 复用和 length-capped 交接；不执行token容量估算或分词槽位调度，program scheduling关闭。Router 前缀树使用 LRU；字符预算与容器 RAM 上限分别配置。L3 SSD 默认关闭，可选配置见部署文档。
+
+## 1P2D 部署
+
+P主机两个EP4实例，D主机各一个EP8实例，共24GPU。P使用相同的NVFP4融合与MTP context-only配置；D保留完整MTP3，seq16 / batch1024 / graph64。启动命令见[deployment1p2d.md](deployment1p2d.md)，不把4P4D的D容量参数直接套入1P2D。

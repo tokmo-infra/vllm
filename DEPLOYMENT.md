@@ -1,5 +1,6 @@
 # GLM5.3 Flash 1103 · 部署入口
 
-当前已跑通的 4P4D 配置、镜像要求、完整启动命令与核验步骤统一见 [deployment4p4d.md](deployment4p4d.md)。
+- [1P2D部署](deployment1p2d.md)：1台双EP4 P、2台EP8 D，合计24GPU；D保持seq16 / graph64。
+- [4P4D部署](deployment4p4d.md)：4台双EP4 P、4台EP8 D，合计64GPU；D为seq32 / graph128。
 
-4 台 Prefill 主机（81–84）每台两个 DEP/EP4 实例，共 8P；4 台 Decode 主机（85–88）每台一个 DEP/EP8 实例，共 4D，合计 64 rank。功能作用、通用复用范围与已有提交见 [README.md](README.md)。
+两份部署文档开头说明NVFP4融合、P侧MTP精简、Router交接和缓存字段的作用与使用示例。P/D均保留原生异步、CUDA图、默认注意力后端与Mooncake缓存；Router使用P cache_aware / D round_robin。

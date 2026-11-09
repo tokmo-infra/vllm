@@ -2,6 +2,41 @@
 
 本文集中给出已实际跑通的 4P4D 启动配置。4P4D 按主机计数：4 台 Prefill 主机、4 台 Decode 主机；实际为 **8P + 4D、64 rank**。所有命令在目标主机的 root Bash 会话执行，适用于已分配的 GPU、端口和目录。
 
+## 启动字段说明与使用示例
+
+引擎中的五个 GLM 优化开关默认均为 `0`，在容器创建前显式设置。P 的基础模型专家保留在 GPU，D 保留完整 MTP3；这些字段不切换注意力后端，也不关闭异步调度、CUDA graph 或通信计算重叠。
+
+| 字段 | P | D | 作用与使用案例 |
+| --- | --- | --- | --- |
+| `VLLM_GLM53_NVFP4_FUSED_MOE` | 1 | 1 | 启用 SM120 GLM NVFP4 MoE 融合；用于 EP4 P / EP8 D，超过融合分发范围的 batch 继续用原生后端。 |
+| `VLLM_GLM53_NVFP4_STAGE_FC2_INPUT` | 1 | 1 | 在融合核中暂存 FC2 输入，减少重复读取；与上面的融合开关配套使用。 |
+| `VLLM_GLM53_NVFP4_VECTOR_WEIGHTS` | 1 | 1 | 使用向量化权重读取；适用于本分支的 NVFP4 原生权重布局。 |
+| `VLLM_GLM53_NVFP4_EXTENDED_PREFETCH` | 1 | 0 | 给 EP4 P 的每 rank 72 个专家扩展预取；EP8 D 不开启。 |
+| `VLLM_GLM53_P_MTP_CONTEXT_ONLY` | 1 | 0 | 专用 P 只加载 MTP 注意力和输入融合必需的18个源键，完成 MTP KV 交接；D 或耦合实例设0，保留完整草稿生成。 |
+| `VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION` | 1 | 0 | 为 P 异步读回后的末段 CoW 状态块留余量，减少抢占重算；诊断开关保持0。 |
+
+下面是 Docker 参数片段；后文的完整命令已包含这些值：
+
+~~~bash
+# P / D 公共参数
+-e VLLM_GLM53_NVFP4_FUSED_MOE=1 \
+-e VLLM_GLM53_NVFP4_STAGE_FC2_INPUT=1 \
+-e VLLM_GLM53_NVFP4_VECTOR_WEIGHTS=1
+# 专用 EP4 P 额外配置；D 对应两项都设0
+-e VLLM_GLM53_NVFP4_EXTENDED_PREFETCH=1 \
+-e VLLM_GLM53_P_MTP_CONTEXT_ONLY=1
+~~~
+
+| Router 字段 | 使用值 | 作用与使用案例 |
+| --- | --- | --- |
+| `--prefill-policy` / `--decode-policy` | `cache_aware` / `round_robin` | P 按前缀复用选择，D 在健康 worker 间轮询；只调整后文登记的 P/D 地址即可用于不同主机数量。 |
+| `VLLM_ROUTER_PD_REUSE_PROMPT_IDS` | 1 | D 复用 P 返回的精确 token IDs，避免同一长输入重复分词；两端 tokenizer 与 chat template 必须一致。 |
+| `VLLM_ROUTER_PD_PREFILL_FORCE_LENGTH_CAP` | 1 | P 的单 token 请求忽略 EOS/stop，确保 Mooncake 发布可读取的 KV；D 保留客户端的输出长度和停止条件。 |
+| `--max-tree-size` / `--eviction-interval` | 2147483648 / 120秒 | 前缀树每 worker/tenant 的字符预算及 LRU 清理周期；长期服务需要更小内存占用时，降低前者或缩短后者。 |
+| `--max-concurrent-requests` | 4096 | Router 总在途请求上限，不是分词槽位；压测并发由客户端单独设置。 |
+
+Router 使用从同名1103分支构建的 `router:glm53flash-1103`。构建命令见 Router 仓库 `DEPLOYMENT.md`；不加载估算分词器或 token 容量配置，也不分配估算分词槽位。Program scheduling 保持关闭。
+
 ## 1. 拓扑与固定参数
 
 | 主机（服务网 IP 示例） | 实例 | GPU / DEP / EP | API / bootstrap / DP RPC 端口 |
@@ -40,7 +75,7 @@ Tokenizer 的 `CACHE_GIB` 参数 P=2、D=16 是兼容参数；共享模式的整
 | P / D 引擎 | 匹配清单的 GLM 原生基底，包含 CUDA 编译器、FlashInfer 0.7.1 与自动调优补丁；构建后设置 `P_IMAGE`、`D_IMAGE`。 |
 | Store | 配套 Mooncake SDK；本地参考 ID：`sha256:bd6c77d709b8225ebf7b4a9a3890509a4e2df87af846fcc7230b65a7a57d16f7`。 |
 | Master | `Dockerfile.mooncake-master` 构建，包含实际占用计账和大块空间回收。 |
-| Router | `router:vllm-yyf`；image ID `sha256:4322e704665f87ef92204d63af35a92c02baecc8f522a8f3803bf6d17dffe687`。 |
+| Router | `router:glm53flash-1103`，从 Router 同名分支构建，分发后核对实际 image ID。 |
 
 NVFP4 内核在实例初始化时编译为 SM120a。保留挂载的 `/root/.cache` 以复用匹配的编译和调优缓存，不在请求路径编译。P2P 内核使用 FlashInfer 的 JIT 和 FFI 头文件，无需 Cake 后端。不要通过 `FLASHINFER_EXTRA_CUDAFLAGS` 或 NVCC prepend/append flags 覆盖架构目标。
 
@@ -67,13 +102,13 @@ docker build -f integrations/glm53flash/Dockerfile.mooncake-master \
   --build-arg BASE_IMAGE="$MASTER_BASE_IMAGE" -t "$MASTER_IMAGE" .
 ~~~
 
-Master 使用 Mooncake `719735896c86b56fabec6cf3e825fb2ea640597a`；构建脚本参数为源码目录、构建目录和 runtime 输出目录。输出应位于构建上下文的 `mooncake-master-runtime/`。Router 使用独立镜像，P `cache_aware`、D `round_robin`，启用 prompt ID 复用和 length-capped 交接，关闭 TokenBalancer、program scheduling 与分词槽位。
+Master 使用 Mooncake `719735896c86b56fabec6cf3e825fb2ea640597a`；构建脚本参数为源码目录、构建目录和 runtime 输出目录。输出应位于构建上下文的 `mooncake-master-runtime/`。Router 使用独立镜像，P `cache_aware`、D `round_robin`，启用 prompt ID 复用和 length-capped 交接，不执行 token 容量估算或分词槽位调度；program scheduling 保持关闭。
 
 ## 3. 每台主机的公共准备
 
 需要 Docker、NVIDIA Container Toolkit、RDMA 驱动，以及 Bash、curl、jq。以下会话变量需在各目标主机设置；`NODE_ID` 分别填 81–88，服务 IP、网卡和路径按实际环境覆盖。P/D/Router 使用同一份 API key，通过交互输入或受控环境注入，不写入文档或版本库。
 
-所有模型节点的 `MODEL_DIR` 应指向同一版本模型文件，包括 tokenizer 配置、tokenizer.json 和 chat template；P/D 的渲染和分词语义保持一致。本方案 Router 不加载估算 Tokenizer，不挂载模型目录或 token-balance JSON；D 通过 prompt ID 复用直接使用 P 的分词结果。
+所有模型节点的 `MODEL_DIR` 应指向同一版本模型文件，包括 tokenizer 配置、tokenizer.json 和 chat template；P/D 的渲染和分词语义保持一致。本方案 Router 不加载估算 Tokenizer，不挂载模型目录或估算容量配置；D 通过 prompt ID 复用直接使用 P 的分词结果。
 
 ~~~bash
 test "$(id -u)" -eq 0
@@ -367,13 +402,13 @@ fi
 
 ## 7. Router：在 Router 主机执行
 
-等待全部 12 个模型实例完成启动，登记 8 个 EP4 P 和 4 个 EP8 D，直接连接原生 vLLM HTTP API。P 使用 `cache_aware`，D 使用 `round_robin`。不生成 token-balance JSON，不传 `VLLM_ROUTER_PD_TOKEN_BALANCE_CONFIG`，不启用 program scheduling 或分词槽位分配。`--max-concurrent-requests 4096` 是 Router 总请求并发上限，不是分词槽位数。
+等待全部 12 个模型实例完成启动，登记 8 个 EP4 P 和 4 个 EP8 D，直接连接原生 vLLM HTTP API。P 使用 `cache_aware`，D 使用 `round_robin`。Program scheduling 保持关闭。`--max-concurrent-requests 4096` 是 Router 总请求并发上限，不是分词槽位数。
 
-Router 使用 `router:vllm-yyf`，不设 CPU quota；内存限制 64 GiB，RAM+swap 总上限 96 GiB，`cpuset-mems=0`。保留 prompt ID 复用、P 单 token length-capped 交接和 listener backlog 4096；模型共享分词缓存与 Mooncake 缓存由 P/D 管理。镜像已包含 `/usr/local/lib/router-listener.so`。
+Router 使用 `router:glm53flash-1103`，不设 CPU quota；内存限制 64 GiB，RAM+swap 总上限 96 GiB，`cpuset-mems=0`。保留 prompt ID 复用、P 单 token length-capped 交接和 listener backlog 4096；模型共享分词缓存与 Mooncake 缓存由 P/D 管理。镜像已包含 `/usr/local/lib/router-listener.so`。
 
 ~~~bash
 if [ "$NODE_IP" = "$ROUTER_IP" ]; then
-  export ROUTER_IMAGE="${ROUTER_IMAGE:-router:vllm-yyf}"
+  export ROUTER_IMAGE="${ROUTER_IMAGE:-router:glm53flash-1103}"
   read -r -a p_hosts <<< "$P_HOSTS"
   read -r -a d_hosts <<< "$D_HOSTS"
   test "${#p_hosts[@]}" -eq 4
@@ -403,13 +438,11 @@ if [ "$NODE_IP" = "$ROUTER_IP" ]; then
     --vllm-pd-disaggregation --kv-connector mooncake \
     "${routes[@]}" \
     --prefill-policy cache_aware --decode-policy round_robin \
-    --max-tree-size 2147483648 --max-concurrent-requests 4096 \
+    --max-tree-size 2147483648 --eviction-interval 120 --max-concurrent-requests 4096 \
     --disable-retries --api-key "$API_KEY" --log-level warn \
     --request-timeout-secs 600 --worker-startup-timeout-secs 7200
 fi
 ~~~
-
-2026-11-07 的 SWE130k / C550 六策略冷测中，本方案为 16037.53 万 TPM，TTFT Mean / P50 / P90 / P99 为 4.257 / 3.267 / 7.506 / 18.857 秒，TPOT Mean 为 24.946 ms，全程 HTTP500 为 0。统计范围是完成 55% 后至持续欠载起点的完整区间。
 
 ### Router 自身的缓存淘汰
 
@@ -461,6 +494,6 @@ curl -fsS -H "Authorization: Bearer $API_KEY" "http://$ROUTER_IP:18300/workers" 
 
 各模型主机再确认宿主 `MemAvailable` 至少 16 GiB，Tokenizer 目录/epoch 的 uid、gid 为 0，p0/p1 的挂载指向同一共享池。P 启动日志应有每个 DP scheduler 的 `P_HOT_TAIL_BUDGET init`，4 条/实例，`enabled=True`、`progress_enabled=False`。
 
-Router 核对镜像 ID、D 侧轮询、复用及 length-cap 开关、无 CPU quota、64 GiB / 96 GiB 内存配置。容器环境中不应有 `VLLM_ROUTER_PD_TOKEN_BALANCE_CONFIG`，命令中不应有 `--enable-program-scheduling`。模型共享分词缓存继续由 P/D 管理，与已关闭的 Router 估算分词槽位是两回事。
+Router 核对镜像 ID、D 侧轮询、复用及 length-cap 开关、无 CPU quota、64 GiB / 96 GiB 内存配置。命令中不启用 `--enable-program-scheduling`。模型共享分词缓存继续由 P/D 管理，与Router请求路由独立。
 
 模型日志应出现 `GLM NVFP4 fused MoE bound`，各 rank 的基础模型 42 个 MoE 层均完成绑定。FC2 staging 与 vector weights 为 True，P extended prefetch 为 True，D 为 False。真实请求应有融合分发记录，较大 batch 使用原生后端。核对 P 的 18 个必需 MTP 源键已加载，D 的完整 MTP3、上下文 1048576 和异步调度均生效。
