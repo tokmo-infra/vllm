@@ -1,0 +1,11 @@
+# 当前 B300 Kimi K3.1 镜像的功能一致性基线。
+# 依赖本地已有的不可变镜像 ID；此方式不会从源码重新编译原生扩展。
+FROM sha256:1a8a702f2bfeded3c90259ae60fefbd9e4ca014241946e7d5f3396badce99e76 AS verify
+COPY vllm /tmp/kimi-k31-source/vllm
+COPY docker/kimi-k31/source-manifest.json /tmp/kimi-k31-source/source-manifest.json
+COPY docker/kimi-k31/verify-source.py /tmp/kimi-k31-source/verify-source.py
+RUN python3 /tmp/kimi-k31-source/verify-source.py
+
+FROM sha256:1a8a702f2bfeded3c90259ae60fefbd9e4ca014241946e7d5f3396badce99e76
+# 显式引用校验阶段，避免 BuildKit 将未使用的校验阶段跳过。
+COPY --from=verify /tmp/kimi-k31-verified.json /opt/kimi-k31-baseline/verified.json
