@@ -1,11 +1,16 @@
-# 当前 B300 Kimi K3.1 镜像的功能一致性基线。
-# 依赖本地已有的不可变镜像 ID；此方式不会从源码重新编译原生扩展。
-FROM sha256:1a8a702f2bfeded3c90259ae60fefbd9e4ca014241946e7d5f3396badce99e76 AS verify
-COPY vllm /tmp/kimi-k31-source/vllm
-COPY docker/kimi-k31/source-manifest.json /tmp/kimi-k31-source/source-manifest.json
-COPY docker/kimi-k31/verify-source.py /tmp/kimi-k31-source/verify-source.py
-RUN python3 /tmp/kimi-k31-source/verify-source.py
-
+# 以 B300 现用镜像为底座应用源码改动，保留原依赖及原生扩展。
 FROM sha256:1a8a702f2bfeded3c90259ae60fefbd9e4ca014241946e7d5f3396badce99e76
-# 显式引用校验阶段，避免 BuildKit 将未使用的校验阶段跳过。
-COPY --from=verify /tmp/kimi-k31-verified.json /opt/kimi-k31-baseline/verified.json
+
+COPY vllm /tmp/kimi-k31-source/vllm
+COPY csrc /tmp/kimi-k31-source/csrc
+COPY cmake /tmp/kimi-k31-source/cmake
+COPY rust /tmp/kimi-k31-source/rust
+COPY requirements /tmp/kimi-k31-source/requirements
+COPY tools /tmp/kimi-k31-source/tools
+COPY CMakeLists.txt setup.py pyproject.toml MANIFEST.in rust-toolchain.toml /tmp/kimi-k31-source/
+COPY docker/kimi-k31/source-manifest.json docker/kimi-k31/native-input-manifest.json /tmp/kimi-k31-source/
+COPY docker/kimi-k31/apply-source.py docker/kimi-k31/check-native-inputs.py /tmp/kimi-k31-source/
+
+RUN python3 /tmp/kimi-k31-source/check-native-inputs.py \
+    && python3 /tmp/kimi-k31-source/apply-source.py \
+    && rm -rf /tmp/kimi-k31-source
