@@ -142,9 +142,9 @@ def benchmark_prefill(
         start = torch.Event(enable_timing=True)
         end = torch.Event(enable_timing=True)
         times = []
-        for _ in range(warmup):
+        for i in range(warmup):
             fn()
-        for _ in range(trials):
+        for i in range(trials):
             start.record()
             fn()
             end.record()

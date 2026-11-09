@@ -3,12 +3,12 @@
 """Kimi K3.1 DSA (DeepSeek Sparse Attention) for the kimi_k3 stack.
 
 The DSA indexer uses the native upstream facilities
-(`DeepseekV32IndexerCache` + `torch.ops.vllm.sparse_attn_indexer`); the
-sparse MLA layers go through `MultiHeadLatentAttentionWrapper` with
-`MLAModules(is_sparse=True)`. Checkpoints name indexer weights
-`self_attn.indexer.{wq_b,wk,weights_proj,k_norm}`; the module tree keeps
-`self_attn.dsa_indexer.*`; load_weights renames into it and stacks `wk`
-and `weights_proj` into the merged `wkv_index`.
+(``DeepseekV32IndexerCache`` + ``torch.ops.vllm.sparse_attn_indexer``); the
+sparse MLA layers go through ``MultiHeadLatentAttentionWrapper`` with
+``MLAModules(is_sparse=True)``. Checkpoints name indexer weights
+``self_attn.indexer.{wq_b,wk,weights_proj,k_norm}``; the module tree keeps
+``self_attn.dsa_indexer.*``; load_weights renames into it and stacks ``wk``
+and ``weights_proj`` into the merged ``wkv_index``.
 """
 
 import math
@@ -51,7 +51,6 @@ from vllm.models.kimi_k3.nvidia.mla import (
     _GATE_MULTI_STREAM_TOKEN_THRESHOLD,
     _gate_sigmoid_mul,
 )
-from vllm.models.kimi_k3.nvidia.ops.dcp_topk_merge import init_dcp_topk_merge
 from vllm.models.kimi_k3.nvidia.ops.dsa_indexer import (
     dsa_fused_prologue,
     indexer_k_norm_quant_insert,
@@ -67,10 +66,7 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.utils.torch_utils import _encode_layer_name
 from vllm.v1.attention.backends.mla import indexer as v32_indexer
-from vllm.v1.attention.backends.mla.index_group import (
-    SparseMLAIndexGroupBuilder,
-    get_sparse_mla_index_group_max_rows,
-)
+from vllm.v1.attention.ops.dcp_topk_merge import init_dcp_topk_merge
 
 logger = init_logger(__name__)
 
@@ -84,11 +80,11 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
 class KimiK3DSAIndexerKNorm(nn.Module):
     """Bias-full fp32 LayerNorm for the DSA indexer shared key.
 
-    `F.layer_norm(x.float(), (dim,), weight.float(), bias.float(),
-    eps).type_as(x)` -- fp32 compute with a cast back to the input dtype.
+    ``F.layer_norm(x.float(), (dim,), weight.float(), bias.float(),
+    eps).type_as(x)`` -- fp32 compute with a cast back to the input dtype.
     weight/bias are stored in fp32 directly (numerically equivalent to
     casting per forward), keeping only the input/output dtype casts.
-    Selected via `dsa_config.index_k_norm_type == "layernorm"`; legacy
+    Selected via ``dsa_config.index_k_norm_type == "layernorm"``; legacy
     checkpoints keep the RMSNorm path untouched.
     """
 
@@ -106,10 +102,10 @@ class KimiK3DSAIndexerKNorm(nn.Module):
 
 
 class KimiK3DSAIndexer(nn.Module):
-    """wq / wkv indexer projections + native `DeepseekV32IndexerCache`.
+    """wq / wkv indexer projections + native ``DeepseekV32IndexerCache``.
 
     Forward quantizes the indexer query, folds the scales into the per-head
-    weights and drives `torch.ops.vllm.sparse_attn_indexer` directly (the
+    weights and drives ``torch.ops.vllm.sparse_attn_indexer`` directly (the
     upstream deepseek_v2.Indexer pattern).
     """
 
@@ -216,6 +212,9 @@ class KimiK3DSAIndexer(nn.Module):
         self.use_pcp = vllm_config.parallel_config.prefill_context_parallel_size > 1
         # Set by KimiK3DSAAttention to skip scoring dense-MHA prefills.
         self.dense_mha_metadata_layer_name = ""
+        # Set by KimiK3DSAAttention when its MLA layer takes ShardQ steps: the
+        # op then follows that layer's token split.
+        self.shardq_layer_name = ""
         self.topk_backend = vllm_config.kernel_config.sparse_indexer_topk_backend
         # PCP gathers the unquantized key inside the op.
         self.use_fused_k_insert = (
@@ -232,8 +231,8 @@ class KimiK3DSAIndexer(nn.Module):
         self.dcp_world_size = self._parallel_config.decode_context_parallel_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self._cp_kv_cache_interleave_size: int | None = None
-        # The specialized decode merges each rank's packed local top-N in one
-        # exchange (0 keeps the generic merge).
+        # Same as the upstream SparseAttnIndexer: decode merges each rank's
+        # packed local top-N in one exchange (0 keeps the generic merge).
         self.dcp_local_topk = init_dcp_topk_merge(vllm_config, index_topk)
 
     @property
@@ -277,10 +276,10 @@ class KimiK3DSAIndexer(nn.Module):
 
     def _shardq_indexer_rows(self) -> torch.Tensor | None:
         """The rows a ShardQ step scores on this rank (decode rows, then this
-        rank's prefill tokens; see shardq_gather_indices), or None outside
-        ShardQ steps and in cudagraph capture or replay: a graph would bake in
-        the capture batch's row count and the address of its rows tensor."""
-        if not getattr(self.k_cache, "use_shardq", False):
+        rank's prefill tokens), or None outside ShardQ steps and in cudagraph
+        capture or replay: a graph would bake in the capture batch's row count
+        and the address of its rows tensor."""
+        if not self.shardq_layer_name:
             return None
         forward_context = get_forward_context()
         if (
@@ -291,10 +290,8 @@ class KimiK3DSAIndexer(nn.Module):
         attn_metadata = forward_context.attn_metadata
         if not isinstance(attn_metadata, dict):
             return None
-        prefill = getattr(attn_metadata.get(self.k_cache.prefix), "prefill", None)
-        if prefill is None:
-            return None
-        return prefill.shardq_gather_indices
+        shardq = getattr(attn_metadata.get(self.shardq_layer_name), "shardq", None)
+        return None if shardq is None else shardq.indexer_rows
 
     def _fused_k_insert(self, index_k: torch.Tensor, num_tokens: int) -> None:
         attn_metadata = get_forward_context().attn_metadata
@@ -368,8 +365,8 @@ class KimiK3DSAIndexer(nn.Module):
         index_weights: torch.Tensor,
         index_k: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Top-k of the current rows into `topk_indices_buffer`; `index_k` is
-        None when the key was already inserted (`use_fused_k_insert`)."""
+        """Top-k of the current rows into ``topk_indices_buffer``; ``index_k`` is
+        None when the key was already inserted (``use_fused_k_insert``)."""
         weight_scale = self.index_softmax_scale * self.indexer_weight_scale
         q_scale: torch.Tensor | None = None
         if self.use_fp4_cache:
@@ -410,6 +407,8 @@ class KimiK3DSAIndexer(nn.Module):
             self.cp_kv_cache_interleave_size,
             skip_topk_buffer_clear=self.use_fused_k_insert,
             topk_backend=self.topk_backend,
+            shardq_layer_name=self.shardq_layer_name,
+            dcp_local_topk=self.dcp_local_topk,
         )
 
 
@@ -417,7 +416,7 @@ class KimiK3DSAAttention(nn.Module):
     """Kimi K3.1 DSA (DeepSeek Sparse Attention) inference path.
 
     Same MLA projections as the dense Kimi-K3 MLA path, plus the DSA indexer
-    wired through `MLAModules(is_sparse=True)` so the FlashMLA sparse
+    wired through ``MLAModules(is_sparse=True)`` so the FlashMLA sparse
     backend consumes the top-k indices.
     """
 
@@ -653,10 +652,6 @@ class KimiK3DSAAttention(nn.Module):
             indexer_rotary_emb=self.rotary_emb,
             is_sparse=True,
             topk_indices_buffer=self.topk_indices_buffer,
-            index_group_builder=SparseMLAIndexGroupBuilder(
-                self.topk_indices_buffer,
-                get_sparse_mla_index_group_max_rows(vllm_config),
-            ),
         )
         self.mla_attn = MultiHeadLatentAttentionWrapper(
             self.hidden_size,
@@ -671,7 +666,6 @@ class KimiK3DSAAttention(nn.Module):
             cache_config,
             quant_config,
             prefix,
-            shardq_eligible=True,
         )
 
         # Dense-MHA prefills never read the top-k indices (PCP excluded, as
@@ -679,10 +673,12 @@ class KimiK3DSAAttention(nn.Module):
         indexer = self.dsa_indexer
         if not indexer.use_pcp:
             indexer.dense_mha_metadata_layer_name = self.mla_attn.mla_attn.layer_name
-        # ShardQ (sparse_mla_shard_q): the indexer is not an indexer_op, so
-        # its cache follows the MLA layer's split here.
-        if self.mla_attn.mla_attn.use_shardq:
-            indexer.k_cache.use_shardq = True
+        # ShardQ (sparse_mla_shard_q): the indexer is not an indexer_op, so the
+        # layer opts in itself, as DeepseekV32Attention does.
+        mla_layer = cast(Any, self.mla_attn.mla_attn)
+        if getattr(mla_layer.impl, "use_shardq", False):
+            mla_layer.use_shardq = True
+            indexer.shardq_layer_name = mla_layer.layer_name
 
         offload = vllm_config.offload_config
         self.weights_offloaded = (
@@ -695,12 +691,9 @@ class KimiK3DSAAttention(nn.Module):
 
     def pack_projections(self) -> None:
         """Enable the fused forward (as DeepseekV32Attention): pack
-        `[q_a | kv_a | wk | weights_proj]` and `[q_b | wq_index]` into one
+        ``[q_a | kv_a | wk | weights_proj]`` and ``[q_b | wq_index]`` into one
         weight each, the linears becoming views. Other configurations keep the
         wrapper forward."""
-        if self._packed is not None:
-            # A rerun after a reload: the loader refilled the views in place.
-            return
         attn = cast(Any, self.mla_attn.mla_attn)
         indexer = cast(Any, self.dsa_indexer)
         if not (

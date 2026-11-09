@@ -10,7 +10,6 @@ intermediate-tensor traffic during decode.
 from vllm.models.minimax_m3.amd.ops.gemma_rmsnorm import (
     gemma_fused_add_rmsnorm,
     gemma_fused_add_rmsnorm_mxfp8,
-    gemma_fused_add_rmsnorm_mxfp8_and_bf16,
     gemma_rmsnorm,
 )
 from vllm.models.minimax_m3.amd.ops.swiglu_oai import (
@@ -22,7 +21,6 @@ __all__ = [
     "gemma_rmsnorm",
     "gemma_fused_add_rmsnorm",
     "gemma_fused_add_rmsnorm_mxfp8",
-    "gemma_fused_add_rmsnorm_mxfp8_and_bf16",
     "swiglu_oai_split",
     "swiglu_oai_quantize_mxfp8",
 ]

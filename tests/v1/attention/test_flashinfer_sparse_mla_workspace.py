@@ -8,7 +8,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from vllm.v1.attention.backends.mla import flashinfer_mla_sparse as fi
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     _DEFAULT_WORKSPACE_BUFFER_SIZE,
     FlashInferMLASparseTRTLLMBackend,
@@ -188,6 +187,8 @@ def test_prims_ts_shardq_reserves_the_rank_slice():
     """A prims_ts ShardQ step attends cdiv(T, tp) + 2 * max_num_seqs tokens
     with every head; the profile reservation covers that slice, not all T
     tokens with every head."""
+    from vllm.v1.attention.backends.mla import flashinfer_mla_sparse as fi
+
     impl = object.__new__(fi.FlashInferMLASparseImpl)
     impl.__dict__.update(
         use_prims_ts=True,
@@ -212,9 +213,9 @@ def test_prims_ts_shardq_reserves_the_rank_slice():
     ):
         impl.reserve_workspace()
 
-    # 96 heads in 4096-row chunks; the step output holds the rank's
-    # 4096 + 2 * 64 tokens.
-    shardq_peak = 4096 * 96 * (512 + 64 + 1024 + 4) + 4224 * 96 * 512 * 2
+    # 96 heads pad to 128 in 4096-row chunks; the step output holds the
+    # rank's 4096 + 2 * 64 tokens.
+    shardq_peak = 4096 * 128 * (512 + 64 + 1024 + 4) + 4224 * 96 * 512 * 2
     head_sharded_peak = 4096 * 12 * (512 + 64 + 1024 + 4) + 32768 * 12 * 512 * 2
     assert reserved == [max(shardq_peak, head_sharded_peak)]
-    assert reserved[0] < 4096 * 96 * 1604 + 32768 * 96 * 512 * 2
+    assert reserved[0] < 4096 * 128 * 1604 + 32768 * 96 * 512 * 2

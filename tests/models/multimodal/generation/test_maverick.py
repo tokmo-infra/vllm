@@ -523,7 +523,7 @@ def save_weights_to_safetensors(
             print(f"Saved shard {i + 1}/{len(shards)}: {filename}")
 
     # Create index file
-    index_data: dict[str, Any] = {
+    index_data = {
         "metadata": {
             "total_size": sum(
                 tensor.numel() * tensor.element_size() for tensor in weights.values()

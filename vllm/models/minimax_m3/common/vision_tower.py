@@ -42,7 +42,8 @@ class MiniMaxVLPatchEmbed(nn.Module):
 
     def __init__(self, config: PreTrainedConfig) -> None:
         super().__init__()
-        temporal_patch_size = config.temporal_patch_size
+        compression = config.img_token_compression_config
+        temporal_patch_size = compression.get("temporal_patch_size", 2)
         patch_size = config.patch_size
         num_channels = config.num_channels
 
@@ -78,7 +79,7 @@ class MiniMaxVLPatchEmbed(nn.Module):
 class MiniMaxVLAttention(nn.Module):
     """Multi-head attention with MiniMax's partial 3D RoPE.
 
-    Partial means only the first `rot_dim` (< head_dim) dimensions of
+    Partial means only the first ``rot_dim`` (< head_dim) dimensions of
     Q and K are rotated; the remaining dims are passed through unchanged.
     """
 
@@ -294,7 +295,7 @@ class MiniMaxVLEncoder(nn.Module):
 class MiniMaxVLVisionTransformer(nn.Module):
     """CLIP-based ViT with 3D RoPE (t/h/w decomposed).
 
-    Faithfully mirrors the reference `MiniMaxVLVisionTransformer`.
+    Faithfully mirrors the reference ``MiniMaxVLVisionTransformer``.
     FLASHINFER backend is not supported; standard flash-attn is used.
     """
 
@@ -307,8 +308,9 @@ class MiniMaxVLVisionTransformer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.spatial_merge_size: int = config.spatial_merge_size
-        self.temporal_patch_size: int = config.temporal_patch_size
+        compression = config.img_token_compression_config
+        self.spatial_merge_size: int = compression.get("spatial_merge_size", 2)
+        self.temporal_patch_size: int = compression.get("temporal_patch_size", 2)
         self.vision_segment_max_frames: int | None = getattr(
             config, "vision_segment_max_frames", None
         )
@@ -336,7 +338,7 @@ class MiniMaxVLVisionTransformer(nn.Module):
         self.w_dim = int(2 * ((rope_dims // 3) // 2))
         # rot_dim = t_dim + h_dim + w_dim (may be < head_dim)
 
-        rope_theta: float = config.rope_parameters["rope_theta"]
+        rope_theta: float = getattr(config, "rope_theta", 10000.0)
         inv_freq_t = 1.0 / (
             rope_theta
             ** (torch.arange(0, self.t_dim, 2, dtype=torch.float32) / self.t_dim)
@@ -620,7 +622,8 @@ class MiniMaxVLVisionModel(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        spatial_merge_size: int = config.spatial_merge_size
+        compression = config.img_token_compression_config
+        spatial_merge_size: int = compression.get("spatial_merge_size", 2)
         self.spatial_merge_size = spatial_merge_size
         self.use_data_parallel = is_vit_use_data_parallel()
 

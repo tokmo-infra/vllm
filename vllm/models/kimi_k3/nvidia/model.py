@@ -150,8 +150,8 @@ def shard_sequence_parallel_mlp(
 ) -> bool:
     """Whether to TP-shard a sequence-parallel MLP instead of replicating it.
 
-    Opt-in via `VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT`; see `KimiMLP` for
-    the trade-off and `vllm.envs` for when it is worth enabling.
+    Opt-in via ``VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT``; see :class:`KimiMLP` for
+    the trade-off and :mod:`vllm.envs` for when it is worth enabling.
     """
     enabled = envs.VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT
     if not (use_sequence_parallel and eligible and enabled):
@@ -166,7 +166,7 @@ def can_shard_sequence_parallel_shared_expert(vllm_config: VllmConfig) -> bool:
     """Whether the active MoE backend preserves the SP shared-expert contract.
 
     MegaMoE invokes the shared expert directly. DeepEP v2 invokes it through
-    `MoERunner`, but its EP combine returns the routed output in the local
+    ``MoERunner``, but its EP combine returns the routed output in the local
     sequence-sharded layout, so the shared expert can use the same
     all-gather/partial-GEMM/reduce-scatter implementation.
     """
@@ -205,13 +205,13 @@ class KimiMLP(nn.Module):
     """Dense / shared-expert MLP, optionally TP-sharded under sequence parallel.
 
     Under sequence parallelism each rank owns a distinct slice of the tokens, so
-    by default both projections are replicated (`disable_tp`) and the block
+    by default both projections are replicated (``disable_tp``) and the block
     needs no collective. That makes every rank stream the entire weight to serve
     its own token shard.
 
-    With `VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT` the weights are TP-sharded
+    With ``VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT`` the weights are TP-sharded
     instead. A rank then holds only a slice of the intermediate dim, so it
-    cannot finish its own tokens alone: `forward` all-gathers the full token
+    cannot finish its own tokens alone: ``forward`` all-gathers the full token
     set, computes this rank's partial, and reduce-scatters. The reduce-scatter
     sums across TP and restores the sequence sharding in one collective, so the
     block still ends with one collective per direction.
@@ -597,19 +597,19 @@ class KimiMoE(nn.Module):
         """Compute the routed-expert down projection alongside the router,
         overlapping them on separate CUDA streams when latent MoE is enabled.
 
-        The router gate and the down projection both read `hidden_states`, so
+        The router gate and the down projection both read ``hidden_states``, so
         the gate runs on the default stream and the down projection on the aux
-        stream, joined via `maybe_execute_in_parallel`. For MegaMoE the
+        stream, joined via ``maybe_execute_in_parallel``. For MegaMoE the
         grouped top-k selection consumes only the gate logits, so it also runs
         on the default stream and overlaps the down projection.
 
         Returns:
-            `(routed_hidden_states, router_output, topk_ids)`.
-            `routed_hidden_states` is the down-projected latent (or the
-            original `hidden_states` when latent MoE is disabled). For MegaMoE
-            `router_output` holds the grouped top-k weights and `topk_ids`
-            the selected experts; otherwise `router_output` holds the raw gate
-            logits and `topk_ids` is `None`.
+            ``(routed_hidden_states, router_output, topk_ids)``.
+            ``routed_hidden_states`` is the down-projected latent (or the
+            original ``hidden_states`` when latent MoE is disabled). For MegaMoE
+            ``router_output`` holds the grouped top-k weights and ``topk_ids``
+            the selected experts; otherwise ``router_output`` holds the raw gate
+            logits and ``topk_ids`` is ``None``.
 
         """
 
@@ -1161,7 +1161,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         pending_mlp_out: torch.Tensor | None,
         block_residual: torch.Tensor,
     ) -> torch.Tensor:
-        """Return the AttnRes stream after `layer_idx`."""
+        """Return the AttnRes stream after ``layer_idx``."""
         prefix = prefix_sum if pending_mlp_out is None else prefix_sum + pending_mlp_out
         if not (self._aux_attn_res_stream and self.use_attn_res):
             return prefix
@@ -1223,6 +1223,8 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 )
             hidden_states = sp_shard(hidden_states)
             assert residual is None, "Currently, SP is not supported with PP"
+
+        remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
 
         # sharded aux hidden states when sp is enabled
         aux_hidden_states: list[torch.Tensor] = []
@@ -1319,8 +1321,8 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 hidden_states = sp_all_gather(hidden_states)
                 hidden_states = hidden_states[:full_num_tokens]
 
-        # NOTE: the final norm is applied in compute_logits instead of here, so
-        # the MTP draft model receives the pre-norm hidden states.
+        # NOTE: the final norm is applied in compute_logits instead of here.
+        aux_hidden_states = remote_aux + aux_hidden_states
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -1411,9 +1413,6 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             if experts_unpacked and name.endswith(".weight_packed"):
                 name = name.replace(".weight_packed", ".weight")
 
-            spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
-            if spec_layer is not None:
-                continue  # skip spec decode layers for main model
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
@@ -1538,6 +1537,13 @@ class KimiLinearForCausalLM(
         # applies it in forward.
         self.needs_norm_in_logits = True
 
+    def process_weights_after_loading(self) -> None:
+        # The specialized decode packs the DSA projections its own way.
+        if self.specialized_decode_config is None:
+            for module in self.model.modules():
+                if isinstance(module, KimiK3DSAAttention):
+                    module.pack_projections()
+
     def build_specialized_decode(self) -> None:
         from .specialized_decode.runtime.decode import SpecializedDecode
 
@@ -1630,8 +1636,7 @@ class KimiLinearForCausalLM(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        # The model's final norm is applied here (not at the end of forward) so
-        # that the pre-norm hidden states can be fed to the MTP draft model.
+        # The model's final norm is applied here, not at the end of forward.
         if self.needs_norm_in_logits:
             hidden_states = self.model.norm(hidden_states, None)
         return self.logits_processor(self.lm_head, hidden_states)
@@ -1639,34 +1644,6 @@ class KimiLinearForCausalLM(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
-
-    def process_weights_after_loading(self) -> None:
-        """The specialized decode is built after the first load and keeps copies
-        derived from the weights; refresh them after a reload."""
-        # The specialized decode packs the DSA projections its own way.
-        if self.specialized_decode_config is None:
-            for module in self.model.modules():
-                if isinstance(module, KimiK3DSAAttention):
-                    module.pack_projections()
-        if self.specialized_decode is not None:
-            self.specialized_decode.process_weights_after_loading()
-
-
-def get_spec_layer_idx_from_weight_name(
-    config: KimiLinearConfig, weight_name: str
-) -> int | None:
-    if hasattr(config, "num_nextn_predict_layers") and (
-        config.num_nextn_predict_layers > 0
-    ):
-        layer_idx = config.num_hidden_layers
-        for i in range(config.num_nextn_predict_layers):
-            # Match regardless of the surrounding prefix. The name may arrive as
-            # ``model.layers.{i}.``, a bare ``layers.{i}.`` (after AutoWeightsLoader
-            # has stripped the ``model.`` prefix in the main model), or with the
-            # multimodal ``language_model.model.layers.{i}.`` prefix.
-            if f"layers.{layer_idx + i}." in weight_name:
-                return layer_idx + i
-    return None
 
 
 @MULTIMODAL_REGISTRY.register_processor(

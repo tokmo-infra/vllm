@@ -7,7 +7,7 @@ from typing import Literal
 
 from pydantic import Field, model_validator
 
-from vllm.config.utils import CompileFactors, config, get_compile_factors
+from vllm.config.utils import config
 
 OffloadBackend = Literal["auto", "uva", "prefetch"]
 
@@ -136,7 +136,7 @@ class OffloadConfig:
             )
         return self
 
-    def compile_factors(self) -> CompileFactors:
+    def compute_hash(self) -> str:
         """Provide a hash that uniquely identifies all the offload configs.
 
         All fields are included because PrefetchOffloader patches module
@@ -145,4 +145,8 @@ class OffloadConfig:
         alter which layers are hooked and how prefetch indices are
         computed, so the compilation cache must distinguish them.
         """
-        return get_compile_factors(self, ignored_factors=set())
+        from vllm.config.utils import get_hash_factors, hash_factors
+
+        factors = get_hash_factors(self, ignored_factors=set())
+        hash_str = hash_factors(factors)
+        return hash_str

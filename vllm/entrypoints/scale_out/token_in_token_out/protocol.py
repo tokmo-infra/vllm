@@ -11,15 +11,12 @@ from pydantic import (
     NonNegativeInt,
     PrivateAttr,
     Tag,
-    field_serializer,
     field_validator,
-    model_serializer,
     model_validator,
 )
 
 from vllm.config import ModelConfig
 from vllm.entrypoints.generate.base.protocol import (
-    DeltaMessage,
     PerRequestMetrics,
     StreamOptions,
     validate_cache_salt,
@@ -68,9 +65,6 @@ class ParseContext(BaseModel):
     ) = "none"
     parallel_tool_calls: bool | None = True
     include_reasoning: bool = True
-    return_tokens_as_token_ids: bool | None = Field(
-        default=None, exclude_if=lambda value: value is None
-    )
     chat_template_kwargs: dict[str, JsonValue] = Field(default_factory=dict)
     """Template kwargs with the render server's defaults already applied,
     without the API server only entries a handler keeps out of the engine."""
@@ -204,7 +198,9 @@ class MultiModalFeatures(BaseModel):
             )
 
         flattened_ranges.sort()
-        for (_, end), (next_offset, _) in zip(flattened_ranges, flattened_ranges[1:]):
+        for (offset, end), (next_offset, _) in zip(
+            flattened_ranges, flattened_ranges[1:]
+        ):
             if next_offset < end:
                 raise ValueError(
                     "mm_placeholders must be globally non-overlapping and sorted"
@@ -313,8 +309,8 @@ class GenerateRequest(BaseModel):
             "strings. 'derender' returns the parsed assistant message and "
             "needs `parse_context` when the server has a parser. 'text' and "
             "'derender' need a server that loads a tokenizer and "
-            "sampling_params.detokenize to be true. With `stream`, "
-            "'derender' returns a parsed chat `delta` per chunk."
+            "sampling_params.detokenize to be true. 'derender' does not "
+            "support `stream`."
         ),
     )
     parse_context: ParseContext | None = Field(
@@ -385,16 +381,6 @@ class GenerateRequest(BaseModel):
         instance = handler(data)
         instance._sampling_params_provided_keys = provided
         return instance
-
-    @model_serializer(mode="wrap")
-    def _serialize(self, handler):
-        # `SamplingParams` omits fields equal to their defaults, so a resolved
-        # `max_tokens=16` would be dropped and read back as not provided.
-        data = handler(self)
-        sp = data.get("sampling_params")
-        if isinstance(sp, dict) and self.is_sampling_param_provided("max_tokens"):
-            sp.setdefault("max_tokens", self.sampling_params.max_tokens)
-        return data
 
     @model_validator(mode="before")
     @classmethod
@@ -480,7 +466,7 @@ class GenerateLogProb(BaseModel):
 class GenerateLogProbsContent(GenerateLogProb):
     """The sampled token at one position, plus its top-k candidates.
 
-    `top_logprobs` is a list, not a dict: JSON turns dict keys into strings
+    ``top_logprobs`` is a list, not a dict: JSON turns dict keys into strings
     and the order would be implicit. It is in the engine's order: the sampled
     token first, then the remaining candidates in rank order.
     """
@@ -491,7 +477,7 @@ class GenerateLogProbsContent(GenerateLogProb):
 class GenerateLogProbs(BaseModel):
     """Output logprobs for one choice.
 
-    `content` holds one entry per generated token.
+    ``content`` holds one entry per generated token.
     """
 
     content: list[GenerateLogProbsContent] | None = None
@@ -570,19 +556,6 @@ class GenerateTextStreamChoice(GenerateStreamChoiceBase):
     logprobs: ChatCompletionLogProbs | None = None
 
 
-class GenerateDerenderStreamChoice(GenerateStreamChoiceBase):
-    delta: DeltaMessage
-    """Parsed delta since the previous chunk of this choice."""
-
-    logprobs: ChatCompletionLogProbs | None = None
-    """Logprobs with decoded token strings and `bytes`. None when reasoning
-    is hidden by `include_reasoning=false`."""
-
-    @field_serializer("delta")
-    def _serialize_delta(self, delta: DeltaMessage) -> dict[str, Any]:
-        return delta.model_dump(exclude_none=True)
-
-
 class GenerateStreamResponseBase(BaseModel):
     request_id: str = Field(
         default_factory=lambda: f"{random_uuid()}",
@@ -606,11 +579,6 @@ class GenerateTokensStreamResponse(GenerateStreamResponseBase):
 class GenerateTextStreamResponse(GenerateStreamResponseBase):
     output_mode: Literal["text"] = "text"
     choices: list[GenerateTextStreamChoice]
-
-
-class GenerateDerenderStreamResponse(GenerateStreamResponseBase):
-    output_mode: Literal["derender"] = "derender"
-    choices: list[GenerateDerenderStreamChoice]
 
 
 class GenerateDerenderChoice(GenerateChoiceBase):
@@ -689,16 +657,9 @@ GenerateResponse: TypeAlias = Annotated[
 ]
 GenerateStreamResponse: TypeAlias = Annotated[
     Annotated[GenerateTokensStreamResponse, Tag("tokens")]
-    | Annotated[GenerateTextStreamResponse, Tag("text")]
-    | Annotated[GenerateDerenderStreamResponse, Tag("derender")],
+    | Annotated[GenerateTextStreamResponse, Tag("text")],
     Discriminator(output_mode_or_tokens),
 ]
-
-
-class AbortRequestsRequest(BaseModel):
-    """Request for the /inference/v1/abort_requests endpoint."""
-
-    request_ids: str | list[str]
 
 
 class DerenderChatRequest(BaseModel):
@@ -723,8 +684,10 @@ class DerenderChatRequest(BaseModel):
     """
 
     prompt_tokens: int | None = None
-    """Prompt token count for usage. If omitted, falls back to
-    `generate_response.usage.prompt_tokens`, then to 0.
+    """Prompt token count for usage; defaults to 0 if omitted.
+
+    GenerateResponse carries only output tokens; the caller already has
+    len(GenerateRequest.token_ids) from the render step.
     """
 
     prompt_token_ids: list[NonNegativeInt] | None = None
@@ -733,11 +696,7 @@ class DerenderChatRequest(BaseModel):
     leading space on SentencePiece tokenizers. Falls back to
     `generate_response.prompt_token_ids`, then to unseeded decoding.
 
-    With a tool or reasoning parser configured, the parser also reads these
-    IDs when `generate_response.prompt_token_ids` is unset, so send the full
-    list: parsers look back to the last reasoning marker, which can be
-    anywhere in the prompt. Without a parser, only the last few IDs are
-    read, so a suffix is enough.
+    Only the last few IDs are read, so a suffix of the prompt is enough.
     """
 
     chat_request: ChatCompletionRequest | None = None
@@ -769,8 +728,7 @@ class DerenderCompletionRequest(BaseModel):
     list[GenerateRequest] returned by /v1/completions/render."""
 
     prompt_tokens: list[int] | None = None
-    """One prompt token count per response. If omitted, each falls back to
-    that response's `usage.prompt_tokens`, then to 0.
+    """One prompt token count per response; each defaults to 0 if omitted.
 
     If provided, len(prompt_tokens) must equal len(generate_responses).
     """
@@ -820,7 +778,7 @@ class DerenderStreamState(BaseModel):
     Two separate sets of fields support two different streaming modes:
 
     - For plain streaming (no parser configured including the completions path):
-      `prev_token_ids`, `prefix_offset` and `read_offset` maintain a bounded incremental
+      `prev_tokens`, `prefix_offset` and `read_offset` maintain a bounded incremental
       decoding window. This requires O(window) transport and O(delta) computation
       per chunk.
     - For parser enabled chat streaming: `output_token_ids`, `output_chunk_lens`,
@@ -836,11 +794,10 @@ class DerenderStreamState(BaseModel):
     The detokenization strategy carries the incremental decode offsets
     directly rather than re-sending the whole token history each chunk.
     `detokenize_incrementally` only ever reads the trailing token window
-    from `prefix_offset`, so we carry just that tail, as ids because pieces may
-    be raw bytes, plus the two offsets. Each chunk resumes exactly where the
-    last one stopped, including any partially processed multi-byte character
-    (tracked by `read_offset`), then trims and rebases the window so it never
-    grows with generation length.
+    `prev_tokens[prefix_offset:]`, so we carry just that tail plus the two
+    offsets. Each chunk resumes exactly where the last one stopped, including
+    any partially processed multi-byte character (tracked by `read_offset`),
+    then trims and rebases the window so it never grows with generation length.
 
     Performance:
     - Compute per chunk is O(delta). One `detokenize_incrementally` call per
@@ -850,9 +807,8 @@ class DerenderStreamState(BaseModel):
       O(n) rather than the O(n^2) a full history round trip would incur.
     """
 
-    prev_token_ids: list[NonNegativeInt] = Field(default_factory=list)
-    """Trailing decode window. Token ids from `prefix_offset` onward, excluding
-    ids that `skip_special_tokens` drops.
+    prev_tokens: list[str] = Field(default_factory=list)
+    """Trailing decode window. Token strings from `prefix_offset` onward.
 
     Bounded, trimmed and rebased each chunk to the tail
     `detokenize_incrementally` still reads, so it does not grow with the
@@ -860,22 +816,20 @@ class DerenderStreamState(BaseModel):
     """
 
     prefix_offset: int = Field(default=0, ge=0)
-    """Prefix offset into `prev_token_ids` for incremental detokenization."""
+    """Prefix offset into `prev_tokens` for incremental detokenization."""
 
     read_offset: int = Field(default=0, ge=0)
-    """Read offset into `prev_token_ids` for incremental detokenization."""
+    """Read offset into `prev_tokens` for incremental detokenization."""
 
-    @field_validator("prev_token_ids")
+    @field_validator("prev_tokens")
     @classmethod
-    def _bound_prev_token_ids(cls, v: list[int]) -> list[int]:
+    def _bound_prev_tokens(cls, v: list[str]) -> list[str]:
         # INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET is small (5) and the trimmed
         # window is O(offset). A generous limit rejects unusually large or malformed
         # payloads without restricting legitimate multi-byte sequences.
         limit = 1024
         if len(v) > limit:
-            raise ValueError(
-                f"prev_token_ids length ({len(v)}) exceeds maximum ({limit})"
-            )
+            raise ValueError(f"prev_tokens length ({len(v)}) exceeds maximum ({limit})")
         return v
 
     role_sent: bool = False
@@ -889,13 +843,13 @@ class DerenderStreamState(BaseModel):
     """Trailing sampled token IDs carried across chunks so byte-fallback
     (U+FFFD) correction during logprob placeholder resolution has context
     at chunk boundaries. Bounded to the 4-token window that
-    `_correct_decoded_token` reads."""
+    ``_correct_decoded_token`` reads."""
 
     logprob_text_offset: int = Field(default=0, ge=0)
     """Cumulative length of reported logprob tokens, including special tokens.
-    Seeds `text_offset` for completion
+    Seeds ``text_offset`` for completion
     streaming logprobs so offsets stay absolute across chunks, mirroring
-    `initial_text_offset` in the generate streaming path."""
+    ``initial_text_offset`` in the generate streaming path."""
 
     output_token_ids: list[int] = Field(default_factory=list)
     """All output tokens seen so far. Parser path only.

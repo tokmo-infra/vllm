@@ -57,13 +57,14 @@ class CUDACheckpointExecutor(MultiprocExecutor):
         if sys.platform != "linux" or not current_platform.is_cuda():
             raise ValueError("CUDA checkpoint requires Linux and NVIDIA CUDA")
         if (
-            vllm_config.model_config.sleep_mode_backend != "cumem"
+            not vllm_config.use_v2_model_runner
+            or vllm_config.model_config.sleep_mode_backend != "cumem"
             or parallel.enable_expert_parallel
             or parallel.worker_cls not in ("auto", "vllm.v1.worker.gpu_worker.Worker")
         ):
             raise ValueError(
-                "CUDA checkpoint requires the cumem sleep backend and standard "
-                "GPU worker, without expert parallelism"
+                "CUDA checkpoint requires the V2 GPU model runner, cumem sleep "
+                "backend and standard GPU worker, without expert parallelism"
             )
         compilation = getattr(vllm_config, "compilation_config", None)
         passes = getattr(compilation, "pass_config", None)

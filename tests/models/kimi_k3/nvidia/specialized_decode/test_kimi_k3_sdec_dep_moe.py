@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kimi K3.1 specialized decode at DEP: every MegaMoE layer's `DepMoe` (the
+"""Kimi K3.1 specialized decode at DEP: every MegaMoE layer's ``DepMoe`` (the
 EpMoeLayer schedule: split-K [shared gate_up | latent down] front, side-stream
 router and shared expert, MegaMoE routed experts, latent RMSNorm + up-projection)
-against the stock `KimiMoE.forward` on identical inputs, on real ranks (DEP2 by
-default; `KIMI_K31_DEP_MOE_WORLD=4` runs DEP4 on one 4-GPU node).
+against the stock ``KimiMoE.forward`` on identical inputs, on real ranks (DEP2 by
+default; ``KIMI_K31_DEP_MOE_WORLD=4`` runs DEP4 on one 4-GPU node).
 
-Live routed experts: under `--load-format dummy` MegaMoE's packed int32 UE8M0
+Live routed experts: under ``--load-format dummy`` MegaMoE's packed int32 UE8M0
 weight scales stay 0, so the routed experts output exactly 0 and a step test
 cannot see the routed path (router, top-k weights, dispatch, combine, latent norm
 and up-projection). Here every expert scale is set to 2^-2, the router weight is
@@ -14,11 +14,11 @@ scaled so the sigmoid top-16 is decisive, and the shared expert is scaled so bot
 branches carry comparable magnitude; the test asserts the routed experts' output is
 live (a sizeable share of the layer output).
 
-Each rank runs `vllm bench forward` in-process on a layer-truncated K3.1
-(`KIMI_K31_DEP_MODEL`, its DSpark draft config `KIMI_K31_DEP_DRAFT`) with real
+Each rank runs ``vllm bench forward`` in-process on a layer-truncated K3.1
+(``KIMI_K31_DEP_MODEL``, its DSpark draft config ``KIMI_K31_DEP_DRAFT``) with real
 routing. During the eager (stock) step, every MoE layer whose batch a DepMoe
 serves takes the layer's input plus per-row noise (distinct rows) through both
-`KimiMoE.forward` and `DepMoe.run` (every DP rank at the same layer and batch,
+``KimiMoE.forward`` and ``DepMoe.run`` (every DP rank at the same layer and batch,
 as the MegaMoE collective requires) and compares the outputs row by row; a
 row-shifted copy of the output is the negative control.
 
@@ -73,9 +73,9 @@ pytestmark = [
 
 
 def admit(capture_sizes):
-    """Admit the specialized decode under `vllm bench forward` (one-shot graph
+    """Admit the specialized decode under ``vllm bench forward`` (one-shot graph
     captures of each exact batch; the deployment's capture sizes are
-    `capture_sizes`)."""
+    ``capture_sizes``)."""
     import dataclasses
 
     import vllm.models.kimi_k3.nvidia.model as model
@@ -122,7 +122,7 @@ def live_moe_weights():
                     t.mul_(SHARED_GAIN)
         return model
 
-    base_loader.BaseModelLoader.load_model = load_model  # type: ignore[method-assign]
+    base_loader.BaseModelLoader.load_model = load_model
 
 
 def compare_layers(records):
@@ -138,7 +138,7 @@ def compare_layers(records):
         init(self, module, *args, **kwargs)
         moes[id(module)] = self
 
-    dep.DepMoe.__init__ = register  # type: ignore[method-assign]
+    dep.DepMoe.__init__ = register
     stock = km.KimiMoE.forward
 
     def forward(self, hidden_states):
@@ -189,7 +189,7 @@ def compare_layers(records):
         )
         return out
 
-    km.KimiMoE.forward = forward  # type: ignore[method-assign]
+    km.KimiMoE.forward = forward
 
 
 def worker(rank, port, out_dir):

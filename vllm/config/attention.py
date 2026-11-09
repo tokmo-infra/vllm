@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from pydantic import Field, field_validator
 
-from vllm.config.utils import CompileFactors, config, get_compile_factors
+from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.mla.prefill.registry import MLAPrefillBackendEnum
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -85,10 +85,7 @@ class AttentionConfig:
 
     mla_prefill_backend: MLAPrefillBackendEnum | None = None
     """MLA prefill backend to use. If None, will be selected automatically.
-    Valid options: FLASH_ATTN (FA3/FA4), FLASHINFER, TRTLLM_RAGGED; on ROCm,
-    ROCM_AITER_FA and ROCM_AITER_FLYDSL_FP8. ROCM_AITER_FLYDSL_FP8 is opt-in
-    (gfx950, bf16 models): it quantizes Q/K/V to FP8 per tensor at runtime and
-    falls back to ROCM_AITER_FA for inputs the FlyDSL kernel cannot take."""
+    Valid options: FLASH_ATTN (FA3/FA4), FLASHINFER, TRTLLM_RAGGED."""
 
     use_prefill_query_quantization: bool = False
     """If set, quantize query for attention in prefill."""
@@ -132,16 +129,6 @@ class AttentionConfig:
     for steps whose contexts are too short for the pool to pay; it is not
     enabled by default there."""
 
-    indexer_logits_dtype: Literal["auto", "float32", "bfloat16"] = "auto"
-    """Output dtype of DeepGEMM's dense MQA-logits kernels in the DeepSeek
-    sparse-attention indexer. "auto" (default) picks the model's default:
-    "bfloat16" for DeepSeek-V3.2 and DeepSeek-V4 on SM100, "float32" otherwise.
-    "float32" reduces the head-weighted scores in FP32 and feeds them to the
-    top-k as is. "bfloat16" halves the logits memory; on SM100 it also reduces
-    in BF16 with BF16 head weights and lets the DeepSelect top-k rank the
-    logits directly, while other top-k kernels read an FP32 copy. The sparse
-    MQA-logits path (`indexer_sparse_logits`) always emits BF16."""
-
     indexer_tp_shard_min_rows: int | None = None
     """Deprecated and has no effect: TP row sharding of the sparse-attention
     indexer was replaced by `sparse_mla_shard_q`. It will be removed in
@@ -154,13 +141,12 @@ class AttentionConfig:
     the query and the attention output between the layouts. Applies to steps
     with at least `sparse_mla_shard_q_min_tokens` prefill tokens on the
     FlashInfer sparse MLA backend, or on FlashMLA sparse with an FP8 DeepSeek
-    KV cache, without DCP, PCP or HiSparse. A mixed step's decode tokens stay
-    sharded by head."""
+    KV cache, without PCP or HiSparse; under DCP, on FlashInfer only. A mixed
+    step's decode tokens stay sharded by head."""
 
     sparse_mla_shard_q_min_tokens: int = Field(default=1024, ge=1)
-    """Minimum number of tokens after a step's decodes (requests of at most
-    1 + num_speculative_tokens tokens) for `sparse_mla_shard_q` to apply. Below
-    it the all-to-all exchanges can cost more than they save."""
+    """Minimum number of prefill tokens in a step for `sparse_mla_shard_q` to
+    apply."""
 
     minimax_m3_indexer_cp: bool = False
     """MiniMax M3 on ROCm with tensor_parallel_size > 1: score the sparse
@@ -258,22 +244,17 @@ class AttentionConfig:
             return default
         return self.indexer_kv_dtype
 
-    def resolve_indexer_logits_dtype(
-        self, default: Literal["float32", "bfloat16"]
-    ) -> Literal["float32", "bfloat16"]:
-        """Resolve `indexer_logits_dtype`, substituting `default` for "auto"."""
-        if self.indexer_logits_dtype == "auto":
-            return default
-        return self.indexer_logits_dtype
-
-    def compile_factors(self) -> CompileFactors:
+    def compute_hash(self) -> str:
         """Provide a hash that uniquely identifies all the configs
         that affect the structure of the computation
         graph from input ids/embeddings to the final hidden states,
         excluding anything before input ids/embeddings and after
         the final hidden states.
         """
-        return get_compile_factors(self, set())
+        from vllm.config.utils import get_hash_factors, hash_factors
+
+        factors = get_hash_factors(self, set())
+        return hash_factors(factors)
 
     @field_validator("backend", mode="before")
     @classmethod

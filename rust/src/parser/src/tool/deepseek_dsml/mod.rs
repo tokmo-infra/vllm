@@ -12,7 +12,7 @@ use super::utils::{
     Attributed, AttributedExt, Marker, MarkerScanState, SpecialToken,
     parse_buffered_event_attributed, safe_text_len_mul, take_until_marker,
 };
-use super::{Result, ToolCallDelta, ToolParserError, ToolParserOutput};
+use super::{Result, ToolCallDelta, ToolParserOutput};
 use crate::tool::Tool;
 
 mod deepseek_v32;
@@ -238,9 +238,7 @@ impl DeepSeekDsmlToolParser {
             DsmlMode::Text => output.push_text(&self.buffer.text),
             DsmlMode::Done => {}
             DsmlMode::ToolBlock { .. } => {
-                return Err(ToolParserError::IncompleteToolCall {
-                    parser: "DeepSeek DSML",
-                });
+                return Err(parsing_failed!("incomplete DeepSeek DSML tool call"));
             }
         }
         let _ = self.reset();

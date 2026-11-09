@@ -5,6 +5,8 @@
 2. test multi loras request
 """
 
+import os
+
 import pytest
 
 from tests.utils import multi_gpu_test
@@ -14,9 +16,9 @@ from vllm.lora.request import LoRARequest
 
 MODEL_PATH = "Qwen/Qwen3-0.6B"
 LORA_NAME_PATH_MAP = {
-    "Alice": "vllm-project/self_cognition_Alice",
-    "Bob": "vllm-project/self_cognition_Bob",
-    "Cat": "vllm-project/self_cognition_Bob",  # same as Bob
+    "Alice": "charent/self_cognition_Alice",
+    "Bob": "charent/self_cognition_Bob",
+    "Cat": "charent/self_cognition_Bob",  # same as Bob
 }
 
 LORA_NAME_ID_MAP = {}
@@ -37,6 +39,18 @@ def format_chatml_messages(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": prompt},
     ]
+
+
+@pytest.fixture(autouse=True)
+def set_mrv2_env():
+    original = os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "0")
+    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
+    yield
+
+    if original is None:
+        os.environ.pop("VLLM_USE_V2_MODEL_RUNNER", None)
+    else:
+        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = original
 
 
 def make_add_lora_request(name: str, path: str):

@@ -290,7 +290,8 @@ mod tests {
 
         let error = parser.finish().unwrap_err();
 
-        expect!["incomplete Qwen3 JSON tool call"].assert_eq(&error.to_report_string());
+        expect!["tool parser parsing failed: incomplete Qwen3 JSON tool call"]
+            .assert_eq(&error.to_report_string());
     }
 
     #[test]

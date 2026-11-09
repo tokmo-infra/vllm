@@ -1,19 +1,42 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Layer resolution for the Transformers modeling backend.
+"""Layer provider resolution for the Transformers modeling backend.
 
-Layers may come from the in-tree and the hw-agnostic path,
-resolved via `vllm.model_executor.hw_agnostic.resolve`.
+When ``VLLM_USE_HW_AGNOSTIC`` is set, layer symbols are imported from
+``vllm.model_executor.hw_agnostic.layers.<module>``, falling back to
+``vllm.model_executor.layers.<module>`` for anything not yet ported. The
+resolved source of every symbol is logged so it is clear which layers run
+hw-agnostic and which fell back to vLLM.
 """
+
+import importlib
 
 import vllm.envs as envs
 from vllm.logger import init_logger
-from vllm.model_executor import hw_agnostic
 
 logger = init_logger(__name__)
 
-RMSNorm = hw_agnostic.resolve("layernorm", "RMSNorm")
-GemmaRMSNorm = hw_agnostic.resolve("layernorm", "GemmaRMSNorm")
+_HW_PKG = "vllm.model_executor.hw_agnostic.layers"
+_VLLM_PKG = "vllm.model_executor.layers"
+
+
+def _resolve(module: str, name: str):
+    """Return `name` from the hw-agnostic `module` when enabled and available,
+    else from vLLM. Logs which source was used."""
+    if envs.VLLM_USE_HW_AGNOSTIC:
+        try:
+            obj = getattr(importlib.import_module(f"{_HW_PKG}.{module}"), name)
+            logger.info("Using hw-agnostic layer: %s", name)
+            return obj
+        except (ImportError, AttributeError):
+            logger.warning(
+                "hw-agnostic layer %s is not available; falling back to default", name
+            )
+    return getattr(importlib.import_module(f"{_VLLM_PKG}.{module}"), name)
+
+
+RMSNorm = _resolve("layernorm", "RMSNorm")
+GemmaRMSNorm = _resolve("layernorm", "GemmaRMSNorm")
 
 
 def get_act_and_mul_fn(act_fn_name: str):

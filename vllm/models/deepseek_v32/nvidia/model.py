@@ -32,12 +32,10 @@ from vllm.model_executor.models.deepseek_v2 import (
 )
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
-    copy_pp_buffers,
     get_pp_missing_layer_names,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
-    pp_topk_buffers,
 )
 from vllm.models.common.ops.fused_allreduce_rms_norm import fused_allreduce_rms_norm
 from vllm.models.common.ops.sequence_parallel import (
@@ -230,11 +228,8 @@ class DeepseekV32Model(torch.nn.Module):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
-        self.pp_buffers = pp_topk_buffers(
-            config, self.topk_indices_buffer, range(config.num_hidden_layers)
-        )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states"], config.hidden_size, self.pp_buffers
+            ["hidden_states"], config.hidden_size
         )
 
         self.aux_hidden_state_layers = tuple[int, ...]()
@@ -271,7 +266,6 @@ class DeepseekV32Model(torch.nn.Module):
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-            copy_pp_buffers(intermediate_tensors, self.pp_buffers)
         # Later PP stages receive the TP-reduced residual stream, like an embedding.
         residual = None
 
@@ -304,12 +298,7 @@ class DeepseekV32Model(torch.nn.Module):
             )
             # PP send/recv needs TP-replicated tensors; reduce the partial sum.
             hidden_states = residual + tensor_model_parallel_all_reduce(hidden_states)
-            return IntermediateTensors(
-                {
-                    "hidden_states": hidden_states,
-                    **{k: v[:full_num_tokens] for k, v in self.pp_buffers.items()},
-                }
-            )
+            return IntermediateTensors({"hidden_states": hidden_states})
 
         if self.use_sequence_parallel:
             hidden_states, _ = self.norm(hidden_states, residual)

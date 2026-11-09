@@ -492,8 +492,6 @@ set(VLLM_EXT_SRC
     "csrc/cpu/activation.cpp"
     "csrc/cpu/sgl-kernels/fla.cpp"
     "csrc/cpu/utils.cpp"
-    "csrc/cpu/block_table.cpp"
-    "csrc/cpu/input_batch.cpp"
     "csrc/cpu/spec_decode_utils.cpp"
     "csrc/cpu/layernorm.cpp"
     "csrc/cpu/mla_decode.cpp"
@@ -695,7 +693,6 @@ else()
         USE_SABI 3
         WITH_SOABI
     )
-    target_compile_definitions(_C PRIVATE VLLM_STANDALONE_CPU_MRV2)
     if (VLLM_OPENBLAS_LIB)
         target_compile_definitions(_C PRIVATE VLLM_HAS_OPENBLAS)
     endif()

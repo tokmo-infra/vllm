@@ -3,9 +3,9 @@
 """Prepared MLA core: the packed input projection feeds the query kernel, then either
 tokenspeed_mla_decode (core "tokenspeed") or the KV-balanced decode at tokenspeed's
 precision (core "balanced", see mla.balanced) into the BF16 latent, and
-MlaValue (W_UV / gate). Under DCP (`dcp`: a DcpBox) the tokenspeed core
+MlaValue (W_UV / gate). Under DCP (``dcp``: a DcpBox) the tokenspeed core
 runs over the local KV shard for every DCP rank's heads between the query's q
-publication and `DcpValue`'s merge (see mla.dcp). Spec verify: `q` query tokens
+publication and ``DcpValue``'s merge (see mla.dcp). Spec verify: ``q`` query tokens
 per request (rows grouped by request, causal among them)."""
 
 from functools import cache
@@ -40,9 +40,9 @@ BALANCED_Q1_BATCH = 8
 def compile_core(
     batch, heads, pitch, specs, device, dcp=0, sms=148, q=1, cap=64, partials="bf16"
 ):
-    """CuTe kernels (query, value) of one batch of rows (`q` per request); under DCP
-    (`dcp`: its size, `cap`: the DcpBox rows) the query publishes and the value
-    is DcpValue (over the DcpBox's `partials`)."""
+    """CuTe kernels (query, value) of one batch of rows (``q`` per request); under DCP
+    (``dcp``: its size, ``cap``: the DcpBox rows) the query publishes and the value
+    is DcpValue (over the DcpBox's ``partials``)."""
     qnorm, kvnorm, qb, uk, uv, qinv, kinv, kv = (
         fake(shape, stride, dtype, 4 if dtype == torch.float32 else 16)
         for shape, stride, dtype in specs
@@ -79,8 +79,8 @@ def compile_core(
 
 
 def core_for(batch, core="auto", q=1, dcp=False, balanced=False):
-    """`core` unless "auto": the balanced core for spec verify (q > 1) and from
-    BALANCED_Q1_BATCH rows at q = 1 where it runs (`balanced`; tokenspeed's even
+    """``core`` unless "auto": the balanced core for spec verify (q > 1) and from
+    BALANCED_Q1_BATCH rows at q = 1 where it runs (``balanced``; tokenspeed's even
     split waits on the longest request of a mixed batch), else tokenspeed (also where
     the balanced core can't run the shape, e.g. M64 tiles on SM100)."""
     if core == "auto":
@@ -98,7 +98,7 @@ def core_for(batch, core="auto", q=1, dcp=False, balanced=False):
 
 
 def pad_requests(batch, block_table, lengths, totals=None):
-    """Request metadata for `batch` rows: PIECEWISE graphs pad the tokens but not
+    """Request metadata for ``batch`` rows: PIECEWISE graphs pad the tokens but not
     the requests, so missing rows become empty requests (length 0 on page 0)."""
     rows = min(lengths.shape[0], block_table.shape[0])
     if rows >= batch:
@@ -111,11 +111,11 @@ def pad_requests(batch, block_table, lengths, totals=None):
 
 
 class PreparedMla:
-    """`max_context` (the deployment's longest sequence) bounds the split count.
-    `dcp`: the model's DcpBox, with this layer's mailbox `parity`. `queries`:
+    """``max_context`` (the deployment's longest sequence) bounds the split count.
+    ``dcp``: the model's DcpBox, with this layer's mailbox ``parity``. ``queries``:
     the query lengths q (spec verify: 1 + the draft length) prepared for every batch
     of rows divisible by q.
-    `balanced`: the model's BalancedMla; `plans`: whether this layer (the step's
+    ``balanced``: the model's BalancedMla; ``plans``: whether this layer (the step's
     first MLA layer) plans the balanced split counts for the step."""
 
     def __init__(
@@ -136,9 +136,6 @@ class PreparedMla:
         self.weights: tuple = (*norms, attention.q_b_proj.weight, attention.W_UK_T)
         self.weights += (attention.W_UV, attention._q_scale_inv, attention._k_scale_inv)
         self.device, self.pitches = attention.q_b_proj.weight.device, pitches
-        # Host floats, so weight reloads need not refresh them: no quant config
-        # gives K3's MLA a KV-cache method, and its post-load processing resets
-        # q/k scales to 1.0 (set_default_quant_scales).
         k_scale = attention._k_scale_float
         softmax = attention.scale * attention._q_scale_float * k_scale
         self.eps = cutlass.Float32(attention.rms_norm_eps)
@@ -194,7 +191,7 @@ class PreparedMla:
             sms = torch.cuda.get_device_properties(self.device).multi_processor_count
             pitch = self.pitches[batch]
             cap = self.dcp.cap if self.dcp is not None else 64
-            args: tuple = batch, self.heads, pitch, specs, device, dcp, sms, q, cap
+            args = batch, self.heads, pitch, specs, device, dcp, sms, q, cap
             if self.dcp is not None:
                 args += (self.dcp.mailbox(batch).format,)
             query = to_cute(self.query_scratch[:batch])
@@ -222,7 +219,7 @@ class PreparedMla:
         self.dcp_args[batch] = (mailbox, box.mc(p), ids[1]), (rows, boxes, peers), ids
 
     def plan(self, lengths, batch, q=1):
-        """The balanced core's plan of this step (`lengths`: this rank's), made by
+        """The balanced core's plan of this step (``lengths``: this rank's), made by
         the step's first MLA layer before its query kernel; nothing for the other
         cores."""
         if self.cores[batch, q] == "balanced":
@@ -232,7 +229,7 @@ class PreparedMla:
         """tokenspeed_mla_decode or the balanced decode (with the step's plan) into
         the BF16 latent (DCP: tokenspeed or balanced for every rank's heads over the
         local shard into the DcpBox rows + LSE; q > 1 masks causally in
-        global positions, `totals`). tokenspeed: a fixed split count per batch (one
+        global positions, ``totals``). tokenspeed: a fixed split count per batch (one
         CTA pair per split filling the SMs); all PDL chained between our kernels."""
         box, reqs = self.dcp, batch // q
         query = self.query_scratch[:batch].view(torch.float8_e4m3fn)
@@ -245,13 +242,7 @@ class PreparedMla:
                 cp.update(pack=True)
         query, out = query.view(reqs, q, *query.shape[1:]), out.view(reqs, q, -1, 512)
         if self.cores[batch, q] == "balanced":
-            args: tuple = (
-                cache,
-                block_table[:reqs],
-                lengths[:reqs],
-                self.stock_scales,
-                out,
-            )
+            args = cache, block_table[:reqs], lengths[:reqs], self.stock_scales, out
             if box is not None:
                 cp = dict(cp=(box.size, box.rank, box.interleave), totals=totals[:reqs])
             self.balanced.decode(query, *args, lse=lse, **cp)
@@ -263,9 +254,9 @@ class PreparedMla:
     def run(
         self, projected, out, *, cache, slots, block_table, lengths, totals=None, q=1
     ):
-        """`lengths`/`block_table`: this rank's KV (the local shard under DCP);
-        `totals`: under DCP, the requests' full lengths. `q` rows per request (spec
-        verify; `slots` per row). Rows of `projected` beyond the requests run as
+        """``lengths``/``block_table``: this rank's KV (the local shard under DCP);
+        ``totals``: under DCP, the requests' full lengths. ``q`` rows per request (spec
+        verify; ``slots`` per row). Rows of ``projected`` beyond the requests run as
         empty requests (zero output)."""
         batch, s = projected.shape[0], stream(self.device)
         reqs = batch // q
@@ -282,7 +273,6 @@ class PreparedMla:
         if self.dcp is not None:  # DcpValue zeroes padded requests (global lengths)
             publish, ((rows, rows_lse), boxes, peers), ids = self.dcp_args[batch]
             if self.dcp.mailbox(batch).format == PROJECTED:
-                assert self.uv_gathered is not None
                 uv = self.uv_gathered[1]
             mq(*q_args, *publish, s)
             self.stock_core(cache, block_table, lengths, batch, q, totals)

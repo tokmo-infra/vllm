@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import replace
-
 import pytest
 
 from vllm import SamplingParams
@@ -36,19 +34,7 @@ QWEN3_XPRESS = ArgsTest(
 )
 
 
-# Adaptive verification shortens the acceptance length a bit,
-# but GSM8K performance should stay constant.
-QWEN3_XPRESS_AV = replace(
-    QWEN3_XPRESS,
-    enable_adaptive_verification=True,
-    expected_acceptance_rate=0.375,
-    expected_acceptance_len=6.5,
-)
-
-
-@pytest.mark.parametrize(
-    "args", [QWEN3_XPRESS, QWEN3_XPRESS_AV], ids=["qwen3_xpress", "qwen3_xpress_av"]
-)
+@pytest.mark.parametrize("args", [QWEN3_XPRESS], ids=["qwen3_xpress"])
 def test_xpress_correctness_and_acceptance_rate(args: ArgsTest, vllm_runner):
     """Guard GSM8K accuracy and acceptance metrics for XPress models."""
     assert_draft_model_correctness(args, vllm_runner)

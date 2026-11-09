@@ -90,11 +90,6 @@ class ZmqClientTransport:
 
     def __init__(self) -> None:
         self._ctx = zmq.Context()
-        # Context defaults reach each DEALER before make_zmq_socket connects it;
-        # libzmq ignores heartbeat options set after connect().
-        self._ctx.setsockopt(zmq.HEARTBEAT_IVL, _HEARTBEAT_IVL_MS)
-        self._ctx.setsockopt(zmq.HEARTBEAT_TIMEOUT, _HEARTBEAT_TIMEOUT_MS)
-        self._ctx.setsockopt(zmq.HEARTBEAT_TTL, _HEARTBEAT_TTL_MS)
         self._connections: dict[PeerAddr, ZmqClientConnection] = {}
 
     def connect(self, addr: PeerAddr) -> ZmqClientConnection:
@@ -110,6 +105,9 @@ class ZmqClientTransport:
             socket_type=zmq.DEALER,
             bind=False,
         )
+        dealer.setsockopt(zmq.HEARTBEAT_IVL, _HEARTBEAT_IVL_MS)
+        dealer.setsockopt(zmq.HEARTBEAT_TIMEOUT, _HEARTBEAT_TIMEOUT_MS)
+        dealer.setsockopt(zmq.HEARTBEAT_TTL, _HEARTBEAT_TTL_MS)
 
         monitor_addr = f"inproc://ec-peer-mon-{host}-{port}"
         dealer.monitor(monitor_addr, zmq.EVENT_DISCONNECTED)
@@ -176,26 +174,16 @@ class ZmqServerTransport:
     routes a reply back to a specific peer by ZMQ identity.
     """
 
-    def __init__(self, host: str, port: int = 0) -> None:
+    def __init__(self, host: str, port: int) -> None:
         self._ctx = zmq.Context()
-        try:
-            self._router = make_zmq_socket(
-                ctx=self._ctx,
-                path=make_zmq_path(scheme="tcp", host=host, port=port),
-                socket_type=zmq.ROUTER,
-                bind=True,
-            )
-        except Exception:
-            self._ctx.destroy(linger=0)
-            raise
+        self._router = make_zmq_socket(
+            ctx=self._ctx,
+            path=make_zmq_path(scheme="tcp", host=host, port=port),
+            socket_type=zmq.ROUTER,
+            bind=True,
+        )
         self._poller = zmq.Poller()
         self._poller.register(self._router, zmq.POLLIN)
-
-    @property
-    def port(self) -> int:
-        """Return the actual bound port, including when port 0 was requested."""
-        endpoint = self._router.getsockopt_string(zmq.LAST_ENDPOINT)
-        return int(endpoint.rsplit(":", 1)[1])
 
     def poll(self, timeout_ms: int = 0) -> list[tuple[bytes, bytes]]:
         """Wait up to timeout_ms for incoming messages, then drain all pending.

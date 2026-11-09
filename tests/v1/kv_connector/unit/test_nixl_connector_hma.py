@@ -43,7 +43,6 @@ from .utils import (
     make_kv_cache_config,
     make_nixl_scheduler,
     maybe_update_block_size,
-    region_pairs_by_index,
 )
 
 
@@ -62,6 +61,7 @@ def region_pull_worker():
     worker._engine_last_active = {}
     worker._handshake_lock = threading.RLock()
     worker._handshake_futures = {}
+    worker._transfer_layer_group_ids = ()
     worker._bidirectional_kv_xfer_enabled = False
     worker._recving_transfers = {}
     worker._failed_remote_engines = set()
@@ -85,9 +85,6 @@ def region_pull_worker():
     worker._group_spec_types = (MLAAttentionSpec, MLAAttentionSpec)
     worker.region_group_ids = [0, 1]
     worker.dst_region_group_ids = {"P": [0, 0]}
-    worker._dst_pairs = {
-        "P": region_pairs_by_index(2, groups=[0, 1], groups_match=False)
-    }
     worker.num_regions = 2
     worker.block_len_per_layer = [1024, 1024]
     worker.transfer_topo = MagicMock()
@@ -100,6 +97,7 @@ def region_pull_worker():
         remote_physical_blocks_per_logical=2,
     )
     worker.tp_mappings = {"P": TPMapping(((0,), (0,)), (0,), {0: 0}, 0)}
+    worker._transfer_layer_group_ids = ()
     worker._mixed_mem_types = True
     worker.src_xfer_handles_by_block_size = {64: 1}
     worker._dram_src_handles_by_block_size = {64: 2}
@@ -195,11 +193,6 @@ def test_dcp_region_pull(region_pull_worker, num_pages, region_groups):
     worker.region_group_ids = list(region_groups)
     worker.num_regions = len(region_groups)
     worker.dst_region_group_ids = {"P": [0] * worker.num_regions}
-    worker._dst_pairs = {
-        "P": region_pairs_by_index(
-            worker.num_regions, groups=region_groups, groups_match=False
-        )
-    }
     worker.dst_region_num_blocks = {
         engine: [100] * worker.num_regions for engine in ("P", "D")
     }
@@ -398,7 +391,7 @@ def test_update_state_after_alloc_tracks_cached_blocks_per_group():
     )
 
     def cached(block_id):
-        return KVCacheBlock(block_id=block_id, block_hash=object())
+        return KVCacheBlock(block_id=block_id, _block_hash=object())
 
     def uncached(block_id):
         return KVCacheBlock(block_id=block_id)
@@ -451,7 +444,7 @@ def test_full_local_hit_is_not_awaited_by_the_scheduler():
         select_transfer_block_ids=lambda block_ids: block_ids
     )
 
-    blocks = KVCacheBlocks(blocks=([KVCacheBlock(block_id=0, block_hash=object())],))
+    blocks = KVCacheBlocks(blocks=([KVCacheBlock(block_id=0, _block_hash=object())],))
     request = create_request(do_remote_prefill=True)
 
     scheduler.update_state_after_alloc(request, blocks, num_external_tokens=0)
@@ -704,7 +697,6 @@ def test_read_blocks_for_req_expands_remote_ids(
     resolved_types = tuple(spec_name_to_type[n] for n in group_spec_types)
 
     worker = object.__new__(NixlConnectorWorker)
-    worker.block_size = 16
     worker._physical_blocks_per_logical_kv_block = local_physical_per_logical
     worker._invalid_remote_engines = set()
     worker._remote_registration_generations = {}
@@ -720,27 +712,18 @@ def test_read_blocks_for_req_expands_remote_ids(
     has_mamba = any(t is MambaSpec for t in resolved_types)
     has_swa = any(t is SlidingWindowSpec for t in resolved_types)
     worker.kv_cache_config = make_kv_cache_config(
-        block_size=16 * local_physical_per_logical,
-        swa_enabled=has_swa,
-        mamba_enabled=has_mamba,
+        block_size=16, swa_enabled=has_swa, mamba_enabled=has_mamba
     )
 
     remote_engine_id = "remote-engine"
     worker.region_group_ids = list(range(len(resolved_types)))
     worker.dst_region_group_ids = {remote_engine_id: list(worker.region_group_ids)}
-    worker._dst_pairs = {
-        remote_engine_id: region_pairs_by_index(
-            len(resolved_types), groups=worker.region_group_ids
-        )
-    }
 
     worker.transfer_topo = MagicMock()
     # tp_ratio not exercised (all_source_ranks is empty so no reads run),
     # but set for realism.
     worker.transfer_topo.tp_ratio.return_value = tp_ratio
-    worker.transfer_topo.block_size_ratio.return_value = 1
     remote_info = MagicMock()
-    remote_info.remote_block_size = 16
     remote_info.remote_physical_blocks_per_logical = remote_physical_per_logical
     remote_info.remote_dcp_size = 1
     worker.transfer_topo.get_engine_info.return_value = remote_info
@@ -762,7 +745,6 @@ def test_read_blocks_for_req_expands_remote_ids(
             "remote_host": "localhost",
             "remote_port": 1234,
             "tp_size": 1,
-            "remote_num_tokens": 1000,
         },
     )
 
@@ -1179,6 +1161,8 @@ def _make_mock_worker_for_desc_ids(
 
     worker = MagicMock(spec=NixlConnectorWorker)
     worker.num_regions = num_regions
+    worker._uses_region_group_mapping = False
+    worker._transfer_layer_group_ids = ()
     worker._has_mamba = has_mamba
     worker._group_spec_types = group_spec_types
     worker.block_len_per_layer = block_len_per_layer or [100]
@@ -1207,14 +1191,16 @@ def _make_mock_worker_for_desc_ids(
 
 
 @pytest.mark.cpu_test
-def test_shared_nixl_region_reads_once_per_paired_group():
-    """A region shared by three groups is read once at each group's blocks."""
+def test_shared_nixl_region_broadcasts_every_group_block_table():
+    """A shared region must receive every group's block table exactly once."""
     worker = _make_mock_worker_for_desc_ids(
         num_regions=3,
         has_mamba=False,
         group_spec_types=(FullAttentionSpec,) * 3,
         block_len_per_layer=[100] * 3,
     )
+    worker.region_group_ids = [0, bw._SHARED_REGION_GROUP_ID, 2]
+    worker._uses_region_group_mapping = True
 
     result = worker._compute_desc_ids(
         block_ids=([1], [2], [3]),
@@ -1222,7 +1208,6 @@ def test_shared_nixl_region_reads_once_per_paired_group():
         block_size_ratio=None,
         physical_blocks_per_logical=1,
         region_num_blocks=[10, 10, 10],
-        pairs=([0, 1, 1, 1, 2], [0, 0, 1, 2, 2]),
     )
 
     assert result.tolist() == [1, 11, 12, 13, 23]
@@ -1264,8 +1249,6 @@ def test_get_block_descs_ids_hybrid_ssm():
         dst_num_blocks=100,
         block_size_ratio=None,
         physical_blocks_per_logical=1,
-        # FA group in both regions, SSM group in SSM region 0.
-        pairs=([0, 1, 0], [0, 0, 1]),
     )
 
     expected = [3, 5, 103, 105, 201, 202, 301, 302, 401, 402, 501, 502]
@@ -1283,12 +1266,14 @@ def test_get_block_descs_ids_selects_attention_regions_by_group():
         group_spec_types=(FullAttentionSpec, FullAttentionSpec),
         block_len_per_layer=[100, 100, 100],
     )
+    worker.region_group_ids = [0, 0, 1]
+    worker._uses_region_group_mapping = True
+
     result = worker._compute_desc_ids(
         block_ids=([1, 2], [7]),
         dst_num_blocks=10,
         block_size_ratio=None,
         physical_blocks_per_logical=1,
-        pairs=([0, 1, 2], [0, 0, 1]),
     )
 
     assert result.tolist() == [1, 2, 11, 12, 27]
@@ -1298,7 +1283,7 @@ def test_get_block_descs_ids_selects_attention_regions_by_group():
         dst_num_blocks=10,
         block_size_ratio=None,
         physical_blocks_per_logical=1,
-        pairs=([0, 1, 2], [1, 1, 0]),
+        region_group_ids=[1, 1, 0],
     )
     assert remapped.tolist() == [21, 22, 7, 17]
 
@@ -1314,13 +1299,15 @@ def test_get_block_descs_ids_uses_per_region_pool_capacity():
         group_spec_types=(FullAttentionSpec, FullAttentionSpec),
         block_len_per_layer=[100, 100],
     )
+    worker.region_group_ids = [0, 1]
+    worker._uses_region_group_mapping = True
+
     result = worker._compute_desc_ids(
         block_ids=([4], [8]),
         dst_num_blocks=10,
         block_size_ratio=None,
         physical_blocks_per_logical=1,
         region_num_blocks=[5, 10],
-        pairs=([0, 1], [0, 1]),
     )
 
     assert result.tolist() == [4, 13]
@@ -1350,8 +1337,6 @@ def test_get_block_descs_ids_kernel_block_mismatch():
         dst_num_blocks=num_blocks,
         block_size_ratio=None,
         physical_blocks_per_logical=ratio,
-        # FA group in both regions, SSM group in SSM region 0.
-        pairs=([0, 1, 0], [0, 0, 1]),
     )
 
     expected = [3, 7, 403, 407, 801, 802, 901, 902, 1001, 1002, 1101, 1102]
@@ -1381,8 +1366,6 @@ def test_get_block_descs_ids_hetero_block_size_hybrid():
         dst_num_blocks=100,
         block_size_ratio=ratio,
         physical_blocks_per_logical=1,
-        # FA group in both regions, SSM group in SSM region 0.
-        pairs=([0, 1, 0], [0, 0, 1]),
     )
 
     # FA regions have 100*4 entries each; SSM regions (4 per layer) start at
@@ -1429,6 +1412,45 @@ def test_map_block_ids_for_block_size_ratio_hybrid():
     worker._group_spec_types = (FullAttentionSpec,)
     local, remote = worker._map_block_ids_for_block_size_ratio([[]], [[30, 31]], 4)
     assert local == []
+
+
+@pytest.mark.cpu_test
+def test_map_block_ids_for_block_size_ratio_sliding_window():
+    """Sliding-window lists hold only the window, so they pair by the
+    position of the last transferred token, not from the start."""
+    from unittest.mock import MagicMock
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
+        NixlConnectorWorker,
+    )
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+    worker = MagicMock(spec=NixlConnectorWorker)
+    worker._group_spec_types = (SlidingWindowSpec,)
+    worker.block_size = 16
+    for name in (
+        "get_mapped_blocks",
+        "_map_block_ids_for_block_size_ratio",
+        "_sliding_window_first_sub_block",
+    ):
+        _bind_worker_method(worker, name)
+
+    # 40 tokens, remote blocks of 4: the remote window (blocks 8, 9) holds
+    # tokens 32-39, which are sub-blocks 0 and 1 of local block 2 (16-47 in
+    # [1, 2]): sub-block ids 8 and 9.
+    local, remote = worker._map_block_ids_for_block_size_ratio(
+        [[1, 2]], [[50, 51]], 4, num_tokens=40
+    )
+    assert local == [[8, 9]]
+    assert remote == [[50, 51]]
+
+    # A remote window that starts before the local list drops its head:
+    # 20 tokens, remote blocks 2-4 (8-19), local block 1 (16-31).
+    local, remote = worker._map_block_ids_for_block_size_ratio(
+        [[3]], [[60, 61, 62]], 4, num_tokens=20
+    )
+    assert local == [[12]]
+    assert remote == [[62]]
 
 
 @pytest.mark.cpu_test
@@ -1484,7 +1506,7 @@ def test_post_process_zeroes_untransferred_tail(
     _bind_worker_method(worker, "post_process_device_kv_on_receive")
 
     # Group 0 request in blocks [2, 3]; only 6 of 8 sub-blocks were received.
-    worker.post_process_device_kv_on_receive(ratio, [(0, [2, 3], range(6))])
+    worker.post_process_device_kv_on_receive(ratio, [(0, [2, 3], 6)])
 
     # Block 2 fully covered; block 3 covered for 2 sub-blocks (4 tokens).
     assert torch.equal(attn_cache[2], expected[2])
@@ -2087,6 +2109,10 @@ def test_exchange_clipped_blocks_ssm_single_state():
     )
     sched.blocks_per_sw = [2, 0]
     assert sched.get_exchange_clipped_blocks(([1, 2, 3], [7, 8, 9])) == ([2, 3], [7])
+    # A lookahead block past the 40 computed tokens (block size 16) goes first.
+    assert sched.get_exchange_clipped_blocks(
+        ([1, 2, 3, 4], [7, 8, 9]), num_tokens=40
+    ) == ([2, 3], [7])
 
     # Non-mamba models pass through unchanged.
     fa_sched = make_nixl_scheduler(has_mamba=False)
@@ -2388,7 +2414,6 @@ def test_push_write_hybrid_mla_replicates_attention():
     worker.src_xfer_handles_by_block_size = {4: 300}
     worker.region_group_ids = [0, 1]
     worker.dst_region_group_ids = {engine_id: [0, 1]}
-    worker._dst_pairs = {engine_id: region_pairs_by_index(2, groups=[0, 1])}
     worker._sending_transfers = defaultdict(list)
     worker._sending_transfers_lock = threading.Lock()
     worker.kv_cache_config = _make_hybrid_mla_kv_cache_config()
@@ -2429,32 +2454,28 @@ def _make_host_buffer_worker(copy_op):
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize(
-    "group_block_ids",
+    "group_block_ids,expected_ids",
     [
-        # Single group (non-hybrid model).
-        [[1, 2, 3]],
-        # Hybrid model: each group copies only its own layers.
-        [[1, 2], [3, 4], [5]],
+        # Single group (non-hybrid model): one copy, as before.
+        ([[1, 2, 3]], [1, 2, 3]),
+        # Hybrid model: three groups collapse into a single copy.
+        ([[1, 2], [3, 4], [5]], [1, 2, 3, 4, 5]),
         # An empty group contributes no ids.
-        [[1, 2], []],
+        ([[1, 2], []], [1, 2]),
     ],
 )
-def test_sync_recved_kv_copies_each_group_own_layers(group_block_ids):
+def test_sync_recved_kv_issues_one_copy_per_request(group_block_ids, expected_ids):
+    """h2d copies are issued once per request, not once per KV cache group."""
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import ReqMeta
 
     calls = []
     worker = _make_host_buffer_worker(
         lambda src, dst, src_ids, dst_ids, direction: calls.append(
-            (list(src), list(dst), src_ids, dst_ids, direction)
+            (src_ids, dst_ids, direction)
         )
     )
-    names = [f"layer.{g}" for g in range(len(group_block_ids))]
-    # "shared" reuses another layer's KV cache: a host buffer, no transfer group.
-    worker.host_xfer_buffers = dict.fromkeys([*names, "shared"])
-    worker.device_kv_caches = dict.fromkeys([*names, "shared"])
-    worker.kv_cache_config = SimpleNamespace(
-        transfer_groups=[SimpleNamespace(layer_names=[name]) for name in names]
-    )
+    worker.host_xfer_buffers = {"layer": None}
+    worker.device_kv_caches = {"layer": None}
 
     meta = ReqMeta(
         local_block_ids=group_block_ids,
@@ -2463,6 +2484,4 @@ def test_sync_recved_kv_copies_each_group_own_layers(group_block_ids):
     )
     worker.sync_recved_kv_to_device("req", meta)
 
-    assert calls == [
-        ([name], [name], ids, ids, "h2d") for name, ids in zip(names, group_block_ids)
-    ]
+    assert calls == [(expected_ids, expected_ids, "h2d")]

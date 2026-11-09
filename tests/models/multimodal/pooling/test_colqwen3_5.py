@@ -15,11 +15,11 @@ import torch
 from ....conftest import VllmRunner
 
 MODELS = [
-    "vllm-project/colqwen3.5-4.5B-v3",
+    "athrael-soju/colqwen3.5-4.5B-v3",
 ]
 
 EMBED_DIMS = {
-    "vllm-project/colqwen3.5-4.5B-v3": 320,
+    "athrael-soju/colqwen3.5-4.5B-v3": 320,
 }
 
 TEXT_QUERIES = [

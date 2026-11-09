@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-r"""DEP EP dispatch / combine (specialized_decode/cutedsl/moe/ep/comm.py) on real ranks.
+"""DEP EP dispatch / combine (specialized_decode/cutedsl/moe/ep/comm.py) on real ranks.
 
 Dispatch: every received row (static slot source x T + token) is the source token's
-MXFP8 latent, bit-identical to `flashinfer.mxfp8_quantize`, with its ids, weights and
+MXFP8 latent, bit-identical to ``flashinfer.mxfp8_quantize``, with its ids, weights and
 source; exactly the tokens with a local expert arrive; empty rows stay non-local. A
 stand-in expert (a per-expert scale of the dequantized row, routing-weighted) fills the
 outputs; combine must return vLLM's RMSNorm of the rank-order FP32 sum of the BF16
@@ -53,7 +53,7 @@ def worker(rank, world, tokens_list=(1, 5, 37)):
         EpRouted,
     )
 
-    device = torch.device("cuda", torch.accelerator.current_device_index())
+    device = torch.device("cuda", torch.cuda.current_device())
     group = dist.group.WORLD
     local = EXPERTS // world
     ep = EpRouted(group, max(tokens_list), device)
@@ -101,7 +101,7 @@ def worker(rank, world, tokens_list=(1, 5, 37)):
 
         for it in range(3):
             ep.dispatch(latent, ids, weights)
-            torch.accelerator.synchronize()
+            torch.cuda.synchronize()
             dist.barrier()
             b, rows = ep.buffers, world * stride(tokens)
             src = b.src(rows).tolist()
@@ -123,7 +123,7 @@ def worker(rank, world, tokens_list=(1, 5, 37)):
             )
             normed = torch.empty_like(latent)
             ep.combine(ids, norm_w, normed)
-            torch.accelerator.synchronize()
+            torch.cuda.synchronize()
             assert (b.src(rows) == -1).all()
             assert ((b.ids(rows) // local) != rank).all()
             torch.testing.assert_close(normed, expected, atol=2e-2, rtol=1e-2)
@@ -134,14 +134,14 @@ def worker(rank, world, tokens_list=(1, 5, 37)):
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             step()
-        torch.accelerator.synchronize()
+        torch.cuda.synchronize()
         dist.barrier()
         with torch.cuda.graph(graph, stream=s):
             graph_out = step()
         for _ in range(3):
             dist.barrier()
             graph.replay()
-            torch.accelerator.synchronize()
+            torch.cuda.synchronize()
             torch.testing.assert_close(graph_out, expected, atol=2e-2, rtol=1e-2)
     dist.barrier()
 
@@ -154,7 +154,7 @@ def _spawned(rank, world, port):
         MASTER_PORT=str(port),
         LOCAL_RANK=str(rank),
     )
-    torch.accelerator.set_device_index(rank)
+    torch.cuda.set_device(rank)
     dist.init_process_group("nccl", device_id=torch.device("cuda", rank))
     try:
         worker(rank, world)
@@ -164,7 +164,7 @@ def _spawned(rank, world, port):
 
 @pytest.mark.skipif(
     not current_platform.is_device_capability_family(100)
-    or torch.accelerator.device_count() < 4,
+    or torch.cuda.device_count() < 4,
     reason="needs 4 SM100 GPUs",
 )
 def test_ep_dispatch_combine_4_ranks():
@@ -211,7 +211,7 @@ if __name__ == "__main__":  # srun: one process per GPU, any number of nodes
         sys.argv[sys.argv.index("--init-file") + 1] if "--init-file" in sys.argv else ""
     )
     local_rank = int(os.environ["LOCAL_RANK"])
-    torch.accelerator.set_device_index(local_rank)
+    torch.cuda.set_device(local_rank)
     dist.init_process_group("nccl", device_id=torch.device("cuda", local_rank))
     worker(dist.get_rank(), dist.get_world_size())
     if dist.get_rank() == 0:

@@ -10,7 +10,6 @@ import sys
 import threading
 import time
 import weakref
-from collections.abc import Sized
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
@@ -57,8 +56,6 @@ if envs.VLLM_USE_SPINLOOP_EXT:
             "spinloop extension could not be loaded, disabling VLLM_USE_SPINLOOP_EXT!"
         )
 SPINLOOP_TIMEOUT_SECONDS = 0.1
-# How long MessageQueue.spin_until_readable() sleeps on a remote reader's socket.
-REMOTE_POLL_WAIT_MS = 1
 
 if TYPE_CHECKING:
     from _typeshed import SizedBuffer
@@ -367,7 +364,7 @@ class ShmRingBuffer:
             ):
                 try:
                     self.shared_memory = shared_memory.SharedMemory(name=name)
-                    # See https://docs.python.org/3/library/multiprocessing.shared_memory.html
+                    # See https://docs.python.org/3/library/multiprocessing.shared_memory.html # noqa
                     # Some platforms allocate memory based on page size,
                     # so the shared memory block size may be larger or equal
                     # to the requested size. The size parameter is ignored
@@ -696,7 +693,7 @@ class MessageQueue:
             # wait for all readers to connect
 
             # local readers
-            for _ in range(self.n_local_reader):
+            for i in range(self.n_local_reader):
                 # wait for subscription messages from all local readers
                 self.local_socket.recv()
             if self.n_local_reader > 0:
@@ -705,7 +702,7 @@ class MessageQueue:
                 self.local_socket.send(b"READY")
 
             # remote readers
-            for _ in range(self.n_remote_reader):
+            for i in range(self.n_remote_reader):
                 # wait for subscription messages from all remote readers
                 self.remote_socket.recv()
             if self.n_remote_reader > 0:
@@ -848,8 +845,11 @@ class MessageQueue:
     ) -> bool:
         """Wait for the current block to be readable by this reader."""
 
-        def check_readable() -> bool:
-            return self._is_readable(metadata_buffer)
+        def check_readable():
+            memory_fence()
+            read_flag = metadata_buffer[self.local_reader_rank + 1]
+            written_flag = metadata_buffer[0]
+            return not (not written_flag or read_flag)
 
         if SPINLOOP_EXT_ENABLED and not check_readable():
             spinloop(
@@ -877,44 +877,6 @@ class MessageQueue:
         if read_timeout.should_warn():
             logger.info(LONG_WAIT_TIME_LOG_MSG, VLLM_RINGBUFFER_WARNING_INTERVAL)
         return False
-
-    def _is_readable(self, metadata_buffer) -> bool:
-        """Whether the current block is written and not yet read by this reader."""
-        memory_fence()
-        read_flag = metadata_buffer[self.local_reader_rank + 1]
-        written_flag = metadata_buffer[0]
-        return bool(written_flag) and not read_flag
-
-    def readable(self) -> bool:
-        """Non-blocking check for whether a message is ready to be dequeued.
-        Raises RuntimeError if the queue has been shut down."""
-        if self.shutting_down:
-            raise RuntimeError("cancelled")
-        if self._is_local_reader:
-            with self.buffer.get_metadata(self.current_idx) as metadata_buffer:
-                return self._is_readable(metadata_buffer)
-        if self._is_remote_reader:
-            return bool(self.remote_socket.poll(timeout=0))
-        raise RuntimeError("Only readers can check readability")
-
-    def spin_until_readable(self, pending: Sized, deadline: float) -> None:
-        """Spin until a message is ready to be dequeued, `pending` is non-empty or
-        time.monotonic() reaches `deadline`. Callers must recheck readable().
-
-        Iterations are kept minimal, since each holds the GIL until it yields. A
-        remote reader instead sleeps briefly on its socket, without the GIL.
-        """
-        if self._is_remote_reader:
-            self.remote_socket.poll(timeout=REMOTE_POLL_WAIT_MS)
-            return
-        read_flag_idx = self.local_reader_rank + 1
-        monotonic = time.monotonic
-        with self.buffer.get_metadata(self.current_idx) as metadata_buffer:
-            while not pending and monotonic() < deadline:
-                memory_fence()
-                if metadata_buffer[0] and not metadata_buffer[read_flag_idx]:
-                    return
-                sched_yield()
 
     @contextmanager
     def acquire_read(

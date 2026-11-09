@@ -479,9 +479,9 @@ __device__ void topk_with_k2(T* output, T const* input, BiasT const* bias,
 template <typename T, typename BiasT, typename IdxT, ScoringFunc SF>
 __global__ void grouped_topk_fused_kernel(
     T* scores, float* topk_values, IdxT* topk_indices, BiasT const* bias,
-    bool const* is_padding, int64_t const num_tokens, int64_t const num_experts,
-    int64_t const n_group, int64_t const topk_group, int64_t const topk,
-    bool renormalize, double routed_scaling_factor) {
+    int64_t const num_tokens, int64_t const num_experts, int64_t const n_group,
+    int64_t const topk_group, int64_t const topk, bool renormalize,
+    double routed_scaling_factor) {
   int32_t const token_id = static_cast<int32_t>(blockIdx.x);
   if (token_id >= num_tokens) {
     return;
@@ -564,11 +564,8 @@ __global__ void grouped_topk_fused_kernel(
 
   if (!proceed) {
     for (int i = lane_id; i < topk_i32; i += WARP_SIZE) {
-      topk_indices[i] =
-          is_padding && is_padding[token_id] ? -1 : static_cast<IdxT>(i);
-      topk_values[i] = is_padding && is_padding[token_id]
-                           ? 0.0f
-                           : 1.0f / static_cast<float>(topk_i32);
+      topk_indices[i] = static_cast<IdxT>(i);
+      topk_values[i] = 1.0f / static_cast<float>(topk_i32);
     }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
@@ -627,9 +624,8 @@ __global__ void grouped_topk_fused_kernel(
   }
 
   if (lane_id < topk_i32) {
-    topk_indices[lane_id] = is_padding && is_padding[token_id] ? -1 : lane_idx;
-    topk_values[lane_id] =
-        is_padding && is_padding[token_id] ? 0.0f : lane_unbiased * scale;
+    topk_indices[lane_id] = lane_idx;
+    topk_values[lane_id] = lane_unbiased * scale;
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -642,8 +638,8 @@ template <typename T, typename BiasT, typename IdxT, ScoringFunc SF,
           int MaxNumTopExperts = DefaultMaxNumTopExperts>
 __global__ void grouped_topk_fused_small_expert_count_kernel(
     T* scores, float* topkValues, IdxT* topkIndices, BiasT const* routingBias,
-    bool const* is_padding, int64_t const numTokens, int64_t const numGroup,
-    int64_t const topkGroup, int64_t const topk, int64_t const numExperts,
+    int64_t const numTokens, int64_t const numGroup, int64_t const topkGroup,
+    int64_t const topk, int64_t const numExperts,
     int64_t const numExpertsPerGroup, bool const renormalize,
     double const routedScalingFactor) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -842,10 +838,8 @@ __global__ void grouped_topk_fused_small_expert_count_kernel(
     }
     // store the topk scores and experts to output
     if (laneIdx < topk) {
-      topkValues[laneIdx] =
-          is_padding && is_padding[blockIdx.x] ? 0.0f : finalScore;
-      topkIndices[laneIdx] =
-          is_padding && is_padding[blockIdx.x] ? -1 : expertIdx;
+      topkValues[laneIdx] = finalScore;
+      topkIndices[laneIdx] = expertIdx;
     }
   }
 
@@ -896,8 +890,7 @@ __device__ __forceinline__ void write_outputs(
     cg::thread_block_tile<WARP_SIZE> const& warp, float lane_selection_score,
     float lane_unbiased, int32_t lane_expert, int32_t lane, int32_t token,
     int32_t topk, float* topk_values, IdxT* topk_indices, bool renormalize,
-    float routed_scaling_factor, bool const* is_padding) {
-  bool const padded = is_padding && is_padding[token];
+    float routed_scaling_factor) {
   bool const finite_selection =
       lane < topk && lane_selection_score != InvalidScore;
   lane_unbiased = finite_selection ? lane_unbiased : 0.0F;
@@ -919,8 +912,8 @@ __device__ __forceinline__ void write_outputs(
     }
 
     int64_t const output_index = int64_t{token} * topk + lane;
-    topk_values[output_index] = padded ? 0.0F : output;
-    topk_indices[output_index] = static_cast<IdxT>(padded ? -1 : lane_expert);
+    topk_values[output_index] = output;
+    topk_indices[output_index] = static_cast<IdxT>(lane_expert);
   }
 }
 
@@ -929,8 +922,8 @@ template <typename T, typename BiasT, typename IdxT, ScoringFunc SF,
 __global__ void __launch_bounds__(BlockDim)
     single_group_topk_block_kernel(T const* scores, float* topk_values,
                                    IdxT* topk_indices, BiasT const* bias,
-                                   bool const* is_padding, int64_t num_experts,
-                                   int64_t topk, bool renormalize,
+                                   int64_t num_experts, int64_t topk,
+                                   bool renormalize,
                                    float routed_scaling_factor,
                                    bool enable_pdl) {
   static constexpr int NumChunks = (MaxNumExperts + WARP_SIZE - 1) / WARP_SIZE;
@@ -1039,7 +1032,7 @@ __global__ void __launch_bounds__(BlockDim)
             : 0.0F;
     write_outputs(warp, lane_score, lane_unbiased, lane_expert, lane, token,
                   topk_i32, topk_values, topk_indices, renormalize,
-                  routed_scaling_factor, is_padding);
+                  routed_scaling_factor);
   } else {
     if (warp_id != 0) {
       return;
@@ -1067,7 +1060,7 @@ __global__ void __launch_bounds__(BlockDim)
             : 0.0F;
     write_outputs(warp, lane_score, lane_unbiased, lane_expert, lane, token,
                   topk_i32, topk_values, topk_indices, renormalize,
-                  routed_scaling_factor, is_padding);
+                  routed_scaling_factor);
   }
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
@@ -1102,9 +1095,9 @@ template <typename T, typename BiasT, typename IdxT, ScoringFunc SF,
 __global__ void __launch_bounds__(WarpTopKLaunchConfig<MaxNumExperts>::BlockDim)
     single_group_topk_warp_kernel(T const* scores, float* topk_values,
                                   IdxT* topk_indices, BiasT const* bias,
-                                  bool const* is_padding, int64_t num_tokens,
-                                  int64_t num_experts, int64_t topk,
-                                  bool renormalize, float routed_scaling_factor,
+                                  int64_t num_tokens, int64_t num_experts,
+                                  int64_t topk, bool renormalize,
+                                  float routed_scaling_factor,
                                   bool enable_pdl) {
   static constexpr int NumChunks = (MaxNumExperts + WARP_SIZE - 1) / WARP_SIZE;
   static constexpr int WarpBlockDim =
@@ -1173,7 +1166,7 @@ __global__ void __launch_bounds__(WarpTopKLaunchConfig<MaxNumExperts>::BlockDim)
     }
     write_outputs(warp, lane_score, lane_unbiased, lane_expert, lane, token,
                   topk_i32, topk_values, topk_indices, renormalize,
-                  routed_scaling_factor, is_padding);
+                  routed_scaling_factor);
   }
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
@@ -1205,10 +1198,9 @@ using PrecomputedSoftmaxBiasTiers =
 template <typename T, typename BiasT, typename IdxT, ScoringFunc SF,
           int MaxNumExperts, int MaxNumTopExperts>
 void launch(T* scores, float* topk_values, IdxT* topk_indices,
-            BiasT const* bias, bool const* is_padding, int64_t num_tokens,
-            int64_t num_experts, int64_t topk, bool renormalize,
-            double routed_scaling_factor, bool enable_pdl,
-            cudaLaunchConfig_t& config) {
+            BiasT const* bias, int64_t num_tokens, int64_t num_experts,
+            int64_t topk, bool renormalize, double routed_scaling_factor,
+            bool enable_pdl, cudaLaunchConfig_t& config) {
   config.dynamicSmemBytes = 0;
   bool const use_block_kernel =
       UseTunedBlockPath<MaxNumExperts, MaxNumTopExperts> ||
@@ -1221,8 +1213,8 @@ void launch(T* scores, float* topk_values, IdxT* topk_indices,
         &config,
         &single_group_topk_block_kernel<T, BiasT, IdxT, SF, MaxNumExperts,
                                         MaxNumTopExperts>,
-        scores, topk_values, topk_indices, bias, is_padding, num_experts, topk,
-        renormalize, static_cast<float>(routed_scaling_factor), enable_pdl);
+        scores, topk_values, topk_indices, bias, num_experts, topk, renormalize,
+        static_cast<float>(routed_scaling_factor), enable_pdl);
   } else {
     using WarpConfig = WarpTopKLaunchConfig<MaxNumExperts>;
     config.gridDim = WarpConfig::grid_dim(num_tokens);
@@ -1231,58 +1223,54 @@ void launch(T* scores, float* topk_values, IdxT* topk_indices,
         &config,
         &single_group_topk_warp_kernel<T, BiasT, IdxT, SF, MaxNumExperts,
                                        MaxNumTopExperts>,
-        scores, topk_values, topk_indices, bias, is_padding, num_tokens,
-        num_experts, topk, renormalize,
-        static_cast<float>(routed_scaling_factor), enable_pdl);
+        scores, topk_values, topk_indices, bias, num_tokens, num_experts, topk,
+        renormalize, static_cast<float>(routed_scaling_factor), enable_pdl);
   }
 }
 
 template <typename T, typename BiasT, typename IdxT, ScoringFunc SF>
-bool dispatch(TierList<>*, T*, float*, IdxT*, BiasT const*, bool const*,
-              int64_t, int64_t, int64_t, bool, double, bool,
-              cudaLaunchConfig_t&) {
+bool dispatch(TierList<>*, T*, float*, IdxT*, BiasT const*, int64_t, int64_t,
+              int64_t, bool, double, bool, cudaLaunchConfig_t&) {
   return false;
 }
 
 template <typename T, typename BiasT, typename IdxT, ScoringFunc SF,
           typename First, typename... Rest>
 bool dispatch(TierList<First, Rest...>*, T* scores, float* topk_values,
-              IdxT* topk_indices, BiasT const* bias, bool const* is_padding,
-              int64_t num_tokens, int64_t num_experts, int64_t topk,
-              bool renormalize, double routed_scaling_factor, bool enable_pdl,
+              IdxT* topk_indices, BiasT const* bias, int64_t num_tokens,
+              int64_t num_experts, int64_t topk, bool renormalize,
+              double routed_scaling_factor, bool enable_pdl,
               cudaLaunchConfig_t& config) {
   if (num_experts <= First::kExperts && topk <= First::kTopK) {
     launch<T, BiasT, IdxT, SF, First::kExperts, First::kTopK>(
-        scores, topk_values, topk_indices, bias, is_padding, num_tokens,
-        num_experts, topk, renormalize, routed_scaling_factor, enable_pdl,
-        config);
+        scores, topk_values, topk_indices, bias, num_tokens, num_experts, topk,
+        renormalize, routed_scaling_factor, enable_pdl, config);
     return true;
   }
   return dispatch<T, BiasT, IdxT, SF>(
       static_cast<TierList<Rest...>*>(nullptr), scores, topk_values,
-      topk_indices, bias, is_padding, num_tokens, num_experts, topk,
-      renormalize, routed_scaling_factor, enable_pdl, config);
+      topk_indices, bias, num_tokens, num_experts, topk, renormalize,
+      routed_scaling_factor, enable_pdl, config);
 }
 
 }  // namespace detail
 
 template <typename T, typename BiasT, typename IdxT, ScoringFunc SF>
 bool invoke(T* scores, float* topk_values, IdxT* topk_indices,
-            BiasT const* bias, bool const* is_padding, int64_t num_tokens,
-            int64_t num_experts, int64_t topk, bool renormalize,
-            double routed_scaling_factor, bool enable_pdl,
-            cudaLaunchConfig_t& config) {
+            BiasT const* bias, int64_t num_tokens, int64_t num_experts,
+            int64_t topk, bool renormalize, double routed_scaling_factor,
+            bool enable_pdl, cudaLaunchConfig_t& config) {
   static_assert(SF == SCORING_NONE || SF == SCORING_SIGMOID);
   if constexpr (SF == SCORING_SIGMOID) {
     return detail::dispatch<T, BiasT, IdxT, SF>(
         static_cast<detail::SigmoidBiasTiers*>(nullptr), scores, topk_values,
-        topk_indices, bias, is_padding, num_tokens, num_experts, topk,
-        renormalize, routed_scaling_factor, enable_pdl, config);
+        topk_indices, bias, num_tokens, num_experts, topk, renormalize,
+        routed_scaling_factor, enable_pdl, config);
   } else {
     return detail::dispatch<T, BiasT, IdxT, SF>(
         static_cast<detail::PrecomputedSoftmaxBiasTiers*>(nullptr), scores,
-        topk_values, topk_indices, bias, is_padding, num_tokens, num_experts,
-        topk, renormalize, routed_scaling_factor, enable_pdl, config);
+        topk_values, topk_indices, bias, num_tokens, num_experts, topk,
+        renormalize, routed_scaling_factor, enable_pdl, config);
   }
 }
 
@@ -1290,11 +1278,10 @@ bool invoke(T* scores, float* topk_values, IdxT* topk_indices,
 
 template <typename T, typename BiasT, typename IdxT, ScoringFunc SF>
 void invokeNoAuxTc(T* scores, float* topk_values, IdxT* topk_indices,
-                   BiasT const* bias, bool const* is_padding,
-                   int64_t const num_tokens, int64_t const num_experts,
-                   int64_t const n_group, int64_t const topk_group,
-                   int64_t const topk, bool const renormalize,
-                   double const routed_scaling_factor,
+                   BiasT const* bias, int64_t const num_tokens,
+                   int64_t const num_experts, int64_t const n_group,
+                   int64_t const topk_group, int64_t const topk,
+                   bool const renormalize, double const routed_scaling_factor,
                    const bool enable_pdl = false,
                    cudaStream_t const stream = 0) {
   cudaLaunchConfig_t config;
@@ -1306,9 +1293,8 @@ void invokeNoAuxTc(T* scores, float* topk_values, IdxT* topk_indices,
   config.attrs = attrs;
   if (n_group == 1 && topk_group == 1 &&
       single_group_topk::invoke<T, BiasT, IdxT, SF>(
-          scores, topk_values, topk_indices, bias, is_padding, num_tokens,
-          num_experts, topk, renormalize, routed_scaling_factor, enable_pdl,
-          config)) {
+          scores, topk_values, topk_indices, bias, num_tokens, num_experts,
+          topk, renormalize, routed_scaling_factor, enable_pdl, config)) {
     return;
   }
 
@@ -1360,9 +1346,9 @@ void invokeNoAuxTc(T* scores, float* topk_values, IdxT* topk_indices,
     config.blockDim = num_threads;
     config.dynamicSmemBytes = 0;
     cudaLaunchKernelEx(&config, kernel_instance, scores, topk_values,
-                       topk_indices, bias, is_padding, num_tokens, n_group,
-                       topk_group, topk, num_experts, num_experts / n_group,
-                       renormalize, routed_scaling_factor);
+                       topk_indices, bias, num_tokens, n_group, topk_group,
+                       topk, num_experts, num_experts / n_group, renormalize,
+                       routed_scaling_factor);
   } else {
     auto* kernel_instance = &grouped_topk_fused_kernel<T, BiasT, IdxT, SF>;
     // One block per token; one warp per group.
@@ -1380,20 +1366,18 @@ void invokeNoAuxTc(T* scores, float* topk_values, IdxT* topk_indices,
     size_t const extra_bytes = 16 + static_cast<size_t>(n_group) * sizeof(T);
     config.dynamicSmemBytes = internal_bytes + extra_bytes;
     cudaLaunchKernelEx(&config, kernel_instance, scores, topk_values,
-                       topk_indices, bias, is_padding, num_tokens, num_experts,
-                       n_group, topk_group, topk, renormalize,
-                       routed_scaling_factor);
+                       topk_indices, bias, num_tokens, num_experts, n_group,
+                       topk_group, topk, renormalize, routed_scaling_factor);
   }
 }
 
 #define INSTANTIATE_NOAUX_TC(T, BiasT, IdxT, SF)                             \
   template void invokeNoAuxTc<T, BiasT, IdxT, SF>(                           \
       T * scores, float* topk_values, IdxT* topk_indices, BiasT const* bias, \
-      bool const* is_padding, int64_t const num_tokens,                      \
-      int64_t const num_experts, int64_t const n_group,                      \
-      int64_t const topk_group, int64_t const topk, bool const renormalize,  \
-      double const routed_scaling_factor, const bool enable_pdl,             \
-      cudaStream_t const stream);
+      int64_t const num_tokens, int64_t const num_experts,                   \
+      int64_t const n_group, int64_t const topk_group, int64_t const topk,   \
+      bool const renormalize, double const routed_scaling_factor,            \
+      const bool enable_pdl, cudaStream_t const stream);
 
 INSTANTIATE_NOAUX_TC(float, float, int32_t, SCORING_SIGMOID);
 INSTANTIATE_NOAUX_TC(float, half, int32_t, SCORING_SIGMOID);
@@ -1419,8 +1403,7 @@ INSTANTIATE_NOAUX_TC(__nv_bfloat16, __nv_bfloat16, int32_t, SCORING_NONE);
 std::tuple<torch::stable::Tensor, torch::stable::Tensor> grouped_topk(
     torch::stable::Tensor const& scores, int64_t n_group, int64_t topk_group,
     int64_t topk, bool renormalize, double routed_scaling_factor,
-    torch::stable::Tensor const& bias, int64_t scoring_func,
-    const std::optional<torch::stable::Tensor>& is_padding) {
+    torch::stable::Tensor const& bias, int64_t scoring_func = 0) {
   const auto data_type = scores.scalar_type();
   const auto bias_type = bias.scalar_type();
   STD_TORCH_CHECK(scores.dim() == 2, "scores must be a 2D Tensor");
@@ -1443,20 +1426,6 @@ std::tuple<torch::stable::Tensor, torch::stable::Tensor> grouped_topk(
           scoring_func == vllm::moe::SCORING_SIGMOID,
       "scoring_func must be SCORING_NONE (0) or SCORING_SIGMOID (1)");
 
-  const bool* is_padding_ptr = nullptr;
-  if (is_padding.has_value()) {
-    STD_TORCH_CHECK(
-        is_padding->scalar_type() == torch::headeronly::ScalarType::Bool,
-        "is_padding must be bool");
-    STD_TORCH_CHECK(is_padding->dim() == 1 && is_padding->size(0) == num_tokens,
-                    "is_padding must have one entry per token");
-    STD_TORCH_CHECK(is_padding->is_contiguous(),
-                    "is_padding must be contiguous");
-    STD_TORCH_CHECK(is_padding->device() == scores.device(),
-                    "is_padding must be on the scores device");
-    is_padding_ptr = is_padding->const_data_ptr<bool>();
-  }
-
   // Always output float32 for topk_values (eliminates Python-side conversion)
   auto topk_values = torch::stable::new_empty(
       scores, {num_tokens, topk}, torch::headeronly::ScalarType::Float);
@@ -1478,8 +1447,8 @@ std::tuple<torch::stable::Tensor, torch::stable::Tensor> grouped_topk(
             reinterpret_cast<T*>(scores.mutable_data_ptr()),                  \
             reinterpret_cast<float*>(topk_values.mutable_data_ptr()),         \
             reinterpret_cast<IdxT*>(topk_indices.mutable_data_ptr()),         \
-            reinterpret_cast<BiasT const*>(bias.data_ptr()), is_padding_ptr,  \
-            num_tokens, num_experts, n_group, topk_group, topk, renormalize,  \
+            reinterpret_cast<BiasT const*>(bias.data_ptr()), num_tokens,      \
+            num_experts, n_group, topk_group, topk, renormalize,              \
             routed_scaling_factor, pdl_flag, stream);                         \
         break;                                                                \
       case vllm::moe::SCORING_SIGMOID:                                        \
@@ -1487,8 +1456,8 @@ std::tuple<torch::stable::Tensor, torch::stable::Tensor> grouped_topk(
             reinterpret_cast<T*>(scores.mutable_data_ptr()),                  \
             reinterpret_cast<float*>(topk_values.mutable_data_ptr()),         \
             reinterpret_cast<IdxT*>(topk_indices.mutable_data_ptr()),         \
-            reinterpret_cast<BiasT const*>(bias.data_ptr()), is_padding_ptr,  \
-            num_tokens, num_experts, n_group, topk_group, topk, renormalize,  \
+            reinterpret_cast<BiasT const*>(bias.data_ptr()), num_tokens,      \
+            num_experts, n_group, topk_group, topk, renormalize,              \
             routed_scaling_factor, pdl_flag, stream);                         \
         break;                                                                \
       default:                                                                \

@@ -51,10 +51,8 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #  13: Add packed-member layouts and order-independent packed-push backend hashes
 #  14: Add Qwen3.8-Flash-Next PLE page length - #59997
 #  15: Add remote_registration_generation to kv_transfer_params
-#  16: Pair regions by the layers both sides hold: every peer advertises
-#      region_members and the cache group of each layer
 #
-NIXL_CONNECTOR_VERSION: int = 16
+NIXL_CONNECTOR_VERSION: int = 15
 
 
 @dataclass
@@ -81,8 +79,6 @@ class NixlAgentMetadata:
     ple_block_len: int | None = None
     # Layer names sharing each advertised region, in region order.
     region_members: list[list[str]] = field(default_factory=list)
-    # Cache group of each layer in region_members.
-    layer_group_ids: dict[str, int] = field(default_factory=dict)
     # Packed member -> (byte offset in its region's block, bytes per page).
     packed_member_layouts: dict[str, tuple[int, int]] = field(default_factory=dict)
 
@@ -109,7 +105,7 @@ def _get_speculative_compatibility_factors(
 ) -> dict[str, Any] | None:
     """Return NIXL compatibility factors for hidden-state-based speculators."""
     speculative_config = vllm_config.speculative_config
-    if speculative_config is None or not speculative_config.uses_target_hidden_states:
+    if speculative_config is None or not speculative_config.use_eagle():
         return None
 
     draft_model_config = speculative_config.draft_model_config
@@ -139,6 +135,7 @@ def _get_speculative_compatibility_factors(
         "model": draft_model_config.model,
         "revision": draft_model_config.revision,
         "code_revision": draft_model_config.code_revision,
+        "parallel_drafting": speculative_config.parallel_drafting,
         "kv_cache_dtype": str(kv_cache_dtype),
         "auxiliary_layer_ids": (
             tuple(auxiliary_layer_ids) if auxiliary_layer_ids is not None else None
@@ -159,7 +156,7 @@ def compute_nixl_compatibility_hash(
     Factors included:
     - vLLM version and NIXL connector version
     - Model architecture (name, dtype, KV heads, layers)
-    - KV cache format (dtype, sliding window)
+    - KV cache format (dtype, DSA indexer key dtype, sliding window)
     - Attention backend
     - EAGLE/MTP configuration that affects transferred state
     - Transfer mode (push vs pull)
@@ -199,6 +196,8 @@ def compute_nixl_compatibility_hash(
         # Attention backend and KV cache dtype affect memory layout
         "attn_backend_name": attn_backend_name,
         "cache_dtype": str(cache_config.cache_dtype),
+        # The DSA indexer key format (fp8 / mxfp4 rows differ in bytes per token).
+        "indexer_kv_dtype": str(vllm_config.attention_config.indexer_kv_dtype),
         "is_hma_enabled": is_hma_enabled,
         "speculative_config": _get_speculative_compatibility_factors(vllm_config),
         # push (WRITE) and pull (READ) connectors are protocol-incompatible
@@ -267,9 +266,6 @@ class ReqMeta:
     # Worker-only, per-region physical pages to zero after a successful pull.
     # None selects group-based completion; empty lists mean no zeroing.
     region_blocks_to_zero: BlockIds | None = None
-    # Worker-only, per-group range of the remote-sized sub-blocks of each local
-    # group a pull covers. None derives it from the block counts.
-    covered_sub_blocks: list[range] | None = None
 
 
 class NixlConnectorMetadata(KVConnectorMetadata):

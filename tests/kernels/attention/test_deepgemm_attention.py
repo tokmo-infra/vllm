@@ -119,8 +119,7 @@ def _packed_requests_test_data(seq_len: int, seq_len_kv: int):
     not current_platform.has_device_capability(90), reason="SM90 and SM100 only"
 )
 @pytest.mark.parametrize("layout", ["cp", "no_cp", "packed"])
-@pytest.mark.parametrize("logits_dtype", [torch.float32, torch.bfloat16])
-def test_deepgemm_fp8_mqa_logits(layout: str, logits_dtype: torch.dtype):
+def test_deepgemm_fp8_mqa_logits(layout: str):
     """FP8 indexer prefill logits, compressed to each row's valid K span."""
     torch.manual_seed(0)
     random.seed(0)
@@ -142,7 +141,7 @@ def test_deepgemm_fp8_mqa_logits(layout: str, logits_dtype: torch.dtype):
 
     q_fp8 = q.to(torch.float8_e4m3fn)
     kv_fp8, kv_sf = per_custom_dims_cast_to_fp8(kv, (0,), True)
-    q_scale, kernel_weights = mqa_logits_mx_inputs(q_fp8, None, weights, logits_dtype)
+    q_scale, kernel_weights = mqa_logits_mx_inputs(q_fp8, None, weights)
     max_seqlen_k = int((ke - ks).max())
     logits = fp8_fp4_mqa_logits(
         (q_fp8, q_scale),
@@ -151,10 +150,8 @@ def test_deepgemm_fp8_mqa_logits(layout: str, logits_dtype: torch.dtype):
         ks,
         ke,
         max_seqlen_k,
-        logits_dtype=logits_dtype,
     )
     assert logits.shape == (seq_len, max_seqlen_k)
-    assert logits.dtype == logits_dtype
     logits = as_fp32_logits(logits, ke - ks)
 
     ref_logits = _ref_fp8_mqa_logits(
@@ -231,10 +228,7 @@ def _ref_fp8_fp4_paged_mqa_logits(
 )
 # next_n = 1 + num_speculative_tokens, so next_n=4 is MTP=3 (issue #35878).
 @pytest.mark.parametrize("batch_size,next_n", [(4, 1), (2, 2), (2, 4)])
-@pytest.mark.parametrize("logits_dtype", [torch.float32, torch.bfloat16])
-def test_deepgemm_fp8_fp4_paged_mqa_logits(
-    batch_size: int, next_n: int, logits_dtype: torch.dtype
-):
+def test_deepgemm_fp8_fp4_paged_mqa_logits(batch_size: int, next_n: int):
     if not native_next_n_supported(next_n):
         pytest.skip(f"next_n={next_n} has no native kernel on this architecture")
 
@@ -296,9 +290,7 @@ def test_deepgemm_fp8_fp4_paged_mqa_logits(
             context_lens_2d = (
                 context_lens.unsqueeze(-1) - next_n + 1 + next_n_arange
             ).contiguous()
-            q_scale, kernel_weights = mqa_logits_mx_inputs(
-                q_fp8, None, weights, logits_dtype
-            )
+            q_scale, kernel_weights = mqa_logits_mx_inputs(q_fp8, None, weights)
             kernel_q = (q_fp8, q_scale)
             kernel_context_lens, kernel_block_tables = context_lens_2d, block_tables
             indices = None
@@ -325,11 +317,10 @@ def test_deepgemm_fp8_fp4_paged_mqa_logits(
                 kernel_block_tables,
                 schedule_metadata,
                 max_model_len,
-                logits_dtype=logits_dtype,
                 indices=indices,
             )
-            assert logits.dtype == logits_dtype
-            logits = as_fp32_logits(logits, kernel_context_lens.view(-1))
+            if indices is not None:
+                logits = as_fp32_logits(logits, kernel_context_lens.view(-1))
 
             ref_logits = _ref_fp8_fp4_paged_mqa_logits(
                 q,
@@ -392,10 +383,7 @@ def test_deepgemm_paged_mqa_packed_manager_block_stride():
         torch.float8_e4m3fn
     )
     q_scale, weights = mqa_logits_mx_inputs(
-        q,
-        None,
-        torch.randn(1, num_heads, device="cuda", dtype=torch.float32),
-        torch.float32,
+        q, None, torch.randn(1, num_heads, device="cuda", dtype=torch.float32)
     )
     context_lens = torch.full((1, 1), block_size, device="cuda", dtype=torch.int32)
     indices = (

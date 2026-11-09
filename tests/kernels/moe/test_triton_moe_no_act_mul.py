@@ -60,9 +60,7 @@ def test_apply_moe_activation_supported_contract():
     assert supported == set(MoEActivation) - {MoEActivation.RELU2}
 
 
-@pytest.mark.skipif(
-    not current_platform.is_cuda_alike(), reason="Requires CUDA or ROCm"
-)
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
 @pytest.mark.parametrize(
     "activation",
     [

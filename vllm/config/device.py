@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import field
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 from pydantic import ConfigDict, SkipValidation
 
-from vllm.config.utils import CompileFactors, config
+from vllm.config.utils import config
+from vllm.utils.hashing import safe_hash
 
 Device = Literal["auto", "cuda", "cpu", "tpu", "xpu"]
 
@@ -26,15 +27,23 @@ class DeviceConfig:
     """Device type from the current platform. This is set in
     `__post_init__`."""
 
-    def compile_factors(self) -> CompileFactors:
-        """This config does not affect the compiled graph.
+    def compute_hash(self) -> str:
+        """WARNING: Whenever a new field is added to this config,
+        ensure that it is included in the factors list if
+        it affects the computation graph.
 
-        If a field starts affecting it, return
-        `get_compile_factors(self, ignored_factors)` with every other field in
-        `ignored_factors`.
+        Provide a hash that uniquely identifies all the configs
+        that affect the structure of the computation
+        graph from input ids/embeddings to the final hidden states,
+        excluding anything before input ids/embeddings and after
+        the final hidden states.
         """
-        # Device/platform info is captured by the torch and vLLM factors.
-        return {}
+        # no factors to consider.
+        # the device/platform information will be summarized
+        # by torch/vllm automatically.
+        factors: list[Any] = []
+        hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
+        return hash_str
 
     def __post_init__(self):
         if self.device == "auto":

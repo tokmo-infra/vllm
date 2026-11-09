@@ -49,56 +49,25 @@ def test_block_mixing_is_causal():
     )
 
 
-# A weight update reruns the post-load hook: the fused copies take the new weights
-# and keep their storage, which captured CUDA graphs read.
-def test_fused_buffers_refilled_in_place():
-    head = _head()
-    head.fold_from_raw_(torch.randn(R, B, B, dtype=torch.float64) * 0.3)
-    head.process_weights_after_loading()
-    buf = head._fused_buf
-    assert buf is not None
-    ptrs = {k: v.data_ptr() for k, v in buf.items()}
-
-    with torch.no_grad():
-        head.mlp_down.weight.mul_(-2)
-    head.fold_from_raw_(torch.randn(R, B, B, dtype=torch.float64) * 0.3)
-    head.process_weights_after_loading()
-
-    assert head._fused_buf is buf
-    assert {k: v.data_ptr() for k, v in buf.items()} == ptrs
-    torch.testing.assert_close(buf["wd_t"], head.mlp_down.weight.t())
-    torch.testing.assert_close(buf["mix_kjc"], head.mix_L.permute(1, 2, 0))
-
-
-# Greedy refine has no sampling, so repeated calls must agree exactly, also when
-# one returns the refined logits the online acceptance estimator reads. Those
-# must be the logits the draft was picked from. The fused kernels are the only
-# implementation, so this runs where they do: on a GPU, at the serving dtype.
+# Greedy refine has no sampling, so repeated calls must agree exactly. The fused
+# kernels are the only implementation, so this runs where they do: on a GPU, at
+# the serving dtype.
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-@pytest.mark.parametrize("topc", [0, 16])
-def test_jacobi_is_deterministic(topc: int):
+def test_jacobi_is_deterministic():
     dtype = torch.bfloat16
     head = _head(device="cuda", dtype=dtype)
-    head.topc = topc
     head.fold_from_raw_(torch.randn(R, B, B, dtype=dtype, device="cuda") * 0.3)
-    head.process_weights_after_loading()
+    head.build_fused_buffers()
     torch.manual_seed(13)
     base = torch.randn(2, B, V, dtype=dtype, device="cuda")
     h = torch.randn(2, B, H, dtype=dtype, device="cuda")
     anchor = torch.randint(0, V, (2,), device="cuda")
     tok_am1 = torch.randint(0, V, (2,), device="cuda")
 
-    first, no_logits = head.jacobi_refine_greedy(base, h, anchor, tok_am1, 4)
-    second, logits = head.jacobi_refine_greedy(
-        base, h, anchor, tok_am1, 4, return_logits=True
-    )
+    first = head.jacobi_refine_greedy(base, h, anchor, tok_am1, 4)
+    second = head.jacobi_refine_greedy(base, h, anchor, tok_am1, 4)
     assert first.shape == (2, B - 1)
     assert torch.equal(first, second)
-    assert no_logits is None
-    assert logits is not None and logits.shape == (2 * (B - 1), topc or V)
-    if not topc:
-        picked = logits.gather(1, first.reshape(-1, 1)).squeeze(1)
-        torch.testing.assert_close(picked, logits.max(dim=-1).values)
 
 
 def _head(

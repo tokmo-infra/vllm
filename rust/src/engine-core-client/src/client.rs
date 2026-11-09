@@ -15,22 +15,19 @@ use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, info, trace};
 
 use crate::client::imp::{ClientInner, run_abort_loop, run_output_dispatcher_loop};
-use crate::client::readiness::{RecheckGuard, run_readiness_loop};
 use crate::coordinator::CoordinatorHandle;
 use crate::error::{Error, Result, bail_invalid_client_config};
 use crate::metrics::EngineSleepState;
-use crate::prompt_block_hasher::PromptBlockHasher;
 use crate::protocol::dtype::ModelDtype;
 use crate::protocol::handshake::EngineCoreReadyResponse;
 use crate::protocol::lora::LoraRequest;
-use crate::protocol::request::EngineCoreRequest;
-use crate::protocol::utility::{CheckpointState, PauseMode, SleepLevel};
+use crate::protocol::request::{EngineCoreRequest, EngineCoreRequestType};
+use crate::protocol::utility::{CheckpointState, EngineCoreUtilityRequest, PauseMode, SleepLevel};
 use crate::runtime::{BackgroundShutdownRuntime, build_zmq_runtime};
 use crate::transport::{self, ConnectedEngine};
 
 pub(crate) mod imp;
 mod output_channel;
-mod readiness;
 mod state;
 mod stream;
 
@@ -49,18 +46,8 @@ pub enum TransportMode {
         /// Host/IP that engines should use to connect back to the frontend
         /// transport sockets.
         advertised_host: String,
-        /// First data-parallel engine rank that this frontend connects to.
-        ///
-        /// The frontend whose range starts at rank 0 handshakes with every
-        /// rank of the deployment; other frontends handshake only with their
-        /// own engines.
-        engine_start_index: u32,
-        /// Total number of engines this frontend connects to.
+        /// Total number of engines expected to join this transport.
         engine_count: usize,
-        /// Deployment-wide data-parallel size. This is larger than
-        /// `engine_count` when frontends partition ranks across nodes (hybrid
-        /// or external DP LB).
-        data_parallel_size: usize,
         /// Maximum time to wait for each startup phase to complete.
         ready_timeout: Duration,
         /// Optional explicit bind address for the input ROUTER socket.
@@ -95,24 +82,10 @@ impl TransportMode {
     /// Return the deployment-wide data-parallel size for this transport.
     pub fn data_parallel_size(&self) -> usize {
         match self {
-            Self::HandshakeOwner {
-                data_parallel_size, ..
-            }
-            | Self::Bootstrapped {
+            Self::HandshakeOwner { engine_count, .. } => *engine_count,
+            Self::Bootstrapped {
                 data_parallel_size, ..
             } => *data_parallel_size,
-        }
-    }
-
-    /// Return the first data-parallel engine rank this frontend connects to.
-    pub fn engine_start_index(&self) -> u32 {
-        match self {
-            Self::HandshakeOwner {
-                engine_start_index, ..
-            }
-            | Self::Bootstrapped {
-                engine_start_index, ..
-            } => *engine_start_index,
         }
     }
 
@@ -129,12 +102,8 @@ impl TransportMode {
         }
 
         match self {
-            Self::HandshakeOwner {
-                engine_start_index,
-                engine_count,
-                ..
-            }
-            | Self::Bootstrapped {
+            Self::HandshakeOwner { .. } => {}
+            Self::Bootstrapped {
                 engine_start_index,
                 engine_count,
                 ..
@@ -203,9 +172,7 @@ impl EngineCoreClientConfig {
             transport_mode: TransportMode::HandshakeOwner {
                 handshake_address: handshake_address.into(),
                 advertised_host: "127.0.0.1".to_string(),
-                engine_start_index: 0,
                 engine_count: 1,
-                data_parallel_size: 1,
                 ready_timeout: Duration::from_secs(30),
                 local_input_address: None,
                 local_output_address: None,
@@ -318,8 +285,6 @@ pub struct EngineCoreClient {
     inner: Arc<ClientInner>,
     coordinator: Option<CoordinatorHandle>,
     abort_tx: mpsc::UnboundedSender<AbortRequest>,
-    /// Hashes prompt blocks for the engines, if they all accept the same hashes.
-    prompt_block_hasher: Option<PromptBlockHasher>,
     /// Whether a profiling session is awaiting an explicit stop. Held across each
     /// start/stop utility call so a stale stop reply cannot clear a newer session.
     profile_active: Mutex<bool>,
@@ -330,7 +295,6 @@ pub struct EngineCoreClient {
     output_task: AbortOnDropHandle<()>,
     dispatcher_task: AbortOnDropHandle<()>,
     abort_task: AbortOnDropHandle<()>,
-    readiness_task: AbortOnDropHandle<()>,
     coordinator_output_task: Option<AbortOnDropHandle<()>>,
     coordinator_task: Option<AbortOnDropHandle<()>>,
 }
@@ -344,24 +308,11 @@ impl EngineCoreClient {
     /// sockets and waits for the expected engine registration frames.
     pub async fn connect(config: EngineCoreClientConfig) -> Result<Self> {
         config.validate()?;
-        let runtime = build_zmq_runtime();
-        let handle = runtime.handle().clone();
-        let connect_task =
-            AbortOnDropHandle::new(handle.spawn(Self::connect_on_runtime(config, runtime)));
-        connect_task.await?
-    }
-
-    async fn connect_on_runtime(
-        config: EngineCoreClientConfig,
-        runtime: BackgroundShutdownRuntime,
-    ) -> Result<Self> {
         let connected = match &config.transport_mode {
             TransportMode::HandshakeOwner {
                 handshake_address,
                 advertised_host,
-                engine_start_index,
                 engine_count,
-                data_parallel_size,
                 ready_timeout,
                 local_input_address,
                 local_output_address,
@@ -376,9 +327,7 @@ impl EngineCoreClient {
 
                 transport::connect_handshake(
                     handshake_address,
-                    *engine_start_index,
                     *engine_count,
-                    *data_parallel_size,
                     advertised_host,
                     local_input_address.as_deref(),
                     local_output_address.as_deref(),
@@ -411,7 +360,7 @@ impl EngineCoreClient {
             }
         };
 
-        Self::from_connected(config, connected, runtime).await
+        Self::from_connected(config, connected).await
     }
 
     /// Create a new client instance from the connected transport state after
@@ -419,18 +368,16 @@ impl EngineCoreClient {
     async fn from_connected(
         config: EngineCoreClientConfig,
         connected: transport::ConnectedTransport,
-        runtime: BackgroundShutdownRuntime,
     ) -> Result<Self> {
         validate_lora_capabilities(&connected.engines)?;
-        let prompt_block_hasher = prompt_block_hasher(&connected.engines);
         let (output_tx, output_rx) = mpsc::channel(64);
         let (abort_tx, abort_rx) = mpsc::unbounded_channel();
         let engines = connected.engines;
+        let runtime = build_zmq_runtime();
         let inner = Arc::new(ClientInner::new(
             connected.input_send,
             runtime.handle().clone(),
             config.model_name.clone(),
-            config.client_index,
             config.engine_stats_enabled,
             &engines,
         ));
@@ -443,8 +390,6 @@ impl EngineCoreClient {
         );
         let abort_task =
             AbortOnDropHandle::new(runtime.spawn(run_abort_loop(inner.clone(), abort_rx)));
-        let readiness_task =
-            AbortOnDropHandle::new(runtime.spawn(run_readiness_loop(inner.clone())));
 
         // If any engine reported a dp_stats_address in its ready response, use it
         // as the external coordinator address.
@@ -453,10 +398,8 @@ impl EngineCoreClient {
 
         let (coordinator, coordinator_output_task, coordinator_task) =
             if let Some(coordinator_transport) = connected.coordinator {
-                let (handle, runner) = CoordinatorHandle::new_inproc(
-                    coordinator_transport.input_socket,
-                    coordinator_transport.frontend_publish_socket,
-                );
+                let (handle, runner) =
+                    CoordinatorHandle::new_inproc(coordinator_transport.input_socket);
                 let (coordinator_output_tx, coordinator_output_rx) = mpsc::channel(64);
                 let coordinator_output_task =
                     AbortOnDropHandle::new(runtime.spawn(transport::run_output_loop(
@@ -485,14 +428,6 @@ impl EngineCoreClient {
                 (None, None, None)
             };
 
-        // Only engines with sleep mode can start paused, prepared for a
-        // checkpoint. Asking here also fails startup with a clear error when
-        // the engines predate the `is_inference_ready` utility.
-        if engines.iter().all(|engine| engine.ready_response.enable_sleep_mode) {
-            let ready = inner.is_inference_ready().await?;
-            inner.readiness().start(ready);
-        }
-
         Ok(Self {
             config,
             input_address: connected.input_address,
@@ -501,13 +436,11 @@ impl EngineCoreClient {
             inner,
             coordinator,
             abort_tx,
-            prompt_block_hasher,
             profile_active: Mutex::new(false),
             runtime,
             output_task,
             dispatcher_task,
             abort_task,
-            readiness_task,
             coordinator_output_task,
             coordinator_task,
         })
@@ -539,11 +472,6 @@ impl EngineCoreClient {
     #[cfg(test)]
     pub(crate) fn pending_utility_call_count(&self) -> usize {
         self.inner.pending_utility_call_count()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn readiness_recheck_pending(&self) -> bool {
-        self.inner.readiness().pending_ask().is_some()
     }
 
     /// Return the engine-side indices connected to this client, as stamped on
@@ -659,31 +587,6 @@ impl EngineCoreClient {
     pub fn health_error(&self) -> Option<Arc<Error>> {
         self.inner.health_error()
     }
-
-    /// Subscribe to whether the engines can accept and process new requests.
-    /// It is `false` while they are paused, asleep, or prepared for a
-    /// checkpoint, or while a weight update has not finished successfully.
-    pub fn subscribe_readiness(&self) -> tokio::sync::watch::Receiver<bool> {
-        self.inner.readiness().subscribe()
-    }
-}
-
-/// Build the prompt block hasher if every engine reports the same supported
-/// prefix hash config. Requests can go to any engine, and an engine that
-/// doesn't hash blocks has no use for the hashes.
-fn prompt_block_hasher(engines: &[ConnectedEngine]) -> Option<PromptBlockHasher> {
-    let config = (engines.iter())
-        .map(|engine| engine.ready_response.prefix_hash_config.as_ref())
-        .all_equal_value()
-        .ok()??;
-    let hasher = PromptBlockHasher::new(config);
-    if hasher.is_none() {
-        debug!(
-            ?config,
-            "engine prefix hash config not supported; engine hashes prompts"
-        );
-    }
-    hasher
 }
 
 fn validate_lora_capabilities(engines: &[ConnectedEngine]) -> Result<()> {
@@ -725,11 +628,6 @@ impl EngineCoreClient {
     pub async fn call(&self, mut req: EngineCoreRequest) -> Result<EngineCoreOutputStream> {
         req.client_index = self.config.client_index;
         req.validate()?;
-        if req.block_hashes.is_none()
-            && let Some(hasher) = &self.prompt_block_hasher
-        {
-            req.block_hashes = hasher.hash_request(&req);
-        }
         trace!(
             request_id = %req.request_id,
             client_index = req.client_index,
@@ -815,16 +713,59 @@ impl EngineCoreClient {
     /// Callers should pass utility arguments using Rust tuple semantics so the
     /// encoded payload matches Python's `(client_index, call_id,
     /// method_name, args)` contract: `()`, `(arg,)`, `(arg1, arg2)`, etc.
-    ///
-    /// Once its requests are prepared, the call is not cancellable: dropping
-    /// the returned future stops waiting, but the requests are still sent and
-    /// their replies collected.
     pub async fn call_utility<T, A>(&self, method: &str, args: A) -> Result<Vec<T>>
     where
         T: serde::de::DeserializeOwned,
         A: serde::Serialize + std::fmt::Debug,
     {
-        self.inner.call_utility(method, args, None).await
+        trace!(
+            method,
+            client_index = self.config.client_index,
+            engine_count = self.engines.len(),
+            "sending utility request"
+        );
+
+        /// Removes utility waiters if a call future is cancelled before completion.
+        struct UtilityCallGuard<'a> {
+            inner: &'a ClientInner,
+            call_ids: Vec<u64>,
+        }
+
+        impl Drop for UtilityCallGuard<'_> {
+            fn drop(&mut self) {
+                self.inner.unregister_utility_calls(self.call_ids.drain(..));
+            }
+        }
+
+        let mut call_guard = UtilityCallGuard {
+            inner: self.inner.as_ref(),
+            call_ids: Vec::with_capacity(self.engines.len()),
+        };
+
+        let mut prepared_calls = Vec::with_capacity(self.engines.len());
+        for engine in &self.engines {
+            let (call_id, rx) = self.inner.allocate_and_register_utility_call()?;
+            call_guard.call_ids.push(call_id);
+            let request =
+                EngineCoreUtilityRequest::new(self.config.client_index, call_id, method, &args)?;
+            prepared_calls.push((&engine.engine_id, call_id, rx, request));
+        }
+
+        let outcomes = join_all(prepared_calls.into_iter().map(
+            |(engine_id, call_id, rx, request)| async move {
+                self.inner
+                    .send_to_engine(engine_id, EngineCoreRequestType::Utility, &request)
+                    .await?;
+                rx.await
+                    .map_err(|_| Error::UtilityCallClosed {
+                        method: method.to_string(),
+                        call_id,
+                    })??
+                    .into_typed_result(method)
+            },
+        ))
+        .await;
+        outcomes.into_iter().collect()
     }
 
     /// Call a utility method on all connected engines and return the shared
@@ -861,31 +802,8 @@ impl EngineCoreClient {
         A: serde::Serialize + std::fmt::Debug,
         K: serde::Serialize + std::fmt::Debug,
     {
-        // Worker methods can change readiness, as a weight update does.
-        let recheck = self.inner.readiness().recheck_after_call();
-        self.collective_rpc_with(recheck, method, timeout, args, kwargs).await
-    }
-
-    /// [`Self::collective_rpc`] as a control call that passes `recheck`.
-    async fn collective_rpc_with<A, K>(
-        &self,
-        recheck: RecheckGuard,
-        method: &str,
-        timeout: Option<f64>,
-        args: A,
-        kwargs: K,
-    ) -> Result<Vec<rmpv::Value>>
-    where
-        A: serde::Serialize + std::fmt::Debug,
-        K: serde::Serialize + std::fmt::Debug,
-    {
         let results = self
-            .inner
-            .call_utility::<rmpv::Value, _>(
-                "collective_rpc",
-                (method, timeout, args, kwargs),
-                Some(recheck),
-            )
+            .call_utility::<rmpv::Value, _>("collective_rpc", (method, timeout, args, kwargs))
             .await?;
 
         Ok(results
@@ -924,8 +842,7 @@ impl EngineCoreClient {
 
     /// Start a weight update for the base model.
     pub async fn start_weight_update(&self) -> Result<()> {
-        self.collective_rpc_with(
-            self.inner.readiness().withdraw_until_recheck(),
+        self.collective_rpc(
             "start_weight_update",
             None,
             Vec::<JsonValue>::new(),
@@ -937,8 +854,7 @@ impl EngineCoreClient {
 
     /// Start a weight update for the speculative draft model.
     pub async fn start_draft_weight_update(&self) -> Result<()> {
-        self.collective_rpc_with(
-            self.inner.readiness().withdraw_until_recheck(),
+        self.collective_rpc(
             "start_draft_weight_update",
             None,
             Vec::<JsonValue>::new(),
@@ -1038,24 +954,15 @@ impl EngineCoreClient {
     }
 
     /// Put the engine to sleep.
-    pub async fn sleep(
-        &self,
-        level: SleepLevel,
-        mode: PauseMode,
-        reset_connector: bool,
-    ) -> Result<()> {
-        let recheck = self.inner.readiness().withdraw_until_recheck();
-        self.inner
-            .call_utility::<(), _>("sleep", (level, mode, reset_connector), Some(recheck))
-            .await?;
+    pub async fn sleep(&self, level: SleepLevel, mode: PauseMode) -> Result<()> {
+        self.call_utility::<(), _>("sleep", (level, mode)).await?;
         self.inner.record_sleep_state(EngineSleepState::Asleep(level));
         Ok(())
     }
 
     /// Release KV cache memory while keeping model weights resident.
-    pub async fn release_kv_cache_memory(&self, reset_connector: bool) -> Result<()> {
-        self.call_utility::<(), _>("release_kv_cache_memory", (reset_connector,))
-            .await?;
+    pub async fn release_kv_cache_memory(&self) -> Result<()> {
+        self.call_utility::<(), _>("release_kv_cache_memory", ()).await?;
         self.inner.record_sleep_state(EngineSleepState::KvCacheReleased);
         Ok(())
     }
@@ -1063,10 +970,8 @@ impl EngineCoreClient {
     /// Wake the engine from sleep, optionally limiting the wake-up to specific
     /// tags, and return whether every engine is fully awake.
     pub async fn wake_up(&self, tags: Option<Vec<String>>) -> Result<bool> {
-        let recheck = self.inner.readiness().recheck_after_call();
         let fully_awake = self
-            .inner
-            .call_utility::<bool, _>("wake_up", (tags,), Some(recheck))
+            .call_utility::<bool, _>("wake_up", (tags,))
             .await?
             .into_iter()
             .all(|fully_awake| fully_awake);
@@ -1080,17 +985,13 @@ impl EngineCoreClient {
     /// Pause generation (e.g. for weight updates). In `abort` and `wait` mode
     /// the engine rejects new requests with a retryable error until resume.
     pub async fn pause_generation(&self, mode: PauseMode, clear_cache: bool) -> Result<()> {
-        let recheck = self.inner.readiness().withdraw_until_recheck();
-        self.inner
-            .call_utility::<(), _>("pause_generation", (mode, clear_cache), Some(recheck))
-            .await?;
+        self.call_utility::<(), _>("pause_generation", (mode, clear_cache)).await?;
         Ok(())
     }
 
     /// Resume the scheduler after a pause
     pub async fn resume_scheduler(&self) -> Result<()> {
-        let recheck = self.inner.readiness().recheck_after_call();
-        self.inner.call_utility::<(), _>("resume_scheduler", (), Some(recheck)).await?;
+        self.call_utility::<(), _>("resume_scheduler", ()).await?;
         Ok(())
     }
 
@@ -1099,18 +1000,14 @@ impl EngineCoreClient {
     /// Returns the first refusal from any engine. An engine that refuses
     /// changes nothing, but with data parallelism the others may have started.
     pub async fn checkpoint_prepare(&self, mode: PauseMode) -> Result<Option<String>> {
-        let recheck = self.inner.readiness().withdraw_until_recheck();
         let refusals: Vec<Option<String>> =
-            self.inner.call_utility("checkpoint_prepare", (mode,), Some(recheck)).await?;
+            self.call_utility("checkpoint_prepare", (mode,)).await?;
         Ok(refusals.into_iter().flatten().next())
     }
 
     /// Bring back what `checkpoint_prepare` released and serve again.
     pub async fn checkpoint_restore(&self) -> Result<()> {
-        let recheck = self.inner.readiness().recheck_after_call();
-        self.inner
-            .call_utility::<(), _>("checkpoint_restore", (), Some(recheck))
-            .await?;
+        self.call_utility::<(), _>("checkpoint_restore", ()).await?;
         Ok(())
     }
 
@@ -1192,7 +1089,6 @@ impl EngineCoreClient {
             output_task,
             dispatcher_task,
             abort_task,
-            readiness_task,
             coordinator_output_task,
             coordinator_task,
             ..
@@ -1204,7 +1100,7 @@ impl EngineCoreClient {
 
         // Abort all client tasks first, then await them.
         // Note the aborting orders here.
-        let mut tasks = vec![readiness_task, abort_task, dispatcher_task, output_task];
+        let mut tasks = vec![abort_task, dispatcher_task, output_task];
         tasks.extend(coordinator_task);
         tasks.extend(coordinator_output_task);
 

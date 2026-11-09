@@ -251,7 +251,10 @@ mod tests {
 
         let error = parser.finish().unwrap_err();
 
-        assert_eq!(error.to_report_string(), "incomplete Seed-OSS tool call");
+        assert_eq!(
+            error.to_report_string(),
+            "tool parser parsing failed: incomplete Seed-OSS tool call"
+        );
     }
 
     #[test]

@@ -22,7 +22,6 @@
 from collections.abc import Iterable
 from itertools import islice
 
-import regex as re
 import torch
 from torch import nn
 from transformers import GPTJConfig
@@ -241,15 +240,6 @@ class GPTJModel(nn.Module):
 
 class GPTJForCausalLM(nn.Module, SupportsPP):
     hf_to_vllm_mapper = WeightsMapper(
-        # Checkpoints store attention quantization scales on the HF attention
-        # module (`attn`), but vLLM's Attention layer is its `attn` child. The
-        # default cache scale rule skips names already ending in
-        # `.attn.k_scale`, so map them here.
-        orig_to_new_regex={
-            re.compile(r"(?<!\.attn)\.attn\.([qkv]_(?:scale|zero_point))$"): (
-                r".attn.attn.\1"
-            ),
-        },
         orig_to_new_stacked={
             # weight_name: (param_name, shard_id)
             ".q_proj": (".qkv_proj", "q"),

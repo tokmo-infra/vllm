@@ -1,3 +1,3 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Cross-platform Muse Spark operators."""
+"""Cross-platform MuseSpark1x operators."""

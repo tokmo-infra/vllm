@@ -9,7 +9,6 @@ from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 
 from vllm.engine.protocol import EngineClient
-from vllm.entrypoints.launchers.utils.constants import DISABLED_ROUTE_TAG
 from vllm.entrypoints.serve.exception_handling.error_response import (
     create_error_response,
 )
@@ -124,7 +123,6 @@ def register_scale_out_api_routers(
                     disabled_scale_out,
                     methods=sorted(route.methods),
                     include_in_schema=False,
-                    tags=[DISABLED_ROUTE_TAG],
                 )
         return
 

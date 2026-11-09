@@ -16,7 +16,6 @@ use vllm_text::{
 };
 
 use super::pb;
-use crate::model_names::ServedModelNames;
 
 fn kv_hints_from_proto(hints: pb::KvHintsEnvelope) -> KvHintsEnvelope {
     KvHintsEnvelope {
@@ -50,15 +49,15 @@ fn kv_hints_from_proto(hints: pb::KvHintsEnvelope) -> KvHintsEnvelope {
 
 /// Convert a gRPC `GenerateRequest` into the internal `TextRequest`.
 ///
-/// `req.model` must be accepted by `served_model_names`; otherwise the request
-/// is rejected with `NotFound`. An empty string is treated as "unset" (proto3
-/// default) and accepted.
+/// If `req.model` is non-empty, it must match one of `served_model_names`;
+/// otherwise the request is rejected with `NotFound`. An empty string is
+/// treated as "unset" (proto3 default) and accepted.
 pub fn to_text_request(
     req: pb::GenerateRequest,
     stream: bool,
-    served_model_names: &ServedModelNames,
+    served_model_names: &[String],
 ) -> Result<TextRequest, Status> {
-    if !served_model_names.accepts(Some(&req.model)) {
+    if !req.model.is_empty() && !served_model_names.iter().any(|n| n == &req.model) {
         return Err(Status::not_found(format!(
             "model `{}` not found",
             req.model
@@ -581,11 +580,6 @@ mod tests {
     use super::{
         ResponseOpts, json_to_proto_struct, pb, to_finish_info, to_sequence_output, to_text_request,
     };
-    use crate::model_names::ServedModelNames;
-
-    fn served() -> ServedModelNames {
-        ServedModelNames::new(vec!["test-model".to_string()])
-    }
 
     fn base_request() -> pb::GenerateRequest {
         pb::GenerateRequest {
@@ -611,7 +605,7 @@ mod tests {
         let encoded = request.encode_to_vec();
         for stream in [false, true] {
             let decoded = pb::GenerateRequest::decode(encoded.as_slice()).unwrap();
-            let text = to_text_request(decoded, stream, &served()).unwrap();
+            let text = to_text_request(decoded, stream, &["test-model".to_string()]).unwrap();
             let engine = vllm_text::lower_text_request(
                 text,
                 vec![1],
@@ -675,7 +669,7 @@ mod tests {
             let encoded = request.encode_to_vec();
             for stream in [false, true] {
                 let request = pb::GenerateRequest::decode(encoded.as_slice()).unwrap();
-                let text = to_text_request(request, stream, &served())
+                let text = to_text_request(request, stream, &["test-model".to_string()])
                     .expect("reasoning controls accepted");
                 let engine = vllm_text::lower_text_request(
                     text,
@@ -714,7 +708,8 @@ mod tests {
             let encoded = request.encode_to_vec();
             for stream in [false, true] {
                 let decoded = pb::GenerateRequest::decode(encoded.as_slice()).unwrap();
-                let text = to_text_request(decoded, stream, &served()).expect("convert request");
+                let text = to_text_request(decoded, stream, &["test-model".to_string()])
+                    .expect("convert request");
                 assert_eq!(text.sampling_params.watermarking, watermarking);
             }
         }
@@ -726,7 +721,7 @@ mod tests {
             temperature: Some(0.7),
             ..base_request()
         };
-        let text = to_text_request(req, false, &served()).expect("convert ok");
+        let text = to_text_request(req, false, &["test-model".to_string()]).expect("convert ok");
         assert_eq!(text.sampling_params.temperature, Some(0.7));
     }
 
@@ -746,7 +741,7 @@ mod tests {
             ..base_request()
         };
 
-        let text = to_text_request(req, false, &served()).expect("convert ok");
+        let text = to_text_request(req, false, &["test-model".to_string()]).expect("convert ok");
         let hints = text.kv_hints.expect("kv hints");
         assert_eq!(hints.protocol_version, "0.1");
         assert_eq!(hints.message_id, "msg-1");
@@ -761,7 +756,8 @@ mod tests {
 
     #[test]
     fn unset_temperature_defaults_to_greedy() {
-        let text = to_text_request(base_request(), false, &served()).expect("convert ok");
+        let text = to_text_request(base_request(), false, &["test-model".to_string()])
+            .expect("convert ok");
         // The gRPC API defaults to greedy (0.0) when temperature is not specified.
         assert_eq!(text.sampling_params.temperature, Some(0.0));
     }
@@ -775,7 +771,7 @@ mod tests {
             }),
             ..base_request()
         };
-        let text = to_text_request(req, false, &served()).expect("convert ok");
+        let text = to_text_request(req, false, &["test-model".to_string()]).expect("convert ok");
         assert_eq!(text.sampling_params.seed, None);
     }
 
@@ -788,7 +784,7 @@ mod tests {
             }),
             ..base_request()
         };
-        let text = to_text_request(req, false, &served()).expect("convert ok");
+        let text = to_text_request(req, false, &["test-model".to_string()]).expect("convert ok");
         assert_eq!(text.sampling_params.seed, Some(0));
     }
 
@@ -832,7 +828,8 @@ mod tests {
                 }),
                 ..base_request()
             };
-            let text = to_text_request(req, false, &served()).expect("convert ok");
+            let text =
+                to_text_request(req, false, &["test-model".to_string()]).expect("convert ok");
             let params = lower_sampling_params(
                 text.sampling_params,
                 SamplingHints::default(),
@@ -875,7 +872,7 @@ mod tests {
             let encoded = request.encode_to_vec();
             for stream in [false, true] {
                 let decoded = pb::GenerateRequest::decode(encoded.as_slice()).unwrap();
-                let text = to_text_request(decoded, stream, &served()).unwrap();
+                let text = to_text_request(decoded, stream, &["test-model".to_string()]).unwrap();
                 let engine = vllm_text::lower_text_request(
                     text,
                     vec![1],
@@ -911,7 +908,7 @@ mod tests {
             }),
             ..base_request()
         };
-        let text = to_text_request(req, false, &served()).expect("convert ok");
+        let text = to_text_request(req, false, &["test-model".to_string()]).expect("convert ok");
         assert_eq!(text.sampling_params.skip_reading_prefix_cache, Some(true));
     }
 
@@ -924,7 +921,7 @@ mod tests {
             }),
             ..base_request()
         };
-        let text = to_text_request(req, false, &served()).expect("convert ok");
+        let text = to_text_request(req, false, &["test-model".to_string()]).expect("convert ok");
         assert_eq!(text.sampling_params.skip_reading_prefix_cache, None);
         // Prompt conversion still succeeds and reaches the expected variant.
         assert!(matches!(text.prompt, Prompt::Text(s) if s == "hi"));
@@ -942,8 +939,6 @@ mod tests {
             ec_transfer_params: None,
             sampling_mask: None,
             spec_decode_metrics: None,
-            weight_versions: None,
-            routed_experts: None,
             timestamps: Default::default(),
         }
     }

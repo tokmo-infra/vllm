@@ -1,7 +1,6 @@
 #!/bin/bash
 
-set +x
-set -eo pipefail
+set -ex
 
 # Clean up old nightly builds from DockerHub, keeping only the last 14 builds
 # This script uses DockerHub API to list and delete old tags with specified prefix
@@ -21,11 +20,11 @@ EXCLUDE_PREFIX="${3:-}"
 echo "Cleaning up tags with prefix: $TAG_PREFIX in repository: $REPO"
 
 # DockerHub API endpoint for the repository
-REPO_API_URL="https://hub.docker.com/v2/namespaces/${REPO%/*}/repositories/${REPO#*/}/tags"
+REPO_API_URL="https://hub.docker.com/v2/repositories/${REPO}/tags"
 
 # Get DockerHub credentials from environment
-if [ -z "$RELEASE_DOCKERHUB_TOKEN" ]; then
-    echo "Error: RELEASE_DOCKERHUB_TOKEN environment variable is not set"
+if [ -z "$DOCKERHUB_TOKEN" ]; then
+    echo "Error: DOCKERHUB_TOKEN environment variable is not set"
     exit 1
 fi
 
@@ -36,20 +35,17 @@ fi
 
 # Get DockerHub bearer token
 echo "Getting DockerHub bearer token..."
-BEARER_TOKEN=$(jq -nc '{identifier: env.DOCKERHUB_USERNAME, secret: env.RELEASE_DOCKERHUB_TOKEN}' | curl -fsS \
+set +x
+BEARER_TOKEN=$(curl -s -X POST \
     -H "Content-Type: application/json" \
-    --data-binary @- \
-    "https://hub.docker.com/v2/auth/token" | jq -er '.access_token')
+    -d "{\"username\": \"$DOCKERHUB_USERNAME\", \"password\": \"$DOCKERHUB_TOKEN\"}" \
+    "https://hub.docker.com/v2/users/login" | jq -r '.token')
+set -x
 
 if [ -z "$BEARER_TOKEN" ] || [ "$BEARER_TOKEN" = "null" ]; then
     echo "Error: Failed to get DockerHub bearer token"
     exit 1
 fi
-
-hub_request() {
-    printf 'header = "Authorization: Bearer %s"\n' "$BEARER_TOKEN" | \
-        curl -q --config - -fsS "$@"
-}
 
 # Function to get all tags from DockerHub
 get_all_tags() {
@@ -57,14 +53,14 @@ get_all_tags() {
     local all_tags=""
     
     while true; do
-        local response
-        response=$(hub_request \
-            "$REPO_API_URL?page=$page&page_size=100") || return
+        set +x
+        local response=$(curl -s -H "Authorization: Bearer $BEARER_TOKEN" \
+            "$REPO_API_URL?page=$page&page_size=100")
+        set -x
         
         # Get both last_updated timestamp and tag name, separated by |
         # Exclude mutable architecture tags and nightly-dev tags from cleanup
-        local tags
-        tags=$(echo "$response" | jq -r --arg prefix "$TAG_PREFIX" --arg exclude "$EXCLUDE_PREFIX" '.results[] | select(.name | startswith($prefix)) | select($exclude == "" or (.name | startswith($exclude) | not)) | select(.name != ($prefix + "x86_64") and .name != ($prefix + "aarch64")) | select(.name | startswith("nightly-dev") | not) | "\(.last_updated)|\(.name)"') || return
+        local tags=$(echo "$response" | jq -r --arg prefix "$TAG_PREFIX" --arg exclude "$EXCLUDE_PREFIX" '.results[] | select(.name | startswith($prefix)) | select($exclude == "" or (.name | startswith($exclude) | not)) | select(.name != ($prefix + "x86_64") and .name != ($prefix + "aarch64")) | select(.name | startswith("nightly-dev") | not) | "\(.last_updated)|\(.name)"')
         
         if [ -z "$tags" ]; then
             break
@@ -82,9 +78,10 @@ delete_tag() {
     local tag_name="$1"
     echo "Deleting tag: $tag_name"
     
-    local delete_url="$REPO_API_URL/$tag_name"
-    local response
-    response=$(hub_request -X DELETE "$delete_url")
+    local delete_url="https://hub.docker.com/v2/repositories/${REPO}/tags/$tag_name"
+    set +x
+    local response=$(curl -s -X DELETE -H "Authorization: Bearer $BEARER_TOKEN" "$delete_url")
+    set -x
     
     if echo "$response" | jq -e '.detail' > /dev/null 2>&1; then
         echo "Warning: Failed to delete tag $tag_name: $(echo "$response" | jq -r '.detail')"

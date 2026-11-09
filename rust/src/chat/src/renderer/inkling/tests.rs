@@ -398,32 +398,18 @@ fn renders_developer_messages_as_system() {
 }
 
 #[test]
-fn coerces_tool_call_arguments_that_are_not_an_object_to_empty() {
-    let render_arguments = |arguments: &str| {
-        let request = ChatRequest {
-            messages: vec![ChatMessage::assistant_blocks(vec![
-                AssistantContentBlock::ToolCall(AssistantToolCall {
-                    id: "call_1".to_string(),
-                    name: "get_weather".to_string(),
-                    arguments: arguments.to_string(),
-                }),
-            ])],
-            ..ChatRequest::for_test()
-        };
-        renderer().render(&request).unwrap().prompt
+fn rejects_non_object_tool_call_arguments() {
+    let request = ChatRequest {
+        messages: vec![ChatMessage::assistant_blocks(vec![
+            AssistantContentBlock::ToolCall(AssistantToolCall {
+                id: "call_1".to_string(),
+                name: "get_weather".to_string(),
+                arguments: "[]".to_string(),
+            }),
+        ])],
+        ..ChatRequest::for_test()
     };
 
-    let empty = render_arguments("{}");
-    for arguments in [
-        r#"{"city": "Par"#,
-        "   ",
-        "[]",
-        "42",
-        "true",
-        r#""hello""#,
-        "null",
-    ] {
-        assert_eq!(render_arguments(arguments), empty, "{arguments:?}");
-    }
-    assert_ne!(render_arguments(r#"{"city":"Paris"}"#), empty);
+    let error = renderer().render(&request).unwrap_err();
+    assert!(error.as_report().to_string().contains("JSON object"));
 }

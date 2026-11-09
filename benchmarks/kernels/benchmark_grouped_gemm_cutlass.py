@@ -54,7 +54,9 @@ def bench_run(
     label = "Quant Matmul"
 
     sub_label = (
-        f"{model}, {num_experts=}, {topk=}, {per_act_token=} {per_out_ch=}, MKN=({mkn})"
+        "{}, num_experts={}, topk={}, per_act_token={} per_out_ch={}, MKN=({})".format(
+            model, num_experts, topk, per_act_token, per_out_ch, mkn
+        )
     )
 
     print(f"Testing: {sub_label}")

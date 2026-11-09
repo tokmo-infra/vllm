@@ -6,8 +6,8 @@ GLM5Next is rope-free MLA: qk_nope_head_dim=256, qk_rope_head_dim=0,
 v_head_dim=256, kv_lora_rank=512 -> head_size 512. These tests pin the
 selection contract only (no GPU required):
 
-* `get_supported_head_sizes` advertises 512 so the backend is a candidate;
-* `supports_combination` admits 512 only for rope-free models on SM90, with
+* ``get_supported_head_sizes`` advertises 512 so the backend is a candidate;
+* ``supports_combination`` admits 512 only for rope-free models on SM90, with
   a bf16 cache or an fp8_ds_mla cache (zero RoPE slot), and rejects
   everything else;
 * adding 512 must NOT reorder the SM100 priority list for bf16, which is why
@@ -138,8 +138,8 @@ def test_flashmla_bf16_nope_accepts_packed_manager_blocks():
 
 @pytest.mark.parametrize("sm100", [False, True])
 def test_flashmla_quantized_cache_kernel_pages(monkeypatch, sm100):
-    """Quantized blocks are read as 64-token pages; SM100 only row-aligns them
-    (TMA) and keeps 64-token blocks."""
+    """Quantized blocks are read as 64-token pages on every architecture: the
+    blocks stay whole, and their stride is a whole number of pages."""
     monkeypatch.setattr(
         current_platform,
         "is_device_capability_family",
@@ -155,11 +155,9 @@ def test_flashmla_quantized_cache_kernel_pages(monkeypatch, sm100):
         state_content_bytes=656,
     )
 
-    kernel_block_size = 64 if sm100 else 1152
-    assert (
-        select_common_block_size(1152, [FlashMLASparseBackend], [spec])
-        == kernel_block_size
-    )
+    assert select_common_block_size(1152, [FlashMLASparseBackend], [spec]) == 1152
+    aligned = FlashMLASparseBackend.customize_spec(spec)
+    assert aligned.get_block_stride_alignment() == 64 * 656
 
 
 def test_fp8_kv_pages_address_packed_blocks():

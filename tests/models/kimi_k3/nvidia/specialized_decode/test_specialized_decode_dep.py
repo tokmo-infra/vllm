@@ -10,7 +10,6 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
-from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import _prims_ts_row_buckets
 
 pytestmark = pytest.mark.skipif(
     not current_platform.is_device_capability_family(100),
@@ -21,7 +20,7 @@ HEADS = 96  # TP1
 
 
 def pitch(heads=HEADS):
-    """The packed [q_a | kv_a | gate | wk | wv] row of `heads` local heads."""
+    """The packed [q_a | kv_a | gate | wk | wv] row of ``heads`` local heads."""
     return 2112 + heads * 128 + 128 + 32
 
 
@@ -40,7 +39,7 @@ def cache(blocks, block, row):
 
 
 def split_query(batch, weights, mla, index, nvfp4, heads=HEADS):
-    """The split query of `batch` rows at `heads` local heads: (run(projected,
+    """The split query of ``batch`` rows at ``heads`` local heads: (run(projected,
     slots, q_scale_inv, k_scale) -> (query, q_c, Q_B rows))."""
     import cutlass
 
@@ -323,10 +322,13 @@ def dep_layer_step(core, batch, q, contexts):
     from vllm.models.kimi_k3.nvidia.specialized_decode.runtime.dep import (
         DepAttention,
     )
+    from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
+        _prims_ts_row_buckets,
+    )
     from vllm.v1.attention.backends.mla.indexer import (
         DeepseekV32IndexerMetadataBuilder,
     )
-    from vllm.v1.kv_cache_interface import get_block_table_width
+    from vllm.v1.worker.block_table import get_block_table_width
 
     cache_dtype, _, kernel = LAYER_CORES[core]
     config = layer_config(core, q)

@@ -15,7 +15,7 @@ a request seeing context + 1 + j keys (spec verify), and requests with 0, 1, 2,
 hold more than N of the row's global top-K), including local lengths in (N, K).
 
 Launch: one process per GPU on one node (2 or 4 ranks), or 8 ranks across two
-GB300 nodes with `srun -n8` and `KIMI_K3_SD_DCP_INIT` (a shared rendezvous
+GB300 nodes with ``srun -n8`` and ``KIMI_K3_SD_DCP_INIT`` (a shared rendezvous
 file), one pytest per rank.
 """
 
@@ -128,7 +128,7 @@ def _global_logits(cache, table, ends, q_rows, weights):
     row_table = table.repeat_interleave(Q, 0).contiguous()
     indices = torch.arange(rows, dtype=torch.int32, device="cuda")
     schedule = get_paged_mqa_logits_metadata(lens, UNIT, get_num_sms(), indices)
-    q_scale, w = mqa_logits_mx_inputs(query, q_scale, weights, torch.bfloat16)
+    q_scale, w = mqa_logits_mx_inputs(query, q_scale, weights)
     return fp8_fp4_paged_mqa_logits(
         (query, q_scale),
         kv_cache_as_quant_view(cache, 128, True),
@@ -137,7 +137,6 @@ def _global_logits(cache, table, ends, q_rows, weights):
         row_table,
         schedule,
         max_model_len=int(ends.max()) + 1,
-        logits_dtype=torch.bfloat16,
         indices=indices,
     )
 
@@ -179,16 +178,14 @@ def _local_shard(cache, table, ends, world, rank):
 def _check(group):
     from types import SimpleNamespace
 
-    from vllm.models.kimi_k3.nvidia.ops.dcp_topk_merge import (
-        dcp_merge_local_topk,
-        dcp_topk_merge_fits,
-    )
-    from vllm.models.kimi_k3.nvidia.ops.dcp_topk_merge.kernels import (
-        dcp_topk_merge_rows,
-    )
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.indexer import (
         FusedIndexer,
     )
+    from vllm.v1.attention.ops.dcp_topk_merge import (
+        dcp_merge_local_topk,
+        dcp_topk_merge_fits,
+    )
+    from vllm.v1.attention.ops.dcp_topk_merge.kernels import dcp_topk_merge_rows
 
     world, rank = group.world_size, group.rank_in_group
     n = dcp_merge_local_topk(TOPK, world)
@@ -298,7 +295,7 @@ def run_worker(rank, world, local_rank, init_method):
         init_distributed_environment,
         initialize_model_parallel,
     )
-    from vllm.models.kimi_k3.nvidia.ops.dcp_topk_merge import init_dcp_topk_merge
+    from vllm.v1.attention.ops.dcp_topk_merge import init_dcp_topk_merge
 
     torch.accelerator.set_device_index(local_rank)
     config = VllmConfig()
@@ -328,8 +325,11 @@ def run_worker(rank, world, local_rank, init_method):
                 model_config=SimpleNamespace(max_model_len=world << 17),
                 scheduler_config=config.scheduler_config,
                 compilation_config=config.compilation_config,
-                speculative_config=SimpleNamespace(num_speculative_tokens=Q - 1),
+                speculative_config=SimpleNamespace(
+                    num_speculative_tokens=Q - 1, parallel_drafting=False
+                ),
                 num_speculative_tokens=Q - 1,
+                use_v2_model_runner=True,
             )
             assert init_dcp_topk_merge(gate, TOPK), "merge disabled"
             _check(get_dcp_group())
@@ -343,7 +343,7 @@ def _spawned(rank, world, init_method):
 
 @pytest.mark.skipif(DCP_INIT is None, reason="needs a multi-node launch")
 def test_dcp_fp4_indexer_merge_exact_launched():
-    """One rank of an `srun -n<world>` launch (DCP8: 2 nodes x 4 GPUs)."""
+    """One rank of an ``srun -n<world>`` launch (DCP8: 2 nodes x 4 GPUs)."""
     rank, world = int(os.environ["SLURM_PROCID"]), int(os.environ["SLURM_NTASKS"])
     local = int(os.environ["SLURM_LOCALID"])
     run_worker(rank, world, local, f"file://{DCP_INIT}")

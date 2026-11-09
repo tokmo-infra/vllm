@@ -55,6 +55,8 @@ class DecodeConfig:
         transfer = getattr(config, "kv_transfer_config", None)
         if transfer is not None and transfer.kv_connector is not None:
             reasons.append("does not support a KV connector")
+        if not getattr(config, "use_v2_model_runner", False):
+            reasons.append("requires Model Runner V2")
         speculative = config.speculative_config
         if speculative is not None and speculative.method != "eagle3":
             reasons.append("supports only EAGLE3 speculative decoding")
@@ -77,12 +79,10 @@ class DecodeConfig:
             reasons.append("does not support routed-expert capture")
         if config.kernel_config.moe_backend != "aiter":
             reasons.append("requires --moe-backend aiter")
+        sparse = getattr(text_config, "sparse_attention_config", None) or {}
         layers = text_config.num_hidden_layers
-        sparse_layers = [
-            i
-            for i, layer_type in enumerate(text_config.layer_types[:layers])
-            if layer_type == "minimax_m3_sparse"
-        ]
+        frequencies = sparse.get("sparse_attention_freq", ())[:layers]
+        sparse_layers = [i for i, enabled in enumerate(frequencies) if enabled]
         if (
             self.last_layer != layers - 1
             or layers <= self.first_layer

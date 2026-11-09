@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import math
+
 import torch
 from torch.distributed import ProcessGroup
 
@@ -30,6 +32,9 @@ logger = init_logger(__name__)
 # Since NCCL 2.29.2, ncclSymkPickKernel accepts registered input with
 # non-registered output for ReduceScatter (ncclSymSendRegRecvNonreg).
 NCCL_DIRECT_SYMM_RS_OUTPUT_MIN_VERSION = 22902
+
+# AITER's all-gather kernel reads the input as 16-byte packs.
+AITER_ALL_GATHER_PACK_BYTES = 16
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -119,7 +124,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.fi_pcie_ipc_ar_comm: FlashInferPcieIpcAllReduce | None = None
         self.aiter_ar_comm: AiterCustomAllreduce | None = None
         self.use_aiter_ag_rs: bool = False
-        self.use_aiter_tp_all_gather: bool = False
 
         # cuMem graph buffers cannot be IPC-registered; capture copies them instead.
         config = get_current_vllm_config_or_none()
@@ -188,10 +192,29 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 self.aiter_ar_comm = None
             else:
                 self.use_aiter_ag_rs = True
-        elif self.aiter_ar_comm is not None and self.world_size in (2, 4, 8):
-            from vllm.platforms.rocm import get_cdna_version
 
-            self.use_aiter_tp_all_gather = get_cdna_version() in (3, 4)
+        # DCP all_gather borrows the TP group's AITER comm (resolved lazily, once
+        # TP exists). Never stored as aiter_ar_comm: destroy() would close the
+        # TP-owned comm, and graph_capture would capture it a second time.
+        self._dcp_ag_comm: AiterCustomAllreduce | None = None
+        self._dcp_ag_resolved = False
+        # A stateless group numbers its ranks globally while the DCP group is
+        # built from local ranks, so the ranks comparison in the lazy resolve
+        # cannot prove the two groups hold the same ranks. Rule it out here,
+        # the same way the DP AITER path above does.
+        self._dcp_ag_candidate = (
+            unique_name.split(":")[0] == "dcp"
+            and tcp_store_group is None
+            and current_platform.is_rocm()
+            and envs.VLLM_ROCM_DCP_AITER_ALLGATHER
+            and self.world_size in (2, 4, 8)
+            and self._dcp_ag_config_allows(config)
+        )
+        # Log the first AITER gather and the first fall back to RCCL.
+        # info_once and warning_once check the rank on every call. DCP
+        # all_gather runs on every step, so call them only the first time.
+        self._dcp_ag_logged_aiter = False
+        self._dcp_ag_logged_fallback = False
 
         if (
             use_custom_allreduce
@@ -229,21 +252,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 self.all2all_manager = DeepEPLLAll2AllManager(
                     self.cpu_group, tcp_store_group
                 )
-            elif self.all2all_backend == "mori" and self._mori_ep_v2():
-                from .all2all import MoriEPv2All2AllManager
-
-                self.all2all_manager = MoriEPv2All2AllManager(self.cpu_group)
             elif self.all2all_backend in (
                 "mori_high_throughput",
                 "mori_low_latency",
-                "mori",
             ):
-                if self.all2all_backend != "mori":
-                    logger.warning_once(
-                        "'%s' is deprecated and will be removed in a future release. "
-                        "Use 'mori', which picks the MoRI kernels automatically.",
-                        self.all2all_backend,
-                    )
                 from .all2all import MoriAll2AllManager
 
                 self.all2all_manager = MoriAll2AllManager(
@@ -305,15 +317,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 scope="global",
             )
 
-    @staticmethod
-    def _mori_ep_v2() -> bool:
-        config = get_current_vllm_config_or_none()
-        return config is not None and bool(config.parallel_config.mori_ep_v2)
-
     def _log_all_reduce_backend_selection(self) -> None:
         """Log the all-reduce backends that are active for this group.
 
-        The dispatch chain in `all_reduce` tries backends in this order and
+        The dispatch chain in ``all_reduce`` tries backends in this order and
         falls through to the next one if the current backend rejects the
         input (size/dtype gates) or is disabled. The list of "enabled"
         backends below is the subset of potential backends that may be
@@ -494,6 +501,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if dim == 0 and should_nccl_symm_mem_ag_rs():
             return self._all_gather_symm_mem(input_.contiguous())
 
+        if self._dcp_ag_candidate:
+            output = self._dcp_aiter_all_gather(input_, dim)
+            if output is not None:
+                return output
+
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is None or pynccl_comm.disabled:
             return super().all_gather(input_, dim)
@@ -504,9 +516,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # copy on every step. This is on the hot path for TP forward passes, so
         # keep ROCm on the base-class collective to avoid a decode regression.
         if current_platform.is_rocm():
-            out = self._maybe_aiter_all_gather(input_, dim)
-            if out is not None:
-                return out
             return super().all_gather(input_, dim)
 
         input_size = input_.size()
@@ -518,32 +527,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
         output_tensor = output_tensor.reshape((self.world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
         return output_tensor.reshape(
-            input_size[:dim]
-            + (self.world_size * input_size[dim],)
-            + input_size[dim + 1 :]
-        )
-
-    def _maybe_aiter_all_gather(
-        self, input_: torch.Tensor, dim: int
-    ) -> torch.Tensor | None:
-        aiter_comm = self.aiter_ar_comm
-        if (
-            not self.use_aiter_tp_all_gather
-            or aiter_comm is None
-            or input_.dtype not in (torch.bfloat16, torch.float16, torch.float32)
-            or input_.numel() == 0
-            or not input_.is_contiguous()
-            or not aiter_comm.should_custom_ag(input_)
-        ):
-            return None
-        input_size = input_.size()
-        if dim > 0:
-            row = input_size[dim:].numel()
-            if row * input_.element_size() % 16 != 0:
-                return None
-            input_ = input_.view(-1, row)
-        output = aiter_comm.all_gather_unreg(input_, dim=0 if dim == 0 else -1)
-        return output.view(
             input_size[:dim]
             + (self.world_size * input_size[dim],)
             + input_size[dim + 1 :]
@@ -723,9 +706,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         """Persistent, pre-registered NCCL symmetric-memory scratch buffer.
 
         Allocating a fresh symm tensor per collective pays the
-        `nccl_symm_mem_context` snapshot + window-registration scan on every
+        ``nccl_symm_mem_context`` snapshot + window-registration scan on every
         call (~0.5 ms/RS+AG pair, dwarfing the NVLS transfer itself). Instead,
-        each `(role, shape[1:], dtype, device)` keeps a geometric high-water
+        each ``(role, shape[1:], dtype, device)`` keeps a geometric high-water
         allocation and returns a leading slice. Superseded allocations remain
         referenced because a captured CUDA graph may still use their pointers;
         geometric growth bounds their total capacity to less than twice the
@@ -859,7 +842,110 @@ class CudaCommunicator(DeviceCommunicatorBase):
         else:
             raise ValueError("No PyNCCL communicator found")
 
+    @staticmethod
+    def _dcp_ag_config_allows(config) -> bool:
+        # Decided at init: the config context is gone by warmup/capture time.
+        if config is None:
+            return False
+        if config.parallel_config.use_ubatching:
+            # Ubatch streams would interleave with TP all-reduces on the
+            # shared AITER signal buffers.
+            logger.info_once(
+                "DCP AITER all-gather disabled: ubatching is enabled.",
+                scope="global",
+            )
+            return False
+        model_config = config.model_config
+        if model_config is not None and model_config.enable_cumem_allocator:
+            # Persistent DCP buffers (e.g. dcp_scores) would live in cuMem
+            # memory, which AITER's registered capture path cannot IPC-export.
+            logger.info_once(
+                "DCP AITER all-gather disabled: cumem allocator is on.",
+                scope="global",
+            )
+            return False
+        return True
+
+    def _resolve_dcp_ag_comm(self) -> AiterCustomAllreduce | None:
+        if self._dcp_ag_resolved:
+            return self._dcp_ag_comm
+        self._dcp_ag_resolved = True
+        from vllm.distributed.parallel_state import get_tp_group
+
+        tp_comm = get_tp_group().device_communicator
+        comm = getattr(tp_comm, "aiter_ar_comm", None)
+        if (
+            tp_comm is None
+            or comm is None
+            or comm.disabled
+            or list(tp_comm.ranks) != list(self.ranks)
+        ):
+            logger.info_once(
+                "DCP AITER all-gather unavailable: no TP AITER comm or DCP ranks "
+                "differ from TP ranks.",
+                scope="global",
+            )
+            return None
+        self._dcp_ag_comm = comm
+        return comm
+
+    def _dcp_aiter_all_gather(
+        self, input_: torch.Tensor, dim: int
+    ) -> torch.Tensor | None:
+        """Byte-exact all-gather over the TP AITER comm; None means fall back.
+
+        The payload is viewed as int32 so any dtype (int64 candidates, fp8/bf16
+        queries) maps onto the fp32 copy kernel, and a dim != 0 gather becomes a
+        last-dim gather of the [outer, row] view, which equals torch.cat(dim).
+        The choice between AITER and RCCL reads only the shape, the dtype and
+        the group size. All ranks therefore choose the same path.
+        """
+        comm = self._resolve_dcp_ag_comm()
+        if comm is None or input_.numel() == 0:
+            return None
+        nbytes = input_.numel() * input_.element_size()
+        outer = math.prod(input_.shape[:dim])
+        # The row size is the whole payload when dim is 0, because outer is
+        # then 1. A row size that is a multiple of 16 bytes also makes the
+        # payload one.
+        if (nbytes // outer) % AITER_ALL_GATHER_PACK_BYTES:
+            return None
+        # Copy an input the kernel cannot read in place. A fall back here
+        # would make the choice depend on the caching allocator. Ranks could
+        # then split between AITER and RCCL and the job would hang.
+        if not input_.is_contiguous():
+            input_ = input_.contiguous()
+        if input_.data_ptr() % AITER_ALL_GATHER_PACK_BYTES:
+            input_ = input_.clone()
+        flat = input_.view(-1).view(torch.int32)
+        payload = flat if outer == 1 else flat.view(outer, -1)
+        if not comm.should_custom_ag(payload):
+            if not self._dcp_ag_logged_fallback:
+                self._dcp_ag_logged_fallback = True
+                logger.warning_once(
+                    "DCP all_gather falls back to RCCL: the payload is larger "
+                    "than the AITER IPC buffer holds per rank, or the ranks "
+                    "are not fully connected.",
+                    scope="global",
+                )
+            return None
+        gathered = comm.custom_all_gather(payload, dim=0 if outer == 1 else 1)
+        if gathered is None:
+            return None
+        if not self._dcp_ag_logged_aiter:
+            self._dcp_ag_logged_aiter = True
+            logger.info_once(
+                "DCP all_gather uses the TP group's AITER IPC all-gather.",
+                scope="global",
+            )
+        shape = input_.shape
+        return gathered.view(input_.dtype).view(
+            shape[:dim] + (self.world_size * shape[dim],) + shape[dim + 1 :]
+        )
+
     def destroy(self):
+        # Borrowed from the TP group; the TP communicator owns and closes it.
+        self._dcp_ag_comm = None
         if self.pynccl_comm is not None:
             self.pynccl_comm.destroy()
             self.pynccl_comm = None

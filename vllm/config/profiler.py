@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
-from typing import Literal, Self
+from typing import Any, Literal, Self
 
 from pydantic import Field, model_validator
 
-from vllm.config.utils import CompileFactors, config
+from vllm.config.utils import config
 from vllm.logger import init_logger
+from vllm.utils.hashing import safe_hash
 
 logger = init_logger(__name__)
 
@@ -89,29 +90,29 @@ class ProfilerConfig:
     separate rank-qualified file."""
 
     proton_context: ProtonContext = "shadow"
-    """Proton context source. `shadow` records explicit scopes with low
-    overhead; `python` records Python call stacks."""
+    """Proton context source. ``shadow`` records explicit scopes with low
+    overhead; ``python`` records Python call stacks."""
 
     proton_data: ProtonData = "tree"
-    """Proton output type. `tree` produces Hatchet data and `trace`
+    """Proton output type. ``tree`` produces Hatchet data and ``trace``
     produces a Chrome trace."""
 
     proton_backend: ProtonBackend | None = None
-    """Proton GPU backend. `None` lets Proton select CUPTI automatically."""
+    """Proton GPU backend. ``None`` lets Proton select CUPTI automatically."""
 
     proton_mode: str | None = None
-    """Optional backend-specific Proton mode string, such as `pcsampling`."""
+    """Optional backend-specific Proton mode string, such as ``pcsampling``."""
 
     proton_hook: ProtonHook | None = None
-    """Optional Proton hook. Use `triton` to add Triton launch metadata."""
+    """Optional Proton hook. Use ``triton`` to add Triton launch metadata."""
 
     proton_output_format: ProtonOutputFormat | None = None
-    """Optional format passed to Proton when finalizing a profile. `None`
-    uses the default format for `proton_data`."""
+    """Optional format passed to Proton when finalizing a profile. ``None``
+    uses the default format for ``proton_data``."""
 
     proton_graph_attribution: bool = False
     """Observe CUDA graph capture so replayed kernels can be attributed.
-    Requires Triton >= 3.7 and `proton_data='tree'`."""
+    Requires Triton >= 3.7 and ``proton_data='tree'``."""
 
     torch_profiler_with_stack: bool = True
     """If `True`, enables stack tracing in the torch profiler. Enabled by default
@@ -135,8 +136,9 @@ class ProfilerConfig:
     Disabled by default."""
 
     capture_torch_profiler: bool = False
-    """Deprecated and has no effect: only the removed Model Runner V1 profiled CUDA
-    graph capture. It will be removed in a future release."""
+    """If `True`, enables a torch profiler during CUDA graph capture on rank 0.
+    Traces are saved to a `capture_traces` subdirectory under `torch_profiler_dir`.
+    Requires `profiler` to be set to 'torch'."""
 
     detailed_trace_annotation: bool = False
     """If `True`, uses detailed annotations with roofline metrics (sk, sqsq,
@@ -192,14 +194,22 @@ class ProfilerConfig:
     Defaults to 0 (no wait period).
     """
 
-    def compile_factors(self) -> CompileFactors:
-        """This config does not affect the compiled graph.
+    def compute_hash(self) -> str:
+        """WARNING: Whenever a new field is added to this config,
+        ensure that it is included in the factors list if
+        it affects the computation graph.
 
-        If a field starts affecting it, return
-        `get_compile_factors(self, ignored_factors)` with every other field in
-        `ignored_factors`.
+        Provide a hash that uniquely identifies all the configs
+        that affect the structure of the computation
+        graph from input ids/embeddings to the final hidden states,
+        excluding anything before input ids/embeddings and after
+        the final hidden states.
         """
-        return {}
+        # no factors to consider.
+        # this config will not affect the computation graph.
+        factors: list[Any] = []
+        hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
+        return hash_str
 
     @model_validator(mode="after")
     def _validate_profiler_config(self) -> Self:
@@ -292,11 +302,6 @@ class ProfilerConfig:
             raise ValueError(
                 "capture_torch_profiler is only applicable when profiler is "
                 "set to 'torch'"
-            )
-        if self.capture_torch_profiler:
-            logger.warning_once(
-                "capture_torch_profiler is deprecated and has no effect. It will "
-                "be removed in a future release."
             )
 
         return self

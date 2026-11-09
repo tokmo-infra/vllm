@@ -1,15 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
-from transformers import DeepseekV2Config
 
-from vllm.config import ModelConfig, ParallelConfig, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationMode
 from vllm.model_executor.models import deepseek_v2 as deepseek_mod
 from vllm.model_executor.models import mistral_large_3_eagle as eagle_mod
@@ -80,14 +77,16 @@ def make_vllm_config(
     return SimpleNamespace(
         model_config=SimpleNamespace(hf_config=hf_config),
         quant_config=None,
-        parallel_config=ParallelConfig(),
+        parallel_config=SimpleNamespace(
+            eplb_config=SimpleNamespace(num_redundant_experts=0),
+        ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
         cache_config=None,
         compilation_config=SimpleNamespace(mode=CompilationMode.NONE),
     )
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def patch_heavy_modules(monkeypatch):
     monkeypatch.setattr(eagle_mod, "get_pp_group", lambda: DummyPPGroup())
     monkeypatch.setattr(deepseek_mod, "get_pp_group", lambda: DummyPPGroup())
@@ -111,7 +110,6 @@ def patch_heavy_modules(monkeypatch):
     ],
 )
 def test_eagle_mistral_large3_initializes_deepseek_runtime_attrs(
-    patch_heavy_modules,
     model_type,
     qk_nope_head_dim,
     qk_rope_head_dim,
@@ -134,9 +132,7 @@ def test_eagle_mistral_large3_initializes_deepseek_runtime_attrs(
 
 
 @pytest.mark.cpu_test
-def test_eagle_mistral_large3_forward_reuses_deepseek_parent_forward(
-    patch_heavy_modules,
-):
+def test_eagle_mistral_large3_forward_reuses_deepseek_parent_forward():
     vllm_config = make_vllm_config()
     model = eagle_mod.EagleMistralLarge3Model(vllm_config=vllm_config)
 
@@ -148,31 +144,3 @@ def test_eagle_mistral_large3_forward_reuses_deepseek_parent_forward(
 
     assert isinstance(output, torch.Tensor)
     assert output.shape == hidden_states.shape
-
-
-@pytest.mark.cpu_test
-@pytest.mark.usefixtures("dist_init", "workspace_init")
-def test_eagle_mistral_large3_loads_weights(tmp_path: Path):
-    config = DeepseekV2Config(
-        architectures=["DeepseekV2ForCausalLM"],
-        vocab_size=32,
-        hidden_size=16,
-        intermediate_size=32,
-        num_hidden_layers=0,
-        num_attention_heads=1,
-        num_key_value_heads=1,
-        n_routed_experts=0,
-        n_shared_experts=0,
-        first_k_dense_replace=0,
-        max_position_embeddings=32,
-    )
-    config.save_pretrained(tmp_path)
-    model_config = ModelConfig(
-        model=str(tmp_path), skip_tokenizer_init=True, max_model_len=32
-    )
-    vllm_config = VllmConfig(model_config=model_config)
-    with set_current_vllm_config(vllm_config):
-        model = eagle_mod.EagleMistralLarge3Model(vllm_config=vllm_config)
-        weight = torch.arange(config.hidden_size, dtype=model.norm.weight.dtype)
-        assert model.load_weights([("norm.weight", weight)]) == {"norm.weight"}
-        torch.testing.assert_close(model.norm.weight, weight, rtol=0, atol=0)

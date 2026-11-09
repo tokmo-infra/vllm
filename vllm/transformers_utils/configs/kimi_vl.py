@@ -34,6 +34,5 @@ class KimiVLConfig(PreTrainedConfig):
 
         self.ignore_index = ignore_index
         self.media_placeholder_token_id = media_placeholder_token_id
-        self.pad_token_id = pad_token_id
 
-        super().__init__(**kwargs)
+        super().__init__(pad_token_id=pad_token_id, **kwargs)

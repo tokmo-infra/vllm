@@ -641,7 +641,7 @@ class MultiModalDataParser:
         if isinstance(audio, np.ndarray):
             return audio, None
         if isinstance(audio, torch.Tensor):
-            return audio.detach().cpu().numpy(), None
+            return audio.numpy(), None
 
         assert_never(audio)
 

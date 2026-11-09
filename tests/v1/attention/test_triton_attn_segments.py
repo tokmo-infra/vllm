@@ -46,7 +46,7 @@ def _build(
             if num_speculative_tokens is None
             else SimpleNamespace(
                 num_speculative_tokens=num_speculative_tokens,
-                speculator_config=SimpleNamespace(parallel_drafting=parallel_drafting),
+                parallel_drafting=parallel_drafting,
             )
         ),
         compilation_config=SimpleNamespace(

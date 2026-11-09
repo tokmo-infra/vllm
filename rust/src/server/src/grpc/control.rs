@@ -382,10 +382,9 @@ impl pb::control_server::Control for ControlServiceImpl {
             Some(level) => SleepLevel::try_from(level).map_err(Status::invalid_argument)?,
             None => SleepLevel::OffloadWeights,
         };
-        let reset_connector = request.reset_connector.unwrap_or(true);
         let _guard = self.rl_lock.lock().await;
         self.client()
-            .sleep(level, mode, reset_connector)
+            .sleep(level, mode)
             .await
             .map_err(|error| utility_status("sleep", error))?;
         Ok(Response::new(pb::SleepResponse {}))

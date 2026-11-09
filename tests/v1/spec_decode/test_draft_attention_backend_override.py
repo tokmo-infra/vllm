@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The draft must honour `attention_backend` from --speculative-config.
+"""The draft must honour ``attention_backend`` from --speculative-config.
 
-`init_attn_backend` reads the backend off each constructed layer, so these
-assert on the config `load_eagle_model` hands to `get_model`.
+``init_attn_backend`` reads the backend off each constructed layer, so these
+assert on the config ``load_eagle_model`` hands to ``get_model``.
 """
 
 from dataclasses import dataclass, field
@@ -100,6 +100,18 @@ def test_override_does_not_mutate_the_target_config():
     cfg = _config("FLASHINFER", "TRITON_ATTN")
     _capture_draft_config(cfg)
     assert cfg.attention_config.backend == "FLASHINFER"
+
+
+def test_cache_dtype_override_keeps_the_block_size_origin():
+    cache_config = CacheConfig()
+    cache_config.block_size = 1088  # resolved, not user-specified
+    cfg = _config("FLASHMLA_SPARSE", None)
+    cfg.cache_config = cache_config
+    cfg.speculative_config.kv_cache_dtype = "fp8"
+
+    used = _capture_draft_config(cfg).cache_config
+    assert (used.cache_dtype, used.block_size) == ("fp8", 1088)
+    assert not used.user_specified_block_size
 
 
 def test_draft_attn_builders_get_overrides_and_keep_resolved_cache_state():

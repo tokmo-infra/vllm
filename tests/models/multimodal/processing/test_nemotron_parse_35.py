@@ -45,15 +45,11 @@ def test_causal_prefix_preserves_host_normalized_packed_images(
     mm_items = processor.info.parse_mm_data({"image": [image]})
     actual = processor([1], mm_items=mm_items)["mm_kwargs"].get_data()
 
-    pixel_values = actual["pixel_values"]
-    assert isinstance(pixel_values, torch.Tensor)
-    assert pixel_values.is_floating_point()
-    assert pixel_values.shape[-1] == 3 * 16**2
+    assert actual["pixel_values"].is_floating_point()
+    assert actual["pixel_values"].shape[-1] == 3 * 16**2
     for name in ("pixel_values", "image_sizes", "content_sizes"):
-        value = actual[name]
-        assert isinstance(value, torch.Tensor)
         torch.testing.assert_close(
-            value, expected[name].to(value.dtype), rtol=0, atol=0
+            actual[name], expected[name].to(actual[name].dtype), rtol=0, atol=0
         )
 
 
@@ -102,4 +98,4 @@ def test_causal_prefix_fields_config_handles_empty_cached_hf_inputs() -> None:
 
     fields = processor._get_mm_fields_config(BatchFeature(), {})
 
-    assert getattr(fields["pixel_values"].field, "slices") == []  # noqa: B009
+    assert fields["pixel_values"].field.slices == []

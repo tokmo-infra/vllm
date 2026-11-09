@@ -105,7 +105,7 @@ def test_kv_balanced_impl_runs_the_kernel():
 
 
 def _paged(rows_per_request, device):
-    """A paged FP8 cache holding `rows_per_request` [n, 576] FP32 rows per request
+    """A paged FP8 cache holding ``rows_per_request`` [n, 576] FP32 rows per request
     at shuffled pages, and its block table."""
     pages = [-(-len(rows) // PAGE) for rows in rows_per_request]
     cache = torch.zeros(sum(pages) + 2, PAGE, LATENT + ROPE, device=device)
@@ -124,7 +124,7 @@ def _paged(rows_per_request, device):
 
 
 def _shard_len(n, cp):
-    """Tokens of a length-`n` request on rank `rank` of `cp` = (world, rank,
+    """Tokens of a length-``n`` request on rank ``rank`` of ``cp`` = (world, rank,
     interleave): rank r holds the interleave-sized chunks r, r + world, ..."""
     world, rank, interleave = cp
     chunks, tail = divmod(n, interleave * world)
@@ -314,8 +314,8 @@ def test_kv_balanced_plan_replays_in_cuda_graph():
 
 
 def _layer(monkeypatch, lengths, cp, lse):
-    """The KV-balanced decode of an MLA layer over random shards of `lengths` on
-    rank `cp[1]`."""
+    """The KV-balanced decode of an MLA layer over random shards of ``lengths`` on
+    rank ``cp[1]``."""
     from vllm.models.kimi_k3.nvidia.kv_balanced_mla import decode
 
     device = torch.device("cuda")
@@ -451,7 +451,6 @@ def test_specialized_mla_core_policy():
     (q > 1) and from BALANCED_Q1_BATCH rows at q = 1 where the kernel runs,
     tokenspeed otherwise (both tokenspeed's kernel, the stock backend's; there is no
     trtllm-gen core); a named balanced core falls back where it can't run."""
-    pytest.importorskip("cutlass")
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla.prepared import (
         BALANCED_Q1_BATCH,
         core_for,
@@ -496,10 +495,9 @@ def test_specialized_mla_core_policy():
     ],
 )
 def test_specialized_balanced_core_matches_reference(lengths, heads, q, cp):
-    """The specialized decode's balanced MLA core (`BalancedMla`: TP8 / DCP8
+    """The specialized decode's balanced MLA core (``BalancedMla``: TP8 / DCP8
     capacity, PDL launch, caller-owned output) against the FP32 reference, captured
     in a CUDA graph with the plan, as the decode step runs it."""
-    from vllm.models.kimi_k3.nvidia.kv_balanced_mla.core import supports
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla.balanced import (
         CAPACITY,
         BalancedMla,
@@ -507,8 +505,6 @@ def test_specialized_balanced_core_matches_reference(lengths, heads, q, cp):
 
     torch.manual_seed(0)
     device = torch.device("cuda")
-    if not supports(heads, q, device):
-        pytest.skip("this GPU runs the shape on M64 tiles, without the balanced core")
     dcp = cp[0] > 1
     local = [_shard_len(n, cp) for n in lengths]
     cache, block_table = _paged(
@@ -558,7 +554,7 @@ def test_specialized_balanced_core_matches_reference(lengths, heads, q, cp):
 
 def _stock_split(heads, q, requests, max_seq, device):
     """tokenspeed_mla_decode's split count (shared by every request of the batch) for
-    `requests` x `q` query rows of `heads` heads and `max_seq`."""
+    ``requests`` x ``q`` query rows of ``heads`` heads and ``max_seq``."""
     from tokenspeed_mla import mla_decode as md
 
     fp8 = torch.float8_e4m3fn
@@ -600,15 +596,13 @@ def test_specialized_balanced_core_bitwise_matches_tokenspeed(lengths, heads, q,
     a summation order); stock's own call is the TOKENSPEED_MLA backend's."""
     from tokenspeed_mla import tokenspeed_mla_decode
 
-    from vllm.models.kimi_k3.nvidia.kv_balanced_mla.core import KV_TILE, supports
+    from vllm.models.kimi_k3.nvidia.kv_balanced_mla.core import KV_TILE
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.mla.balanced import (
         BalancedMla,
     )
 
     torch.manual_seed(0)
     device = torch.device("cuda")
-    if not supports(heads, q, device):
-        pytest.skip("this GPU runs the shape on M64 tiles, without the balanced core")
     world, rank, interleave = cp
     dcp = world > 1
     local = [_shard_len(n, cp) for n in lengths]
@@ -670,6 +664,6 @@ def test_specialized_balanced_core_bitwise_matches_tokenspeed(lengths, heads, q,
     balanced.decode(
         query, cache, block_table, local_t, (softmax, output_scale), out, lse, **extra
     )
-    torch.accelerator.synchronize()
+    torch.cuda.synchronize()
     assert torch.equal(out.view(torch.int16), stock_out.view(torch.int16))
     assert torch.equal(lse.view(torch.int32), stock_lse.view(torch.int32))

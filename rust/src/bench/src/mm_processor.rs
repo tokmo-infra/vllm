@@ -19,7 +19,7 @@ use vllm_chat::{
     load_model_backends,
 };
 use vllm_engine_core_client::{EngineCoreClient, EngineCoreClientConfig, TransportMode};
-use vllm_llm::EngineCoreLlm;
+use vllm_llm::Llm;
 use vllm_managed_engine::cli::ManagedEngineArgs;
 use vllm_managed_engine::{ManagedEngineConfig, ManagedEngineHandle};
 use vllm_text::TextLlm;
@@ -160,7 +160,6 @@ pub async fn run_mm_processor(args: MmProcessorArgs, timing: RequestTimingStats)
         handshake_host: args.engine.handshake_host.clone(),
         handshake_port,
         data_parallel_size: args.engine.data_parallel_size,
-        client_handshake_address: None,
         python_args,
     };
     eprintln!(
@@ -219,15 +218,14 @@ async fn run_mm_processor_with_engine(
     }
 
     // Connect to the engine over the same transport the serving frontend uses.
-    let engine_count =
-        args.engine.data_parallel_size_local.unwrap_or(args.engine.data_parallel_size);
     let client = EngineCoreClient::connect(EngineCoreClientConfig {
         transport_mode: TransportMode::HandshakeOwner {
             handshake_address: format!("tcp://{}:{}", args.engine.handshake_host, handshake_port),
             advertised_host: args.engine.handshake_host.clone(),
-            engine_start_index: 0,
-            engine_count,
-            data_parallel_size: engine_count,
+            engine_count: args
+                .engine
+                .data_parallel_size_local
+                .unwrap_or(args.engine.data_parallel_size),
             ready_timeout: ENGINE_READY_TIMEOUT,
             local_input_address: None,
             local_output_address: None,
@@ -241,7 +239,7 @@ async fn run_mm_processor_with_engine(
     .context("failed to connect to engine core")?;
 
     let chat = ChatLlm::new(
-        TextLlm::new(EngineCoreLlm::new(client), backends.text_backend),
+        TextLlm::new(Llm::new(client), backends.text_backend),
         backends.chat_backend,
     );
 

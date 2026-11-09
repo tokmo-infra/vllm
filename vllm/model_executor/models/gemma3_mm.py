@@ -39,7 +39,6 @@ from vllm.multimodal.processing.processor import (
 from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
-from ..layers.fusion.mm_input_norm import build_mm_input_norm
 from .interfaces import (
     MultiModalEmbeddings,
     SupportsEncoderCudaGraph,
@@ -524,7 +523,6 @@ class Gemma3ForConditionalGeneration(
     )
 
     supports_tower_connector_lora = True
-    supports_mm_device_do_normalize = True
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -556,7 +554,6 @@ class Gemma3ForConditionalGeneration(
                 config.vision_config,
                 quant_config,
                 prefix=maybe_prefix(prefix, "vision_tower"),
-                input_norm=build_mm_input_norm(self.model_config, layout="bchw"),
             )
             self.multi_modal_projector = Gemma3MultiModalProjector(config)
 
@@ -785,8 +782,7 @@ class Gemma3ForConditionalGeneration(
         )
 
         image_size = self.config.vision_config.image_size
-        dtype = self.vision_tower.vision_model.input_norm.input_dtype or dtype
-        dummy_pixel_values = torch.zeros(
+        dummy_pixel_values = torch.randn(
             num_images,
             3,
             image_size,

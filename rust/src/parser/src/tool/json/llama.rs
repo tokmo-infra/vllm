@@ -14,8 +14,7 @@ use super::{
 };
 use crate::tool::utils::{JsonObjectScanState, parse_buffered_event};
 use crate::tool::{
-    Result, StructuralTagBuilder, Tool, ToolCallDelta, ToolParser, ToolParserError,
-    ToolParserOutput,
+    Result, StructuralTagBuilder, Tool, ToolCallDelta, ToolParser, ToolParserOutput,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,9 +174,7 @@ impl ToolParser for Llama3JsonToolParser {
             }
             LlamaJsonMode::AfterCall if self.buffer.trim().is_empty() => {}
             LlamaJsonMode::Header | LlamaJsonMode::Arguments { .. } => {
-                return Err(ToolParserError::IncompleteToolCall {
-                    parser: "Llama JSON",
-                });
+                return Err(parsing_failed!("incomplete Llama JSON tool call"));
             }
             LlamaJsonMode::AfterCall => {
                 return Err(parsing_failed!("invalid Llama JSON"));
@@ -498,7 +495,8 @@ mod tests {
 
         let error = parser.finish().unwrap_err();
 
-        expect!["incomplete Llama JSON tool call"].assert_eq(&error.to_report_string());
+        expect!["tool parser parsing failed: incomplete Llama JSON tool call"]
+            .assert_eq(&error.to_report_string());
     }
 
     #[test]

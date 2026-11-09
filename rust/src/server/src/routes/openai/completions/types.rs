@@ -151,9 +151,7 @@ pub struct CompletionRequest {
     #[serde(default = "default_true")]
     pub skip_special_tokens: bool,
 
-    /// Add spaces between special tokens during detokenization. Accepted as a
-    /// no-op: the detokenizers of the served tokenizers already emit adjacent
-    /// added tokens without a separator, which is what `false` asks for.
+    /// Add spaces between special tokens during detokenization
     #[serde(default = "default_true")]
     pub spaces_between_special_tokens: bool,
 
@@ -165,9 +163,6 @@ pub struct CompletionRequest {
 
     /// Restrict output to these token IDs only
     pub allowed_token_ids: Option<Vec<u32>>,
-
-    /// List of bad words to avoid during generation
-    pub bad_words: Option<Vec<String>>,
 
     /// Number of prompt logprobs to return
     pub prompt_logprobs: Option<i32>,
@@ -211,11 +206,8 @@ pub struct CompletionRequest {
     pub return_token_ids: Option<bool>,
 
     /// Include the weight-version spans that sampled each choice's output
-    /// tokens.
+    /// tokens. Not supported yet.
     pub return_weight_versions: Option<bool>,
-
-    /// Skip the first N prompt tokens from the returned routed-expert rows.
-    pub routed_experts_prompt_start: Option<u32>,
 
     /// Salt for prefix cache isolation in multi-user environments
     #[validate(length(min = 1))]
@@ -279,10 +271,10 @@ pub(super) struct CompletionChoice {
     pub prompt_logprobs: Option<PromptLogprobs>,
     pub token_ids: Option<Vec<u32>>,
     pub prompt_token_ids: Option<Vec<u32>>,
-    /// The request's routed-expert rows as a base64 NumPy `.npy`, when
-    /// `--enable-return-routed-experts` is set.
+    /// Always `None`.
+    /// TODO: return routed experts when `--enable-return-routed-experts` is set.
     pub routed_experts: Option<String>,
-    /// Contiguous weight-version spans over output-token indexes.
+    /// Always `None` until `return_weight_versions` is supported.
     pub weight_versions: Option<Vec<WeightVersionSpan>>,
 }
 
@@ -295,8 +287,6 @@ pub(super) struct CompletionStreamResponse {
     pub choices: Vec<CompletionStreamChoice>,
     pub usage: Option<Usage>,
     pub metrics: Option<StreamPerRequestMetrics>,
-    /// Set only on the last chunk.
-    pub system_fingerprint: Option<String>,
     /// Set only on the chunk carrying the finish reason.
     pub kv_transfer_params: Option<Value>,
 }
@@ -309,7 +299,6 @@ impl CompletionStreamResponse {
             choices: Vec::new(),
             usage: None,
             metrics: None,
-            system_fingerprint: None,
             kv_transfer_params: None,
         }
     }
@@ -326,8 +315,6 @@ pub(super) struct CompletionStreamChoice {
     pub stop_reason: Option<Value>,
     pub token_ids: Option<Vec<u32>>,
     pub prompt_token_ids: Option<Vec<u32>>,
-    /// Set on the final chunk only; covers the whole output.
-    pub weight_versions: Option<Vec<WeightVersionSpan>>,
 }
 
 #[derive(Debug, Clone, Serialize)]

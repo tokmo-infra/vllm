@@ -404,7 +404,6 @@ class Plamo3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.scheduler_config = vllm_config.scheduler_config
-        self.quant_config = vllm_config.quant_config
 
         self.model = Plamo3Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
@@ -419,8 +418,7 @@ class Plamo3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
             self.config.hidden_size,
             org_num_embeddings=self.config.vocab_size,
             padding_size=DEFAULT_VOCAB_PADDING_SIZE,
-            quant_config=self.quant_config,
-            prefix=maybe_prefix(prefix, "lm_head"),
+            prefix=f"{prefix}.lm_head",
         )
         if self.config.tie_word_embeddings:
             self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)

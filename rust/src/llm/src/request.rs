@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use serde::Deserialize;
 use uuid::Uuid;
@@ -15,7 +14,7 @@ use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
 use crate::error::{Error, Result};
 use crate::request_metrics::current_unix_timestamp_secs;
 
-/// Tokenized decoder-only generate request accepted by [`crate::EngineCoreLlm`].
+/// Tokenized decoder-only generate request accepted by [`crate::Llm`].
 ///
 /// This is the first-stage Rust subset of the inputs that eventually flow into
 /// Python `AsyncLLM.generate()`. The boundary is intentionally above
@@ -68,8 +67,6 @@ pub struct GenerateRequest {
 #[derive(Debug)]
 pub(crate) struct PreparedGenerateRequest {
     pub engine_request: EngineCoreRequest,
-    /// The original prompt token IDs, also moved into the raw engine request.
-    pub prompt_token_ids: Arc<[u32]>,
 }
 
 impl GenerateRequest {
@@ -105,10 +102,9 @@ impl GenerateRequest {
             external_request_id.clone()
         };
         Ok(PreparedGenerateRequest {
-            prompt_token_ids: prompt_token_ids.as_slice().into(),
             engine_request: EngineCoreRequest {
                 request_id: engine_request_id,
-                prompt_token_ids: Some(prompt_token_ids.into()),
+                prompt_token_ids: Some(prompt_token_ids),
                 mm_features,
                 sampling_params: Some(sampling_params),
                 pooling_params: None,
@@ -129,9 +125,6 @@ impl GenerateRequest {
                 reasoning_ended,
                 reasoning_parser_kwargs,
                 abort_immediately: false,
-                // Computed by the engine-core client, which knows the engine's
-                // prefix hash config.
-                block_hashes: None,
             },
         })
     }
@@ -163,6 +156,14 @@ impl PreparedGenerateRequest {
             None
         }
     }
+
+    /// Return the original prompt token IDs copied into the raw engine request.
+    pub fn prompt_token_ids(&self) -> &[u32] {
+        self.engine_request
+            .prompt_token_ids
+            .as_ref()
+            .expect("prepared request must have prompt token ids")
+    }
 }
 
 #[cfg(test)]
@@ -173,7 +174,6 @@ mod tests {
     use vllm_engine_core_client::protocol::kv_hints::{KvHintAction, KvHintsEnvelope};
     use vllm_engine_core_client::protocol::request::ReasoningParserKwargs;
     use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
-    use vllm_engine_core_client::test_utils::decode_prompt_token_ids;
 
     use super::GenerateRequest;
     use crate::error::Error;
@@ -221,16 +221,13 @@ mod tests {
     fn prepare_builds_engine_core_request() {
         let prepared = sample_request().prepare(true).unwrap();
 
-        assert_eq!(&*prepared.prompt_token_ids, &[11, 22, 33]);
+        assert_eq!(prepared.prompt_token_ids(), &[11, 22, 33]);
 
         let request = prepared.engine_request;
         assert_eq!(request.external_req_id.as_deref(), Some("req-1"));
         assert!(request.request_id.starts_with("req-1-"));
         assert_ne!(request.request_id, "req-1");
-        assert_eq!(
-            decode_prompt_token_ids(&request).as_deref(),
-            Some(&[11, 22, 33][..])
-        );
+        assert_eq!(request.prompt_token_ids.as_deref(), Some(&[11, 22, 33][..]));
         assert_eq!(request.arrival_time, 42.5);
         assert_eq!(request.cache_salt.as_deref(), Some("salt"));
         assert_eq!(request.data_parallel_rank, Some(2));

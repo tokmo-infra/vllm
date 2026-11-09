@@ -59,7 +59,7 @@ async def print_stream_response(
     print()
 
 
-class CarType(enum.StrEnum):
+class CarType(str, enum.Enum):
     SEDAN = "SEDAN"
     SUV = "SUV"
     TRUCK = "TRUCK"

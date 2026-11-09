@@ -8,7 +8,6 @@ license.workspace = true
 test-util = []
 
 [dependencies]
-async-trait.workspace = true
 easy-ext.workspace = true
 enum-as-inner.workspace = true
 futures.workspace = true

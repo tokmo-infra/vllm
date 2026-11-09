@@ -14,13 +14,14 @@ from tests.v1.attention.utils import (
     create_common_attn_metadata,
     create_vllm_config,
 )
-from vllm.config import SpeculativeConfig
+from vllm.config import SpeculativeConfig, VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
 from vllm.models.kimi_k3.nvidia.kda_metadata import (
     KimiK3KDAAttentionBackend,
     KimiK3KDAMetadata,
     KimiK3KDAMetadataBuilder,
+    _mamba_get_block_table_tensor,
     stage_spec_decode_metadata,
 )
 from vllm.models.kimi_k3.nvidia.model import KimiLinearForCausalLM
@@ -106,7 +107,6 @@ def _make_builder(
     disable_eagle_block_drop: bool = False,
     cache_hit_alignment_tokens: int | None = None,
     hash_block_size: int | None = None,
-    num_hash_lookahead_tokens: int = 0,
 ) -> _BuilderT:
     vllm_config = create_vllm_config(
         model_name="Qwen/Qwen3.5-0.8B",
@@ -134,7 +134,6 @@ def _make_builder(
     vllm_config.cache_config.cache_hit_alignment_tokens = (
         cache_hit_alignment_tokens or hash_block_size
     )
-    vllm_config.num_hash_lookahead_tokens = num_hash_lookahead_tokens
     builder = builder_cls(
         kv_cache_spec=MambaSpec(
             block_size=mamba_block_size,
@@ -178,9 +177,7 @@ def test_kda_recoverssm_startup_metadata_flow_without_model(monkeypatch):
             use_kda_recoverssm=True,
         ),
         parallel_config=SimpleNamespace(tensor_parallel_size=1),
-        speculative_config=SimpleNamespace(
-            num_speculative_tokens=2, max_num_new_slots_for_drafting=0
-        ),
+        speculative_config=SimpleNamespace(num_speculative_tokens=2),
     )
     kv_cache_spec = MambaSpec(
         block_size=BLOCK_SIZE,
@@ -217,7 +214,7 @@ def test_kda_recoverssm_startup_metadata_flow_without_model(monkeypatch):
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
         speculative_config=SimpleNamespace(
             num_speculative_tokens=2,
-            max_num_new_slots_for_drafting=0,
+            parallel_drafting=False,
             enable_adaptive_verification=False,
             use_eagle_block_drop=Mock(return_value=False),
         ),
@@ -230,6 +227,7 @@ def test_kda_recoverssm_startup_metadata_flow_without_model(monkeypatch):
         additional_config={},
         num_speculative_tokens=2,
         num_hash_lookahead_tokens=0,
+        use_v2_model_runner=True,
     )
     builder = KimiK3KDAMetadataBuilder(
         kv_cache_spec=kv_cache_spec,
@@ -387,6 +385,7 @@ def test_internal_checkpoint_metadata_targets_last_aligned_boundary(
 )
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_spec_internal_checkpoint_metadata_targets_replay_boundary(
+    monkeypatch: pytest.MonkeyPatch,
     seq_len: int,
     disable_eagle_block_drop: bool,
     num_hash_lookahead_tokens: int,
@@ -394,6 +393,11 @@ def test_spec_internal_checkpoint_metadata_targets_replay_boundary(
     expected_offset: int | None,
 ) -> None:
     """Lookahead hashes need no back-off from the replay boundary."""
+    monkeypatch.setattr(
+        VllmConfig,
+        "num_hash_lookahead_tokens",
+        property(lambda _: num_hash_lookahead_tokens),
+    )
     device = torch.device("cuda")
     batch = BatchSpec(seq_lens=[seq_len], query_lens=[seq_len])
     common_attn_metadata = create_common_attn_metadata(
@@ -413,7 +417,6 @@ def test_spec_internal_checkpoint_metadata_targets_replay_boundary(
         prefix_match_unit=prefix_match_unit,
         use_eagle=True,
         disable_eagle_block_drop=disable_eagle_block_drop,
-        num_hash_lookahead_tokens=num_hash_lookahead_tokens,
         device=device,
     )
     assert isinstance(builder, KimiK3KDAMetadataBuilder)
@@ -1040,6 +1043,43 @@ def test_stage_spec_decode_metadata_matches_pytorch():
     torch.testing.assert_close(staged_state_indices, expected_state_indices)
     torch.testing.assert_close(staged_query_start_loc, expected_query_start_loc)
     torch.testing.assert_close(staged_num_accepted_tokens, expected_num_accepted_tokens)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_aligned_block_table_matches_shared_gdn():
+    device = torch.device("cuda")
+    seq_lens = torch.tensor(
+        [0, 1, 15, 16, 17, 31, 32, 33, 511, 512, 513],
+        dtype=torch.int32,
+        device=device,
+    ).repeat(6)[:65]
+    block_table_storage = torch.arange(
+        seq_lens.numel() * 128,
+        dtype=torch.int32,
+        device=device,
+    ).reshape(seq_lens.numel(), 128)
+    block_table = block_table_storage[:, ::2]
+    kv_cache_spec = MambaSpec(
+        block_size=BLOCK_SIZE,
+        shapes=((16, 64),),
+        dtypes=(torch.float16,),
+        num_speculative_blocks=2,
+    )
+
+    expected = mamba_get_block_table_tensor(
+        block_table,
+        seq_lens,
+        kv_cache_spec,
+        "align",
+    )
+    actual = _mamba_get_block_table_tensor(
+        block_table,
+        seq_lens,
+        kv_cache_spec,
+        "align",
+    )
+
+    torch.testing.assert_close(actual, expected)
 
 
 def _build_non_spec(batch, is_prefilling, full_cuda_graph=False):

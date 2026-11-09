@@ -282,14 +282,11 @@ class AuxOutputWorkerConnector:
                 local_start = emit_start % block_size
                 rows = stored[local_start : local_start + stored_end - emit_start]
                 if stored_end < token_end:
-                    suffix = buffer.read(
-                        request_id, stored_end, token_end, state.pending_blocks
+                    rows = np.concatenate(
+                        (rows, buffer.read(request_id, stored_end, token_end))
                     )
-                    rows = np.concatenate((rows, suffix))
             else:
-                rows = buffer.read(
-                    request_id, emit_start, token_end, state.pending_blocks
-                )
+                rows = buffer.read(request_id, emit_start, token_end)
             outputs[request_id] = AuxRequestOutput(emit_start, rows)
             state.emit_cursor = token_end
         return outputs

@@ -31,7 +31,7 @@ use super::utils::{
     JsonObjectScanState, json_str, parse_buffered_event, safe_text_len, safe_text_len_mul,
     take_json_object,
 };
-use super::{Result, ToolCallDelta, ToolParserError, ToolParserOutput};
+use super::{Result, ToolCallDelta, ToolParserOutput};
 
 pub(crate) type JsonToolInput<'i> = Partial<&'i str>;
 
@@ -118,9 +118,10 @@ impl JsonToolCallParser {
         match &self.mode {
             JsonToolCallMode::Text => output.push_text(&self.buffer),
             JsonToolCallMode::Header | JsonToolCallMode::Arguments { .. } => {
-                return Err(ToolParserError::IncompleteToolCall {
-                    parser: self.config.parser_name,
-                });
+                return Err(parsing_failed!(
+                    "incomplete {} tool call",
+                    self.config.parser_name
+                ));
             }
         }
         let _ = self.reset();

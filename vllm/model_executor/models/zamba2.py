@@ -818,7 +818,7 @@ class Zamba2Model(nn.Module):
 
         # Process through layers
         original_hidden_states = torch.clone(hidden_states)
-        for layer in self.layers:
+        for layer_idx, layer in enumerate(self.layers):
             layer_outputs = layer(
                 hidden_states,
                 original_hidden_states=original_hidden_states,

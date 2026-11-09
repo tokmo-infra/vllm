@@ -122,10 +122,10 @@ def _shard(cache, table, ends, requests, world, rank):
 
 
 def _check(group):
-    from vllm.models.kimi_k3.nvidia.ops.dcp_topk_merge import dcp_merge_local_topk
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.topk_exchange import (  # noqa: E501
         reserve,
     )
+    from vllm.v1.attention.ops.dcp_topk_merge import dcp_merge_local_topk
 
     world, rank = group.world_size, group.rank_in_group
     n = dcp_merge_local_topk(TOPK, world)
@@ -142,13 +142,11 @@ def _merge_local_select(fused, rows, logits, row_ends, args):
     """#63's NCCL merge over the fused local select's B' rows (its push-variant
     kernel; the pushes it also makes carry the current epoch and are rewritten
     by the next exchange call)."""
-    from vllm.models.kimi_k3.nvidia.ops.dcp_topk_merge.kernels import (
-        dcp_topk_merge_rows,
-    )
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
         stream,
         to_cute,
     )
+    from vllm.v1.attention.ops.dcp_topk_merge.kernels import dcp_topk_merge_rows
 
     local, _ = fused.exchange_kernels[rows, Q]
     out, valid = fused.out[:rows], fused.valid[:rows]
@@ -172,7 +170,7 @@ def _same_logits(group, logits, row_ends, stock, ours, rows, max_local_len):
     every = group.all_gather(local.unsqueeze(0), dim=0)  # [W, rows, width]
     ends = group.all_gather(row_ends[:rows].contiguous().unsqueeze(0), dim=0)
     assert torch.equal(stock[1], ours[1]), "counts"
-    bad: dict[str, list] = {"stock": [], "exchange": []}
+    bad = {"stock": [], "exchange": []}
     for t in range(rows):
         row = torch.cat([every[r, t, : int(ends[r, t])] for r in range(world)])
         c = min(TOPK, row.numel())
@@ -195,12 +193,10 @@ def _check_requests(group, exchange, n, requests):
     with a saturated rank."""
     from types import SimpleNamespace
 
-    from vllm.models.kimi_k3.nvidia.ops.dcp_topk_merge.kernels import (
-        dcp_topk_merge_rows,
-    )
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.indexer import (
         FusedIndexer,
     )
+    from vllm.v1.attention.ops.dcp_topk_merge.kernels import dcp_topk_merge_rows
 
     world, rank = group.world_size, group.rank_in_group
     device = torch.device("cuda", torch.accelerator.current_device_index())
@@ -277,7 +273,6 @@ def _check_requests(group, exchange, n, requests):
         _merge_local_select(fused, rows, logits, row_ends, merge_args(ref))
         torch.accelerator.synchronize()
         _same_logits(group, logits, row_ends, stock, ref, rows, max_local_len)
-    assert fused.workspace is not None
     sat = (fused.workspace.sat_word[:rows] >> 16).ne(0)
 
     def exchange_call(out):
@@ -348,7 +343,7 @@ def run_worker(rank, world, init_method):
         init_distributed_environment,
         initialize_model_parallel,
     )
-    from vllm.models.kimi_k3.nvidia.ops.dcp_topk_merge import init_dcp_topk_merge
+    from vllm.v1.attention.ops.dcp_topk_merge import init_dcp_topk_merge
 
     torch.accelerator.set_device_index(rank)
     config = VllmConfig()
@@ -375,8 +370,11 @@ def run_worker(rank, world, init_method):
                 model_config=SimpleNamespace(max_model_len=world << 17),
                 scheduler_config=config.scheduler_config,
                 compilation_config=config.compilation_config,
-                speculative_config=SimpleNamespace(num_speculative_tokens=Q - 1),
+                speculative_config=SimpleNamespace(
+                    num_speculative_tokens=Q - 1, parallel_drafting=False
+                ),
                 num_speculative_tokens=Q - 1,
+                use_v2_model_runner=True,
             )
             assert init_dcp_topk_merge(gate, TOPK), "merge disabled"
             _check(get_dcp_group())

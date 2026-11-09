@@ -107,8 +107,7 @@ def _stock_verify(layer, heads, projected, caches, table, q, record_indices=None
         query_start_loc=starts, max_query_len=q, validate_data=False,
         out=torch.empty_like(projected[:, : 3 * dim]),
     )  # fmt: skip
-    xq, xk, xv = (x.reshape(1, n, heads, D) for x in mixed.split(dim, dim=-1))
-    qkv = xq, xk, xv
+    qkv = [x.reshape(1, n, heads, D) for x in mixed.split(dim, dim=-1)]
     core = kda_recoverssm_verify(
         *qkv, g1, beta, layer.A_log, layer.dt_bias, LOWER_BOUND, state,
         layer.recoverssm_records, starts, table, q, record_indices=record_indices,
@@ -120,8 +119,8 @@ def _stock_verify(layer, heads, projected, caches, table, q, record_indices=None
 
 
 def _reference(layer, state, inputs, q, n_prev, prev):
-    """FP64: the replay of `n_prev` accepted tokens of the previous step's
-    operands `prev` (normalized keys, decays, corrections) and this step's verify
+    """FP64: the replay of ``n_prev`` accepted tokens of the previous step's
+    operands ``prev`` (normalized keys, decays, corrections) and this step's verify
     from it; returns (replayed checkpoint, corrections, core outputs)."""
     qs, ks, vs, g1, beta, _ = inputs
     heads = state.shape[0]
@@ -152,7 +151,7 @@ def _reference(layer, state, inputs, q, n_prev, prev):
 
 
 def _record_operands(layer, records, row, heads, n):
-    """FP64 normalized keys, decays and corrections of record slot `row`."""
+    """FP64 normalized keys, decays and corrections of record slot ``row``."""
     a = layer.A_log.double().exp()
     dt = layer.dt_bias.double().view(heads, D)
     kg = records.key_gate[row].double()
@@ -350,7 +349,7 @@ def test_fused_ws_uneven_ctas(heads, requests, ctas, monkeypatch):
     monkeypatch.setattr(
         prepared,
         "KdaFusedWS",
-        lambda *args: ws(*args[:-1], ctas),  # type: ignore[call-arg]
+        lambda *args: ws(*args[:-1], ctas),
     )
     prepared.executable.cache_clear()
     try:
@@ -406,7 +405,7 @@ def test_padded_rows_and_graph(split, path):
                 recs[1].clone(),
             )
             fn()
-            torch.accelerator.synchronize()
+            torch.cuda.synchronize()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 fn()
@@ -417,7 +416,7 @@ def test_padded_rows_and_graph(split, path):
             graph.replay()
         else:
             fn()
-        torch.accelerator.synchronize()
+        torch.cuda.synchronize()
         return out, caches, recs, pending_buf
 
     rows = torch.tensor([4, 0, 6, 2, 3], dtype=torch.int32, device=DEVICE)
@@ -449,7 +448,7 @@ def test_padded_rows_and_graph(split, path):
 @torch.inference_mode()
 def test_stock_verify_record_indices():
     """The deferred RecoverSSM's Triton verify (the stock one, indexed) writes
-    request b's records to slot `record_indices[b]` (deferred steps the stock path
+    request b's records to slot ``record_indices[b]`` (deferred steps the stock path
     runs), else to row b."""
     heads, requests, q = 12, 4, 5
     dim, slots = heads * D, 1 + requests

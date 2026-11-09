@@ -28,15 +28,9 @@ class XpuCommunicator(DeviceCommunicatorBase):
         )
         self.ca_comm: None = None
         if self.use_all2all:
-            if self.all2all_backend in (
-                "naive",
-                "allgather_reducescatter",
-                "alltoall_batched",
-            ):
+            if self.all2all_backend in ("naive", "allgather_reducescatter"):
                 from .all2all import AgRsAll2AllManager
 
-                # alltoall_batched dispatches via all_to_all_single directly and
-                # only needs this manager for group metadata.
                 self.all2all_manager = AgRsAll2AllManager(self.cpu_group)
                 logger.info("Using AgRs manager on XPU device.")
 

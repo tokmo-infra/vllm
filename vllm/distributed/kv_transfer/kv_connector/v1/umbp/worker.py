@@ -382,11 +382,7 @@ class UMBPStoreConnectorWorker:
         return result
 
     def close(self) -> None:
-        try:
-            self.wait_for_save()
-            self._drain_store_jobs(wait=True)
-            self._drain_load_jobs(wait=True)
-        except TimeoutError as exc:
-            logger.warning("UMBP transfers are still in flight at shutdown: %s", exc)
-        finally:
-            self.runtime.close()
+        self.wait_for_save()
+        self._drain_store_jobs(wait=True)
+        self._drain_load_jobs(wait=True)
+        self.runtime.close()

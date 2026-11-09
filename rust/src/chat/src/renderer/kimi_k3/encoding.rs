@@ -284,8 +284,7 @@ fn content_is_empty(content: &ChatContent) -> bool {
             ChatContentPart::ImageUrl { .. }
             | ChatContentPart::VideoUrl { .. }
             | ChatContentPart::InputAudio { .. }
-            | ChatContentPart::AudioUrl { .. }
-            | ChatContentPart::ToolReference { .. } => false,
+            | ChatContentPart::AudioUrl { .. } => false,
         }),
     }
 }
@@ -489,9 +488,6 @@ fn write_content(
                     }
                     ChatContentPart::AudioUrl { .. } => {
                         return Err(Error::UnsupportedMultimodalContent("audio_url"));
-                    }
-                    ChatContentPart::ToolReference { .. } => {
-                        return Err(Error::UnsupportedContentPart("tool_reference"));
                     }
                 }
             }

@@ -39,7 +39,6 @@ from vllm.model_executor.models.interfaces import (
     SupportsLoRA,
     SupportsMultiModal,
     SupportsMultiModalPruning,
-    SupportsReplaySSM,
 )
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
@@ -636,7 +635,7 @@ class NanoNemotronVLMultiModalProcessor(
 
         Videos whose bytes are missing or that contain no audio stream are
         silently skipped.  The returned *has_audio* mask is aligned with
-        the video list so callers know which `<video>` tokens need an
+        the video list so callers know which ``<video>`` tokens need an
         accompanying audio context.
 
         Returns:
@@ -935,7 +934,6 @@ class NemotronH_Nano_VL_V2(
     SupportsMultiModal,
     SupportsMultiModalPruning,
     SupportsLoRA,
-    SupportsReplaySSM,
 ):
     supports_mm_device_do_normalize = True
     requires_sequential_video_encoding = True

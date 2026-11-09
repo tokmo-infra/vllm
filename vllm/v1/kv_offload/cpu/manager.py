@@ -43,10 +43,6 @@ class _RequestCacheAccess:
     inserted_keys: set[OffloadKey] = field(default_factory=set)
     reused_keys: set[OffloadKey] = field(default_factory=set)
     store_miss_keys: set[OffloadKey] = field(default_factory=set)
-    # Keys this request has counted toward store_threshold. Each counts once
-    # per request: a retry of a failed offer, or a re-offer after preemption,
-    # is not another use of the content.
-    counted_keys: set[OffloadKey] = field(default_factory=set)
     finished: bool = False
 
 
@@ -130,21 +126,14 @@ class CPUOffloadingManager(OffloadingManager):
     ) -> CPULoadStoreSpec:
         return CPULoadStoreSpec([chunk.chunk_id for chunk in chunks])
 
-    def _record_accesses(
-        self, keys: Collection[OffloadKey], counted: Collection[OffloadKey]
-    ) -> None:
-        """Record an offer without evicting its tracked candidates.
-
-        Keys in `counted` were counted by an earlier offer of the same request:
-        they stay tracked but don't count again.
-        """
+    def _record_accesses(self, keys: Collection[OffloadKey]) -> None:
+        """Record an offer without evicting its tracked candidates."""
         assert self.counts is not None
         protected: set[OffloadKey] = set()
         for key in keys:
             if key in self.counts:
                 self.counts.move_to_end(key)
-                if key not in counted:
-                    self.counts[key] += 1
+                self.counts[key] += 1
                 protected.add(key)
 
         num_unprotected = len(self.counts) - len(protected)
@@ -252,6 +241,10 @@ class CPUOffloadingManager(OffloadingManager):
         return self._get_load_store_spec(keys, chunks)
 
     @override
+    def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
+        self._policy.touch(keys, req_context)
+
+    @override
     def complete_load(
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> None:
@@ -271,9 +264,8 @@ class CPUOffloadingManager(OffloadingManager):
         req_context: ReqContext,
     ) -> PrepareStoreOutput | None:
         keys = list(keys)
-        state = self._get_request_cache_access(req_context)
         if self.counts is not None:
-            self._record_accesses(keys, state.counted_keys)
+            self._record_accesses(keys)
         # Partition the original offer before admission filtering. Ready
         # resident chunks are request reuses even if their tracker entry was
         # aged out; the threshold applies only to new store candidates.
@@ -288,15 +280,17 @@ class CPUOffloadingManager(OffloadingManager):
                     ready_existing_keys.append(key)
 
         if self.counts is not None:
-            admitted_keys: list[OffloadKey] = []
-            for key in keys_to_store:
-                if self.counts.get(key, 0) >= self.store_threshold:
-                    admitted_keys.append(key)
-                elif key not in state.counted_keys:
-                    self.stores_skipped_in_current_batch += 1
-            keys_to_store = admitted_keys
-            state.counted_keys.update(keys)
+            num_store_candidates = len(keys_to_store)
+            keys_to_store = [
+                key
+                for key in keys_to_store
+                if self.counts.get(key, 0) >= self.store_threshold
+            ]
+            self.stores_skipped_in_current_batch += num_store_candidates - len(
+                keys_to_store
+            )
 
+        state = self._get_request_cache_access(req_context)
         new_store_misses = [
             key for key in keys_to_store if key not in state.store_miss_keys
         ]
@@ -421,8 +415,6 @@ class CPUOffloadingManager(OffloadingManager):
                     keys=stored_keys,
                     medium=self.medium,
                     removed=False,
-                    removal_expected=True,
-                    req_context=req_context,
                 )
             )
 

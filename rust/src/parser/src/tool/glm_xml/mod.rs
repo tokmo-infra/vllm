@@ -10,7 +10,7 @@ use winnow::token::{literal, rest, take_until, take_while};
 
 use super::parameters::ToolSchemas;
 use super::utils::{MarkerScanState, parse_buffered_event, safe_text_len_mul, take_until_marker};
-use super::{Result, ToolCallDelta, ToolParserError, ToolParserOutput};
+use super::{Result, ToolCallDelta, ToolParserOutput};
 use crate::tool::Tool;
 
 mod glm45_moe;
@@ -134,7 +134,7 @@ impl GlmXmlToolParser {
             match self.mode {
                 GlmMode::Text => output.push_text(&self.buffer),
                 GlmMode::ToolCall { .. } => {
-                    return Err(ToolParserError::IncompleteToolCall { parser: "GLM MoE" });
+                    return Err(parsing_failed!("incomplete GLM MoE tool call"));
                 }
                 GlmMode::AfterToolCall => {}
             }

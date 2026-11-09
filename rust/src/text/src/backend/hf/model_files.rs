@@ -61,17 +61,13 @@ pub struct ModelFileSources {
     /// Source of `config.json` and `generation_config.json`, or `None` for
     /// `model`. When set, it must provide `config.json`.
     pub hf_config: Option<ModelSource>,
-    /// Resolve no tokenizer-side files (tokenizer, tokenizer config, chat
-    /// template), like Python's `skip_tokenizer_init`. `tokenizer` is ignored.
-    pub skip_tokenizer_init: bool,
 }
 
 /// Concrete tokenizer/config file locations resolved for one HF model id.
 #[derive(Debug, Clone)]
 pub struct ResolvedModelFiles {
-    /// The selected tokenizer source for this model, or `None` with
-    /// [`ModelFileSources::skip_tokenizer_init`].
-    pub tokenizer: Option<TokenizerSource>,
+    /// The selected tokenizer source for this model.
+    pub tokenizer: TokenizerSource,
     pub tokenizer_config_path: Option<PathBuf>,
     pub generation_config_path: Option<PathBuf>,
     pub preprocessor_config_path: Option<PathBuf>,
@@ -113,7 +109,6 @@ impl ResolvedModelFiles {
             },
             tokenizer: None,
             hf_config: None,
-            skip_tokenizer_init: false,
         })
         .await
     }
@@ -124,39 +119,27 @@ impl ResolvedModelFiles {
             model,
             tokenizer,
             hf_config,
-            skip_tokenizer_init,
         } = sources;
         // A cached model snapshot must contain the files that only the model provides.
         let model_required = match (tokenizer, hf_config) {
-            (None, _) if !*skip_tokenizer_init => RequiredFile::Tokenizer,
-            (_, None) => RequiredFile::Config,
-            (_, Some(_)) => RequiredFile::Nothing,
+            (None, _) => RequiredFile::Tokenizer,
+            (Some(_), None) => RequiredFile::Config,
+            (Some(_), Some(_)) => RequiredFile::Nothing,
         };
         let model_files = SourceFiles::open(model, model_required).await?;
-        // Under `skip_tokenizer_init` no tokenizer-side file is read: not the
-        // tokenizer, its config, or the chat template.
-        let (tokenizer, tokenizer_config_path, chat_template_path) = if *skip_tokenizer_init {
-            (None, None, None)
-        } else {
-            let tokenizer_files = match tokenizer {
-                Some(source) => Some(SourceFiles::open(source, RequiredFile::Tokenizer).await?),
-                None => None,
-            };
-            let tokenizer_files = tokenizer_files.as_ref().unwrap_or(&model_files);
-            let tokenizer_config_path = tokenizer_files.get("tokenizer_config.json").await?;
-            let tokenizer_config = load_tokenizer_config(tokenizer_config_path.as_deref())?;
-            (
-                Some(tokenizer_files.tokenizer(&tokenizer_config).await?),
-                tokenizer_config_path,
-                tokenizer_files.chat_template().await?,
-            )
+        let tokenizer_files = match tokenizer {
+            Some(source) => Some(SourceFiles::open(source, RequiredFile::Tokenizer).await?),
+            None => None,
         };
+        let tokenizer_files = tokenizer_files.as_ref().unwrap_or(&model_files);
         let config_files = match hf_config {
             Some(source) => Some(SourceFiles::open(source, RequiredFile::Config).await?),
             None => None,
         };
         let config_files = config_files.as_ref().unwrap_or(&model_files);
 
+        let tokenizer_config_path = tokenizer_files.get("tokenizer_config.json").await?;
+        let tokenizer_config = load_tokenizer_config(tokenizer_config_path.as_deref())?;
         let config_path = config_files.get("config.json").await?;
         if config_path.is_none()
             && let Some(source) = hf_config
@@ -169,7 +152,7 @@ impl ResolvedModelFiles {
         }
 
         Ok(Self {
-            tokenizer,
+            tokenizer: tokenizer_files.tokenizer(&tokenizer_config).await?,
             tokenizer_config_path,
             generation_config_path: config_files.get("generation_config.json").await?,
             preprocessor_config_path: model_files.get("preprocessor_config.json").await?,
@@ -177,7 +160,7 @@ impl ResolvedModelFiles {
                 .get("video_preprocessor_config.json")
                 .await?,
             processor_config_path: model_files.get("processor_config.json").await?,
-            chat_template_path,
+            chat_template_path: tokenizer_files.chat_template().await?,
             config_path,
             config_temp_path: None,
         })
@@ -598,7 +581,7 @@ mod tests {
             .await
             .expect("resolve local model files");
 
-        match files.tokenizer.expect("tokenizer resolved") {
+        match files.tokenizer {
             TokenizerSource::HuggingFace(path) => {
                 assert_eq!(path, dir.path().join("tokenizer.json"));
             }
@@ -634,7 +617,6 @@ mod tests {
             model: source(model.path(), None),
             tokenizer: Some(source(tokenizer.path(), None)),
             hf_config: Some(source(config.path(), None)),
-            skip_tokenizer_init: false,
         })
         .await
         .unwrap();
@@ -644,10 +626,7 @@ mod tests {
             ["model", "tokenizer", "config"][dirs.iter().position(|d| d.path() == dir).unwrap()]
         };
         let origins = [
-            (
-                "tokenizer",
-                files.tokenizer.as_ref().map(TokenizerSource::path),
-            ),
+            ("tokenizer", Some(files.tokenizer.path())),
             ("tokenizer_config", files.tokenizer_config_path.as_deref()),
             ("chat_template", files.chat_template_path.as_deref()),
             ("config", files.config_path.as_deref()),
@@ -697,12 +676,11 @@ mod tests {
             model: source(model.path(), None),
             tokenizer: Some(source(tokenizer.path(), None)),
             hf_config: Some(source(tokenizer.path(), None)),
-            skip_tokenizer_init: false,
         })
         .await
         .unwrap();
         assert_eq!(
-            files.tokenizer.unwrap().path(),
+            files.tokenizer.path(),
             tokenizer.path().join("tokenizer.json")
         );
         assert_eq!(
@@ -722,7 +700,6 @@ mod tests {
             model: source(model.path(), None),
             tokenizer: None,
             hf_config: Some(source(model.path(), Some("release"))),
-            skip_tokenizer_init: false,
         })
         .await
         .unwrap_err();
@@ -768,7 +745,7 @@ mod tests {
             let files = ResolvedModelFiles::new("test/model", Some("release")).await.unwrap();
             let cache = PathBuf::from(std::env::var_os("HF_HUB_CACHE").unwrap());
             assert_eq!(
-                files.tokenizer.as_ref().unwrap().path(),
+                files.tokenizer.path(),
                 cache.join("models--test--model/snapshots/commit/tokenizer.json")
             );
             let error = ResolvedModelFiles::new("test/model", Some("missing")).await.unwrap_err();
@@ -781,11 +758,10 @@ mod tests {
                 model: source("test/weights", Some("release")),
                 tokenizer: Some(source("test/model", Some("release"))),
                 hf_config: Some(source("test/config", Some("release"))),
-                skip_tokenizer_init: false,
             };
             let files = ResolvedModelFiles::from_sources(&sources).await.unwrap();
             assert_eq!(
-                files.tokenizer.as_ref().unwrap().path(),
+                files.tokenizer.path(),
                 cache.join("models--test--model/snapshots/commit/tokenizer.json")
             );
             assert_eq!(
@@ -843,7 +819,7 @@ mod tests {
             .expect("resolve real Kimi K2.5 model files");
 
         let tokenizer_path = match &files.tokenizer {
-            Some(TokenizerSource::Tiktoken(path)) => path.clone(),
+            TokenizerSource::Tiktoken(path) => path.clone(),
             other => panic!("expected tiktoken tokenizer source, got {other:?}"),
         };
 

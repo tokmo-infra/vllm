@@ -54,8 +54,6 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
     Supports expert parallelism natively.
     """
 
-    kept_constants: tuple[str, ...] = ("per_token_global_scale",)
-
     def __init__(
         self,
         moe_config: FusedMoEConfig,

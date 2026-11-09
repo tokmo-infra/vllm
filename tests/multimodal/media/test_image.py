@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import inspect
 import struct
-from io import BytesIO
 from pathlib import Path
 
 import numpy as np
@@ -261,6 +260,7 @@ def test_image_pixel_limit_respected():
     import vllm.envs as envs
 
     image = Image.new("RGB", (100, 100), (255, 0, 0))
+    from io import BytesIO
 
     buf = BytesIO()
     image.save(buf, format="PNG")
@@ -280,6 +280,7 @@ def test_image_pixel_limit_rejected(monkeypatch):
     monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", 100)
 
     image = Image.new("RGB", (20, 20), (0, 255, 0))
+    from io import BytesIO
 
     buf = BytesIO()
     image.save(buf, format="PNG")
@@ -288,23 +289,6 @@ def test_image_pixel_limit_rejected(monkeypatch):
     image_io = ImageMediaIO()
     with pytest.raises(ValueError, match="exceed"):
         image_io.load_bytes(data)
-
-
-def test_image_decompression_bomb_rejected(monkeypatch):
-    """Pillow rejects images above twice `Image.MAX_IMAGE_PIXELS` with its own
-    non-OSError exception, which must surface as a client-side ValueError."""
-    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 50)
-
-    image = Image.new("RGB", (20, 20), (0, 255, 0))
-
-    buf = BytesIO()
-    image.save(buf, format="PNG")
-    data = buf.getvalue()
-
-    image_io = ImageMediaIO()
-    with pytest.raises(ValueError, match="Failed to load image") as exc_info:
-        image_io.load_bytes(data)
-    assert isinstance(exc_info.value.__cause__, Image.DecompressionBombError)
 
 
 def test_image_broken_png_rejected():
@@ -373,6 +357,7 @@ def test_image_pixel_limit_disabled(monkeypatch):
     monkeypatch.setattr(envs, "VLLM_MAX_IMAGE_PIXELS", 0)
 
     image = Image.new("RGB", (1000, 1000), (0, 0, 255))
+    from io import BytesIO
 
     buf = BytesIO()
     image.save(buf, format="PNG")
@@ -384,6 +369,8 @@ def test_image_pixel_limit_disabled(monkeypatch):
 
 
 def _png_bytes(width: int, height: int) -> bytes:
+    from io import BytesIO
+
     buf = BytesIO()
     Image.new("RGB", (width, height), (1, 2, 3)).save(buf, format="PNG")
     return buf.getvalue()

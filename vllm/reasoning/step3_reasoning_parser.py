@@ -10,7 +10,6 @@ from transformers import PreTrainedTokenizerBase
 
 from vllm.entrypoints.generate.base.protocol import DeltaMessage
 from vllm.reasoning import ReasoningParser
-from vllm.v1.token_buffer import rfind_tokens
 
 if TYPE_CHECKING:
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
@@ -107,7 +106,7 @@ class Step3ReasoningParser(ReasoningParser):
             return reasoning, content
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
-        return rfind_tokens(input_ids, (self.think_end_token_id,)) >= 0
+        return self.think_end_token_id in input_ids
 
     def is_reasoning_end_streaming(
         self, input_ids: Sequence[int], delta_ids: Iterable[int]

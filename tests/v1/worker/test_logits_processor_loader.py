@@ -18,6 +18,9 @@ import torch
 import vllm.v1.worker.gpu.sample.logits_processor.loader as loader
 from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import SamplingParams
+from vllm.v1.sample.logits_processor import (
+    LogitsProcessor as V1LogitsProcessor,
+)
 from vllm.v1.worker.gpu.sample.logits_processor import (
     LogitsContext,
     LogitsProcessor,
@@ -38,9 +41,9 @@ class AltV2Processor(DummyV2Processor):
     """Second V2 processor, used to assert plugin/FQCN load ordering."""
 
 
-class NonSubclassProcessor:
-    """Not a LogitsProcessor subclass. Never instantiated: the loader must
-    reject it at the issubclass check, before any constructor runs."""
+class DummyV1Processor(V1LogitsProcessor):
+    """A V1-interface processor. Never instantiated: the loader must reject
+    it at the issubclass check, before any constructor runs."""
 
 
 def not_a_processor() -> None:
@@ -108,25 +111,25 @@ def test_loads_v2_processors(monkeypatch: pytest.MonkeyPatch, source: ProcSource
     ("custom", "plugin_cls", "exc_type", "msg_fragment"),
     [
         pytest.param(
-            [NonSubclassProcessor],
+            [DummyV1Processor],
             None,
             ValueError,
             "not a subclass",
-            id="non-subclass-class-object",
+            id="v1-class-object",
         ),
         pytest.param(
-            [f"{__name__}:NonSubclassProcessor"],
+            [f"{__name__}:DummyV1Processor"],
             None,
             ValueError,
             "not a subclass",
-            id="non-subclass-fqcn",
+            id="v1-fqcn",
         ),
         pytest.param(
             [],
-            NonSubclassProcessor,
+            DummyV1Processor,
             ValueError,
             "V1-interface plugins are not supported",
-            id="non-subclass-entrypoint",
+            id="v1-entrypoint",
         ),
         pytest.param(
             [f"{__name__}:not_a_processor"],
@@ -165,7 +168,7 @@ def test_rejects_invalid(
     exc_type: type[Exception],
     msg_fragment: str,
 ):
-    """Non-subclass processors and malformed references fail at load time, not at
+    """V1 processors and malformed references fail at load time, not at
     sampling time, with a message naming the offending reference."""
     if plugin_cls is not None:
         monkeypatch.setattr(
@@ -219,6 +222,7 @@ def test_loader_import_stays_frontend_safe():
         "import sys\n"
         "import vllm.v1.worker.gpu.sample.logits_processor.loader\n"
         "assert 'vllm.sampling_params' not in sys.modules\n"
+        "assert 'vllm.v1.sample.logits_processor' not in sys.modules\n"
         "assert 'vllm.v1.worker.gpu.states' not in sys.modules\n"
         "assert 'vllm.v1.worker.gpu.buffer_utils' not in sys.modules\n"
     )

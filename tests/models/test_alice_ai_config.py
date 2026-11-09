@@ -6,7 +6,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.v1.spec_decode.utils import fake_speculative_config
 from vllm.model_executor.models.config import AliceAIForCausalLMConfig
 
 
@@ -83,10 +82,7 @@ def test_runtime_config_rejects_unsupported_alice_modes(
         speculative_config=(
             None
             if speculative_method is None
-            else fake_speculative_config(
-                method=speculative_method,
-                draft_model_config=SimpleNamespace(hf_config=SimpleNamespace()),
-            )
+            else SimpleNamespace(method=speculative_method)
         ),
     )
 

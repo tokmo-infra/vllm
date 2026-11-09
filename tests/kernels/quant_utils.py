@@ -155,7 +155,9 @@ def native_w8a8_block_matmul(
     return C
 
 
-def native_per_token_group_quant_fp8(x, group_size, eps=1e-10, dtype=FP8_DTYPE):
+def native_per_token_group_quant_fp8(
+    x, group_size, eps=1e-10, dtype=torch.float8_e4m3fn
+):
     """Function to perform per-token-group quantization on an input tensor
     `x` using native torch."""
     assert x.shape[-1] % group_size == 0, (
@@ -163,7 +165,9 @@ def native_per_token_group_quant_fp8(x, group_size, eps=1e-10, dtype=FP8_DTYPE):
     )
     assert x.is_contiguous(), "`x` is not contiguous"
 
-    fp8_min, fp8_max = get_fp8_min_max()
+    finfo = torch.finfo(dtype)
+    fp8_min = finfo.min
+    fp8_max = finfo.max
 
     x_ = x.reshape(x.numel() // group_size, group_size)
     amax = x_.abs().max(dim=-1, keepdim=True)[0].clamp(min=eps).to(torch.float32)

@@ -40,8 +40,6 @@ class _QueryAttention(nn.Module):
 def test_draft_attention_stores_kv_after_compile(
     dist_init, monkeypatch, kv_cache_dtype, query_pre_quantized
 ):
-    from transformers import MiniMaxM3VLTextConfig
-
     from vllm.compilation.decorators import support_torch_compile
     from vllm.config import (
         CompilationConfig,
@@ -52,9 +50,10 @@ def test_draft_attention_stores_kv_after_compile(
     )
     from vllm.forward_context import set_forward_context
     from vllm.models.minimax_m3.common.dspark import MiniMaxM3DSparkAttention
+    from vllm.transformers_utils.configs.minimax_m3 import MiniMaxM3TextConfig
 
     monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", "1")
-    config = MiniMaxM3VLTextConfig(
+    config = MiniMaxM3TextConfig(
         hidden_size=512,
         num_attention_heads=8,
         num_key_value_heads=2,

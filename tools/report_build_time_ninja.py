@@ -84,7 +84,7 @@ class Target:
         # Allow for modest floating-point errors
         epsilon = 0.000002
         if self.weighted_duration > self.Duration() + epsilon:
-            print(f"{self.weighted_duration} > {self.Duration()}?")
+            print("{} > {}?".format(self.weighted_duration, self.Duration()))
         assert self.weighted_duration <= self.Duration() + epsilon
         return self.weighted_duration
 
@@ -106,7 +106,9 @@ def ReadTargets(log, show_all):
 
     The result is a list of Target objects."""
     header = log.readline()
-    assert header == "# ninja log v5\n", f"unrecognized ninja log version {header!r}"
+    assert header == "# ninja log v5\n", "unrecognized ninja log version {!r}".format(
+        header
+    )
     targets_dict = {}
     last_end_seen = 0.0
     for line in log:
@@ -256,8 +258,9 @@ def SummarizeEntries(entries, extra_step_types):
     if abs(length - weighted_total) > 500:
         print(
             "Warning: Possible corrupt ninja log, results may be "
-            f"untrustworthy. Length = {length:.3f}, "
-            f"weighted total = {weighted_total:.3f}"
+            "untrustworthy. Length = {:.3f}, weighted total = {:.3f}".format(
+                length, weighted_total
+            )
         )
 
     entries_by_ext = defaultdict(list)
@@ -266,21 +269,25 @@ def SummarizeEntries(entries, extra_step_types):
         entries_by_ext[extension].append(target)
 
     for key, values in entries_by_ext.items():
-        print(f"    Longest build steps for {key}:")
+        print("    Longest build steps for {}:".format(key))
         values.sort(key=lambda x: x.WeightedDuration())
         for target in values[-long_count:]:
             print(
-                f"      {target.WeightedDuration():8.1f} weighted s to build "
-                f"{target.DescribeTargets()} ({target.Duration():.1f} s elapsed time)"
+                "      {:8.1f} weighted s to build {} ({:.1f} s elapsed time)".format(
+                    target.WeightedDuration(),
+                    target.DescribeTargets(),
+                    target.Duration(),
+                )
             )
 
     print(
-        f"    {length:.1f} s weighted time ({total_cpu_time:.1f} s elapsed time sum, "
-        f"{total_cpu_time * 1.0 / length:1.1f}x parallelism)"
+        "    {:.1f} s weighted time ({:.1f} s elapsed time sum, {:1.1f}x "
+        "parallelism)".format(length, total_cpu_time, total_cpu_time * 1.0 / length)
     )
     print(
-        f"    {len(entries)} build steps completed, "
-        f"average of {len(entries) / (length):1.2f}/s"
+        "    {} build steps completed, average of {:1.2f}/s".format(
+            len(entries), len(entries) / (length)
+        )
     )
 
 
@@ -309,7 +316,7 @@ def main():
             entries = ReadTargets(log, False)
             SummarizeEntries(entries, args.step_types)
     except OSError:
-        print(f"Log file {log_file!r} not found, no build summary created.")
+        print("Log file {!r} not found, no build summary created.".format(log_file))
         return errno.ENOENT
 
 

@@ -584,7 +584,7 @@ def test_candidate_walk_revisited_position_matches_step_seed(use_fp64):
         pytest.param(False, "missing_weight_scale_2", True, id="missing-global-scale"),
     ],
 )
-def test_checkpoint_rejects_wrong_heads_and_allows_partial_buckets(
+def test_checkpoint_coverage_rejects_incomplete_or_wrong_heads(
     monkeypatch, convolution, mismatch, quantized
 ):
     from vllm.model_executor.models.lilicorr import LiLiCorr, LiLiCorrForCausalLM
@@ -593,7 +593,6 @@ def test_checkpoint_rejects_wrong_heads_and_allows_partial_buckets(
     nn.Module.__init__(wrapper)
     wrapper.model = LiLiCorr.__new__(LiLiCorr)
     nn.Module.__init__(wrapper.model)
-    wrapper.model._context_kv_proj = None  # set by __init__ (no MXFP8 projection)
     wrapper.has_own_lm_head = False
     with set_current_vllm_config(
         VllmConfig(
@@ -661,8 +660,13 @@ def test_checkpoint_rejects_wrong_heads_and_allows_partial_buckets(
         wrapper.model, "_build_fused_kv_buffers", lambda: None, raising=False
     )
     supplied = [("model." + name, value) for name, value in weights.items()]
-    if mismatch and mismatch.startswith("extra"):
-        with pytest.raises(ValueError, match="no module or parameter"):
+    if mismatch:
+        message = (
+            "no module or parameter"
+            if mismatch.startswith("extra")
+            else "coverage mismatch"
+        )
+        with pytest.raises(ValueError, match=message):
             wrapper.load_weights(supplied)
     else:
         wrapper.load_weights(supplied)
@@ -737,7 +741,10 @@ def owned_head_model(monkeypatch):
     return build
 
 
-def test_owned_nvfp4_lm_head_loads_required_checkpoint_tensors(owned_head_model):
+@pytest.mark.parametrize("missing", [None, "weight", "weight_scale", "weight_scale_2"])
+def test_owned_nvfp4_lm_head_loads_required_checkpoint_tensors(
+    owned_head_model, missing
+):
     model, _ = owned_head_model()
     assert model.lm_head.weight.dtype == torch.uint8
     assert model.lm_head.weight.shape == (64, 8)
@@ -745,12 +752,17 @@ def test_owned_nvfp4_lm_head_loads_required_checkpoint_tensors(owned_head_model)
         name: torch.ones_like(value) for name, value in model.state_dict().items()
     }
     del weights["lm_head.input_scale"]  # Deprecated and unused for W4A16.
-    model.load_weights(weights.items())
-    assert model.has_own_lm_head
-    for name in ("weight", "weight_scale", "weight_scale_2"):
-        torch.testing.assert_close(
-            getattr(model.lm_head, name), weights[f"lm_head.{name}"]
-        )
+    if missing:
+        del weights[f"lm_head.{missing}"]
+        with pytest.raises(ValueError, match=f"lm_head.{missing}"):
+            model.load_weights(weights.items())
+    else:
+        model.load_weights(weights.items())
+        assert model.has_own_lm_head
+        for name in ("weight", "weight_scale", "weight_scale_2"):
+            torch.testing.assert_close(
+                getattr(model.lm_head, name), weights[f"lm_head.{name}"]
+            )
 
 
 @pytest.mark.parametrize("owned", [False, True])

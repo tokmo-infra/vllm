@@ -10,10 +10,8 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
-from vllm.model_executor.model_loader.weight_utils import finalize_model_weights
-from vllm.model_executor.utils import weights_already_processed
 
-from .lifecycle import finish_reload, start_reload
+from .layerwise import finalize_layerwise_reload, initialize_layerwise_reload
 
 logger = init_logger(__name__)
 
@@ -93,10 +91,9 @@ def reload_weights(
     logger.info_once("Reloading weights inplace...")
     if is_checkpoint_format:
         # load weights from checkpoint/ original model format
-        device = torch.device(load_config.device or vllm_config.device_config.device)
-        start_reload(model)
+        initialize_layerwise_reload(model)
         loaded_weights = model.load_weights(weights_iterator)
-        finish_reload(model, model_config, device)
+        finalize_layerwise_reload(model, model_config)
 
     else:
         # load weights from kernel format
@@ -109,9 +106,6 @@ def reload_weights(
             param = get_parameter_for_reload(model, name)  # TODO: buffers?
             param.copy_(loaded_weight)
             loaded_weights.add(name)
-        # kernel-format weights: hooks rebuild derived state, transform nothing
-        with weights_already_processed():
-            finalize_model_weights(model)
 
     # logging and validation
     counter_after_reloading = time.perf_counter()

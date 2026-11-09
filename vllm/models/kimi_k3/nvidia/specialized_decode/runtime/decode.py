@@ -19,7 +19,6 @@ from ...ops import attn_res
 from ..cutedsl.attn_res.prepared import PreparedAttnRes
 from ..cutedsl.common.embedding import PreparedEmbedding
 from ..cutedsl.common.twoshot import TwoShot
-from ..cutedsl.kda.prepared import PreparedKda
 from ..cutedsl.moe.dense import PreparedDenseMLP
 from ..cutedsl.moe.experts_runtime import PersistentExperts
 from ..cutedsl.moe.front import SharedFront
@@ -102,11 +101,7 @@ def caches_of(attention):
 class SpecializedDecode:
     """Built once the weights are loaded; owns every prepared provider, the
     mailboxes and the decode buffers. Reads the backbone, never modifies it (but
-    for the deferred RecoverSSM's per-instance KDA verify, `recoverssm.state`)."""
-
-    attention: dict[int, Any]
-    feed_forward: dict[int, Any]
-    wide_moe: dict[int, Any]
+    for the deferred RecoverSSM's per-instance KDA verify, ``recoverssm.state``)."""
 
     def __init__(self, backbone, config):
         # The deferred RecoverSSM's KDA layers, before any provider reads them.
@@ -198,7 +193,7 @@ class SpecializedDecode:
     def build_dep(self, rounded):
         """DEP: no full specialized step (its MoE, o-projection and AttnRes
         providers are TP8 / TP16 ones); every decode or uniform verify step of up
-        to the KV cache dtype's DEP_ROWS rows runs `run_wide` with the DEP_KINDS
+        to the KV cache dtype's DEP_ROWS rows runs ``run_wide`` with the DEP_KINDS
         attention layers specialized at TP1 (runtime.dep.DepAttention), the rest
         stock."""
         from .dep import (
@@ -233,7 +228,7 @@ class SpecializedDecode:
                 self.wide_moe[layer.layer_idx] = moe
 
     def wide_batches(self, kind):
-        """The wide step rows whose `kind` attention layers run the specialized
+        """The wide step rows whose ``kind`` attention layers run the specialized
         projection and core."""
         return tuple(b for b in self.wide if b <= self.wide_cap[kind])
 
@@ -252,7 +247,6 @@ class SpecializedDecode:
         for d in layers:  # before the prefetch tables take the weight addresses
             if attention_kind(d.self_attn) == "dsa":
                 pack_dsa_projection(d.self_attn)
-        self.packed = packed
         prefetch = self.prefetch = PrefetchController(self, layers, packed)
         state = self.moe_state = MoEScratch(tp, device, batches)
         mailbox, tail_box, moe_layers = (
@@ -263,10 +257,10 @@ class SpecializedDecode:
         twoshot = TwoShot(*owner)
         front_box = OprojMailbox(*owner, (1, 64, 3584 + 2 * 896))
         small_batch = small_batch_chain.SmallBatchBox(*owner)
-        self.attention = {}
-        self.feed_forward = {}
+        self.attention: dict[int, Attention] = {}
+        self.feed_forward: dict[int, Any] = {}
         # Wide steps' MoE layers (moe.wide), sharing one scratch.
-        self.wide_moe = {}
+        self.wide_moe: dict[int, WideMoE] = {}
         wide = wide_batches(self.wide)
         wide_state = WideScratch(tp, device, wide) if wide else None
         for layer in layers:
@@ -299,37 +293,13 @@ class SpecializedDecode:
             )
             self.feed_forward[index] = moe
             if wide_state is not None:
-                self.wide_moe[index] = WideMoE(
-                    module,
-                    experts,
-                    wide_state,
-                    beta,
-                    linear_beta,
-                    packed=packed[index],
-                )
+                args = (module, experts, wide_state, beta, linear_beta)
+                self.wide_moe[index] = WideMoE(*args, packed=packed[index])
 
     def bind_model_state(self, state):
         """Install the runner-state side of the deferred RecoverSSM on the model
-        runner state (`recoverssm.state.install_model_state`)."""
+        runner state (``recoverssm.state.install_model_state``)."""
         install_recoverssm_model_state(state)
-
-    @torch.no_grad()
-    def process_weights_after_loading(self):
-        """After a weight reload: re-derive, in place, the copies built from the
-        weights. Everything else reads the backbone's tensors directly, which a
-        reload refills at the same addresses."""
-        for layer in self.layers:
-            if layer.is_moe_layer:
-                fresh = pack_front(layer.mlp, self.rank, self.tp)
-                self.packed[layer.layer_idx].copy_(fresh)
-            else:
-                self.feed_forward[layer.layer_idx].process_weights_after_loading(
-                    layer.mlp
-                )
-            core = self.attention[layer.layer_idx].core
-            # KDA keeps derived copies; MLA reads the backbone's tensors
-            if isinstance(core, PreparedKda):
-                core.process_weights_after_loading(layer.self_attn)
 
     def prepare_kv(self):
         """Compile each layer's cores for its bound KV cache layout. The memory
@@ -357,11 +327,11 @@ class SpecializedDecode:
         """This step's decode plan, or None to run the stock forward instead.
 
         Steps that run the stock forward:
-        - pipeline-parallel stage inputs (`intermediate_tensors`);
-        - token counts without prepared providers (not in `batches`, and not a
-          wide verify step: q > 1 and in `wide`, the rows past the step cap
+        - pipeline-parallel stage inputs (``intermediate_tensors``);
+        - token counts without prepared providers (not in ``batches``, and not a
+          wide verify step: q > 1 and in ``wide``, the rows past the step cap
           that some attention layer kind's projection and core take, run_wide);
-        - steps before `prepare_kv` bound the KV cache (the memory profiling's
+        - steps before ``prepare_kv`` bound the KV cache (the memory profiling's
           cache is never prepared);
         - steps outside a CUDA graph capture (profiling, warmup and the warmup run
           before each capture), so every stock kernel runs before its capture;
@@ -466,10 +436,8 @@ class SpecializedDecode:
             # moe.wide for the rows it prepared (65-WIDE_ROWS); dense MLP and any
             # other wide rows (a step cap below 64): stock.
             moe = self.wide_moe.get(layer.layer_idx)
-            if moe is not None and moe.serves(b):
-                hidden = moe.run(hidden)
-            else:
-                hidden = layer.mlp(hidden)
+            wide_moe = moe is not None and moe.serves(b)
+            hidden = moe.run(hidden) if wide_moe else layer.mlp(hidden)
             if layer.layer_idx + 1 in self.aux_layers:
                 aux.append(
                     backbone._capture_aux_hidden_stream(
@@ -497,7 +465,7 @@ class SpecializedDecode:
 
         Runs in chunks of at most 255 rows: the stock RMSNorm kernel reduces with
         1024-thread blocks below 256 rows and 256-thread blocks above, so chunking keeps
-        the reduction order `compute_logits` uses for the few sampled rows, and
+        the reduction order ``compute_logits`` uses for the few sampled rows, and
         prefill logits match stock.
         """
         hidden, aux = output if isinstance(output, tuple) else (output, None)

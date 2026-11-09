@@ -129,7 +129,7 @@ class DirectCPWorkspace:
 
     def _multicast_ptrs(self, storage: torch.Tensor) -> list[int]:
         disabled = [0] * self.num_ubatches
-        for allocated, handle, _ in self._allocations:  # noqa: B007
+        for allocated, handle, _ in self._allocations:
             if allocated is storage:
                 break
         else:

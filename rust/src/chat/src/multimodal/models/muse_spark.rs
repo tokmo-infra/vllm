@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-//! Muse Spark Omni model spec: NaViT vision (image + video) and raw-waveform
-//! audio on the Muse Spark stack.
+//! MuseSpark1x Omni model spec: NaViT vision (image + video) and raw-waveform
+//! audio on the MuseSpark1x stack.
 //!
 //! Mirrors vLLM `models/muse_spark/common/processor.py`
-//! (`MuseSparkOmniMultiModalProcessor`):
+//! (`MuseSpark1xOmniMultiModalProcessor`):
 //!
 //! - Placeholders are the vocabulary tokens `<|patch|>`, `<|video|>`, `<|audio|>`;
 //!   structural/embedding token ids are resolved from the tokenizer vocabulary
@@ -471,7 +471,7 @@ mod tests {
 
         let config = json!({"model_type": "unknown"});
         let id_metadata = ModelMetadata {
-            model_id: "example/Muse-Spark-Omni",
+            model_id: "example/Muse-Spark-1x-Omni",
             ..metadata(&tokenizer, &config)
         };
         let spec = lookup_spec(&id_metadata).unwrap();

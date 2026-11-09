@@ -44,9 +44,7 @@ __global__ void __launch_bounds__(512, 1)
 #pragma unroll
   for (int i = 0; i < ngpus; i++) {
     int target = (rank + i) % ngpus;
-    // Absolute rank order (same as 1-stage); tmps keeps the (rank + i) rotation
-    // for stage 2.
-    ptrs[i] = (const P*)_dp->ptrs[i];
+    ptrs[i] = (const P*)_dp->ptrs[target];
     tmps[i] = get_tmp_buf<P>(sg.signals[target]);
   }
   auto tmp_out = tmps[0];

@@ -255,7 +255,7 @@ def order16(bits):
 
 
 def exact_topk(bits, k):
-    """Key indices of the top `k` of BF16 `bits` (ties to the lowest index),
+    """Key indices of the top ``k`` of BF16 ``bits`` (ties to the lowest index),
     in key order."""
     pos = torch.arange(bits.shape[0], device=bits.device)
     key = order16(bits.int()).long() << 32 | (2**32 - 1 - pos)
@@ -328,9 +328,7 @@ def deepgemm_logits(x, rows, q, max_len):
     table = x.table.repeat_interleave(q, 0)[:rows].contiguous()
     indices = torch.arange(rows, dtype=torch.int32, device="cuda")
     schedule = get_paged_mqa_logits_metadata(lens, UNIT, get_num_sms(), indices)
-    q_scale, weights = mqa_logits_mx_inputs(
-        query, q_scale, x.weights[:rows], torch.bfloat16
-    )
+    q_scale, weights = mqa_logits_mx_inputs(query, q_scale, x.weights[:rows])
     return fp8_fp4_paged_mqa_logits(
         (query, q_scale),
         kv_cache_as_quant_view(x.index, 128, True),
@@ -339,7 +337,6 @@ def deepgemm_logits(x, rows, q, max_len):
         table,
         schedule,
         max_model_len=max_len,
-        logits_dtype=torch.bfloat16,
         indices=indices,
     )
 
@@ -658,13 +655,8 @@ def _local_select(rows, n, pitch, world):
 
 def _local_workspace(world, rank, max_rows, topk, n):
     """A rescue workspace whose W peers are this GPU's own buffers."""
-    from vllm.models.kimi_k3.nvidia.ops.dcp_topk_merge import (
-        packed_row_words,
-        rescue_slots,
-    )
-    from vllm.models.kimi_k3.nvidia.ops.dcp_topk_merge.kernels import (
-        DCPTopkRescueWorkspace,
-    )
+    from vllm.v1.attention.ops.dcp_topk_merge import packed_row_words, rescue_slots
+    from vllm.v1.attention.ops.dcp_topk_merge.kernels import DCPTopkRescueWorkspace
 
     ws = DCPTopkRescueWorkspace.__new__(DCPTopkRescueWorkspace)
     slots = rescue_slots(topk, n)
@@ -672,10 +664,8 @@ def _local_workspace(world, rank, max_rows, topk, n):
         max_rows, slots, packed_row_words(topk), dtype=torch.int32, device="cuda"
     )
     flags = torch.zeros(world, max_rows, dtype=torch.int32, device="cuda")
-    peer_recv, peer_flags = (
-        torch.tensor([t.data_ptr()] * world, device="cuda") for t in (recv, flags)
-    )
-    ws._init(recv, flags, peer_recv, peer_flags, max_rows, topk, n)
+    ptrs = [torch.tensor([t.data_ptr()] * world, device="cuda") for t in (recv, flags)]
+    ws._init(recv, flags, *ptrs, max_rows, topk, n)
     ws.world_size, ws.rank, ws.device_group = world, rank, None
     return ws
 
@@ -705,11 +695,6 @@ def test_dcp_topk_exchange_merge(case):
     threshold score (the merge's tie ranking and its radix fallback)."""
     from types import SimpleNamespace as NS
 
-    from vllm.models.kimi_k3.nvidia.ops.dcp_topk_merge import dcp_merge_local_topk
-    from vllm.models.kimi_k3.nvidia.ops.dcp_topk_merge.kernels import (
-        _RowsOutput,
-        dcp_topk_select,
-    )
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.common.host import (
         dynamic_view,
         stream,
@@ -718,6 +703,11 @@ def test_dcp_topk_exchange_merge(case):
     from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.dsa.topk_exchange import (  # noqa: E501
         ExchangeMerge,
         ll_pairs,
+    )
+    from vllm.v1.attention.ops.dcp_topk_merge import dcp_merge_local_topk
+    from vllm.v1.attention.ops.dcp_topk_merge.kernels import (
+        _RowsOutput,
+        dcp_topk_select,
     )
 
     contexts, q, kind = EXCHANGE_CASES[case]

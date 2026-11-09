@@ -3,15 +3,18 @@
 
 use super::types::{GenerateOutputMode, GenerateRequest};
 use crate::error::{ApiError, bail_invalid_request};
-use crate::model_names::ServedModelNames;
 
 /// Enforce the minimal compatibility contract for the Rust token generate
 /// route.
 pub(crate) fn validate_request_compat(
     request: &GenerateRequest,
-    served_model_names: &ServedModelNames,
+    served_model_names: &[String],
 ) -> Result<(), ApiError> {
-    served_model_names.check(request.model.as_deref())?;
+    if let Some(model) = request.model.as_ref()
+        && !served_model_names.iter().any(|n| n == model)
+    {
+        return Err(ApiError::model_not_found(model.clone()));
+    }
 
     if request.sampling_params.n.unwrap_or(1) != 1 {
         bail_invalid_request!(param = "n", "Only n=1 is supported.");
@@ -93,7 +96,6 @@ mod tests {
     use serde_json::json;
 
     use super::validate_request_compat;
-    use crate::model_names::ServedModelNames;
     use crate::routes::inference::generate::types::GenerateRequest;
 
     fn base_request() -> GenerateRequest {
@@ -105,8 +107,8 @@ mod tests {
         .expect("parse request")
     }
 
-    fn served(names: &[&str]) -> ServedModelNames {
-        ServedModelNames::new(names.iter().map(|s| s.to_string()).collect())
+    fn served(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]

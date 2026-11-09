@@ -71,8 +71,13 @@ def get_named_metrics_from_prometheus() -> list[tuple[str, float]]:
     """Collects current metrics from Prometheus and returns some of them
     in the form of the `named_metrics` list for `create_orca_header()`.
 
-    Returns:
-        List of tuples of metric names and their values.
+    Parameters
+    ----------
+    - None
+
+    Returns
+    -------
+    - list[tuple[str, float]]: List of tuples of metric names and their values.
 
     """
     named_metrics: list[tuple[str, float]] = []

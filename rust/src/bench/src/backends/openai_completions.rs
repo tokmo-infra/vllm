@@ -6,10 +6,9 @@ use std::time::Instant;
 
 use futures::StreamExt;
 
-use super::streaming::StreamedResponseHandler;
+use super::streaming::{StreamedResponseHandler, trim_bytes};
 use super::{
-    CompletionChunk, NO_VALID_CHUNK_ERROR, RequestFuncInput, RequestFuncOutput, build_headers,
-    update_server_metrics,
+    CompletionChunk, RequestFuncInput, RequestFuncOutput, build_headers, update_server_metrics,
 };
 use crate::error::Result;
 
@@ -98,16 +97,30 @@ impl OpenAICompletionsBackend {
                             }
                         };
 
-                        let messages = handler.add_chunk(&chunk_bytes);
+                        let trimmed_bytes = trim_bytes(&chunk_bytes);
+                        if trimmed_bytes.is_empty() {
+                            continue;
+                        }
+
+                        let messages = handler.add_chunk(trimmed_bytes);
                         for message in messages {
-                            // Take the data: line of each event, which may carry other
-                            // fields (Dynamo sends "event: message\ndata: {...}").
-                            // Comments and other events without data are skipped.
-                            let Some(chunk) =
-                                message.lines().find_map(|l| l.strip_prefix("data: "))
-                            else {
+                            // Skip SSE comments
+                            if message.starts_with(':') {
                                 continue;
+                            }
+
+                            // Handle multi-field SSE events (e.g., Dynamo sends
+                            // "event: message\ndata: {...}"). Extract the data: line.
+                            let raw = if message.contains('\n') {
+                                match message.lines().find(|l| l.starts_with("data: ")) {
+                                    Some(l) => l,
+                                    None => continue,
+                                }
+                            } else {
+                                message.as_str()
                             };
+
+                            let chunk = raw.strip_prefix("data: ").unwrap_or(raw);
 
                             if chunk == "[DONE]" {
                                 continue;
@@ -153,7 +166,9 @@ impl OpenAICompletionsBackend {
                         output.success = true;
                     } else {
                         output.success = false;
-                        output.error = NO_VALID_CHUNK_ERROR.to_string();
+                        output.error = "Never received a valid chunk to calculate TTFT. \
+                                        This response will be marked as failed!"
+                            .to_string();
                     }
                     output.generated_text = generated_text;
                     output.latency = most_recent_timestamp.duration_since(st).as_secs_f64();

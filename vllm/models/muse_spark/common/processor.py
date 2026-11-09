@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Multimodal preprocessing for Muse Spark Omni checkpoints."""
+"""Multimodal preprocessing for MuseSpark1x Omni checkpoints."""
 
 import itertools
 import math
@@ -446,11 +446,11 @@ VIDEO_PROCESSOR_MAPPING_NAMES.setdefault("muse_spark", "MuseSparkVideoProcessor"
     "muse_spark",
     video_processor="MuseSparkVideoProcessor",
 )
-class MuseSparkOmniVideoBackend(VideoBackend):
+class MuseSpark1xOmniVideoBackend(VideoBackend):
     """Video loader that applies the model's frame sampling at load time.
 
-    The connector's default `num_frames=32` is indistinguishable from an
-    explicit request, so `num_frames` is always replaced by the model's cap.
+    The connector's default ``num_frames=32`` is indistinguishable from an
+    explicit request, so ``num_frames`` is always replaced by the model's cap.
     """
 
     @classmethod
@@ -481,7 +481,7 @@ class MuseSparkOmniVideoBackend(VideoBackend):
         return np.linspace(0, total - 1, n, dtype=int).tolist()
 
 
-class MuseSparkOmniProcessingInfo(BaseProcessingInfo):
+class MuseSpark1xOmniProcessingInfo(BaseProcessingInfo):
     def get_placeholder(self, modality: str) -> str:
         if modality == "image":
             return "<|patch|>"
@@ -568,8 +568,8 @@ class MuseSparkOmniProcessingInfo(BaseProcessingInfo):
         )
 
 
-class MuseSparkOmniDummyInputsBuilder(
-    BaseDummyInputsBuilder[MuseSparkOmniProcessingInfo]
+class MuseSpark1xOmniDummyInputsBuilder(
+    BaseDummyInputsBuilder[MuseSpark1xOmniProcessingInfo]
 ):
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
         parts: list[str] = ["Question:"]
@@ -623,8 +623,8 @@ class MuseSparkOmniDummyInputsBuilder(
         return data
 
 
-class MuseSparkOmniMultiModalProcessor(
-    BaseMultiModalProcessor[MuseSparkOmniProcessingInfo]
+class MuseSpark1xOmniMultiModalProcessor(
+    BaseMultiModalProcessor[MuseSpark1xOmniProcessingInfo]
 ):
     """Omni processor using native preprocessing instead of an HF processor."""
 

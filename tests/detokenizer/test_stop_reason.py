@@ -17,9 +17,6 @@ MODEL = "distilbert/distilgpt2"
 STOP_STR = "."
 SEED = 42
 MAX_TOKENS = 1024
-# Sampled tokens depend on batch composition, which depends on timing, so
-# without a bias some trajectories never emit STOP_STR within MAX_TOKENS.
-STOP_BIAS = 5.0
 
 
 @pytest.fixture
@@ -41,7 +38,6 @@ def test_stop_reason(vllm_model, example_prompts):
             seed=SEED,
             max_tokens=MAX_TOKENS,
             stop_token_ids=[stop_token_id],
-            logit_bias={stop_token_id: STOP_BIAS},
         ),
     )
     for output in outputs:
@@ -53,11 +49,7 @@ def test_stop_reason(vllm_model, example_prompts):
     outputs = llm.generate(
         example_prompts,
         sampling_params=SamplingParams(
-            ignore_eos=True,
-            seed=SEED,
-            max_tokens=MAX_TOKENS,
-            stop=".",
-            logit_bias={stop_token_id: STOP_BIAS},
+            ignore_eos=True, seed=SEED, max_tokens=MAX_TOKENS, stop="."
         ),
     )
     for output in outputs:

@@ -69,6 +69,7 @@ from vllm.scalar_type import ScalarType
 from vllm.utils.humming import create_humming_locks
 from vllm.utils.import_utils import has_humming
 from vllm.utils.platform_utils import num_compute_units
+from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.utils.humming import (
@@ -300,7 +301,7 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
 
     @classmethod
     def is_batched(cls) -> bool:
-        return cls.activation_format().is_batched
+        return cls.activation_format() == mk.FusedMoEActivationFormat.BatchedExperts
 
     @staticmethod
     def _supports_quant_scheme(
@@ -595,6 +596,17 @@ class HummingExpertsBase(mk.FusedMoEExpertsModular):
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         return self._workspace_shapes(M, topk, activation)
 
+    def make_workspaces(self, M: int, topk: int, activation: MoEActivation):
+        shapes = self._workspace_shapes(M, topk, activation)
+        workspace1_shape, workspace2_shape, output_shape = shapes
+        torch_dtype = self.moe_config.in_dtype
+        workspace1, workspace2 = current_workspace_manager().get_simultaneous(
+            (workspace1_shape, torch_dtype),
+            (workspace2_shape, torch_dtype),
+        )
+        output = _resize_cache(workspace1, output_shape)
+        return workspace1, workspace2, output
+
     def prepare_buffers(
         self,
         workspace1: torch.Tensor,
@@ -668,7 +680,7 @@ class HummingIndexedExperts(HummingExpertsBase):
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
-        return mk.FusedMoEActivationFormat.PaddedStandard
+        return mk.FusedMoEActivationFormat.Standard
 
     @staticmethod
     def humming_gemm_type() -> "HummingGemmType":
@@ -880,7 +892,7 @@ class HummingGroupedExperts(HummingExpertsBase):
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
-        return mk.FusedMoEActivationFormat.PaddedStandard
+        return mk.FusedMoEActivationFormat.Standard
 
     @staticmethod
     def humming_gemm_type() -> "HummingGemmType":

@@ -56,9 +56,9 @@ def load_shared_bf16x4(pointer):
 
 
 class KdaStream(KdaWide):
-    """KdaWide's operands and semantics; `ctas` persistent CTAs (two per SM),
-    `conv_dim_first` the convolution cache layout ([channel, window] when true,
-    else [window, channel] per slot) and `window` its length."""
+    """KdaWide's operands and semantics; ``ctas`` persistent CTAs (two per SM),
+    ``conv_dim_first`` the convolution cache layout ([channel, window] when true,
+    else [window, channel] per slot) and ``window`` its length."""
 
     def __init__(
         self,
@@ -124,7 +124,7 @@ class KdaStream(KdaWide):
                     copy_g2s(at(convs, part, per * k), source)
         else:
             row_granules: cutlass.Constexpr = 128 // per
-            total: cutlass.Constexpr = 9 * row_granules  # type: ignore[no-redef]
+            total: cutlass.Constexpr = 9 * row_granules
             for j in cutlass.range_constexpr((total + THREADS - 1) // THREADS):
                 g = tid + THREADS * j
                 if g < total:

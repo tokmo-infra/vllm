@@ -400,11 +400,11 @@ def test_muse_megamoe_dummy_loading(tmp_path, monkeypatch, vllm_runner, nvfp4):
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     ModelRegistry.register_model(
-        "MuseSparkForCausalLM",
-        "vllm.models.muse_spark.nvidia.model:MuseSparkForCausalLM",
+        "MuseSpark1xForCausalLM",
+        "vllm.models.muse_spark.nvidia.model:MuseSpark1xForCausalLM",
     )
     config = dict(
-        architectures=["MuseSparkForCausalLM"],
+        architectures=["MuseSpark1xForCausalLM"],
         model_type="muse_spark_text",
         vocab_size=128,
         hidden_size=512,

@@ -51,7 +51,7 @@ HF_IMAGE_PROMPTS = IMAGE_ASSETS.prompts(
     }
 )
 
-MODELS = ["vllm-project/e5-v"]
+MODELS = ["royokong/e5-v"]
 
 
 def _run_test(
@@ -126,7 +126,7 @@ def test_models_text(
         hf_runner,
         vllm_runner,
         input_texts,
-        input_images,
+        input_images,  # type: ignore
         model,
         dtype=dtype,
     )

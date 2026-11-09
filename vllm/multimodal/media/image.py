@@ -103,7 +103,6 @@ class ImageMediaIO(MediaIO[Image.Image]):
             Image.UnidentifiedImageError,
             SyntaxError,
             RuntimeError,
-            Image.DecompressionBombError,
         ) as e:
             raise ValueError(f"Failed to load image: {e}") from e
 

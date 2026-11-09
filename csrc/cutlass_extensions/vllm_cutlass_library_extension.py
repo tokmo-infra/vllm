@@ -3,15 +3,7 @@
 
 import enum
 
-from cutlass_library import (
-    DataType,
-    DataTypeNames,
-    DataTypeSize,
-    DataTypeTag,
-    KernelScheduleTag,
-    KernelScheduleType,
-    enum_auto,
-)
+from cutlass_library import *
 
 #
 #   Extend cutlass library with custom types, and missing values

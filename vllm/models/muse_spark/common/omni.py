@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Muse Spark Omni: NaViT vision and waveform audio on the Muse Spark stack."""
+"""MuseSpark1x Omni: NaViT vision and waveform audio on the MuseSpark1x stack."""
 
 import itertools
 import math
@@ -34,11 +34,11 @@ from vllm.model_executor.models.vision import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from .audio import AutoEncoder
-from .layers import MuseSparkRMSNorm
+from .layers import MuseSpark1xRMSNorm
 from .processor import (
-    MuseSparkOmniDummyInputsBuilder,
-    MuseSparkOmniMultiModalProcessor,
-    MuseSparkOmniProcessingInfo,
+    MuseSpark1xOmniDummyInputsBuilder,
+    MuseSpark1xOmniMultiModalProcessor,
+    MuseSpark1xOmniProcessingInfo,
 )
 from .vision import NaViT, get_navit_patch_count, get_navit_video_patch_count
 
@@ -139,16 +139,16 @@ OMNI_WEIGHTS_MAPPER = WeightsMapper(
 def register_omni_processor(cls: type) -> type:
     """Register the Omni multimodal processor for a vendor's Omni class."""
     return MULTIMODAL_REGISTRY.register_processor(
-        MuseSparkOmniMultiModalProcessor,
-        info=MuseSparkOmniProcessingInfo,
-        dummy_inputs=MuseSparkOmniDummyInputsBuilder,
+        MuseSpark1xOmniMultiModalProcessor,
+        info=MuseSpark1xOmniProcessingInfo,
+        dummy_inputs=MuseSpark1xOmniDummyInputsBuilder,
     )(cls)
 
 
-class MuseSparkOmniMixin:
+class MuseSpark1xOmniMixin:
     """The Omni towers, their embedding merge and their weight mapping.
 
-    Not a `Protocol`: it precedes the text stack in the bases so `__init__`
+    Not a ``Protocol``: it precedes the text stack in the bases so ``__init__``
     runs after the stack is built, and a Protocol would swallow that chain.
     """
 
@@ -204,7 +204,7 @@ class MuseSparkOmniMixin:
                     quant_config=None,
                     prefix=maybe_prefix(prefix, "vision_projection"),
                 )
-                self.perception_emb_norm = MuseSparkRMSNorm(
+                self.perception_emb_norm = MuseSpark1xRMSNorm(
                     llm_hidden_size, eps=1e-5, has_weight=False
                 )
 
@@ -549,4 +549,4 @@ class MuseSparkOmniMixin:
         )
 
 
-__all__ = ["OMNI_WEIGHTS_MAPPER", "MuseSparkOmniMixin", "register_omni_processor"]
+__all__ = ["OMNI_WEIGHTS_MAPPER", "MuseSpark1xOmniMixin", "register_omni_processor"]

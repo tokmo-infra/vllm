@@ -54,15 +54,16 @@ class LoRARequest(
         return self.lora_path
 
     def __eq__(self, value: object) -> bool:
-        """Compares lora_name and lora_int_id. A name loaded again at runtime
-        gets a new lora_int_id while requests for the old one may still be
-        running, and the engine needs both adapters active.
+        """Overrides the equality method to compare LoRARequest
+        instances based on lora_name. This allows for identification
+        and comparison lora adapter across engines.
         """
-        return (
-            isinstance(value, self.__class__)
-            and self.lora_name == value.lora_name
-            and self.lora_int_id == value.lora_int_id
-        )
+        return isinstance(value, self.__class__) and self.lora_name == value.lora_name
 
     def __hash__(self) -> int:
-        return hash((self.lora_name, self.lora_int_id))
+        """Overrides the hash method to hash LoRARequest instances
+        based on lora_name. This ensures that LoRARequest instances
+        can be used in hash-based collections such as sets and dictionaries,
+        identified by their names across engines.
+        """
+        return hash(self.lora_name)

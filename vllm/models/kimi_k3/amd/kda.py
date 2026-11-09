@@ -44,7 +44,7 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
-from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.utils import is_weights_pre_processed, set_weight_attrs
 from vllm.models.kimi_k3.amd.kda_metadata import (
     PREFILL_CONV_BLOCK_M,
     KimiK3ROCmKDABackend,
@@ -74,7 +74,7 @@ logger = init_logger(__name__)
 
 
 class _PaddedKimiGDNMergedColumnParallelLinear(_KimiGDNMergedColumnParallelLinear):
-    """Merged projection with `padding_size` zero rows appended per rank."""
+    """Merged projection with ``padding_size`` zero rows appended per rank."""
 
     def __init__(self, *args, padding_size: int = 0, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -127,18 +127,10 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> MambaSpec:
         spec = super().get_kv_cache_spec(vllm_config)
         assert isinstance(spec, MambaSpec)
-        # Only the fused path exports the checkpoint snapshots. AITER's
-        # chunk_kda cannot, so the gluon backend hands the steps that carry a
-        # checkpoint to the fused kernel when the build has it.
+        # Only the fused path exports the checkpoint snapshots
         can_checkpoint = (
             self.use_prefill_checkpoint
-            and (
-                self.kda_prefill_backend == "fused"
-                or (
-                    self.kda_prefill_backend == "gluon"
-                    and is_fused_kda_chunk_supported()
-                )
-            )
+            and self.kda_prefill_backend == "fused"
             and self.use_safe_gate
         )
         if can_checkpoint and vllm_config.cache_config.mamba_cache_mode == "align":
@@ -238,6 +230,13 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         self.use_aiter_decode = recurrent_state_dtype == torch.float32 and bool(
             rocm_aiter_ops.is_kda_gluon_decode_available()
         )
+        self.aiter_supports_strided_state = False
+        if self.use_aiter_decode:
+            from aiter.ops.triton.attention.kda import fused_recurrent_kda as aiter_kda
+
+            self.aiter_supports_strided_state = bool(
+                getattr(aiter_kda, "supports_unaligned_state_stride", False)
+            )
         use_hip_decode = not self.use_aiter_decode and is_fused_kda_decode_supported(
             self.local_num_heads,
             self.head_dim,
@@ -345,7 +344,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         compilation_config.static_forward_context[prefix] = self
 
     @torch.no_grad()
-    def process_weights_after_loading(self) -> None:
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        if is_weights_pre_processed():
+            return
         if self.decode_conv1d_weight is not None:
             self.decode_conv1d_weight.copy_(
                 self.conv1d.weight.view(
@@ -451,8 +452,16 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         if not is_conv_state_dim_first():
             conv_state = conv_state.transpose(-1, -2)
 
+        # The packed DSA block row gives state slots a fractional-row pitch.
+        # Older AITER versions address states by whole rows and cannot take
+        # that, so only fuse when the installed kernel declares support.
+        use_aiter_decode = self.use_aiter_decode and (
+            self.aiter_supports_strided_state
+            or recurrent_state.stride(0) % recurrent_state.shape[-1] == 0
+        )
+
         if (
-            self.use_aiter_decode
+            use_aiter_decode
             and spec_sequence_masks is None
             and m.num_prefills == 0
             and m.num_decodes > 0
@@ -476,11 +485,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             )
             return
 
-        if (
-            self.use_aiter_decode
-            and spec_sequence_masks is not None
-            and m.num_prefills == 0
-        ):
+        if use_aiter_decode and spec_sequence_masks is not None and m.num_prefills == 0:
             # Spec-only batch (gdn_attn never mixes spec and plain decodes).
             assert spec_state_indices_tensor is not None
             assert spec_query_start_loc is not None
@@ -766,12 +771,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     cu_seqlens=prefill_query_start_loc,
                     chunk_indices=m.chunk_indices,
                     chunk_offsets=m.chunk_offsets,
-                    # Checkpoint metadata exists only when get_kv_cache_spec
-                    # reserved the block, which it does only with the fused
-                    # kernel available.
-                    backend=(
-                        "fused" if checkpoint is not None else self.kda_prefill_backend
-                    ),
+                    backend=self.kda_prefill_backend,
                     out=core_attn_out[:, nd_tok:num_actual_tokens] if direct else None,
                     checkpoint_state=checkpoint_state,
                     checkpoint_offsets=checkpoint_offsets,

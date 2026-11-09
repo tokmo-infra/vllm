@@ -124,7 +124,7 @@ def wide(heads, requests, tokens, record):
     return heads * requests >= WIDE_ITEMS[kind_of(tokens, record)]
 
 
-def stream_layout(specs, tokens) -> tuple[bool, int] | None:
+def stream_layout(specs, tokens):
     """(conv dim-first, window) when KdaStream can cp.async this step's operands
     (16-byte aligned rows and slots), else None."""
     (_, x_stride, _), conv = specs[0], specs[3]
@@ -215,8 +215,8 @@ def deferred_supported(backend, state, lower_bound):
     """Whether the KDA metadata of the specialized decode defers a layer's RecoverSSM
     commit: the layer's RecoverSSM kernels are Triton (the stock FP32-state path) and
     the specialized FP32 commit can fold its checkpoints (FP32 [slot, H, 128, 128] on
-    SM10x, a bounded gate). `recoverssm.context.KDADeferredCommitContext` takes
-    the same decision (its commit backend `fp32_deferred`)."""
+    SM10x, a bounded gate). ``recoverssm.context.KDADeferredCommitContext`` takes
+    the same decision (its commit backend ``fp32_deferred``)."""
     from .commit import supported
 
     return backend == "triton" and supported(state, lower_bound)
@@ -244,18 +244,11 @@ class PreparedKda:
         self.conv_dim_first, self.kernels = conv_dim_first, {}
         # RecoverSSM: verify steps leave the state checkpoint and write the records.
         records = getattr(attention, "recoverssm_records", None)
-        self.records: tuple = (records.correction, records.key_gate) if records else ()
+        self.records = (records.correction, records.key_gate) if records else ()
         self.backend = getattr(attention, "recoverssm_backend", None)
         self.lower_bound = attention.gate_lower_bound
         self.fused = False  # set by prepare_caches (deferred_supported)
         self.flushes = set()  # deferred steps that fold the replays first (keys)
-
-    @torch.no_grad()
-    def process_weights_after_loading(self, attention):
-        """Refill the derived conv weight and FP32 norm after a weight reload."""
-        conv_w, *_, norm = self.weights
-        conv_w.copy_(decode_conv_weight(attention.conv1d.weight))
-        norm.copy_(attention.o_norm.weight)
 
     def _operands(self, caches, projected, slots, out, accepted=None, deferred=()):
         """Kernel tensors in launch order: 13 before the scalars, then F_B (and the
@@ -288,7 +281,7 @@ class PreparedKda:
             slots = torch.empty(shape, dtype=torch.int32, **meta)
             accepted = accepted if tokens > 1 else None
             fused = record and self.fused
-            deferred: tuple = ()
+            deferred = ()
             if fused and not replays(self.heads, requests, True):
                 self.flushes.add(key)
             if fused:
@@ -305,13 +298,13 @@ class PreparedKda:
         return self
 
     def run(self, projected, out, *, caches, slots, accepted=None, q=1, deferred=None):
-        """`accepted` [>= B] (verify steps of `q` tokens): `slots` is [>= B, q]
-        contiguous, or [>= B, 1] (the checkpoints) under RecoverSSM. `deferred`
-        (the KDA metadata's `recoverssm_deferred`): the record rows [>= B] and
+        """``accepted`` [>= B] (verify steps of ``q`` tokens): ``slots`` is [>= B, q]
+        contiguous, or [>= B, 1] (the checkpoints) under RecoverSSM. ``deferred``
+        (the KDA metadata's ``recoverssm_deferred``): the record rows [>= B] and
         pending counts of a deferred RecoverSSM step."""
         batch = projected.shape[0]
         key, rows = batch, batch
-        extra: tuple = ()
+        extra = ()
         if accepted is not None:
             rows = batch // q
             key, accepted = (rows, q), accepted[:rows]

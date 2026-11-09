@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Muse Spark text model for AMD ROCm GPUs."""
+"""MuseSpark1x text model for AMD ROCm GPUs."""
 
 import functools
 import math
@@ -42,16 +42,16 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.models.muse_spark.common.layers import (
     MulTanhSoftCap,
-    MuseSparkNormPreservingResidualConnection,
-    MuseSparkQKVOGateParallelLinear,
-    MuseSparkResidualConnection,
-    MuseSparkResidualStream,
-    MuseSparkRMSNorm,
-    MuseSparkRMSNormWithInputScale,
+    MuseSpark1xNormPreservingResidualConnection,
+    MuseSpark1xQKVOGateParallelLinear,
+    MuseSpark1xResidualConnection,
+    MuseSpark1xResidualStream,
+    MuseSpark1xRMSNorm,
+    MuseSpark1xRMSNormWithInputScale,
     materialize_residual_path_constants,
     norm_then_gated_residual,
 )
-from vllm.models.muse_spark.common.moe import MuseSparkMoEConfig, MuseSparkRouter
+from vllm.models.muse_spark.common.moe import MuseSpark1xRouter, MuseSparkMoEConfig
 from vllm.models.muse_spark.common.ops.fused_qk_norm_rope_kv import (
     supports_fused_kv_insert,
 )
@@ -69,7 +69,6 @@ from vllm.transformers_utils.configs.muse_spark import (
     MuseSparkTextConfig,
 )
 
-from .mono import MuseSparkMono, maybe_attach_mono
 from .muse_moe_runner import (
     MuseMoERunner,
     MuseSparkQuarkOCPMXFusedMoE,
@@ -100,16 +99,16 @@ def _supports_router_bf16x3_device() -> bool:
 
 
 def norm_residual_then_norm(
-    x: MuseSparkResidualStream,
-    pre_norm: MuseSparkRMSNorm,
+    x: MuseSpark1xResidualStream,
+    pre_norm: MuseSpark1xRMSNorm,
     *,
     out_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Post-norm, blend and pre-norm in one kernel; returns `(out, new_stream)`."""
+    """Post-norm, blend and pre-norm in one kernel; returns ``(out, new_stream)``."""
     post_norm, connection = x.post_norm, x.connection
     branch, stream = x.branch, x.stream
     if (
-        isinstance(connection, MuseSparkNormPreservingResidualConnection)
+        isinstance(connection, MuseSpark1xNormPreservingResidualConnection)
         and getattr(connection, "_coefficients_ready", False)
         and post_norm.supports_fused_kernel(branch)
         and pre_norm.supports_fused_kernel(stream)
@@ -150,7 +149,7 @@ class MuseSparkTorchLinearMethod(UnquantizedLinearMethod):
         return F.linear(x, layer.weight, bias)
 
 
-class MuseSparkMoE(nn.Module):
+class MuseSpark1xMoE(nn.Module):
     post_norm_routed_experts_cls = MuseSparkRoutedExperts
     post_norm_runner_cls = MuseMoERunner
 
@@ -201,7 +200,7 @@ class MuseSparkMoE(nn.Module):
         self._router_multiplier_folded = False
         self.router.weight.weight_loader = self._load_router_weight
 
-        self.moe_router = MuseSparkRouter(
+        self.moe_router = MuseSpark1xRouter(
             top_k=config.num_experts_per_tok,
             num_experts=config.num_local_experts,
             expert_bias=self.expert_bias,
@@ -232,7 +231,7 @@ class MuseSparkMoE(nn.Module):
         self.unpooler.quant_method = MuseSparkTorchLinearMethod()
 
         if self.pooler is not None:
-            self.pre_expert_norm: MuseSparkRMSNorm | None = MuseSparkRMSNorm(
+            self.pre_expert_norm: MuseSpark1xRMSNorm | None = MuseSpark1xRMSNorm(
                 hidden_size=hidden_size,
                 eps=config.rms_norm_eps,
                 has_weight=True,
@@ -247,15 +246,17 @@ class MuseSparkMoE(nn.Module):
 
         self.intermediate_size = config.moe_intermediate_size
 
-        self.post_expert_norm: MuseSparkRMSNorm | None = MuseSparkRMSNormWithInputScale(
-            hidden_size=hidden_size,
-            eps=config.post_norm_eps,
-            has_weight=True,
-            is_post_norm=True,
-            zero_centered_gamma=True,
-            post_norm_gain_center_type="one",
-            residual_id=None,
-            output_norm_gain_center_type="zero",
+        self.post_expert_norm: MuseSpark1xRMSNorm | None = (
+            MuseSpark1xRMSNormWithInputScale(
+                hidden_size=hidden_size,
+                eps=config.post_norm_eps,
+                has_weight=True,
+                is_post_norm=True,
+                zero_centered_gamma=True,
+                post_norm_gain_center_type="one",
+                residual_id=None,
+                output_norm_gain_center_type="zero",
+            )
         )
         self.experts: nn.Module = FusedMoEFactory(
             num_experts=config.num_local_experts,
@@ -371,7 +372,7 @@ class MuseSparkMoE(nn.Module):
         return experts_out
 
 
-class MuseSparkAttention(nn.Module):
+class MuseSpark1xAttention(nn.Module):
     def __init__(
         self,
         config: MuseSparkTextConfig | MuseSparkDSparkConfig,
@@ -424,7 +425,7 @@ class MuseSparkAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
 
         self.qk_norm = (
-            MuseSparkRMSNorm(
+            MuseSpark1xRMSNorm(
                 hidden_size=self.head_dim,
                 eps=config.rms_norm_eps,
                 has_weight=False,  # matches the training side
@@ -437,7 +438,7 @@ class MuseSparkAttention(nn.Module):
         )
         self.default_dtype = torch.get_default_dtype()
         self.o_norm = (
-            MuseSparkRMSNorm(
+            MuseSpark1xRMSNorm(
                 hidden_size=self.head_dim,
                 eps=config.rms_norm_eps,
                 has_weight=False,
@@ -464,7 +465,7 @@ class MuseSparkAttention(nn.Module):
             # Exact since RoPE is a rotation; keeps the QK-norm weightless.
             self.scaling *= self.scale_query_by
 
-        self.pre_qkv_proj_norm = MuseSparkRMSNorm(
+        self.pre_qkv_proj_norm = MuseSpark1xRMSNorm(
             hidden_size=self.hidden_size,
             eps=config.rms_norm_eps,
             has_weight=norm_affine,
@@ -485,7 +486,7 @@ class MuseSparkAttention(nn.Module):
                 prefix=f"{prefix}.qkv_proj",
             )
         else:
-            self.qkv_proj = MuseSparkQKVOGateParallelLinear(
+            self.qkv_proj = MuseSpark1xQKVOGateParallelLinear(
                 hidden_size=self.hidden_size,
                 head_size=self.head_dim,
                 total_num_heads=self.total_num_heads,
@@ -581,7 +582,7 @@ class MuseSparkAttention(nn.Module):
         floor_scale: float,
         q_scale: float,
     ) -> torch.Tensor:
-        """Query scale: 1.0 up to `floor_scale`, logarithmic above it."""
+        """Query scale: 1.0 up to ``floor_scale``, logarithmic above it."""
         scaling = torch.log((positions.float() + 1.0) / floor_scale) * q_scale + 1.0
         return scaling.clamp_min(1.0).unsqueeze(-1)
 
@@ -597,7 +598,7 @@ class MuseSparkAttention(nn.Module):
     def _qk_norm_rope_kv_insert(
         self, qkv: torch.Tensor, positions: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """QK-norm, temperature scale and RoPE; returns `(q, k, v, o_gate)`."""
+        """QK-norm, temperature scale and RoPE; returns ``(q, k, v, o_gate)``."""
         cos_sin_cache = None
         rotary_dim = 0
         if self.use_rope:
@@ -664,10 +665,7 @@ class MuseSparkAttention(nn.Module):
             attn_output = self.attn(q, None, None)
         else:
             attn_output = self.attn(q, k, v)
-        return self.back(attn_output, og)
 
-    def back(self, attn_output: torch.Tensor, og: torch.Tensor | None) -> torch.Tensor:
-        """O-norm, O-gate and the output projection."""
         if self.fuse_o_norm_gate:
             assert og is not None
             attn_output = attn_output.reshape(-1, self.num_heads, self.head_dim)
@@ -697,8 +695,8 @@ class MuseSparkAttention(nn.Module):
         return output
 
 
-class MuseSparkDecoderLayer(nn.Module):
-    moe_cls = MuseSparkMoE
+class MuseSpark1xDecoderLayer(nn.Module):
+    moe_cls = MuseSpark1xMoE
 
     def __init__(
         self,
@@ -729,7 +727,7 @@ class MuseSparkDecoderLayer(nn.Module):
         self.layer_idx = extract_layer_index(prefix)
         self.hidden_size = config.hidden_size
 
-        self.self_attn = MuseSparkAttention(
+        self.self_attn = MuseSpark1xAttention(
             config=config,
             max_position_embeddings=(
                 max(
@@ -753,7 +751,7 @@ class MuseSparkDecoderLayer(nn.Module):
             if is_draft
             else config.mlp_layer_types[self.layer_idx] == "sparse"
         )
-        self.pre_ffn_norm = MuseSparkRMSNorm(
+        self.pre_ffn_norm = MuseSpark1xRMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             has_weight=norm_affine,
@@ -783,7 +781,7 @@ class MuseSparkDecoderLayer(nn.Module):
                 bias=False,
                 prefix=f"{prefix}.feed_forward",
             )
-        self.post_attn_norm = MuseSparkRMSNorm(
+        self.post_attn_norm = MuseSpark1xRMSNorm(
             config.hidden_size,
             eps=post_norm_eps,
             has_weight=post_norm_affine,
@@ -794,7 +792,7 @@ class MuseSparkDecoderLayer(nn.Module):
             output_norm_gain_center_type=output_gain_center_type,
         )
         post_ffn_cls = (
-            MuseSparkRMSNormWithInputScale if learnable_scales else MuseSparkRMSNorm
+            MuseSpark1xRMSNormWithInputScale if learnable_scales else MuseSpark1xRMSNorm
         )
         self.post_ffn_norm = post_ffn_cls(
             config.hidden_size,
@@ -810,14 +808,14 @@ class MuseSparkDecoderLayer(nn.Module):
         self.default_dtype = torch.get_default_dtype()
 
         if not is_draft or config.use_residual_gate:
-            self.add_attn = MuseSparkNormPreservingResidualConnection(
+            self.add_attn = MuseSpark1xNormPreservingResidualConnection(
                 dim=config.hidden_size,
                 activation="sigmoid",
                 temperature=0.3 if is_draft else config.residual_gate_temperature,
                 use_stream_gate=True,
                 channel_wise=True,
             )
-            self.add_ffn = MuseSparkNormPreservingResidualConnection(
+            self.add_ffn = MuseSpark1xNormPreservingResidualConnection(
                 dim=config.hidden_size,
                 activation="sigmoid",
                 temperature=0.3 if is_draft else config.residual_gate_temperature,
@@ -825,14 +823,14 @@ class MuseSparkDecoderLayer(nn.Module):
                 channel_wise=True,
             )
         else:
-            self.add_attn = MuseSparkResidualConnection()
-            self.add_ffn = MuseSparkResidualConnection()
+            self.add_attn = MuseSpark1xResidualConnection()
+            self.add_ffn = MuseSpark1xResidualConnection()
 
     def forward(
         self,
         positions: torch.Tensor,
-        x: MuseSparkResidualStream | torch.Tensor,
-    ) -> MuseSparkResidualStream:
+        x: MuseSpark1xResidualStream | torch.Tensor,
+    ) -> MuseSpark1xResidualStream:
         """Run attention and FFN; the FFN boundary is returned unblended."""
         if isinstance(x, torch.Tensor):
             stream = x
@@ -846,14 +844,8 @@ class MuseSparkDecoderLayer(nn.Module):
         assert stream.dtype == self.residual_dtype
 
         attn_out = self.self_attn(positions=positions, hidden_states=attn_input)
-        return self.after_attention(stream, attn_out)
-
-    def after_attention(
-        self, stream: torch.Tensor, attn_out: torch.Tensor
-    ) -> MuseSparkResidualStream:
-        """Attention boundary and FFN; the FFN boundary is returned unblended."""
         ffn_in, stream = norm_residual_then_norm(
-            MuseSparkResidualStream(
+            MuseSpark1xResidualStream(
                 stream=stream,
                 branch=attn_out,
                 post_norm=self.post_attn_norm,
@@ -863,7 +855,7 @@ class MuseSparkDecoderLayer(nn.Module):
             out_dtype=self.default_dtype,
         )
         branch = self.feed_forward(ffn_in)
-        return MuseSparkResidualStream(
+        return MuseSpark1xResidualStream(
             stream=stream,
             branch=branch,
             post_norm=self.post_ffn_norm,
@@ -872,7 +864,7 @@ class MuseSparkDecoderLayer(nn.Module):
 
 
 def _drop_gate_up_stacking(base: WeightsMapper) -> WeightsMapper:
-    """Keep Quark's per-expert gate/up names unstacked for `RoutedExperts`."""
+    """Keep Quark's per-expert gate/up names unstacked for ``RoutedExperts``."""
     return WeightsMapper(
         orig_to_new_renaming=base.orig_to_new_renaming,
         orig_to_new_regex=base.orig_to_new_regex,
@@ -889,7 +881,7 @@ def _drop_gate_up_stacking(base: WeightsMapper) -> WeightsMapper:
 
 # Runs uncompiled under breakable cudagraphs; drop LlamaModel's torch.compile.
 @ignore_torch_compile
-class MuseSparkModel(LlamaModel):
+class MuseSpark1xModel(LlamaModel):
     hf_to_vllm_mapper = _drop_gate_up_stacking(LlamaModel.hf_to_vllm_mapper)
 
     def __init__(
@@ -897,13 +889,13 @@ class MuseSparkModel(LlamaModel):
         *,
         vllm_config: VllmConfig,
         prefix: str = "",
-        layer_type: type[MuseSparkDecoderLayer] = MuseSparkDecoderLayer,
+        layer_type: type[MuseSpark1xDecoderLayer] = MuseSpark1xDecoderLayer,
     ):
         super().__init__(vllm_config=vllm_config, prefix=prefix, layer_type=layer_type)
 
         config = self.config
         if get_pp_group().is_last_rank:
-            self.norm = MuseSparkRMSNorm(
+            self.norm = MuseSpark1xRMSNorm(
                 config.hidden_size,
                 eps=config.rms_norm_eps,
                 is_post_norm=False,
@@ -915,7 +907,7 @@ class MuseSparkModel(LlamaModel):
         else:
             self.norm = PPMissingLayer()
 
-        self.tok_embeddings_norm = MuseSparkRMSNorm(
+        self.tok_embeddings_norm = MuseSpark1xRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, has_weight=False
         )
 
@@ -924,8 +916,6 @@ class MuseSparkModel(LlamaModel):
 
         self.fuse_across_layers = get_pp_group().world_size == 1
         self.make_empty_intermediate_tensors = self._make_empty_intermediate_tensors
-        # Set after weight loading under --monokernel.
-        self.mono: MuseSparkMono | None = None
 
     def _make_empty_intermediate_tensors(
         self, batch_size: int, dtype: torch.dtype, device: torch.device
@@ -960,31 +950,26 @@ class MuseSparkModel(LlamaModel):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
 
-        x: MuseSparkResidualStream | torch.Tensor = hidden_states.to(
+        x: MuseSpark1xResidualStream | torch.Tensor = hidden_states.to(
             self.residual_dtype
         )
+        remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
         aux_hidden_states: list[torch.Tensor] = []
         if get_pp_group().is_first_rank:
             self._maybe_add_hidden_state(aux_hidden_states, self.start_layer, x, None)
-        mono_out = None
-        if self.mono is not None:
-            mono_out = self.mono.try_forward(self, positions, x, aux_hidden_states)
         for idx, layer in enumerate(
-            self.layers[self.start_layer : self.end_layer] if mono_out is None else [],
-            start=self.start_layer,
+            self.layers[self.start_layer : self.end_layer], start=self.start_layer
         ):
             x = layer(positions, x)
-            if not self.fuse_across_layers and isinstance(x, MuseSparkResidualStream):
+            if not self.fuse_across_layers and isinstance(x, MuseSpark1xResidualStream):
                 x = norm_then_gated_residual(x)
             if idx + 1 in self.aux_hidden_state_layers:
                 state = (
                     norm_then_gated_residual(x)
-                    if isinstance(x, MuseSparkResidualStream)
+                    if isinstance(x, MuseSpark1xResidualStream)
                     else x
                 )
                 aux_hidden_states.append(state)
-        if mono_out is not None:
-            x = mono_out
 
         if not get_pp_group().is_last_rank:
             assert isinstance(x, torch.Tensor)  # fuse_across_layers is off here
@@ -1001,14 +986,15 @@ class MuseSparkModel(LlamaModel):
             output, _ = norm_residual_then_norm(
                 x, self.norm, out_dtype=self.default_dtype
             )
+        aux_hidden_states = remote_aux + aux_hidden_states
         if aux_hidden_states:
             return output, aux_hidden_states
         return output
 
 
-class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
-    model_cls = MuseSparkModel
-    decoder_layer_cls = MuseSparkDecoderLayer
+class MuseSpark1xForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
+    model_cls = MuseSpark1xModel
+    decoder_layer_cls = MuseSpark1xDecoderLayer
     supported_quantization_configs: tuple[type[QuantizationConfig], ...] = (
         QuarkConfig,
     )
@@ -1026,20 +1012,20 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
         *,
         vllm_config: VllmConfig,
         prefix: str = "",
-        layer_type: type[MuseSparkDecoderLayer] | None = None,
+        layer_type: type[MuseSpark1xDecoderLayer] | None = None,
     ):
         config = vllm_config.model_config.hf_text_config
         gated_delta_net = getattr(config, "gated_delta_net", None)
         if gated_delta_net is not None and getattr(gated_delta_net, "enable", False):
             raise NotImplementedError(
-                "Muse Spark gated_delta_net layers are not supported by the "
+                "MuseSpark1x gated_delta_net layers are not supported by the "
                 "native vLLM text stack."
             )
         if vllm_config.quant_config is not None and not isinstance(
             vllm_config.quant_config, self.supported_quantization_configs
         ):
             raise NotImplementedError(
-                "Muse Spark on ROCm only supports "
+                "MuseSpark1x on ROCm only supports "
                 f"{self.supported_quantization_description} quantized checkpoints; "
                 "got quantization "
                 f"{vllm_config.quant_config.get_name()!r}."
@@ -1048,7 +1034,6 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
             layer_type = self.decoder_layer_cls
 
         super().__init__(vllm_config=vllm_config, prefix=prefix, layer_type=layer_type)
-        self.vllm_config = vllm_config
 
         # qkv_proj fuses Q+K+V+OG, so LoRA must treat it as one module.
         self.packed_modules_mapping = {  # type: ignore[misc]
@@ -1079,7 +1064,7 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
         self,
         vllm_config: VllmConfig,
         prefix: str = "",
-        layer_type: type[MuseSparkDecoderLayer] = MuseSparkDecoderLayer,
+        layer_type: type[MuseSpark1xDecoderLayer] = MuseSpark1xDecoderLayer,
     ):
         return self.model_cls(
             vllm_config=vllm_config, prefix=prefix, layer_type=layer_type
@@ -1092,8 +1077,8 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
             if isinstance(layer, PPMissingLayer):
                 continue
 
-            assert isinstance(layer, MuseSparkDecoderLayer)
-            if isinstance(layer.feed_forward, MuseSparkMoE):
+            assert isinstance(layer, MuseSpark1xDecoderLayer)
+            if isinstance(layer.feed_forward, MuseSpark1xMoE):
                 example_moe = layer.feed_forward
                 self.moe_layers.append(layer.feed_forward.experts)
 
@@ -1106,7 +1091,7 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
             self.num_routed_experts = 0
             self.num_shared_experts = 0
             self.num_redundant_experts = 0
-            logger.warning("No MuseSparkMoE layer found in model.layers.")
+            logger.warning("No MuseSpark1xMoE layer found in model.layers.")
         else:
             self.num_moe_layers = len(self.moe_layers)
             self.num_expert_groups = 1
@@ -1130,7 +1115,7 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
             if isinstance(layer, PPMissingLayer):
                 continue
 
-            if isinstance(layer.feed_forward, MuseSparkMoE):
+            if isinstance(layer.feed_forward, MuseSpark1xMoE):
                 moe = layer.feed_forward
                 moe.n_local_physical_experts = num_local_physical_experts
                 moe.n_physical_experts = num_physical_experts
@@ -1141,8 +1126,6 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        if self.model.mono is not None:
-            self.model.mono.poll_health()
         hidden_states = hidden_states.to(self.lm_head.weight.dtype)
         logits = self.logits_processor(self.lm_head, hidden_states)
         if logits is None:
@@ -1150,8 +1133,6 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
         return self._apply_output_transform(logits)
 
     def compute_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.model.mono is not None:
-            self.model.mono.poll_health()
         hidden_states = hidden_states.to(self.lm_head.weight.dtype)
         logits = self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
         return self._apply_output_transform(logits)
@@ -1198,27 +1179,23 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
                 yield name, weight
 
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(interleaved_weights(), mapper=self.hf_to_vllm_mapper)
-
-    def process_weights_after_loading(self) -> None:
+        loaded = loader.load_weights(
+            interleaved_weights(), mapper=self.hf_to_vllm_mapper
+        )
         n_gates = materialize_residual_path_constants(self)
         logger.info(
             "Materialized residual-path constants for %d gated residual connections",
             n_gates,
         )
-        # The experts are in their kernel layout only after the per-layer
-        # quant finalize, which runs between load_weights and this hook. The
-        # monokernel also needs the cached coefficients and the folded router
-        # weights from above.
-        maybe_attach_mono(self)
+        return loaded
 
 
 __all__ = [
-    "MuseSparkAttention",
-    "MuseSparkDecoderLayer",
-    "MuseSparkForCausalLM",
-    "MuseSparkMoE",
-    "MuseSparkModel",
+    "MuseSpark1xAttention",
+    "MuseSpark1xDecoderLayer",
+    "MuseSpark1xForCausalLM",
+    "MuseSpark1xMoE",
+    "MuseSpark1xModel",
     "MuseSparkTorchLinearMethod",
     "norm_residual_then_norm",
 ]

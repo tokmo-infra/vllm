@@ -21,7 +21,6 @@ from vllm.config.speculative import SpeculativeConfig
 from vllm.config.structured_outputs import StructuredOutputsBackend
 from vllm.parser.engine.adapters import ParserEngineReasoningAdapter
 from vllm.parser.engine.parser_engine import ReasoningEnd
-from vllm.reasoning import ReasoningParser
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
@@ -61,9 +60,8 @@ class FlowCase:
     xfail_guidance: str | None = None
 
 
-class MockReasoner(ReasoningParser):
+class MockReasoner:
     def __init__(self, tokenizer, marker: int | None = None):
-        super().__init__(tokenizer)
         self.marker = marker
 
     def is_reasoning_end(self, input_ids):
@@ -76,8 +74,8 @@ class MockReasoner(ReasoningParser):
 
 
 class MockEngineReasoner(ParserEngineReasoningAdapter):
-    """Ends reasoning implicitly on `marker`, which is also content, and
-    explicitly on `end_marker` when one is given."""
+    """Ends reasoning implicitly on ``marker``, which is also content, and
+    explicitly on ``end_marker`` when one is given."""
 
     def __init__(self, tokenizer, marker: int, end_marker: int | None = None):
         self.marker = marker

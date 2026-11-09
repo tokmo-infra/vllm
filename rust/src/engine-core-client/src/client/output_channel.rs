@@ -18,17 +18,12 @@
 //! values.
 
 use std::num::NonZeroU32;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::client::stream::{EngineCoreStreamDelivery as Delivery, EngineCoreStreamOutput};
 use crate::error::{Error, Result};
-
-/// Keep Tokio's 32-slot channel blocks pointer-sized.
-type QueuedOutput = Box<Result<Delivery>>;
 
 /// Create the output channel for one request.
 pub(crate) fn output_channel(stream_interval: NonZeroU32) -> (OutputSender, OutputReceiver) {
@@ -40,32 +35,16 @@ pub(crate) fn output_channel(stream_interval: NonZeroU32) -> (OutputSender, Outp
         buffered: Vec::new(),
         buffered_tokens: 0,
     };
-    (sender, OutputReceiver { rx })
+    (sender, rx)
 }
 
 /// Receiving half of a request's output channel.
-#[derive(Debug)]
-pub(crate) struct OutputReceiver {
-    rx: mpsc::UnboundedReceiver<QueuedOutput>,
-}
-
-impl OutputReceiver {
-    pub fn poll_recv(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Delivery>>> {
-        Pin::new(&mut self.get_mut().rx)
-            .poll_recv(cx)
-            .map(|item| item.map(|item| *item))
-    }
-
-    #[cfg(test)]
-    pub fn try_recv(&mut self) -> std::result::Result<Result<Delivery>, mpsc::error::TryRecvError> {
-        self.rx.try_recv().map(|item| *item)
-    }
-}
+pub(crate) type OutputReceiver = mpsc::UnboundedReceiver<Result<Delivery>>;
 
 /// Sending half of a request's output channel, owned by its registry entry.
 #[derive(Debug)]
 pub(crate) struct OutputSender {
-    tx: mpsc::UnboundedSender<QueuedOutput>,
+    tx: mpsc::UnboundedSender<Result<Delivery>>,
     /// Minimum number of new tokens per delivery after the first one.
     stream_interval: usize,
     /// Whether the first output has been delivered.
@@ -110,13 +89,11 @@ impl OutputSender {
     /// Deliver the held-back outputs, then terminate the stream with `error`.
     pub fn send_error(mut self, error: Error) {
         self.flush();
-        let _ = self.tx.send(Box::new(Err(error)));
+        let _ = self.tx.send(Err(error));
     }
 
     fn deliver(&self, delivery: Delivery) {
-        if let Err(mpsc::error::SendError(item)) = self.tx.send(Box::new(Ok(delivery)))
-            && let Ok(delivery) = *item
-        {
+        if let Err(mpsc::error::SendError(Ok(delivery))) = self.tx.send(Ok(delivery)) {
             debug!(
                 request_id = delivery.first().request_id,
                 "request output stream receiver dropped"

@@ -9,7 +9,6 @@ validated by this test module.
 
 import asyncio
 from collections import OrderedDict
-from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -18,7 +17,6 @@ import pytest
 import torch
 
 from tests.v1.attention.utils import dense_kv_cache_views
-from vllm import SamplingParams
 from vllm.config import set_current_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (
     KVConnectorRole,
@@ -28,17 +26,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     MooncakeXferMetadata,
     SendBlockMeta,
     TransferRegion,
+    _mamba_hetero_tp_segments,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_scheduler import (
-    NixlPushConnectorScheduler,
+from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
+    MambaConvSplitInfo,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.scheduler import (
-    NixlConnectorScheduler,
-)
-from vllm.utils.hashing import sha256
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -46,36 +40,25 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayout,
     MambaSpec,
 )
-from vllm.v1.request import Request
 
 from .test_mooncake_connector import patch_worker_dependencies
-from .utils import (
-    create_request,
-    create_scheduler,
-    create_vllm_config,
-    maybe_update_block_size,
-    set_mtp_config,
-)
+from .utils import create_request, create_vllm_config, maybe_update_block_size
 
 
 def noop_shutdown():
     pass
 
 
-def make_hybrid_gdn_kv_cache_config(
-    block_size: int, num_blocks: int = 16, mamba_cache_mode: str = "none"
-) -> KVCacheConfig:
+def make_hybrid_gdn_kv_cache_config(block_size: int) -> KVCacheConfig:
     gdn_spec = MambaSpec(
         block_size=block_size,
         shapes=((6, 3), (1, 2, 2)),
         dtypes=(torch.float16, torch.float16),
         mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
-        mamba_cache_mode=mamba_cache_mode,
     )
     assert gdn_spec.mamba_type == MambaAttentionBackendEnum.GDN_ATTN
     return KVCacheConfig(
-        num_blocks=num_blocks,
-        hash_block_size=block_size,
+        num_blocks=16,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
@@ -124,67 +107,6 @@ def test_hybrid_gdn_remote_prefill_uses_mamba_n_minus_one():
 
 
 @pytest.mark.cpu_test
-@pytest.mark.parametrize(
-    "kv_role,expected_attn_pull_blocks",
-    [
-        # The local attention prefix is kept; only the suffix and GDN state move.
-        ("kv_consumer", 2),
-        # Roles that prefill locally keep the reconciled lookup: no local hit.
-        ("kv_both", 6),
-    ],
-)
-def test_hybrid_gdn_remote_prefill_keeps_local_attention_prefix(
-    kv_role: str, expected_attn_pull_blocks: int
-):
-    vllm_config = create_vllm_config(kv_connector="MooncakeConnector", kv_role=kv_role)
-    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
-    vllm_config.cache_config.mamba_cache_mode = "align"
-    block_size = vllm_config.cache_config.block_size
-    kv_cache_config = make_hybrid_gdn_kv_cache_config(
-        block_size, num_blocks=64, mamba_cache_mode="align"
-    )
-    scheduler = create_scheduler(
-        vllm_config,
-        num_blocks=kv_cache_config.num_blocks,
-        kv_cache_config=kv_cache_config,
-    )
-    manager = scheduler.kv_cache_manager
-
-    # Cache a 4-block prefix, then evict its GDN states: the attention blocks
-    # stay hit while no block boundary has a local recurrent state.
-    prefix_len = 4 * block_size
-    fill = create_request(num_tokens=prefix_len, common_prefix_len=prefix_len)
-    computed_blocks, num_computed, _ = manager.get_computed_blocks(fill)
-    assert num_computed == 0
-    gdn_ids = []
-    for i in range(4):
-        manager.allocate_slots(
-            fill, block_size, new_computed_blocks=computed_blocks if i == 0 else None
-        )
-        fill.num_computed_tokens += block_size
-        gdn_ids.append(manager.get_block_ids(fill.request_id)[1][i])
-    manager.free(fill)
-    manager.block_pool.evict_blocks(set(gdn_ids))
-
-    replay = create_request(
-        num_tokens=6 * block_size, common_prefix_len=prefix_len, max_tokens=1
-    )
-    replay.kv_transfer_params = dict(
-        do_remote_prefill=True,
-        remote_engine_id="prefill-engine",
-        remote_bootstrap_addr="prefill-host:8998",
-        transfer_id="xfer-0",
-    )
-    scheduler.add_request(replay)
-    output = scheduler.schedule()
-
-    [pull] = output.kv_connector_metadata.reqs_to_recv["prefill-engine"].values()
-    attn_pull, gdn_pull = pull.local_block_ids
-    assert len(attn_pull) == expected_attn_pull_blocks
-    assert len(gdn_pull) == 1
-
-
-@pytest.mark.cpu_test
 def test_hybrid_gdn_remote_decode_truncates_prefill_before_cache_lookup():
     vllm_config = create_vllm_config(
         kv_connector="MooncakeConnector",
@@ -224,79 +146,6 @@ def test_hybrid_gdn_remote_decode_truncates_prefill_before_cache_lookup():
 
     assert num_new_tokens == 0
     assert is_async is False
-
-
-@pytest.mark.cpu_test
-@pytest.mark.parametrize(
-    "hash_block_size, num_lookahead, nixl_kept",
-    [(16, 0, 2), (16, 1, 2), (16, 5, 2), (4, 9, 1), (4, 17, 0)],
-)
-@pytest.mark.parametrize("use_embeds", [False, True])
-@pytest.mark.parametrize(
-    "scheduler_cls, connector_name",
-    [
-        (MooncakeConnectorScheduler, "MooncakeConnector"),
-        (NixlConnectorScheduler, "NixlConnector"),
-        (NixlPushConnectorScheduler, "NixlPushConnector"),
-    ],
-)
-def test_lookahead_hashes_follow_truncated_prefill(
-    scheduler_cls, connector_name, hash_block_size, num_lookahead, nixl_kept, use_embeds
-):
-    """P-side hashes must describe the shortened prompt and actual sampled token."""
-    block_size = 16
-    config = create_vllm_config(
-        kv_connector=connector_name,
-        kv_role="kv_producer",
-    )
-    if num_lookahead:
-        set_mtp_config(config, num_lookahead)
-    config.cache_config.prefix_match_unit = hash_block_size
-    kv_config = make_hybrid_gdn_kv_cache_config(block_size)
-    kv_config.hash_block_size = hash_block_size
-    group = kv_config.kv_cache_groups[1]
-    group.kv_cache_spec = replace(group.kv_cache_spec, mamba_cache_mode="align")
-    scheduler = scheduler_cls(config, "test-engine", kv_config)
-    init_none_hash(sha256)
-    hasher = get_request_block_hasher(hash_block_size, sha256, num_lookahead)
-    tokens = list(range(3 * hash_block_size + num_lookahead))
-    request = Request(
-        request_id="prefill",
-        prompt_token_ids=None if use_embeds else tokens,
-        prompt_embeds=(
-            torch.arange(len(tokens) * 4).reshape(-1, 4).float() if use_embeds else None
-        ),
-        sampling_params=SamplingParams(max_tokens=1),
-        pooling_params=None,
-        block_hasher=hasher,
-    )
-    request.kv_transfer_params = {"do_remote_decode": True}
-    original_hashes = request.block_hashes.copy()
-    assert len(original_hashes) == 3
-
-    scheduler.on_new_request(request)
-
-    kept = 2 if scheduler_cls is MooncakeConnectorScheduler else nixl_kept
-    assert request.block_hashes == original_hashes[:kept]
-    assert all(a is b for a, b in zip(request.block_hashes, original_hashes))
-    shortened_tokens = list(request.all_token_ids)
-    request.append_output_token_ids(999)
-    reference = Request(
-        request_id="reference",
-        prompt_token_ids=None if use_embeds else shortened_tokens,
-        prompt_embeds=request.prompt_embeds,
-        sampling_params=SamplingParams(max_tokens=1),
-        pooling_params=None,
-        block_hasher=hasher,
-    )
-    reference.append_output_token_ids(999)
-    assert request.block_hashes == reference.block_hashes
-    assert request.block_hashes != original_hashes
-    scheduler.on_new_request(request)
-    assert request.num_prompt_tokens == len(shortened_tokens)
-    assert request.block_hashes == reference.block_hashes
-    if isinstance(scheduler, (NixlConnectorScheduler, NixlPushConnectorScheduler)):
-        scheduler.shutdown()
 
 
 def test_register_kv_caches_emits_fa_and_gdn_regions(monkeypatch):
@@ -780,3 +629,205 @@ def test_hybrid_gdn_keeps_packed_fa_and_gdn_regions_whole(
         worker.shutdown()
         worker.shutdown = noop_shutdown
         connector.connector_worker = None
+
+
+def _gdn_page(q, k, v, ssm, rank: int, tp: int) -> bytes:
+    """One rank's DS-layout GDN page: [Q | K | V] conv rows, then temporal."""
+
+    def shard(x):
+        n = x.shape[0] // tp
+        return x[rank * n : (rank + 1) * n]
+
+    conv = torch.cat([shard(q), shard(k), shard(v)])
+    return conv.numpy().tobytes() + shard(ssm).numpy().tobytes()
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("p_tp", "d_tp"), [(8, 4), (4, 8), (2, 1), (1, 2), (8, 2), (4, 4)]
+)
+def test_mamba_hetero_tp_segments_reassemble_gdn_shards(p_tp: int, d_tp: int):
+    gen = torch.Generator().manual_seed(0)
+    rows, key_dim, value_dim, heads = 3, 16, 32, 8
+
+    def rand(*shape):
+        return torch.randint(-1000, 1000, shape, generator=gen).to(torch.float16)
+
+    q, k, v = rand(key_dim, rows), rand(key_dim, rows), rand(value_dim, rows)
+    ssm = rand(heads, 4, 4)
+    p_pages = [_gdn_page(q, k, v, ssm, rank, p_tp) for rank in range(p_tp)]
+    row_bytes = rows * 2
+    conv_proj_bytes = (
+        key_dim // p_tp * row_bytes,
+        key_dim // p_tp * row_bytes,
+        value_dim // p_tp * row_bytes,
+    )
+    ssm_bytes = heads // p_tp * 4 * 4 * 2
+
+    for d_rank in range(d_tp):
+        if p_tp >= d_tp:
+            ratio = p_tp // d_tp
+            p_ranks = range(d_rank * ratio, (d_rank + 1) * ratio)
+        else:
+            p_ranks = [d_rank // (d_tp // p_tp)]
+        expected = _gdn_page(q, k, v, ssm, d_rank, d_tp)
+        page = bytearray(len(expected))
+        for p_rank in p_ranks:
+            for src, dst, length in _mamba_hetero_tp_segments(
+                conv_proj_bytes, ssm_bytes, p_rank, p_tp, d_rank, d_tp
+            ):
+                page[dst : dst + length] = p_pages[p_rank][src : src + length]
+        assert bytes(page) == expected
+
+
+def _hetero_transfer_worker(
+    kv_cache_config: KVCacheConfig, tp_rank: int, tp_size: int
+) -> MooncakeConnectorWorker:
+    worker = object.__new__(MooncakeConnectorWorker)
+    worker.shutdown = noop_shutdown
+    worker.use_mla = False
+    worker.tp_rank = tp_rank
+    worker.tp_size = tp_size
+    worker.block_size = 16
+    # Replicated attention KV (as MLA): only the first producer rank sends it.
+    worker.transfer_topo = SimpleNamespace(local_replicates_kv_cache=True)
+    worker.kv_cache_config = kv_cache_config
+    worker._layer_specs = {
+        layer_name: group.kv_cache_spec
+        for group in kv_cache_config.kv_cache_groups
+        for layer_name in group.layer_names
+    }
+    # GDN spec of make_hybrid_gdn_kv_cache_config: fp16 conv (6, 3), ssm (1, 2, 2).
+    worker._mamba_conv_split = MambaConvSplitInfo(
+        conv_rows=3,
+        local_proj_dims=(2, 2, 2),
+        conv_dtype_size=2,
+        ssm_sizes=(36, 8),
+    )
+    return worker
+
+
+@pytest.mark.cpu_test
+@pytest.mark.asyncio
+async def test_build_transfer_params_hetero_block_size_and_tp():
+    # Producer TP2 with 2 kernel blocks per logical block feeds a consumer TP1
+    # with 4 (a hybrid model's logical block grows as TP shrinks).
+    kv_cache_config = make_hybrid_gdn_kv_cache_config(block_size=32)
+    worker = _hetero_transfer_worker(kv_cache_config, tp_rank=0, tp_size=2)
+    worker._physical_blocks_per_logical_kv_block = 2
+
+    fa, gdn = "model.layers.0.self_attn", "model.layers.1.linear_attn"
+    local_regions = [
+        TransferRegion(fa, 0, 0x1000, block_len=16, kv_block_len=16, group_index=0),
+        TransferRegion(gdn, 1, 0x8000, block_len=64, kv_block_len=64, group_index=1),
+    ]
+    remote_regions = [
+        TransferRegion(fa, 0, 0x100000, block_len=16, kv_block_len=16, group_index=0),
+        TransferRegion(
+            gdn, 1, 0x200000, block_len=128, kv_block_len=128, group_index=1
+        ),
+    ]
+    send_meta = SendBlockMeta(
+        p_req_id="p-req",
+        transfer_id="xfer",
+        # Two logical blocks (4 kernel blocks); GDN state in block 9.
+        local_block_ids=[[3, 5], [NULL_BLOCK_ID, 9]],
+        ready=asyncio.Event(),
+    )
+    xfer_meta = MooncakeXferMetadata(
+        remote_hostname="consumer-host",
+        remote_port=54321,
+        remote_tp_size=1,
+        remote_tp_rank=0,
+        # Two consumer logical blocks (8 kernel blocks), more than the prompt.
+        req_blocks={"d-req": ("xfer", [[1, 2], [2]])},
+        kv_caches_base_addr=[],
+        block_lens=[],
+        kv_block_lens=[],
+        kernel_block_size=16,
+        physical_blocks_per_logical=4,
+    )
+
+    (
+        src_ptrs,
+        dst_ptrs,
+        lengths,
+        err_reqs,
+        err_msg,
+    ) = await worker._build_transfer_params(
+        [("d-req", send_meta)], xfer_meta, local_regions, remote_regions
+    )
+
+    assert err_reqs == []
+    assert err_msg is None
+    # Attention: producer kernel blocks 6,7,10,11 -> consumer 4,5,6,7, as two
+    # contiguous runs; the consumer's extra kernel blocks are left alone.
+    attention = [(0x1000 + 6 * 16, 0x100000 + 4 * 16, 32)]
+    attention.append((0x1000 + 10 * 16, 0x100000 + 6 * 16, 32))
+    # GDN: rank 0's Q, K, V and temporal state into the first half of each
+    # part of the TP1 page (Q 12 B, K 12 B, V 12 B, ssm 8 B per rank).
+    gdn_src, gdn_dst = 0x8000 + 9 * 64, 0x200000 + 2 * 128
+    mamba = [
+        (gdn_src + src, gdn_dst + dst, length)
+        for src, dst, length in [(0, 0, 12), (12, 24, 12), (24, 48, 12), (36, 72, 8)]
+    ]
+    assert list(zip(src_ptrs, dst_ptrs, lengths)) == attention + mamba
+
+
+@pytest.mark.cpu_test
+def test_validate_hetero_layout():
+    kv_cache_config = make_hybrid_gdn_kv_cache_config(block_size=32)
+    worker = _hetero_transfer_worker(kv_cache_config, tp_rank=0, tp_size=2)
+    worker._physical_blocks_per_logical_kv_block = 2
+
+    def meta(**kwargs) -> MooncakeXferMetadata:
+        fields = dict(
+            remote_hostname="consumer-host",
+            remote_port=54321,
+            remote_tp_size=1,
+            remote_tp_rank=0,
+            req_blocks={},
+            kv_caches_base_addr=[],
+            block_lens=[],
+            kv_block_lens=[],
+            kernel_block_size=16,
+            physical_blocks_per_logical=4,
+        )
+        fields.update(kwargs)
+        return MooncakeXferMetadata(**fields)
+
+    assert worker._validate_hetero_layout(meta()) is None
+    # Old peers that do not send the layout are assumed to match.
+    assert (
+        worker._validate_hetero_layout(
+            meta(kernel_block_size=0, physical_blocks_per_logical=0)
+        )
+        is None
+    )
+    err = worker._validate_hetero_layout(meta(prefix_caching=True))
+    assert err is not None and "--no-enable-prefix-caching" in err
+    err = worker._validate_hetero_layout(meta(kernel_block_size=64))
+    assert err is not None and "kernel block sizes" in err
+    worker._mamba_conv_split = None
+    err = worker._validate_hetero_layout(meta())
+    assert err is not None and "VLLM_SSM_CONV_STATE_LAYOUT=DS" in err
+
+    # Attention-only models with different logical block sizes need the
+    # whole prompt from the consumer too.
+    attn_only = KVCacheConfig(
+        num_blocks=16,
+        kv_cache_tensors=[],
+        kv_cache_groups=kv_cache_config.kv_cache_groups[:1],
+    )
+    worker = _hetero_transfer_worker(attn_only, tp_rank=0, tp_size=1)
+    worker._physical_blocks_per_logical_kv_block = 2
+    assert worker._validate_hetero_layout(meta()) is None
+    err = worker._validate_hetero_layout(meta(prefix_caching=True))
+    assert err is not None and "--no-enable-prefix-caching" in err
+    # Same logical block size: prefix caching hits line up.
+    assert (
+        worker._validate_hetero_layout(
+            meta(prefix_caching=True, physical_blocks_per_logical=2)
+        )
+        is None
+    )

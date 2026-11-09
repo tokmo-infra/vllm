@@ -130,7 +130,12 @@ VAR_SEQ_LENS = [
 NUM_HEADS = [1, 16]
 NUM_KV_HEADS = [1]
 HEAD_SIZES = [64, 80]
-DTYPES = [torch.half, torch.bfloat16, torch.float]
+# flshattF and tritonflashattF supported: {torch.float16, torch.bfloat16}
+DTYPES = (
+    [torch.half, torch.bfloat16, torch.float]
+    if not current_platform.is_rocm()
+    else [torch.half, torch.bfloat16]
+)
 CUDA_DEVICES = ["cuda"]
 
 

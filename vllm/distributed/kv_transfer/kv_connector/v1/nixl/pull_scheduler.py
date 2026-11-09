@@ -158,12 +158,9 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                     # Each count fixes where that group's DCP slice starts, which the
                     # worker needs to line up with the remote's slice.
                     local_num_computed_blocks = tuple(
-                        len(
-                            [
-                                block
-                                for block in group
-                                if block.block_hash is not None and not block.is_null
-                            ]
+                        sum(
+                            block.block_hash is not None and not block.is_null
+                            for block in group
                         )
                         for group in blocks.blocks
                     )
@@ -274,9 +271,10 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
             # trimming down after allocating for the whole sequence length. Empty
             # blocks are always at the start of the list.
             # Here we "unpad" blocks to send the actual remote blocks to be read.
-            block_ids = self.get_exchange_clipped_blocks(block_ids)
-
             remote_num_tokens = request.num_computed_tokens
+            block_ids = self.get_exchange_clipped_blocks(
+                block_ids, num_tokens=remote_num_tokens
+            )
 
         return delay_free_blocks, dict(
             do_remote_prefill=is_p_node,

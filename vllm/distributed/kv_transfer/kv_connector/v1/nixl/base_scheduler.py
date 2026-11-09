@@ -251,7 +251,10 @@ class NixlBaseConnectorScheduler:
                     del self._heartbeat_by_engine[engine_id]
 
     def get_exchange_clipped_blocks(
-        self, block_ids: BlockIds, clip_ssm: bool = True
+        self,
+        block_ids: BlockIds,
+        clip_ssm: bool = True,
+        num_tokens: int | None = None,
     ) -> BlockIds:
         """Clip a request's block lists down to the transferable blocks.
 
@@ -264,9 +267,11 @@ class NixlBaseConnectorScheduler:
         speculative scratch slots and everything before the running state
         (null placeholders and the previous step's superseded state) go.
 
-        Use this at every block-id exchange point. Pass `clip_ssm=False`
+        Use this at every block-id exchange point. Pass ``clip_ssm=False``
         for per-step partial lists (host-buffer save), where the SSM strip
-        does not apply.
+        does not apply. Pass the computed ``num_tokens`` to drop speculative
+        lookahead blocks first, so a window ends at the last computed token
+        on both sides.
         """
         if len(block_ids) == 0:
             # No blocks to clip, e.g. a full prefix cache hit.
@@ -283,6 +288,11 @@ class NixlBaseConnectorScheduler:
         clipped = []
         for i, blocks in enumerate(block_ids):
             if n_sw := self.blocks_per_sw[i]:
+                if num_tokens is not None:
+                    block_size = self.kv_cache_config.transfer_groups[
+                        i
+                    ].kv_cache_spec.block_size
+                    blocks = blocks[: cdiv(num_tokens, block_size)]
                 blocks = blocks[-n_sw:]
             elif (
                 clip_ssm
@@ -401,7 +411,7 @@ class NixlBaseConnectorScheduler:
 
     def _get_remote_prefill_token_count(self, num_prompt_tokens: int) -> int:
         """D-side only. The number of prompt tokens to load from the prefiller.
-        Stops short of the trailing `_prefill_backoff()` tokens that the decoder
+        Stops short of the trailing ``_prefill_backoff()`` tokens that the decoder
         will recompute locally."""
         backoff = self._prefill_backoff()
         if backoff and num_prompt_tokens > backoff:
@@ -409,12 +419,12 @@ class NixlBaseConnectorScheduler:
         return num_prompt_tokens
 
     def _truncate_request_for_prefill(self, request: "Request") -> None:
-        """P-side only: drop the trailing `_prefill_backoff()` prompt tokens
+        """P-side only: drop the trailing ``_prefill_backoff()`` prompt tokens
         so the prefiller stops short of what the decoder recomputes locally.
         For Mamba that is the single token needed to yield h(N-1); for
         multi-module MTP it is the drafter's whole lookahead window.
 
-        Guarded by `_p_side_truncated` to avoid repeated truncation if the
+        Guarded by ``_p_side_truncated`` to avoid repeated truncation if the
         request is preempted and rescheduled."""
         backoff = self._prefill_backoff()
         params = request.kv_transfer_params
@@ -438,11 +448,6 @@ class NixlBaseConnectorScheduler:
             del request._all_token_ids[-backoff:]
             request.num_prompt_tokens -= backoff
             request.max_tokens = 1
-            hash_block_size = self.kv_cache_config.hash_block_size
-            assert hash_block_size is not None
-            request.truncate_block_hashes(
-                hash_block_size, self.vllm_config.num_hash_lookahead_tokens
-            )
             params["_p_side_truncated"] = True
 
     def _build_save_meta(

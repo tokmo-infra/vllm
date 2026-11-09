@@ -56,7 +56,8 @@ pub async fn prepare(
     State(state): State<Arc<AppState>>,
     params: Result<Query<PrepareParams>, QueryRejection>,
 ) -> CheckpointResult {
-    let Query(params) = params?;
+    let Query(params) =
+        params.map_err(|error| ApiError::invalid_request(error.body_text(), Some("mode")))?;
     let (mut checkpoint_state, mut error) = current_state(&state).await?;
     match checkpoint_state {
         CheckpointState::Running => {

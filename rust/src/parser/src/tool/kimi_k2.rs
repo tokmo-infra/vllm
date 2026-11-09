@@ -11,7 +11,7 @@ use winnow::stream::Partial;
 use winnow::token::{literal, rest, take_until, take_while};
 
 use super::utils::{JsonObjectScanState, parse_buffered_event, safe_text_len, take_json_object};
-use super::{Result, ToolCallDelta, ToolParser, ToolParserError, ToolParserOutput};
+use super::{Result, ToolCallDelta, ToolParser, ToolParserOutput};
 use crate::tool::{StructuralTagBuilder, Tool};
 
 const TOOL_CALLS_START: &str = "<|tool_calls_section_begin|>";
@@ -178,7 +178,7 @@ impl ToolParser for KimiK2ToolParser {
             KimiK2Mode::Text => output.push_text(&self.buffer),
             KimiK2Mode::ToolBlock | KimiK2Mode::Done => {}
             KimiK2Mode::Header | KimiK2Mode::Arguments { .. } => {
-                return Err(ToolParserError::IncompleteToolCall { parser: "Kimi K2" });
+                return Err(parsing_failed!("incomplete Kimi K2 tool call"));
             }
         }
         let _ = self.reset();
@@ -586,7 +586,8 @@ mod tests {
 
         let error = parser.finish().unwrap_err();
 
-        expect!["incomplete Kimi K2 tool call"].assert_eq(&error.to_report_string());
+        expect!["tool parser parsing failed: incomplete Kimi K2 tool call"]
+            .assert_eq(&error.to_report_string());
     }
 
     #[test]

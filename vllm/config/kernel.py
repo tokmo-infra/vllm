@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal
 
 from pydantic import Field, field_validator
 
-from vllm.config.utils import CompileFactors, config, get_compile_factors
+from vllm.config.utils import config, get_hash_factors, hash_factors
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -37,14 +37,14 @@ class IrOpPriorityConfig:
     gelu_and_mul_sparse: list[str] = Field(default_factory=list)
     """Priority list for vllm.ir.ops.gelu_and_mul_sparse"""
 
-    def compile_factors(self) -> CompileFactors:
+    def compute_hash(self) -> str:
         """Produces a hash unique to the pass configuration.
         Any new fields that affect compilation should be added to the hash.
         Any future fields that don't affect compilation should be excluded.
 
         Also, manually add IR op impl UUIDs to make sure they affect the compile cache.
         """
-        factors = get_compile_factors(self, set())
+        factors = get_hash_factors(self, set())
 
         # Implementations are hidden from Dynamo,
         # so they don't show up in the traced files list.
@@ -61,7 +61,7 @@ class IrOpPriorityConfig:
             for name, p in asdict(self).items()  # type: ignore[call-overload]
         }
 
-        return factors
+        return hash_factors(factors)
 
     @field_validator("*", mode="before")
     @classmethod
@@ -176,6 +176,7 @@ SparseIndexerTopkBackend = Literal[
     "persistent",
     "per_row",
     "flashinfer",
+    "flashinfer_gvr2",
     "torch",
     "aiter",
 ]
@@ -196,14 +197,14 @@ FLASHINFER_MOE_EP_ARCHITECTURES = frozenset(
 def bind_passthrough_all2all_backend(
     moe_backend: str, parallel_config: "ParallelConfig"
 ) -> None:
-    """Bind `all2all_backend="passthrough"` to MoE backends that own their
+    """Bind ``all2all_backend="passthrough"`` to MoE backends that own their
     expert-parallel communication (currently the FlashInfer MoE-EP megakernels).
 
-    Such a deployment gets `passthrough` when the all2all backend is left at
+    Such a deployment gets ``passthrough`` when the all2all backend is left at
     its default and rejects any other explicit choice; the value is meaningless
     with a MoE backend that relies on the framework to communicate. The CLI does
     not offer the value; the early return keeps repeated
-    `set_platform_defaults` calls idempotent.
+    ``set_platform_defaults`` calls idempotent.
     """
     a2a = parallel_config.all2all_backend
     if moe_backend in FLASHINFER_MOE_EP_BACKENDS:
@@ -311,10 +312,7 @@ class KernelConfig:
     """If True, run the eligible layers of decode steps on the model's
     MonoKernel: a persistent kernel that runs most or all of one decoder layer
     in a single launch (DeepSeek-V4.1 on MI355X, DeepSeek-V4-Pro at TP8 on
-    MI355X; Muse Spark MXFP4 on MI355X with tensor parallel size 8, expert
-    parallelism and a 7-token DSpark draft, for speculative verify steps of 1-16
-    requests, with bf16 MoE activations instead of the checkpoint's MXFP4). A
-    deployment that cannot run it is refused at startup."""
+    MI355X). A deployment that cannot run it is refused at startup."""
 
     moe_backend: MoEBackend = "auto"
     """Backend for MoE expert computation kernels. Available options:
@@ -360,22 +358,24 @@ class KernelConfig:
     sparse_indexer_topk_backend: SparseIndexerTopkBackend = "auto"
     """Backend for the DSA sparse indexer decode top-k kernel. Available options:
 
-    - "auto": The pre-existing chain (cooperative -> persistent -> per_row)
-      on CUDA and per_row on ROCm; the other backends are opt-in
+    - "auto": The pre-existing chain (cooperative -> persistent -> per_row);
+      the other backends are opt-in. On SM100 the prefill top-k (without
+      DCP) runs DeepSelect on the BF16 logits, as under "deep_select"
     - "deep_select": Use DeepSelect kernels (SM100a/SM103a only)
     - "cooperative": Use vLLM's cooperative_topk kernel
-    - "persistent": Use vLLM's persistent_topk kernel (CUDA and ROCm)
+    - "persistent": Use vLLM's persistent_topk kernel
     - "per_row": Use vLLM's top_k_per_row_decode kernel
     - "flashinfer": Use FlashInfer's top_k_ragged_transform kernel
+    - "flashinfer_gvr2": Use FlashInfer's self-sampling GVR V2 top-k
+      (`top_k_varlen(backend="gvr_2")`). SM100 family, fp32 logits, topk in
+      {512, 1024, 2048}. Also routes prefill chunks of >= 1024 row-relative
+      rows to gvr_2. Its latency depends on the logit distribution (rows with
+      strong position skew or many ties at the k-th value are slower)
     - "torch": Use a plain torch.topk implementation (debug reference)
     - "aiter": Use AITER's top_k_per_row_decode kernel (ROCm gfx950 only,
       requires VLLM_ROCM_USE_AITER)
 
     Explicit values raise RuntimeError when their constraints are not met.
-
-    On SM100 decode without DCP, cooperative and persistent (including auto
-    selecting them) read BF16 logits directly and widen scores inside the
-    kernel, avoiding a full FP32 logits copy.
     """
 
     flashinfer_sparse_mla_kernel: FlashInferSparseMLAKernel = "auto"
@@ -422,8 +422,8 @@ class KernelConfig:
         default=None, min_length=1
     )
     """Backend overrides keyed by linear quantization scheme. Overrides take
-    precedence over `linear_backend`; for example,
-    `{"nvfp4_w4a16": "humming"}`."""
+    precedence over ``linear_backend``; for example,
+    ``{"nvfp4_w4a16": "humming"}``."""
 
     rdna_hybrid_w4a16_prefill_dequant: RDNAHybridW4A16PrefillDequantMode = "disable"
     """Cache a dense dequantized copy of each weight for the RDNA hybrid W4A16
@@ -469,7 +469,7 @@ class KernelConfig:
             return value.lower().replace("-", "_")
         return value
 
-    def compile_factors(self) -> CompileFactors:
+    def compute_hash(self) -> str:
         """Produces a hash unique to the pass configuration.
         Any new fields that affect compilation should be added to the hash.
         Any future fields that don't affect compilation should be excluded.
@@ -480,10 +480,13 @@ class KernelConfig:
             "enable_flashinfer_autotune",
             "enable_rocm_segmented_attn_autotune",
             "enable_rocm_aiter_gemm_warmup",
+            "ir_op_priority",  # handled separately below
         }
         if self.linear_backend_per_quant is None:
             ignored_factors.add("linear_backend_per_quant")
-        return get_compile_factors(self, ignored_factors)
+        factors = get_hash_factors(self, ignored_factors)
+        factors["ir_op_priority"] = self.ir_op_priority.compute_hash()
+        return hash_factors(factors)
 
     @field_validator(
         "enable_flashinfer_autotune",

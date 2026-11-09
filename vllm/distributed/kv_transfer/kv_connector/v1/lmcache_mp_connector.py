@@ -1067,7 +1067,8 @@ class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
 
             # Update block ids
             new_block_ids = reformat_block_ids(cached_reqs.new_block_ids[idx])
-            request_tracker.append_block_ids(new_block_ids)
+            if request_id not in cached_reqs.resumed_req_ids:
+                request_tracker.append_block_ids(new_block_ids)
 
             # Use the incremental num_scheduled_tokens to
             # stay consistent with _process_new_requests.
