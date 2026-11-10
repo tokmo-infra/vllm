@@ -35,9 +35,10 @@ export MASTER_IP=11.8.0.86 ROUTER_IP=11.8.0.86
 
 | Router 字段 | 使用值 | 作用与使用案例 |
 | --- | --- | --- |
-| `--prefill-policy` / `--decode-policy` | `cache_aware` / `round_robin` | P 按前缀复用选择，D 在健康 worker 间轮询；只调整后文登记的 P/D 地址即可用于不同主机数量。 |
+| `--prefill-policy` / `--decode-policy` | `cache_aware` / `round_robin` | P 按前缀复用选择，D 按 DP rank 交错各健康实例轮询；只调整后文登记的 P/D 地址即可用于不同主机数量。 |
 | `VLLM_ROUTER_PD_REUSE_PROMPT_IDS` | 1 | D 复用 P 返回的精确 token IDs，避免同一长输入重复分词；两端 tokenizer 与 chat template 必须一致。 |
 | `VLLM_ROUTER_PD_PREFILL_FORCE_LENGTH_CAP` | 1 | P 的单 token 请求忽略 EOS/stop，确保 Mooncake 发布可读取的 KV；D 保留客户端的输出长度和停止条件。 |
+| `--balance-abs-threshold` / `--balance-rel-threshold` | 64 / 1.5 | P 的纠偏阈值随健康 worker 的平均在途数向下缩放，C8/C16/C32 也会避开忙碌实例；等前缀命中优先当前负载与累计请求较少的实例和 rank。一般保留默认值。 |
 | `--max-tree-size` / `--eviction-interval` | 2147483648 / 120秒 | 前缀树每 worker/tenant 的字符预算及 LRU 清理周期；长期服务需要更小内存占用时，降低前者或缩短后者。 |
 | `--max-concurrent-requests` | 4096 | Router 总在途请求上限，不是分词槽位；压测并发由客户端单独设置。 |
 

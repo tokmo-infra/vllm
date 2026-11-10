@@ -21,10 +21,10 @@
   "router": {
     "repository": "https://github.com/tokmo-infra/router",
     "branch": "glm5.3-flash-1103",
-    "source_snapshot": "6f9391b4724d41b894b5edfed1679e93d44bb143",
-    "binary_sha256": "2dd7fd1614df198e3453e7a2b0f451b6409a88dc8aa24188d3e582d85cf35387",
+    "source_snapshot": "1099991813586d98c58862cbb29609d28a211f47",
+    "binary_sha256": "7eaceb8c4bc0c0be4e02ba7e8b9fa88b306cea3bf81fb91fb5836132e79d8af4",
     "image_tag": "router:glm53flash-1103",
-    "image_id": "sha256:300f9f516715d417592e050068d525dd6dc216df1f8934ae8db041e5c3611810"
+    "image_id": "sha256:eb9567c4b1735c56a11d803fe716573c3dfcd1e5ff8c3c01281547c2d39c576d"
   },
   "historical_baseline_source_files": [
     {
