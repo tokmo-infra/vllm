@@ -15,5 +15,5 @@ for file in vllm/renderers/kimi_k3.py vllm/tokenizers/kimi_k3_cache.py \
 done
 git -C "$ROOT" show "$SOURCE_COMMIT:docker/kimi31-b300-xinhao/Dockerfile.runtime" \
   > "$CONTEXT/Dockerfile"
-docker build --pull=false --build-arg VLLM_BUILD_COMMIT="$SOURCE_COMMIT" \
+docker build --pull=false --build-arg YYF_SOURCE_COMMIT="$SOURCE_COMMIT" \
   -t "$IMAGE_TAG" "$CONTEXT"
