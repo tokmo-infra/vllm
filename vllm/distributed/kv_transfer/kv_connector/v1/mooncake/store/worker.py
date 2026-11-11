@@ -94,6 +94,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from .metrics import MooncakeStoreConnectorStats
+from .retire_checkpoints import CheckpointRetirer, validate_retirement_scope
 from .staged_lookup import LookupCandidate, staged_lookup_exists
 
 logger = init_logger(__name__)
@@ -127,16 +128,16 @@ def _compact_group_cache_tensors(
     """Return every registered state view for exactly one KV-cache group."""
     missing_layers = [name for name in group.layer_names if name not in kv_caches]
     if missing_layers:
-        raise ValueError(
-            f"Missing transferable KV caches for layers: {missing_layers}"
-        )
+        raise ValueError(f"Missing transferable KV caches for layers: {missing_layers}")
 
     result: list[torch.Tensor] = []
     for layer_name in group.layer_names:
         value = kv_caches[layer_name]
         states = (value,) if isinstance(value, torch.Tensor) else value
-        if not isinstance(states, Sequence) or not states or not all(
-            isinstance(state, torch.Tensor) for state in states
+        if (
+            not isinstance(states, Sequence)
+            or not states
+            or not all(isinstance(state, torch.Tensor) for state in states)
         ):
             raise TypeError(
                 f"KV cache for {layer_name} must be a tensor or a non-empty "
@@ -447,6 +448,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         supports_group_ids: bool = False,
         record_operation: Callable[..., None] | None = None,
         group_participates: Sequence[bool] | None = None,
+        retire_checkpoints: bool = False,
     ):
         super().__init__(
             store,
@@ -494,6 +496,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # Retained only after a failed store so retry events can recover the
         # token suffix without full snapshots on the normal path.
         self._retry_token_ids: dict[str, tuple[int, list[int]]] = {}
+        self._checkpoint_retirer = (
+            CheckpointRetirer(self) if retire_checkpoints else None
+        )
 
     def add_request(self, request: ReqMeta) -> None:
         # Register before enqueueing so a job is never picked up unledgered.
@@ -712,6 +717,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 e,
             )
             return False
+        if len(exists) != len(keys):
+            logger.error("Malformed boundary exists statuses; not persisted")
+            return False
         self._record_operation("save_exists", exists_start, len(keys))
         missing = [i for i, e in enumerate(exists) if e != 1]
         if not missing:
@@ -749,6 +757,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
             )
             return False
 
+        if len(res) != len(keys):
+            logger.error("Malformed boundary PUT statuses; not persisted")
+            return False
         failed = [i for i, value in enumerate(res) if value < 0]
         self._record_operation(
             "save_put",
@@ -797,6 +808,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
             if not self.is_live_store_job(req_meta):
                 return
+            retirer = getattr(self, "_checkpoint_retirer", None)
+            if retirer is not None:
+                retirer.collect_due()
 
             if self.enable_kv_event:
                 retry_token_ids = self._get_retry_token_ids(req_meta)
@@ -818,6 +832,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
             # normal positional save, which may be skipped this step).
             if not self._maybe_offload_boundary_states(req_meta):
                 return
+            if retirer is not None:
+                retirer.after_persist(req_meta)
 
             if token_len == 0:
                 return
@@ -1491,6 +1507,14 @@ class MooncakeStoreWorker:
         assert kv_role is not None
         self.kv_role = kv_role
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+        self._retire_enabled = validate_retirement_scope(
+            extra_config,
+            self.tp_size,
+            self.pcp_size,
+            self.dcp_size,
+            self.pp_size,
+            vllm_config.kv_transfer_config.kv_load_failure_policy,
+        )
         compact_payload_option = extra_config.get("store_compact_group_payloads", False)
         if type(compact_payload_option) is not bool:
             raise ValueError("store_compact_group_payloads must be a boolean")
@@ -1521,6 +1545,10 @@ class MooncakeStoreWorker:
         self._mem_pool = self._create_mem_pool(extra_config, model_config)
 
         self.store = MooncakeDistributedStore()
+        if self._retire_enabled and not callable(
+            getattr(self.store, "batch_remove", None)
+        ):
+            raise ValueError("native Store lacks batch_remove(keys, force)")
         local_ip = get_ip()
         local_hostname = rdma_utils.get_requester_local_hostname(local_ip)
         setup_mooncake_store(self.store, store_config, local_hostname)
@@ -1668,7 +1696,9 @@ class MooncakeStoreWorker:
             if not compact_payloads:
                 return namespace
             marker = "@store_format:compact_group_views_v1"
-            return f"{namespace}@payload:compact_group_views_v1" if namespace else marker
+            return (
+                f"{namespace}@payload:compact_group_views_v1" if namespace else marker
+            )
 
         lcm_store_tp_enabled = extra_config.get("enable_store_tp_lcm") is True
         store_tp_requested = (
@@ -1761,7 +1791,7 @@ class MooncakeStoreWorker:
                 group_id=group_idx,
                 tp_rank=group_tp_rank,
             )
-            store_layout: TPShardedStoreLayout | None = None
+            store_layout: TPShardedStoreLayout | CompactGroupStoreLayout | None = None
             if (
                 getattr(self, "_store_compact_group_payloads", False)
                 and layout_cls is None
@@ -1773,9 +1803,7 @@ class MooncakeStoreWorker:
                 )
                 tail_shape = None
                 if inner_specs and all(
-                    isinstance(
-                        inner_spec, (MLAAttentionSpec, SlidingWindowMLASpec)
-                    )
+                    isinstance(inner_spec, (MLAAttentionSpec, SlidingWindowMLASpec))
                     for inner_spec in inner_specs
                 ):
                     spec = inner_specs[0]
@@ -1971,7 +1999,7 @@ class MooncakeStoreWorker:
             for db in self.token_dbs:
                 db.store_layout.register_kv_caches(cache_tensors, self.num_blocks)
 
-        registered_buffers: dict[int, int] = {}
+        registered_buffers = {}
         num_host_segments = 0
         num_device_segments = 0
 
@@ -2093,6 +2121,7 @@ class MooncakeStoreWorker:
                     group.kv_cache_spec.prefix_cacheable
                     for group in self._kv_cache_groups
                 ],
+                retire_checkpoints=self._retire_enabled,
             )
             self.kv_send_thread.start()
 
@@ -2341,7 +2370,8 @@ class MooncakeStoreWorker:
                     )
                 candidate_meta.append((g_idx, bytes(h)))
                 candidate_boundaries.append(
-                    (chunk_id + 1) * (self.hash_block_size if fine_grained else spec_block_size)
+                    (chunk_id + 1)
+                    * (self.hash_block_size if fine_grained else spec_block_size)
                 )
 
         if not candidate_keys:
@@ -2361,9 +2391,14 @@ class MooncakeStoreWorker:
                     candidate_meta, candidate_boundaries, strict=True
                 ):
                     count = len(self._lookup_key_prefixes[g_idx])
-                    candidates.append(LookupCandidate(
-                        g_idx, hash_bytes, tuple(candidate_keys[pos:pos+count]), boundary
-                    ))
+                    candidates.append(
+                        LookupCandidate(
+                            g_idx,
+                            hash_bytes,
+                            tuple(candidate_keys[pos : pos + count]),
+                            boundary,
+                        )
+                    )
                     pos += count
 
                 def check_keys(keys):
@@ -2373,20 +2408,26 @@ class MooncakeStoreWorker:
 
                 def usable_hit(exists, length):
                     pool = ExternalCachedBlockPool(self.hash_block_size, exists)
-                    _, hit = self.coord.find_longest_cache_hit(block_hashes, length, pool)
+                    _, hit = self.coord.find_longest_cache_hit(
+                        block_hashes, length, pool
+                    )
                     # Preserve the existing sampling-token recomputation: an
                     # all-hit lookup may need the preceding KDA checkpoint.
                     if hit >= num_tokens:
                         bound = self.coord.align_lookup_length(num_tokens - 1)
                         if bound <= 0:
                             return 0
-                        _, hit = self.coord.find_longest_cache_hit(block_hashes, bound, pool)
+                        _, hit = self.coord.find_longest_cache_hit(
+                            block_hashes, bound, pool
+                        )
                     return hit
 
                 exists_set = staged_lookup_exists(
-                    candidates, token_len=token_len,
+                    candidates,
+                    token_len=token_len,
                     mamba_group_ids=self.coord.mamba_group_ids,
-                    batch_is_exist=check_keys, find_hit_length=usable_hit,
+                    batch_is_exist=check_keys,
+                    find_hit_length=usable_hit,
                 )
             else:
                 checked_key_count = len(candidate_keys)

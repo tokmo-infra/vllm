@@ -247,7 +247,7 @@
     },
     {
       "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py",
-      "sha256": "f48cd2134b1d62251d8c90b3182b6a762f1e19827a6f6ace1831b962f77bcd23"
+      "sha256": "a00fcd10749c36caa4b4078b84d6952db696fd6421ba2ae152e59ca146f5e1de"
     },
     {
       "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/lease.py",
@@ -259,7 +259,7 @@
     },
     {
       "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py",
-      "sha256": "c45368c9f15ca4be2baab08f517532bd00b532e7e2fe896a7c6a700815430cce"
+      "sha256": "c8a46225af2406c2c1d1379faee181367802028d0069dcc7467e5b8703ca99c0"
     },
     {
       "path": "vllm/envs.py",
@@ -291,7 +291,7 @@
     },
     {
       "path": "vllm/model_executor/warmup/kernel_warmup.py",
-      "sha256": "67cec3830838b63847c6ad7314cca382273e8da96f36aeef97fce6e4ecd95aa6"
+      "sha256": "c0f7543e321857c2190c41be2d538e5951127774ad497d59a271f6685514cd9f"
     },
     {
       "path": "vllm/models/glm5next/common/model.py",
@@ -416,6 +416,14 @@
     {
       "path": "vllm/v1/worker/gpu/warmup.py",
       "sha256": "be4e97be9c676a56e6e88b9da2683a1addc8cb65f8e22024e0a21610b97f9628"
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py",
+      "sha256": "1541b10ace2aa40c8e1da312729c8a6a740403ebf7352b5105afe39dec6af8b2"
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/retire_checkpoints.py",
+      "sha256": "e2f7cc08725e2b8cc43f1706c57d263222cd5170066232a94a0156bc094de896"
     }
   ],
   "image_overlay_files": [
@@ -469,7 +477,7 @@
     },
     {
       "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py",
-      "sha256": "c45368c9f15ca4be2baab08f517532bd00b532e7e2fe896a7c6a700815430cce"
+      "sha256": "c8a46225af2406c2c1d1379faee181367802028d0069dcc7467e5b8703ca99c0"
     },
     {
       "path": "vllm/envs.py",
@@ -526,6 +534,22 @@
     {
       "path": "vllm/v1/worker/gpu/warmup.py",
       "sha256": "be4e97be9c676a56e6e88b9da2683a1addc8cb65f8e22024e0a21610b97f9628"
+    },
+    {
+      "path": "vllm/model_executor/warmup/kernel_warmup.py",
+      "sha256": "c0f7543e321857c2190c41be2d538e5951127774ad497d59a271f6685514cd9f"
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py",
+      "sha256": "a00fcd10749c36caa4b4078b84d6952db696fd6421ba2ae152e59ca146f5e1de"
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py",
+      "sha256": "1541b10ace2aa40c8e1da312729c8a6a740403ebf7352b5105afe39dec6af8b2"
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/retire_checkpoints.py",
+      "sha256": "e2f7cc08725e2b8cc43f1706c57d263222cd5170066232a94a0156bc094de896"
     }
   ],
   "base_validation_files": [
@@ -600,6 +624,18 @@
     {
       "path": "vllm/v1/worker/gpu/warmup.py",
       "sha256": "daeac5713fb5c7bbc9a2409e5111fba2dba446acddabb77fbaa7705fd5af87a4"
+    },
+    {
+      "path": "vllm/model_executor/warmup/kernel_warmup.py",
+      "sha256": "67cec3830838b63847c6ad7314cca382273e8da96f36aeef97fce6e4ecd95aa6"
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py",
+      "sha256": "f48cd2134b1d62251d8c90b3182b6a762f1e19827a6f6ace1831b962f77bcd23"
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py",
+      "sha256": "48d9a639b27810fb3173357f69f50dc5972bc0776e43aba787f830d94ffe94fe"
     }
   ],
   "feature_commits": {
@@ -642,5 +678,16 @@
       "VLLM_GLM53_P_MTP_CONTEXT_ONLY": "0"
     },
     "jit": "CUDA SM120a; FlashInfer 0.7.1 gen_jit_spec and tvm_ffi_utils.h; no Cake/DS4.1 runtime required for P2P."
+  },
+  "prefill_cache": {
+    "autotune_scope": "DP-gathered token buckets; per-rank dummy allocation unchanged",
+    "remove_superseded_checkpoints": {
+      "default": false,
+      "P": true,
+      "D": false,
+      "delay_s": 10,
+      "removal": "native batch_remove(keys, False); complete successor cohort checked twice",
+      "scope": "rank-local TP/PP/PCP/DCP1; no group semantics or Store-TP remapping"
+    }
   }
 }

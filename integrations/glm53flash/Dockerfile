@@ -14,6 +14,10 @@ COPY vllm/_glm53_nvfp4/nvfp4_ep/reference_cpu.py /usr/local/lib/python3.12/dist-
 COPY vllm/_glm53_nvfp4/nvfp4_ep/verification.py /usr/local/lib/python3.12/dist-packages/vllm/_glm53_nvfp4/nvfp4_ep/verification.py
 COPY vllm/_glm53_nvfp4/nvfp4_ep/weights.py /usr/local/lib/python3.12/dist-packages/vllm/_glm53_nvfp4/nvfp4_ep/weights.py
 COPY vllm/_glm53_nvfp4/nvfp4_ep/workspace.py /usr/local/lib/python3.12/dist-packages/vllm/_glm53_nvfp4/nvfp4_ep/workspace.py
+COPY vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
+COPY vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
+COPY vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/retire_checkpoints.py /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/retire_checkpoints.py
+COPY vllm/model_executor/warmup/kernel_warmup.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/warmup/kernel_warmup.py
 COPY vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
 COPY vllm/envs.py /usr/local/lib/python3.12/dist-packages/vllm/envs.py
 COPY vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py

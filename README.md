@@ -11,7 +11,8 @@
 | Mooncake PUT 恢复 | 缓存分配失败后，每发送线程最多每秒用一个有效 job 探测，成功后恢复保存。 |
 | Mooncake GET 恢复 | 对 -707 key 刷新副本租约并完整重读；按完整 group 和相邻 checkpoint 恢复混合 Mamba / MLA 状态。 |
 | Master 空间回收 | 按分配器实际占用计账，检查大块可分配槽数并触发原生淘汰；使用配套 patched Master。 |
-| FlashInfer 自动调优 | 复用匹配的调优配置，保留原生预热；编译和调优缓存挂载到持久目录。 |
+| FlashInfer 自动调优 | 调优桶覆盖DP聚合输入：P的本地batch2048 / DP4覆盖到8192，本地dummy仍为2048。保留匹配的持久缓存及原生预热。 |
+| 旧KDA检查点清理 | P的Store子配置设置 `remove_superseded_checkpoints=true`；完整新尾保存成功至少10秒后复核并非强制删除旧尾，保留租约、整块状态和原GET恢复行为。D及代码默认关闭。 |
 | P 末段准入预算 | `VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION=1` 保护特定异步加载请求的 CoW 状态块余量，减少抢占重算；代码默认关闭。 |
 | RDMA 目的网卡亲和 | `MC_ENABLE_DEST_DEVICE_AFFINITY=1`，结合各 GPU 分组的实际 HCA 映射。 |
 

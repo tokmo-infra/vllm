@@ -361,6 +361,9 @@ def _run_flashinfer_autotune_dummy_runs(
                 max_tuning_tokens, num_draft_reqs * num_query_per_req
             )
 
+        # AG/RS experts consume DP-gathered rows; keep the dummy run local.
+        max_tuning_tokens *= runner.vllm_config.parallel_config.data_parallel_size
+
         tuning_buckets = fi_utils.flashinfer_get_hybrid_num_tokens_buckets(
             max_tuning_tokens
         )
@@ -506,15 +509,15 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
 
 _native_kernel_warmup = kernel_warmup
 
-def kernel_warmup(worker, *, process_local_only=False):
+
+def kernel_warmup(worker, *, process_local_only=False):  # type: ignore[no-redef]
     """Optionally load saved FlashInfer tactics before ordinary warmup."""
     import os
 
     if os.environ.get("GLM_FLASHINFER_PRETUNED_ONLY") == "1":
         if worker.vllm_config.kernel_config.enable_flashinfer_autotune is not False:
             raise RuntimeError(
-                "GLM_FLASHINFER_PRETUNED_ONLY requires "
-                "enable_flashinfer_autotune=false"
+                "GLM_FLASHINFER_PRETUNED_ONLY requires enable_flashinfer_autotune=false"
             )
         from flashinfer.autotuner import AutoTuner
 
@@ -531,6 +534,8 @@ def kernel_warmup(worker, *, process_local_only=False):
             raise RuntimeError("pre-tuned FlashInfer cache environment mismatch")
         logger.info(
             "GLM_PRETUNED_LOAD_ONLY dp=%s rank=%s file=%s",
-            dp, world.rank_in_group, path,
+            dp,
+            world.rank_in_group,
+            path,
         )
     return _native_kernel_warmup(worker, process_local_only=process_local_only)

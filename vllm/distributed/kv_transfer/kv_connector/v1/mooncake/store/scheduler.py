@@ -42,6 +42,8 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
+from .retire_checkpoints import mark_prompt_retirement, retirement_enabled
+
 logger = init_logger(__name__)
 
 
@@ -148,6 +150,7 @@ class MooncakeStoreScheduler:
         # Skips lookup CPU cost on instances that never load KV from the store.
         self.enable_lookup = kvc_extra_config.get("enable_lookup", True)
         self.save_decode_cache = kvc_extra_config.get("save_decode_cache", False)
+        self.remove_superseded_checkpoints = retirement_enabled(kvc_extra_config)
         kv_event_config = vllm_config.kv_events_config
         self.enable_kv_events = bool(
             kv_event_config and kv_event_config.enable_kv_cache_events
@@ -345,6 +348,7 @@ class MooncakeStoreScheduler:
                     else None
                 ),
                 prefill_end_tokens=len(prefill_tokens),
+                admitted_tokens=request.num_computed_tokens,
             )
             self._request_trackers[request.req_id] = request_tracker
 
@@ -399,6 +403,7 @@ class MooncakeStoreScheduler:
                             else None
                         ),
                         prefill_end_tokens=len(prefill_tokens),
+                        admitted_tokens=request_real.num_computed_tokens,
                     )
                     self._request_trackers[req_id] = request_tracker
 
@@ -558,6 +563,12 @@ class MooncakeStoreScheduler:
                 continue
             if tail := _partial_tail_non_mamba_puts(coord, req_meta, block_sizes):
                 req_meta.boundary_puts = [*tail, *(req_meta.boundary_puts or [])]
+            mark_prompt_retirement(
+                self,
+                self._request_trackers.get(req_meta.req_id),
+                req_meta,
+                get_mamba_prefill_checkpoint_position,
+            )
             req_meta.store_job_id = store_job_id = self._next_store_job_id
             self._next_store_job_id += 1
             block_ids = [put.block_id for put in req_meta.boundary_puts or []]
@@ -637,6 +648,9 @@ class MooncakeStoreScheduler:
             ),
             *mamba_puts,
         ]
+        mark_prompt_retirement(
+            self, tracker, req_meta, get_mamba_prefill_checkpoint_position
+        )
         pinned_block_ids = list(
             dict.fromkeys(put.block_id for put in req_meta.boundary_puts)
         )

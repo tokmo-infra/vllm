@@ -14,6 +14,7 @@
 | `VLLM_GLM53_NVFP4_EXTENDED_PREFETCH` | 1 | 0 | 给 EP4 P 的每 rank 72 个专家扩展预取；EP8 D 不开启。 |
 | `VLLM_GLM53_P_MTP_CONTEXT_ONLY` | 1 | 0 | 专用 P 只加载 MTP 注意力和输入融合必需的18个源键，完成 MTP KV 交接；D 或耦合实例设0，保留完整草稿生成。 |
 | `VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION` | 1 | 0 | 为 P 异步读回后的末段 CoW 状态块留余量，减少抢占重算；诊断开关保持0。 |
+| Store `remove_superseded_checkpoints` | `true` | `false` | 完整新尾保存成功后，至少等10秒再尝试清理已被替代的旧KDA尾；只用原生非强制删除，租约拒绝则跳过。适用于本部署的TP/PP/PCP/DCP1、rank-local Store；代码默认关闭。 |
 
 下面是 Docker 参数片段；后文的完整命令已包含这些值：
 
@@ -26,6 +27,17 @@
 -e VLLM_GLM53_NVFP4_EXTENDED_PREFETCH=1 \
 -e VLLM_GLM53_P_MTP_CONTEXT_ONLY=1
 ~~~
+
+Store 字段写在 `MultiConnector` 的 `MooncakeStoreConnector` 子配置中，P/D 分别设为 `true` / `false`：
+
+~~~json
+{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_both",
+ "kv_connector_extra_config":{"remove_superseded_checkpoints":true}}
+~~~
+
+只清理被完整新检查点替代的非整块KDA尾；整块状态、DSA注意力KV和索引器证明对象保留。清理前复核新尾全部对象仍存在；失败PUT、已取消job、丢失分片或租约保护都会跳过清理。GET读回、刷新重读及错误处理保持原有行为。
+
+FlashInfer 启动调优覆盖DP聚合后的输入，例如每DP batch2048、DP4时覆盖到8192；本地dummy仍为2048，运行batch、CUDA图和异步路径不变。保留匹配的持久调优缓存，未覆盖的新桶在启动预热时补齐。
 
 | Router 字段 | 使用值 | 作用与使用案例 |
 | --- | --- | --- |
@@ -294,12 +306,13 @@ L3_DOCKER_ARGS=(
 start_model() {
   local slot="$1" image gpu_request hcas port bootstrap rpc dp apis
   local seq batch shared_gib cache_gib pd_role store_role role_work engine_id kv ib_hca
+  local retire_checkpoints=false
   local -a role_env=() graph_args=()
   case "$slot" in
     p0|p1)
       image="${P_IMAGE:?设置已导入的 P 镜像}"
       dp=4; apis=4; seq=24; batch=2048; shared_gib=15.5; cache_gib=2
-      pd_role=kv_producer; store_role=kv_both
+      pd_role=kv_producer; store_role=kv_both; retire_checkpoints=true
       role_env=(-e VLLM_GLM53_P_MTP_CONTEXT_ONLY=1
                 -e VLLM_GLM53_NVFP4_EXTENDED_PREFETCH=1
                 -e VLLM_MOONCAKE_LOAD_RECV_THREADS=4
@@ -343,7 +356,8 @@ start_model() {
      "kv_connector_extra_config":{"mooncake_protocol":"rdma","device_name":"$hcas"}},
     {"kv_connector":"MooncakeStoreConnector","kv_role":"$store_role",
      "kv_connector_extra_config":{"cache_prefix":"$CACHE_NAMESPACE",
-       "load_async":true,"lookup_async":true,"store_compact_group_payloads":true}}
+       "load_async":true,"lookup_async":true,"store_compact_group_payloads":true,
+       "remove_superseded_checkpoints":$retire_checkpoints}}
   ]}
 }
 EOF

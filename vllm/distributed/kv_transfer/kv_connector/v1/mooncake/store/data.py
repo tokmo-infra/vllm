@@ -589,7 +589,9 @@ class CompactGroupStoreLayout(RankLocalStoreLayout):
     ) -> tuple[list[list[int]], list[list[int]], list[int]]:
         if not chunks:
             return [], [], []
-        if len(chunks) != len(shard_ids) or any(shard_id != 0 for shard_id in shard_ids):
+        if len(chunks) != len(shard_ids) or any(
+            shard_id != 0 for shard_id in shard_ids
+        ):
             raise ValueError("Compact rank-local Store chunks require shard 0")
 
         all_addrs: list[list[int]] = []
@@ -598,7 +600,8 @@ class CompactGroupStoreLayout(RankLocalStoreLayout):
         for start, end in chunks:
             if start < 0 or end <= start or start % self.block_size != 0:
                 raise ValueError(
-                    f"Compact Store chunks must start on a block boundary: {(start, end)}"
+                    "Compact Store chunks must start on a block boundary: "
+                    f"{(start, end)}"
                 )
             first_block = start // self.block_size
             last_block = (end - 1) // self.block_size
@@ -990,6 +993,7 @@ class RequestTracker:
     # request it includes previously-generated tokens, which are re-prefilled.
     prefill_end_tokens: int = 0
     partial_tail_sent: bool = False
+    admitted_tokens: int = 0
 
     def reset(self) -> None:
         self.token_len = 0
@@ -999,6 +1003,7 @@ class RequestTracker:
         self.has_pending_offload = False
         self.prefill_end_tokens = 0
         self.partial_tail_sent = False
+        self.admitted_tokens = 0
 
     def update(
         self,
@@ -1061,6 +1066,8 @@ class ReqMeta:
     # Set on the save that first covers the whole prompt, so the scheduler
     # publishes the prompt's partial tail once rather than on every save.
     publish_partial_tail: bool = False
+    superseded_boundary: int | None = None
+    successor_boundary: int | None = None
 
     @staticmethod
     def from_request_tracker(

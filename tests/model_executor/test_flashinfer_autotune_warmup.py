@@ -45,7 +45,7 @@ def _make_runner(modules, *, max_tokens: int = 8192):
         scheduler_config=SimpleNamespace(max_num_batched_tokens=max_tokens),
         vllm_config=SimpleNamespace(
             attention_config=SimpleNamespace(hisparse_config=None),
-            parallel_config=SimpleNamespace(data_parallel_rank=0),
+            parallel_config=SimpleNamespace(data_parallel_rank=0, data_parallel_size=1),
         ),
         get_model=Mock(
             return_value=SimpleNamespace(modules=Mock(return_value=modules))
@@ -416,4 +416,25 @@ def test_autotune_cache_key_normalizes_kv_init_fields():
     assert (
         _normalize_cache_config_for_hash(resolved).compute_hash()
         != fresh.compute_hash()
+    )
+
+
+@pytest.mark.parametrize("dp_size", [1, 4])
+def test_flashinfer_autotune_buckets_cover_dp_gathered_tokens(dp_size):
+    """Widen tuning M without exceeding per-rank dummy buffers."""
+    runner = _make_runner([], max_tokens=2048)
+    runner.vllm_config.parallel_config.data_parallel_size = dp_size
+    with (
+        patch(
+            "vllm.utils.flashinfer.flashinfer_get_hybrid_num_tokens_buckets"
+        ) as get_buckets,
+        patch("vllm.utils.flashinfer.autotune"),
+    ):
+        _run_flashinfer_autotune_dummy_runs(runner)
+    get_buckets.assert_called_once_with(2048 * dp_size)
+    runner._dummy_run.assert_called_once_with(
+        num_tokens=2048,
+        skip_eplb=True,
+        is_profile=True,
+        randomize_inputs=True,
     )
