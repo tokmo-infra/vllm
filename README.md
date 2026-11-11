@@ -24,6 +24,7 @@
 - 共享 workspace，直接引用原生权重和 scale；使用 uint4 向量读取、FC2 输入 staging 和 P 侧专家预取。
 - 初始化完成 JIT、标定检查和 EP rendezvous；请求路径在当前 CUDA stream 上执行，不增加 host 同步或额外 collective。
 - 分发使用各 rank 一致的 DP metadata。P dense batch 最大 192，稀疏 batch 最大 256 且总 token ≤512；D 最大 128。其他形状使用原生后端，保留原生共享专家调度。
+- 融合分块自动选择，无需额外启动参数：D 的各 DP rank 平均输入行数达到64时用32，否则用24；P保持24。选择只读取已有CPU metadata，不增加GPU同步。
 
 | 环境变量 | 默认 | 4P4D P | 4P4D D |
 | --- | --- | --- | --- |

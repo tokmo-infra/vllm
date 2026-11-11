@@ -7,6 +7,13 @@ SMALL_CAPACITY = 128
 DENSE_CAPACITY = 192
 
 
+def tokens_per_item(sizes, workspace_capacity):
+    """Use validated, rank-uniform CPU sizes; leave P scheduling unchanged."""
+    if workspace_capacity == SMALL_CAPACITY and sum(sizes) >= 64 * len(sizes):
+        return 32
+    return 24
+
+
 def uniform_bound(sizes, rows, ep_size, allow_extended=False):
     if ep_size not in (4, 8) or not isinstance(sizes, (list, tuple)):
         return None

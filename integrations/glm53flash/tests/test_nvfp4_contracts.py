@@ -60,6 +60,25 @@ def test_sparse_256_keeps_total_work_cap_and_d_remains_128(policy, ep):
 
 
 @pytest.mark.parametrize(
+    "sizes,tile",
+    [
+        ([0] * 8, 24),
+        ([8] * 8, 24),
+        ([32] * 8, 24),
+        ([63] * 8, 24),
+        ([64] * 8, 32),
+        ([96] * 8, 32),
+        ([128] * 8, 32),
+        ([128] * 4 + [0] * 4, 32),
+        ([60, 60, 92, 60, 76, 52, 44, 53], 24),
+    ],
+)
+def test_decode_tile_uses_total_work_not_one_busy_rank(policy, sizes, tile):
+    assert policy.tokens_per_item(sizes, 128) == tile
+    assert policy.tokens_per_item(sizes, 256) == 24
+
+
+@pytest.mark.parametrize(
     "sizes,rows,ep",
     [
         (None, 1, 4),

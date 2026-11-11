@@ -21,6 +21,8 @@ export MASTER_IP=11.8.0.86 ROUTER_IP=11.8.0.86
 | `VLLM_GLM53_P_MTP_CONTEXT_ONLY` | 1 | 0 | 专用 P 只加载 MTP 注意力和输入融合必需的18个源键，完成 MTP KV 交接；D 或耦合实例设0，保留完整草稿生成。 |
 | `VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION` | 1 | 0 | 为 P 异步读回后的末段 CoW 状态块留余量，减少抢占重算；诊断开关保持0。 |
 | Store `remove_superseded_checkpoints` | `true` | `false` | 完整新尾保存成功后，至少等10秒再尝试清理已被替代的旧KDA尾；只用原生非强制删除，租约拒绝则跳过。适用于本部署的TP/PP/PCP/DCP1、rank-local Store；代码默认关闭。 |
+| `--prefix-match-unit` | 256 | 256 | 前缀匹配的token边界粒度，不是下面的CLI block size 64，也不表示每256 token保存一整套KDA状态。 |
+| Store `lookup_async` / `load_async` | `true` / `true` | `true` / `true` | 前者在后台查询缓存命中，未就绪请求留到后续调度重试；后者异步加载KV。两者分别控制查询和数据搬运。 |
 
 下面是 Docker 参数片段；后文的完整命令已包含这些值：
 
@@ -44,6 +46,10 @@ Store 字段写在 `MultiConnector` 的 `MooncakeStoreConnector` 子配置中，
 只清理被完整新检查点替代的非整块KDA尾；整块状态、DSA注意力KV和索引器证明对象保留。清理前复核新尾全部对象仍存在；失败PUT、已取消job、丢失分片或租约保护都会跳过清理。GET读回、刷新重读及错误处理保持原有行为。
 
 FlashInfer 启动调优覆盖DP聚合后的输入，例如每DP batch2048、DP4时覆盖到8192；本地dummy仍为2048，运行batch、CUDA图和异步路径不变。保留匹配的持久调优缓存，未覆盖的新桶在启动预热时补齐。
+
+NVFP4融合分块由已有CPU侧DP metadata自动选择，无需增加启动参数：D的各rank平均输入行数达到64时用32，否则用24；P保持24。选择在各rank一致，不增加GPU同步或改变原生异步、CUDA图和通信计算重叠。
+
+匹配粒度保持256。调小粒度可更精细地复用前缀，也会增加哈希、候选key构造和缓存查询的CPU开销；不改变物理KV页大小，也不等于按相同频率保存完整状态。比较不同粒度时，同时检查实际查询key数、查询耗时、命中率、总TPM和TTFT，保留本节的异步查询与异步加载设置。
 
 | Router 字段 | 使用值 | 作用与使用案例 |
 | --- | --- | --- |

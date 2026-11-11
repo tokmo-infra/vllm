@@ -15,11 +15,16 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
-from .glm53_nvfp4_policy import CAPACITY, supported_geometry, uniform_bound
+from .glm53_nvfp4_policy import (
+    CAPACITY,
+    supported_geometry,
+    tokens_per_item,
+    uniform_bound,
+)
 
 logger = init_logger(__name__)
 _WORKSPACES = {}
-_LOGGED: set[tuple[int, int, int, bool, str]] = set()
+_LOGGED: set[tuple[int, int, int, bool, str, int]] = set()
 
 
 def _eligible(experts, layer):
@@ -209,18 +214,20 @@ class SmallMoE:
         )
         if bound is None:
             return None
+        tile = tokens_per_item(sizes, self.workspace.capacity)
         sample = (
             self.ep_size,
             rows,
             bound,
             shared_experts is not None,
             str(getattr(context, "cudagraph_runtime_mode", "unknown")),
+            tile,
         )
         if sample not in _LOGGED and len(_LOGGED) < 64:
             _LOGGED.add(sample)
             logger.info(
                 "GLM NVFP4 fused dispatch EP%s rows=%s uniform_bound=%s "
-                "shared=%s mode=%s",
+                "shared=%s mode=%s tile=%s",
                 *sample,
             )
         self.workspace.stage(
@@ -247,5 +254,5 @@ class SmallMoE:
             dtype=hidden_states.dtype,
         )
         return self.workspace.compute(
-            self.weights, output=output, swiglu_limit=10.0, tokens_per_item=24
+            self.weights, output=output, swiglu_limit=10.0, tokens_per_item=tile
         )

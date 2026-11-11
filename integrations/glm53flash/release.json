@@ -279,11 +279,11 @@
     },
     {
       "path": "vllm/model_executor/layers/fused_moe/glm53_nvfp4.py",
-      "sha256": "02b675a4abdcee20141f42ac585b45081de3eaedc9a9bfc9ff5e79d190d45440"
+      "sha256": "80eb4801057b698f575e31ad0e770ace0921555034869710b7b2b055576c4dbb"
     },
     {
       "path": "vllm/model_executor/layers/fused_moe/glm53_nvfp4_policy.py",
-      "sha256": "ad5339a2864c7b284a84fd168e165c95028264f9cd3480b7d7e2afb9a7230aee"
+      "sha256": "e778b540b09354438cb404a5517651f345e170f0401bd6c18a4880dde42e10ce"
     },
     {
       "path": "vllm/model_executor/layers/fused_moe/modular_kernel.py",
@@ -489,11 +489,11 @@
     },
     {
       "path": "vllm/model_executor/layers/fused_moe/glm53_nvfp4.py",
-      "sha256": "02b675a4abdcee20141f42ac585b45081de3eaedc9a9bfc9ff5e79d190d45440"
+      "sha256": "80eb4801057b698f575e31ad0e770ace0921555034869710b7b2b055576c4dbb"
     },
     {
       "path": "vllm/model_executor/layers/fused_moe/glm53_nvfp4_policy.py",
-      "sha256": "ad5339a2864c7b284a84fd168e165c95028264f9cd3480b7d7e2afb9a7230aee"
+      "sha256": "e778b540b09354438cb404a5517651f345e170f0401bd6c18a4880dde42e10ce"
     },
     {
       "path": "vllm/model_executor/layers/fused_moe/modular_kernel.py",
@@ -677,7 +677,16 @@
       "VLLM_GLM53_NVFP4_EXTENDED_PREFETCH": "0",
       "VLLM_GLM53_P_MTP_CONTEXT_ONLY": "0"
     },
-    "jit": "CUDA SM120a; FlashInfer 0.7.1 gen_jit_spec and tvm_ffi_utils.h; no Cake/DS4.1 runtime required for P2P."
+    "jit": "CUDA SM120a; FlashInfer 0.7.1 gen_jit_spec and tvm_ffi_utils.h; no Cake/DS4.1 runtime required for P2P.",
+    "tokens_per_item": {
+      "P": 24,
+      "D": {
+        "mean_rank_input_rows_threshold": 64,
+        "below_threshold": 24,
+        "at_or_above_threshold": 32
+      },
+      "selection": "validated rank-uniform CPU DP metadata; no additional GPU synchronization"
+    }
   },
   "prefill_cache": {
     "autotune_scope": "DP-gathered token buckets; per-rank dummy allocation unchanged",
