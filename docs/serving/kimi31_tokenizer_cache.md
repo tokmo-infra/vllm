@@ -1,33 +1,54 @@
 # Kimi K3.1 CPU tokenizer cache
 
-The Kimi renderer can reuse native XTML text-piece tokenization with a bounded,
-process-private cache. Set `KIMI31_TOKENIZER_CACHE_GIB=12` to allow up to 12 GiB
-per API process. The default is `0` (disabled). This budget grows on demand;
-it is separate from GPU prefix KV caching and Mooncake L2.
+The renderer reuses native XTML text-piece encoding without changing chunk
+boundaries, ordinary/control-token policy or token IDs. This is a **CPU cache**,
+separate from GPU prefix KV matching and Mooncake's KV store. An 8-GPU deployment
+can budget 2 GiB per GPU as one **16 GiB shared L2**, not 16 GiB per API and not GPU
+memory.
 
-The cache calls the original Kimi `_encode_text_piece` on misses and keeps its
-chunking and ordinary/control-token policy. The key includes that policy and
-the tokenizer backend identity. Returned token lists are independent copies.
-One shared LRU budget covers tokenizer instances in an API process.
+## Configuration
 
-Prometheus metrics use the `api_process` label:
+The YYF runtime image enables:
 
-- `vllm:tokenizer_cache_bytes`, `vllm:tokenizer_cache_max_bytes`
-- `vllm:tokenizer_cache_tokens_total{source="reused_tokens"|"encoded_tokens"|"special_tokens"}`
-- `vllm:tokenizer_cache_requests_total{path="hit"|"miss"|"fallback"}`
-- `vllm:tokenizer_cache_evictions_total`
+    KIMI31_TOKENIZER_CACHE_GIB=16
+    KIMI31_TOKENIZER_CACHE_L1_MIB=64
+    KIMI31_TOKENIZER_CACHE_SHARED_PATH=/tmp/kimi31-tokenizer-cache-yyf
 
-Bytes are a conservative charge for retained strings, ID arrays and LRU entries;
-monitor API RSS as well. Token reuse is `reused / (reused + encoded + special)`
-over counter deltas. These counters cover native text-piece encoding, including
-structural tokens. They measure CPU tokenization reuse, independently of KV hits.
+Each API has a bounded 64 MiB private L1. One private local service owns the
+shared 16 GiB L2, growing on demand; APIs in the serving container connect to the
+same service. Container termination also terminates the cache service. Use a
+deployment-private shared path. L1 memory is additional: eight API processes can
+retain up to 512 MiB of aggregate L1.
 
-`KIMI31_TOKENIZER_CACHE_EPOCH_FILE` optionally names a shared epoch file. Change
-it only after ingress is stopped and requests drain. Each process checks the
-file at most once per second while encoding; the next encoding clears entries
-when the epoch changes. Clearing is lazy, so a changed file alone does not prove
-that the byte gauge has already reached zero.
+Set KIMI31_TOKENIZER_CACHE_GIB=0 to disable caching. Without a shared path,
+KIMI31_TOKENIZER_CACHE_GIB retains the original process-private behavior and
+KIMI31_TOKENIZER_CACHE_L1_MIB does not apply. Budgets must be finite and
+nonnegative. Startup and communication errors are explicit, not reported as hits.
 
-A Kimi tokenizer that lacks `_encode_text_piece` fails explicitly when the cache
-is requested. The cache does not change renderer concurrency or implement P/D
-token-ID forwarding. The current TP8/DP1/DCP8 deployment is coupled.
+L2 identity fingerprints the native encoder source, BPE ranks, regex and special
+token map. Keys retain exact text and ordinary/control-token policy, not a
+process-local object address. Returned token lists are independent copies.
+Text is not rechunked or approximately matched.
+
+## Metrics and reset
+
+Existing metrics have the api_process label:
+
+- vllm:tokenizer_cache_bytes and vllm:tokenizer_cache_max_bytes describe private
+  L1 in shared mode, or the original private cache otherwise.
+- vllm:tokenizer_cache_tokens_total, source=reused_tokens/encoded_tokens/special_tokens
+- vllm:tokenizer_cache_requests_total, path=hit/miss/fallback
+- vllm:tokenizer_cache_evictions_total
+
+A hit can come from L1 or L2. Bytes conservatively charge retained strings, ID
+arrays and LRU entries; RSS also includes Python and tokenizer memory. Shared
+occupancy and limits are available through the cache service's stats(). Do not
+sum the shared capacity once per API. CPU token reuse does not measure GPU KV
+hits or prove that Mooncake get/put completed.
+
+KIMI31_TOKENIZER_CACHE_EPOCH_FILE optionally names a shared epoch file. Change
+it only after ingress stops and requests drain. Each API checks it at most once
+per second and clears L1 on change. L2 identity includes the epoch, so an old
+in-flight computation cannot populate a new epoch. Old epoch entries remain
+bounded by the LRU until eviction; an epoch change is not proof of zero resident
+bytes. Use a fresh deployment-private shared path for a genuinely fresh cache.
