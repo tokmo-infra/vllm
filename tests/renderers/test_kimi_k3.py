@@ -384,3 +384,57 @@ async def test_render_messages_async_returns_token_prompt():
 
     assert prompt == {"prompt_token_ids": [4, 5]}
     assert conversation[0]["role"] == "user"
+
+
+def test_text_piece_cache_preserves_native_control_policy_and_list_ownership():
+    """Identical text in ordinary and structural modes must keep different IDs."""
+    import tiktoken
+
+    from vllm.tokenizers.kimi_k3_cache import TextPieceCache
+
+    encoding = tiktoken.Encoding(
+        name="kimi-cache-test",
+        pat_str=r"\s+|[^\s]+",
+        mergeable_ranks={bytes([i]): i for i in range(256)},
+        special_tokens={"<|control|>": 256},
+    )
+
+    def native(text, allow_special_tokens=True):
+        if allow_special_tokens:
+            return encoding.encode(text, allowed_special="all")
+        return encoding.encode(text, disallowed_special=())
+
+    cache = TextPieceCache(4096, "policy-test")
+    text = "你好 <|control|> test"
+    for flag in (False, True, False, True):
+        expected = native(text, flag)
+        result = cache.encode("native", native, text, flag, frozenset({256}))
+        assert result == expected
+        result.clear()
+        assert cache.encode("native", native, text, flag, frozenset({256})) == expected
+    assert native(text, False) != native(text, True)
+
+
+def test_text_piece_cache_keeps_exact_ids_after_budget_eviction():
+    """A small real BPE cache must remain exact as entries are evicted."""
+    import tiktoken
+
+    from vllm.tokenizers.kimi_k3_cache import TextPieceCache
+
+    encoding = tiktoken.Encoding(
+        name="kimi-cache-budget-test",
+        pat_str=r"\s+|[^\s]+",
+        mergeable_ranks={bytes([i]): i for i in range(256)},
+        special_tokens={},
+    )
+
+    def native(text, allow_special_tokens=True):
+        return encoding.encode(text, disallowed_special=())
+
+    cache = TextPieceCache(4096, "budget-test")
+    for i in range(48):
+        text = (f"value {i} " * 16) + "中文"
+        assert cache.encode("native", native, text, False, frozenset()) == native(text)
+        assert 0 <= cache.bytes <= 4096
+    first = ("value 0 " * 16) + "中文"
+    assert cache.encode("native", native, first, False, frozenset()) == native(first)

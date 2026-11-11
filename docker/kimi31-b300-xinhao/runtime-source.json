@@ -1,0 +1,10 @@
+{
+  "branch": "kimi31-b300-xinhao",
+  "runtime_source_commit": "a79a8889f8d750243361bdc93849bb61711ab848",
+  "base_source_commit": "266e88c051ca46607fd9de20216bd58426f80052",
+  "base_image_id": "sha256:1a8a702f2bfeded3c90259ae60fefbd9e4ca014241946e7d5f3396badce99e76",
+  "deployed_image_id": "sha256:c0c11bb4c2b0c5e8dcc4c8542c1152d8e2ac535c2613ad25a03589b02c651601",
+  "payload_files": ["vllm/renderers/kimi_k3.py", "vllm/tokenizers/kimi_k3_cache.py"],
+  "validation": {"native_chat_cases": 3, "text_piece_mode_cases": 10, "concurrent_renders": 48, "result": "passed"},
+  "source_note": "The archived runtime commit preserves the exact deployed Python files. Later source cleanup only normalizes formatting and narrows the already-checked cache-hit Optional type."
+}

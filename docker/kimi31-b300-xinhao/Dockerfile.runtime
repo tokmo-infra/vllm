@@ -1,0 +1,6 @@
+FROM vllm/vllm-openai:kimi-k31
+LABEL org.opencontainers.image.source="https://github.com/tokmo-infra/vllm" \
+      io.tokmo.source.branch="kimi31-b300-xinhao" \
+      io.tokmo.base.image-id="sha256:1a8a702f2bfeded3c90259ae60fefbd9e4ca014241946e7d5f3396badce99e76"
+COPY vllm/renderers/kimi_k3.py /usr/local/lib/python3.12/dist-packages/vllm/renderers/kimi_k3.py
+COPY vllm/tokenizers/kimi_k3_cache.py /usr/local/lib/python3.12/dist-packages/vllm/tokenizers/kimi_k3_cache.py
