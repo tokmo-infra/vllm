@@ -74,6 +74,19 @@ Set the config path via environment variable:
 export MOONCAKE_CONFIG_PATH=/path/to/mooncake_config.json
 ```
 
+### Recovering from Store pressure and expired read leases
+
+When a PUT returns `-200` (no available handle), affected requests pause further
+saves. Each sending thread permits at most one recovery probe per second while
+pressure persists; a successful PUT reopens the gate. Probes use the current
+job's pinned blocks, and failed or skipped ranges are not marked as saved.
+
+When a GET returns `-707` (expired read lease), the connector issues one fresh
+GET for only those keys, using the same destination buffers. Other errors and
+a failed retry retain the normal KV-load failure handling. Initial GET metrics
+and `load_get_retry` metrics are recorded separately. No additional configuration
+is required.
+
 ## Usage
 
 ### Single-Node KV Cache Offloading

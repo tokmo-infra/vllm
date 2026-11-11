@@ -9,8 +9,11 @@ test "$(docker image inspect "$BASE" --format '{{.Id}}')" = "$EXPECTED"
 CONTEXT=$(mktemp -d)
 trap 'rm -rf "$CONTEXT"' EXIT
 mkdir -p "$CONTEXT/vllm/renderers" "$CONTEXT/vllm/tokenizers"
+mkdir -p "$CONTEXT/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store"
 for file in vllm/renderers/kimi_k3.py vllm/tokenizers/kimi_k3_cache.py \
-  vllm/tokenizers/kimi_k3_cache_shared.py; do
+  vllm/tokenizers/kimi_k3_cache_shared.py \
+  vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py \
+  vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/lease.py; do
   git -C "$ROOT" show "$SOURCE_COMMIT:$file" > "$CONTEXT/$file"
 done
 git -C "$ROOT" show "$SOURCE_COMMIT:docker/kimi31-b300-xinhao/Dockerfile.runtime" \

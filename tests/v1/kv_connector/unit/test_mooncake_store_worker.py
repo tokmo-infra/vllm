@@ -9,7 +9,9 @@ import math
 import queue
 import sys
 import threading
+import time
 import types
+from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -152,6 +154,8 @@ def _make_store_sending_thread(
     replicate_config: object | None = None,
     enable_group_semantics: bool = False,
     supports_group_ids: bool = False,
+    record_operation: Callable[..., None] | None = None,
+    mock_task_done: bool = True,
 ) -> mooncake_store_worker.KVCacheStoreSendingThread:
     if coord is None:
         coord = _default_send_coord()
@@ -172,8 +176,10 @@ def _make_store_sending_thread(
         replicate_config=replicate_config,
         enable_group_semantics=enable_group_semantics,
         supports_group_ids=supports_group_ids,
+        record_operation=record_operation,
     )
-    thread.request_queue.task_done = MagicMock()
+    if mock_task_done:
+        thread.request_queue.task_done = MagicMock()
     return thread
 
 
@@ -183,6 +189,8 @@ def _make_store_recving_thread(
     tp_rank: int = 0,
     disk_offload_buffer_budget_bytes: int | None = None,
     is_hma_required: bool = False,
+    record_operation: Callable[..., None] | None = None,
+    mock_task_done: bool = True,
 ) -> mooncake_store_worker.KVCacheStoreRecvingThread:
     from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
 
@@ -206,8 +214,10 @@ def _make_store_recving_thread(
         coord=coord,
         disk_offload_buffer_budget_bytes=disk_offload_buffer_budget_bytes,
         is_hma_required=is_hma_required,
+        record_operation=record_operation,
     )
-    thread.request_queue.task_done = MagicMock()
+    if mock_task_done:
+        thread.request_queue.task_done = MagicMock()
     return thread
 
 
@@ -341,7 +351,7 @@ def _make_vllm_config(
 
 def _make_kv_cache_config(
     *, block_size: int = 16, prefix_cache_retention_interval: int | None = 0
-) -> object:
+) -> KVCacheConfig:
     """Minimal single-group KVCacheConfig for topology tests."""
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
@@ -900,13 +910,8 @@ def test_tp_sharded_group_saves_every_block_on_every_rank():
 def test_store_sending_thread_retries_skipped_range_after_pressure():
     store = MagicMock()
     store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
-    store.batch_put_from_multi_buffers.side_effect = lambda keys, *a: [256] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = [[-200], [256, 256]]
     thread = _make_store_sending_thread(store, tp_rank=0, put_step=2)
-
-    # Under pressure the request is skipped without persisting anything, so the
-    # saved offset stays at 0.
-    thread._store_pressure_active = True
-    thread._skip_store_requests.add("req-a")
 
     _run_store_req(
         thread,
@@ -919,11 +924,22 @@ def test_store_sending_thread_retries_skipped_range_after_pressure():
         ),
     )
 
-    store.batch_is_exist.assert_not_called()
+    _run_store_req(
+        thread,
+        ReqMeta(
+            req_id="req-a",
+            token_len_chunk=16,
+            block_ids=([1],),
+            block_hashes=[b"a0"],
+            can_save=True,
+        ),
+    )
+
+    assert store.batch_is_exist.call_count == 1
+    assert store.batch_put_from_multi_buffers.call_count == 1
     assert thread._saved_offset.get("req-a", 0) == 0
 
-    thread._store_pressure_active = False
-    thread._skip_store_requests.clear()
+    _wait_for_store_pressure_probe(thread)
 
     # The next batch resumes from offset 0, re-covering the chunk skipped under
     # pressure (chunk 0) rather than losing it.
@@ -1250,14 +1266,16 @@ def test_partial_tail_offload_replaces_stale_group_ids_after_filtering():
 
 def test_partial_tail_offload_honors_active_pressure_gate():
     store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.return_value = [-200]
     thread = _make_partial_tail_send_thread(store)
-    thread._store_pressure_active = True
-    thread._skip_store_requests.add("req-a")
 
     _run_store_req(thread, _make_partial_tail_req([1, 2, 3]))
 
-    store.batch_is_exist.assert_not_called()
-    store.batch_put_from_multi_buffers.assert_not_called()
+    _run_store_req(thread, _make_partial_tail_req([1, 2, 3]))
+
+    assert store.batch_is_exist.call_count == 1
+    assert store.batch_put_from_multi_buffers.call_count == 1
 
 
 def test_partial_tail_put_failure_activates_pressure_gate():
@@ -5336,3 +5354,141 @@ def test_blob_block_hashes_empty():
     view = BlobBlockHashes(memoryview(b""), 0)
     assert len(view) == 0
     assert list(view) == []
+
+
+def _wait_for_store_pressure_probe(thread):
+    # Poll the real policy deadline; do not mock clocks or vLLM internals.
+    deadline = getattr(thread, "_store_pressure_probe_at", time.monotonic() + 1.0)
+    wakeup = threading.Event()
+    while (remaining := deadline - time.monotonic()) > 0:
+        wakeup.wait(min(remaining, 0.01))
+
+
+@pytest.mark.cpu_test
+def test_store_pressure_same_request_retries_after_space_recovers():
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = [[-200, -200], [256, 256]]
+    stats = MooncakeStoreConnectorStats()
+    thread = _make_store_sending_thread(
+        store, record_operation=stats.record_operation, mock_task_done=False
+    )
+    first = _make_store_req("req-a", [b"a0", b"a1"])
+    _run_store_req(thread, first)
+    assert thread.take_completed_saves() == {first.store_job_id: 1}
+    assert thread.request_queue.unfinished_tasks == 0
+
+    _wait_for_store_pressure_probe(thread)
+    retry = _make_store_req("req-a", [b"a0", b"a1"])
+    _run_store_req(thread, retry)
+    assert thread.take_completed_saves() == {retry.store_job_id: 1}
+    assert thread.request_queue.unfinished_tasks == 0
+    puts = store.batch_put_from_multi_buffers.call_args_list
+    assert len(puts) == 2
+    assert puts[0].args == puts[1].args
+    assert puts[1].args[1:3] == ([[0x1100], [0x1200]], [[256], [256]])
+    assert [row["status"] for row in stats.data["save_put"]] == [
+        "partial_failure",
+        "ok",
+    ]
+
+    # A later job on the persisted range must not write it again.
+    next_job = _make_store_req("req-a", [b"a0", b"a1"])
+    _run_store_req(thread, next_job)
+    assert store.batch_put_from_multi_buffers.call_count == 2
+    assert thread.take_completed_saves() == {next_job.store_job_id: 1}
+    assert thread.take_completed_saves() == {}
+    assert thread.request_queue.unfinished_tasks == 0
+
+
+@pytest.mark.cpu_test
+def test_store_pressure_stale_job_does_not_consume_due_probe():
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = [[-200, -200], [256, 256]]
+    thread = _make_store_sending_thread(store, mock_task_done=False)
+    stale = _make_store_req("req-a", [b"a0", b"a1"])
+    stale.store_job_id = next(_TEST_SAVE_SEQ)
+    thread.add_request(stale)
+    stale = thread.request_queue.get_nowait()
+    thread.delete_finished_stored_request("req-a")
+
+    live = _make_store_req("req-a", [b"a0", b"a1"])
+    _run_store_req(thread, live)
+    assert thread.take_completed_saves() == {live.store_job_id: 1}
+    assert thread.request_queue.unfinished_tasks == 1
+    _wait_for_store_pressure_probe(thread)
+    due = getattr(thread, "_store_pressure_probe_at", None)
+    thread._handle_request(stale)
+    assert getattr(thread, "_store_pressure_probe_at", None) == due
+    assert store.batch_put_from_multi_buffers.call_count == 1
+    assert thread.take_completed_saves() == {stale.store_job_id: 1}
+    assert thread.request_queue.unfinished_tasks == 0
+
+    retry = _make_store_req("req-a", [b"a0", b"a1"])
+    _run_store_req(thread, retry)
+    assert store.batch_put_from_multi_buffers.call_count == 2
+    assert thread.take_completed_saves() == {retry.store_job_id: 1}
+    assert thread.take_completed_saves() == {}
+    assert thread.request_queue.unfinished_tasks == 0
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "initial_code,retry_result,retry_status,failed",
+    [
+        (-707, [256], "ok", False),
+        (-707, [-707], "partial_failure", True),
+        (-500, None, None, True),
+        (-707, RuntimeError("lease retry failed"), "error", True),
+    ],
+    ids=["lease-success", "lease-still-expired", "nonlease", "retry-exception"],
+)
+def test_recv_lease_retry_preserves_failure_metrics_and_completion(
+    initial_code, retry_result, retry_status, failed
+):
+    store = MagicMock()
+    store.batch_get_replica_desc.return_value = {}
+    responses = [[initial_code, 256]]
+    if retry_status is not None:
+        responses.append(retry_result)
+    store.batch_get_into_multi_buffers.side_effect = responses
+    stats = MooncakeStoreConnectorStats()
+    thread = _make_store_recving_thread(
+        store,
+        is_hma_required=True,
+        record_operation=stats.record_operation,
+        mock_task_done=False,
+    )
+    req = _make_load_req("req-a", [b"a0", b"a1"], token_len=32)
+    thread.add_request(req)
+    thread._handle_request(thread.request_queue.get_nowait())
+
+    calls = store.batch_get_into_multi_buffers.call_args_list
+    assert len(calls) == (2 if retry_status is not None else 1)
+    assert calls[0].args[1:3] == ([[0x1000], [0x1100]], [[256], [256]])
+    if retry_status is not None:
+        keys, buffers, sizes = calls[0].args
+        assert calls[1].args == ([keys[0]], [buffers[0]], [sizes[0]])
+        assert calls[1].args[1][0] is buffers[0]
+        assert len(stats.data["load_get_retry"]) == 1
+        retried = stats.data["load_get_retry"][0]
+        assert retried["status"] == retry_status
+        assert retried["num_keys"] == 1
+        assert retried["num_bytes"] == 256
+        assert retried["num_failed_keys"] == int(failed)
+    else:
+        assert "load_get_retry" not in stats.data
+    assert len(stats.data["load_get"]) == 1
+    initial = stats.data["load_get"][0]
+    assert initial["status"] == "partial_failure"
+    assert initial["num_keys"] == 2
+    assert initial["num_bytes"] == 512
+    assert initial["num_failed_keys"] == 1
+    assert thread.get_and_clear_block_ids_with_load_errors() == set()
+    assert thread.get_and_clear_failed_requests() == ({"req-a"} if failed else set())
+    assert thread.get_and_clear_failed_requests() == set()
+    assert thread.get_and_clear_finished_requests() == {"req-a"}
+    assert thread.get_and_clear_finished_requests() == set()
+    assert thread.request_queue.empty()
+    assert thread.request_queue.unfinished_tasks == 0

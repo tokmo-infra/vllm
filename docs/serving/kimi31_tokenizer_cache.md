@@ -46,6 +46,34 @@ occupancy and limits are available through the cache service's stats(). Do not
 sum the shared capacity once per API. CPU token reuse does not measure GPU KV
 hits or prove that Mooncake get/put completed.
 
+The single-API HTTP /metrics endpoint also exports:
+
+- vllm:tokenizer_l2_cache_bytes
+- vllm:tokenizer_l2_cache_entries
+- vllm:tokenizer_l2_cache_max_bytes
+- vllm:tokenizer_l2_cache_evictions_total
+
+An independent collector preserves the L1 counters and gauges when engine logger
+initialization unregisters its metric wrappers. With no
+PROMETHEUS_MULTIPROC_DIR, the L2 daemon enables mmap metrics in the private
+SHARED_PATH/metrics directory before importing prometheus_client; the API keeps
+its normal single-process registry. Scrapes only read these files: they make no
+cache RPC, acquire no cache lock, and neither encode text nor change LRU order.
+Cache keys, byte charging, capacity and native token IDs are unchanged.
+The existing per-put L2 gauge updates now write to mmap files; this has
+observability overhead to account for in CPU replay. Gauges are sampled
+independently, not as one atomic stats() snapshot.
+
+When PROMETHEUS_MULTIPROC_DIR is already configured, the daemon keeps using that
+directory and the normal multiprocess exporter collects its budget once. Set
+this environment before starting processes/importing prometheus_client; do not
+set or change it midway through a run. A replacement daemon clears its old live
+gauges before publishing the new budget. The files can retain the last snapshot
+after an abnormal exit, and multiprocess eviction counters can include earlier
+daemon lifetimes: these metrics are not a daemon-health probe or an L2 hit-rate
+measurement. Reuse of a terminated deployment's metric directory is unsupported;
+use a fresh private cache path. Do not modify or delete metric files during a run.
+
 KIMI31_TOKENIZER_CACHE_EPOCH_FILE optionally names a shared epoch file. Change
 it only after ingress stops and requests drain. Each API checks it at most once
 per second and clears L1 on change. L2 identity includes the epoch, so an old

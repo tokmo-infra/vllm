@@ -25,7 +25,7 @@ From a committed checkout on a host with that exact base image:
     docker run --rm --network=none --entrypoint cat \
       vllm/vllm-openai:kimi-k31-yyf /opt/kimi31-yyf-source.sha256
 
-The context contains three Python payload files and the Dockerfile from one
+The context contains five Python payload files and the Dockerfile from one
 selected commit, not arbitrary uncommitted files. SOURCE_COMMIT selects a
 committed revision; IMAGE_TAG changes the output tag. The original image is not
 overwritten. Revision labels and installed hashes identify actual code. A
@@ -55,3 +55,6 @@ dataset and statistics window; do not mix fixes into the running baseline.
 Checks cover large-batch autotune coverage, lookup/get/put versus real reused
 tokens, pressure recovery, leases, checkpoint alignment and load-error handling.
 A lookup hit alone proves neither successful retrieval nor token reuse.
+The optimized runtime also includes bounded Store pressure probes and one-shot
+expired-lease recovery; see the
+[Store recovery behavior](../../docs/features/mooncake_store_connector_usage.md#recovering-from-store-pressure-and-expired-read-leases).

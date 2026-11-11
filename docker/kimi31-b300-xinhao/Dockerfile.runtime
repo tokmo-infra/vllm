@@ -11,7 +11,11 @@ ENV KIMI31_TOKENIZER_CACHE_GIB=16 \
 COPY vllm/renderers/kimi_k3.py /usr/local/lib/python3.12/dist-packages/vllm/renderers/kimi_k3.py
 COPY vllm/tokenizers/kimi_k3_cache.py /usr/local/lib/python3.12/dist-packages/vllm/tokenizers/kimi_k3_cache.py
 COPY vllm/tokenizers/kimi_k3_cache_shared.py /usr/local/lib/python3.12/dist-packages/vllm/tokenizers/kimi_k3_cache_shared.py
+COPY vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+COPY vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/lease.py /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/lease.py
 RUN sha256sum /usr/local/lib/python3.12/dist-packages/vllm/renderers/kimi_k3.py \
     /usr/local/lib/python3.12/dist-packages/vllm/tokenizers/kimi_k3_cache.py \
     /usr/local/lib/python3.12/dist-packages/vllm/tokenizers/kimi_k3_cache_shared.py \
+    /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py \
+    /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/lease.py \
     > /opt/kimi31-yyf-source.sha256

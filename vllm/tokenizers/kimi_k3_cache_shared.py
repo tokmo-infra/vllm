@@ -14,7 +14,8 @@ or transient RPC copies. IDs stay packed bytes, never a replicated 16 GiB L2.
 The detached server outlives API clients and stops with the container. No GPU
 or vLLM imports are required, including when executed directly by file path.
 Only the server creates Prometheus L2 metrics; livesum gauges thus count the
-shared capacity once. Pass PROMETHEUS_MULTIPROC_DIR through to the server.
+shared capacity once. Without PROMETHEUS_MULTIPROC_DIR, it uses a private mmap
+directory for the single API's exporter; the API's own environment is unchanged.
 """
 
 import argparse
@@ -35,6 +36,13 @@ _START_TIMEOUT = 10.0
 _MAX_BYTES = 16 * 1024**3
 _METHODS = ("get", "put", "stats")
 _CACHE_FACTORY = "cache"
+
+
+def _metrics_directory(path):
+    configured = os.environ.get("PROMETHEUS_MULTIPROC_DIR") or os.environ.get(
+        "prometheus_multiproc_dir"  # noqa: SIM112
+    )
+    return Path(configured) if configured else path / "metrics"
 
 
 def _deep_size(value):
@@ -258,6 +266,7 @@ class SharedTextPieceCache:
         if type(max_bytes) is not int or not 0 < max_bytes <= _MAX_BYTES:
             raise ValueError("max_bytes must be a positive integer <= 16 GiB")
         self.path = Path(os.path.abspath(path))
+        self.metrics_directory = _metrics_directory(self.path)
         self.max_bytes = max_bytes
         self._pid = os.getpid()
         self._lock = threading.Lock()
@@ -331,7 +340,12 @@ class SharedTextPieceCache:
 
 def _serve(path, max_bytes, lease, ready_fd):
     os.umask(0o077)
-    if os.environ.get("PROMETHEUS_MULTIPROC_DIR") and (path / "server.pid").exists():
+    metrics_dir = _metrics_directory(path)
+    metrics_dir.mkdir(mode=0o700, exist_ok=True)
+    # This fresh interpreter has not imported prometheus_client yet. Enable
+    # mmap before its ValueClass is selected, without changing the API process.
+    os.environ["PROMETHEUS_MULTIPROC_DIR"] = str(metrics_dir)
+    if (path / "server.pid").exists():
         from prometheus_client.multiprocess import mark_process_dead
 
         # The inherited lease proves the previous server is gone. Remove its

@@ -58,6 +58,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
     TPShardedStoreLayout,
     group_compact_kernel_blocks,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.lease import (  # noqa: E501
+    LEASE_EXPIRED,
+    retry_expired_get_once,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.protocol import (  # noqa: E501
     LOOKUP_MSG,
     RESET_MSG,
@@ -93,6 +97,7 @@ from .metrics import MooncakeStoreConnectorStats
 logger = init_logger(__name__)
 
 MOONCAKE_NO_AVAILABLE_HANDLE = -200
+_STORE_PRESSURE_PROBE_INTERVAL_S = 1.0
 _T = TypeVar("_T")
 
 
@@ -452,6 +457,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # Pause store requests when CPU/disk offloading is under pressure.
         self._store_pressure_active = False
         self._skip_store_requests: set[str] = set()
+        self._store_pressure_probe_at = 0.0
 
         # Per-request high-water mark of tokens actually persisted; the next
         # batch resumes here, so pressure-skipped or failed ranges are retried.
@@ -547,12 +553,31 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
     def _should_skip_request(self, req_id: str) -> bool:
         with self.done_task_lock:
-            return self._store_pressure_active and req_id in self._skip_store_requests
+            if (
+                not self._store_pressure_active
+                or req_id not in self._skip_store_requests
+            ):
+                return False
+            now = time.monotonic()
+            if now < self._store_pressure_probe_at:
+                return True
+            # All active requests may have failed allocation. Requiring another
+            # request's successful PUT to reopen the gate can then suppress every
+            # later checkpoint even after the Store has evicted enough data.
+            # Reserve one probe per sending thread; the caller uses only this
+            # job's pinned blocks and still retires it through the normal finally.
+            self._store_pressure_probe_at = now + _STORE_PRESSURE_PROBE_INTERVAL_S
+        logger.info("Mooncake store pressure recovery probe for request %s", req_id)
+        return False
 
     def _mark_request_skipped_for_pressure(self, req_meta: ReqMeta) -> bool:
         req_id = req_meta.req_id
         with self.done_task_lock:
             already_skipped = req_id in self._skip_store_requests
+            if not self._store_pressure_active:
+                self._store_pressure_probe_at = (
+                    time.monotonic() + _STORE_PRESSURE_PROBE_INTERVAL_S
+                )
             self._store_pressure_active = True
             # The pressure itself is global, but only a live job may sentence its
             # own request to being skipped.
@@ -566,6 +591,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 return False
             self._store_pressure_active = False
             self._skip_store_requests.clear()
+            self._store_pressure_probe_at = 0.0
         return True
 
     def _boundary_puts(
@@ -1243,6 +1269,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         current_batch_keys: list[str] = key_list_c
         current_batch_block_ids: list[int] = block_id_list_c
         batch_bytes = 0
+        load_get_recorded = False
         try:
             for (
                 batch_keys,
@@ -1252,6 +1279,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             ) in load_batches:
                 current_batch_keys = batch_keys
                 current_batch_block_ids = batch_block_ids
+                load_get_recorded = False
                 batch_bytes = _sum_batch_bytes(batch_sizes)
                 tiers_by_key: dict[str, str] | None = None
                 if envs.VLLM_MOONCAKE_STORE_TIER_LOG:
@@ -1280,6 +1308,48 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     status="partial_failure" if failed else "ok",
                     num_failed_keys=len(failed),
                 )
+                load_get_recorded = True
+                expired = [i for i, value in enumerate(res) if value == LEASE_EXPIRED]
+                if expired:
+                    logger.warning(
+                        "Refreshing expired Mooncake read leases once for "
+                        "%d/%d keys of request %s",
+                        len(expired),
+                        len(batch_keys),
+                        req_id,
+                    )
+                    retry_start = time.perf_counter()
+                    retry_bytes = _sum_batch_bytes([batch_sizes[i] for i in expired])
+                    try:
+                        res = retry_expired_get_once(
+                            self.store, batch_keys, batch_addrs, batch_sizes, res
+                        )
+                    except Exception:
+                        self._record_operation(
+                            "load_get_retry",
+                            retry_start,
+                            len(expired),
+                            num_bytes=retry_bytes,
+                            status="error",
+                            num_failed_keys=len(expired),
+                        )
+                        raise
+                    remaining = sum(res[i] < 0 for i in expired)
+                    self._record_operation(
+                        "load_get_retry",
+                        retry_start,
+                        len(expired),
+                        num_bytes=retry_bytes,
+                        status="partial_failure" if remaining else "ok",
+                        num_failed_keys=remaining,
+                    )
+                    failed = [
+                        (key, value, block_id)
+                        for key, value, block_id in zip(
+                            batch_keys, res, batch_block_ids, strict=True
+                        )
+                        if value < 0
+                    ]
                 if failed:
                     self._report_load_error(
                         req_id, [block_id for _, _, block_id in failed]
@@ -1294,14 +1364,15 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     break
         except Exception as e:
             self._report_load_error(req_id, current_batch_block_ids)
-            self._record_operation(
-                "load_get",
-                load_get_start,
-                len(current_batch_keys),
-                num_bytes=batch_bytes,
-                status="error",
-                num_failed_keys=len(current_batch_keys),
-            )
+            if not load_get_recorded:
+                self._record_operation(
+                    "load_get",
+                    load_get_start,
+                    len(current_batch_keys),
+                    num_bytes=batch_bytes,
+                    status="error",
+                    num_failed_keys=len(current_batch_keys),
+                )
             logger.warning(
                 "Failed to get Mooncake sub-batch %s, error: %s",
                 current_batch_keys[:3],

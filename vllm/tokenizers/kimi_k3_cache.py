@@ -14,32 +14,71 @@ from collections import OrderedDict
 from pathlib import Path
 from types import MethodType
 
-from prometheus_client import Counter, Gauge
+from prometheus_client import REGISTRY, Counter, Gauge, multiprocess
+from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 
 _LABELS = ["api_process"]
 _TOKENS = Counter(
     "vllm:tokenizer_cache_tokens",
     "Kimi text-piece tokens by source",
     _LABELS + ["source"],
+    registry=None,
 )
 _REQUESTS = Counter(
-    "vllm:tokenizer_cache_requests", "Kimi text-piece calls by path", _LABELS + ["path"]
+    "vllm:tokenizer_cache_requests",
+    "Kimi text-piece calls by path",
+    _LABELS + ["path"],
+    registry=None,
 )
 _BYTES = Gauge(
     "vllm:tokenizer_cache_bytes",
     "Charged CPU cache bytes",
     _LABELS,
     multiprocess_mode="livesum",
+    registry=None,
 )
 _LIMIT = Gauge(
     "vllm:tokenizer_cache_max_bytes",
     "CPU cache byte budget",
     _LABELS,
     multiprocess_mode="livesum",
+    registry=None,
 )
-_EVICTIONS = Counter("vllm:tokenizer_cache_evictions", "Kimi cache evictions", _LABELS)
+_EVICTIONS = Counter(
+    "vllm:tokenizer_cache_evictions", "Kimi cache evictions", _LABELS, registry=None
+)
 _CACHE = None
 _INIT_LOCK = threading.Lock()
+
+
+class _TokenizerCacheCollector:
+    """Keep cache metrics independent of the engine logger's wrapper cleanup."""
+
+    def __init__(self):
+        self.shared = None
+
+    def describe(self):
+        for metric in (_TOKENS, _REQUESTS, _BYTES, _LIMIT, _EVICTIONS):
+            yield from metric.describe()
+        for name, description in (
+            ("bytes", "Charged shared CPU text-piece cache bytes"),
+            ("entries", "Shared CPU text-piece cache entries"),
+            ("max_bytes", "Total shared CPU text-piece cache budget"),
+        ):
+            yield GaugeMetricFamily("vllm:tokenizer_l2_cache_" + name, description)
+        yield CounterMetricFamily(
+            "vllm:tokenizer_l2_cache_evictions", "Shared CPU text-piece LRU evictions"
+        )
+
+    def collect(self):
+        for metric in (_TOKENS, _REQUESTS, _BYTES, _LIMIT, _EVICTIONS):
+            yield from metric.collect()
+        if self.shared is not None:
+            yield from self.shared.collect()
+
+
+_CACHE_METRICS = _TokenizerCacheCollector()
+REGISTRY.register(_CACHE_METRICS)
 
 
 class TextPieceCache:
@@ -57,6 +96,14 @@ class TextPieceCache:
         self.shared = shared
         _LIMIT.labels(self.rank).set(max_bytes)
         _BYTES.labels(self.rank).set(0)
+        if shared is not None and not (
+            os.environ.get("PROMETHEUS_MULTIPROC_DIR")
+            or os.environ.get("prometheus_multiproc_dir")  # noqa: SIM112
+        ):
+            # Scrapes read the daemon's mmap files, never the cache RPC/lock.
+            _CACHE_METRICS.shared = multiprocess.MultiProcessCollector(
+                None, path=str(shared.metrics_directory)
+            )
 
     def _epoch(self):
         return self.epoch_path.read_text().strip() if self.epoch_path else ""

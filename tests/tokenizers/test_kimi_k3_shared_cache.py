@@ -6,7 +6,8 @@ Minimal CPU-only invocation (bypasses the repository's GPU conftest):
     .venv/bin/python -m pytest --confcutdir=tests/tokenizers \
         tests/tokenizers/test_kimi_k3_shared_cache.py
 
-These exercise the standalone L2 API, not renderer/tokenizer integration.
+These exercise the standalone L2 API and real CPU-only Prometheus HTTP export,
+not model loading or full OpenAI server integration.
 """
 
 import contextlib
@@ -73,6 +74,88 @@ def _late_writer(path, start, queue):
 
 def _inherited_reader(cache, queue):
     queue.put(cache.get(KEY, "e1"))
+
+
+def _single_api_scrape(path, queue):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from prometheus_client import (
+        REGISTRY,
+        CollectorRegistry,
+        make_asgi_app,
+        multiprocess,
+    )
+
+    spec = importlib.util.spec_from_file_location(
+        "single_api_cache_test", MODULE.with_name("kimi_k3_cache.py")
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    shared = _client(path)
+    cache = module.TextPieceCache(4096, "single-api", shared=shared)
+
+    def native(text, allow_special_tokens=True):
+        return [7, 11]
+
+    for _ in range(2):
+        assert cache.encode("backend", native, "exact text", False, set()) == [7, 11]
+    # The default logger removes MetricWrapperBase collectors by this prefix.
+    for collector in list(REGISTRY._collector_to_names):
+        if getattr(collector, "_name", "").startswith("vllm:"):
+            REGISTRY.unregister(collector)
+    registry = REGISTRY
+    if os.environ.get("PROMETHEUS_MULTIPROC_DIR") is not None:
+        registry = CollectorRegistry()
+        multiprocess.MultiProcessCollector(registry)
+    app = FastAPI()
+    app.mount("/metrics", make_asgi_app(registry=registry))
+    before = shared.stats()
+    with TestClient(app) as client:
+        first = client.get("/metrics/")
+        second = client.get("/metrics/")
+    queue.put(
+        (
+            first.status_code,
+            first.text,
+            second.text,
+            before,
+            shared.stats(),
+            os.environ.get("PROMETHEUS_MULTIPROC_DIR"),
+        )
+    )
+
+
+def _scrape_samples(path, monkeypatch, multiprocess_mode=False):
+    from prometheus_client.parser import text_string_to_metric_families
+
+    monkeypatch.delenv("PROMETHEUS_MULTIPROC_DIR", raising=False)
+    monkeypatch.delenv("prometheus_multiproc_dir", raising=False)
+    if multiprocess_mode:
+        (path / "metrics").mkdir()
+        monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(path / "metrics"))
+    ctx = multiprocessing.get_context("spawn")
+    queue = ctx.Queue()
+    worker = ctx.Process(target=_single_api_scrape, args=(path, queue))
+    worker.start()
+    status, first, second, before, after, env = queue.get(timeout=20)
+    _join(worker)
+    assert status == 200
+    assert before == after
+    assert env == (str(path / "metrics") if multiprocess_mode else None)
+
+    def samples(text):
+        result = {}
+        for metric in text_string_to_metric_families(text):
+            for sample in metric.samples:
+                if sample.name.startswith("vllm:tokenizer"):
+                    key = sample.name, tuple(sorted(sample.labels.items()))
+                    assert key not in result, "duplicate cache metric sample"
+                    result[key] = sample.value
+        return result
+
+    assert samples(first) == samples(second)
+    return samples(first), before
 
 
 def _join(process):
@@ -256,6 +339,69 @@ def test_server_only_multiprocess_metrics_count_one_budget(cache_path, monkeypat
         registry.get_sample_value("vllm:tokenizer_l2_cache_evictions_total")
         == evictions
     )
+
+
+@pytest.mark.parametrize("multiprocess_mode", [False, True])
+def test_single_api_l1_metrics_survive_logger_cleanup(
+    cache_path, monkeypatch, multiprocess_mode
+):
+    samples, _ = _scrape_samples(cache_path, monkeypatch, multiprocess_mode)
+    label = (("api_process", "single-api"),)
+    assert samples.get(("vllm:tokenizer_cache_max_bytes", label)) == 4096
+    assert samples.get(("vllm:tokenizer_cache_bytes", label), 0) > 0
+    assert (
+        samples.get(
+            (
+                "vllm:tokenizer_cache_tokens_total",
+                label + (("source", "encoded_tokens"),),
+            )
+        )
+        == 2
+    )
+    assert (
+        samples.get(
+            (
+                "vllm:tokenizer_cache_tokens_total",
+                label + (("source", "reused_tokens"),),
+            )
+        )
+        == 2
+    )
+    assert (
+        samples.get(("vllm:tokenizer_cache_requests_total", label + (("path", "hit"),)))
+        == 1
+    )
+
+
+def test_single_api_l2_metrics_scrape_without_cache_mutation(cache_path, monkeypatch):
+    samples, stats = _scrape_samples(cache_path, monkeypatch)
+    assert samples.get(("vllm:tokenizer_l2_cache_max_bytes", ())) == BUDGET
+    assert samples.get(("vllm:tokenizer_l2_cache_entries", ())) == stats["entries"] == 1
+    assert samples.get(("vllm:tokenizer_l2_cache_bytes", ())) == stats["bytes"]
+    assert samples.get(("vllm:tokenizer_l2_cache_evictions_total", ())) == 0
+    files = list((cache_path / "metrics").glob("*.db"))
+    assert files
+    pid = (cache_path / "server.pid").read_text()
+    assert all(path.stem.endswith("_" + pid) for path in files)
+
+
+def test_single_api_default_metrics_restart_counts_one_live_budget(
+    cache_path, monkeypatch
+):
+    from prometheus_client import CollectorRegistry, multiprocess
+
+    monkeypatch.delenv("PROMETHEUS_MULTIPROC_DIR", raising=False)
+    monkeypatch.delenv("prometheus_multiproc_dir", raising=False)
+    cache = _client(cache_path)
+    cache.put(KEY, PACKED, 1, "e1")
+    _stop_server(cache_path)
+    replacement = _client(cache_path)
+    assert replacement.get(KEY, "e1") is None
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry, path=str(cache_path / "metrics"))
+    assert registry.get_sample_value("vllm:tokenizer_l2_cache_max_bytes") == BUDGET
+    assert registry.get_sample_value("vllm:tokenizer_l2_cache_bytes") == 0
+    assert registry.get_sample_value("vllm:tokenizer_l2_cache_entries") == 0
 
 
 def test_dead_server_rpc_fails_and_new_client_restarts_without_double_budget(
