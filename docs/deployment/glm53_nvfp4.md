@@ -79,8 +79,8 @@ vllm serve /model --served-model-name glm53-nvfp4 \
   --data-parallel-address HEAD_IP --data-parallel-backend mp \
   --data-parallel-rpc-port 20550 --enable-expert-parallel \
   --enable-ep-weight-filter --max-model-len 131072 \
-  --max-num-seqs 32 --max-num-batched-tokens 2048 \
-  --gpu-memory-utilization 0.95 --kv-cache-dtype fp8 --block-size 64 \
+  --max-num-seqs 32 --max-num-batched-tokens 1024 \
+  --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --block-size 64 \
   --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
   --enable-prefix-caching --scheduler-reserve-full-isl \
   --enable-flashinfer-autotune --enable-cumem-allocator --numa-bind \
@@ -95,6 +95,12 @@ vllm serve /model --served-model-name glm53-nvfp4 \
 `VLLM_HOST_IP`、`MC_TCP_BIND_ADDRESS`、`MOONCAKE_REQUESTER_LOCAL_HOSTNAME`
 及实际 `NCCL_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME`。RDMA GID、HCA 列表及
 GPU 亲和以实测拓扑为准。模型进程保留 `VLLM_USE_V2_MODEL_RUNNER=1`。
+
+在 CUDA 可见显存约 83 GiB 的 6000D 上，完整模型每 rank 权重约
+60.33 GiB，CUDA 图约 0.95 GiB。上述配置的 GPU KV 约 8.8 GiB/rank。
+FlashInfer 调优还会临时分配数 GiB 工作区，因此首次启动从 `0.90` 开始，
+将缓存目录持久挂载。调优完成后的运行峰值与 KV 容量分别核验，再调整
+利用率；保留异步、MTP 和 CUDA 图，不靠关闭这些功能节省显存。
 
 Router 使用 GLM 分支的缓存亲和及低并发均衡实现，耦合部署设置
 `--worker-urls http://HEAD_IP:19483 --intra-node-data-parallel-size 16`
