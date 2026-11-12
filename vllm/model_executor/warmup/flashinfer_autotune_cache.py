@@ -35,7 +35,9 @@ def flashinfer_autotune_cache_hash(runner: "GPUModelRunner") -> str:
     if cache_config is not vllm_config.cache_config:
         vllm_config = replace(vllm_config, cache_config=cache_config)
     config_hash = vllm_config.compute_hash(include_version=False)
-    return hashlib.sha256(config_hash.encode()).hexdigest()
+    # A pre-gather sweep can have valid files but omit serving-time DP buckets.
+    cache_identity = f"glm53-dp-gather-v1:{config_hash}"
+    return hashlib.sha256(cache_identity.encode()).hexdigest()
 
 
 def flashinfer_autotune_root() -> Path:

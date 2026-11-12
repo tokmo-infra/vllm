@@ -1263,7 +1263,11 @@ def test_partial_tail_offload_honors_active_pressure_gate():
 def test_partial_tail_put_failure_activates_pressure_gate():
     store = MagicMock()
     store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
-    store.batch_put_from_multi_buffers.return_value = [256, -200, 256]
+    # The native API returns one status per submitted key, including a
+    # boundary-only PUT. Fail the Mamba key, not an unrelated result slot.
+    store.batch_put_from_multi_buffers.side_effect = lambda keys, *_args: [
+        -200 if "@group:1@" in key else 256 for key in keys
+    ]
     thread = _make_partial_tail_send_thread(store)
 
     _run_store_req(
@@ -2365,7 +2369,8 @@ def test_recv_thread_stops_after_first_failing_disk_offload_sub_batch():
     thread._handle_request(req)
 
     assert store.batch_get_into_multi_buffers.call_count == 1
-    assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1}
+    # The last block's sub-batch was never attempted, so it is invalid too.
+    assert thread.get_and_clear_block_ids_with_load_errors() == {0, 1, 2}
 
 
 def test_recv_thread_skips_split_when_budget_holds_all_keys():
@@ -5192,3 +5197,203 @@ def test_blob_block_hashes_empty():
     view = BlobBlockHashes(memoryview(b""), 0)
     assert len(view) == 0
     assert list(view) == []
+
+
+class _ProtocolStore:
+    """Only the external native Store boundary is simulated."""
+
+    def __init__(self, *, get_results=(), put_results=(), exists_results=None):
+        self.get_results = iter(get_results)
+        self.put_results = iter(put_results)
+        self.exists_results = exists_results
+        self.reads = []
+        self.writes = []
+        self.persisted = set()
+
+    def batch_is_exist(self, keys):
+        if self.exists_results is not None:
+            return self.exists_results
+        return [int(key in self.persisted) for key in keys]
+
+    def batch_put_from_multi_buffers(self, keys, addrs, sizes, _replicate):
+        self.writes.append((list(keys), addrs, sizes))
+        result = next(self.put_results, [sum(size) for size in sizes])
+        if isinstance(result, Exception):
+            raise result
+        if len(result) == len(keys):
+            self.persisted.update(
+                key for key, status in zip(keys, result, strict=True) if status >= 0
+            )
+        return result
+
+    def batch_get_into_multi_buffers(self, keys, addrs, sizes):
+        self.reads.append((list(keys), addrs, sizes))
+        result = next(self.get_results)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+def _protocol_transfer_thread(store, *, sending=False, budget=None, stats=None):
+    """Real transfer thread, coordinator, layouts, queue, and completion ledger."""
+    coord = _default_send_coord()
+    db = ChunkedTokenDatabase(KeyMetadata("test-model", 0, 0, 0, 0), block_size=16)
+    db.set_kv_caches_base_addr([0x1000])
+    db.set_block_len([256])
+    common = dict(
+        store=store,
+        coord=coord,
+        token_databases=[db],
+        block_size=16,
+        tp_rank=0,
+        ready_event=threading.Event(),
+        record_operation=stats.record_operation if stats is not None else None,
+    )
+    if sending:
+        return worker.KVCacheStoreSendingThread(
+            **common, group_put_steps=[1], kv_role="kv_both"
+        )
+    return worker.KVCacheStoreRecvingThread(
+        **common, disk_offload_buffer_budget_bytes=budget
+    )
+
+
+def _process_queued_job(thread, request):
+    thread.add_request(request)
+    thread._handle_request(thread.request_queue.get_nowait())
+    assert thread.request_queue.unfinished_tasks == 0
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("code", [-707, -800])
+def test_fresh_get_recovers_native_read_failure_before_reporting_a_hit(code):
+    store = _ProtocolStore(get_results=[[256, code], [256]])
+    stats = MooncakeStoreConnectorStats()
+    receiver = _protocol_transfer_thread(store, stats=stats)
+    _process_queued_job(receiver, _make_load_req("read", [b"a0", b"a1"], token_len=32))
+    assert receiver.get_and_clear_finished_requests() == {"read"}
+    assert receiver.get_and_clear_block_ids_with_load_errors() == set()
+    assert receiver.get_and_clear_failed_requests() == set()
+    assert [len(keys) for keys, _, _ in store.reads] == [2, 1]
+    assert store.reads[1][0] == [store.reads[0][0][1]]
+    assert stats.data["load_get_retry"][0]["num_failed_keys"] == 0
+    assert stats.data["load_get_retry"][0]["num_bytes"] == 256
+    assert len(stats.data["load_get"]) == 1
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("retry_result", [[-800], [], RuntimeError("replica lost")])
+def test_failed_refresh_invalidates_the_read_and_finishes_the_async_job(retry_result):
+    store = _ProtocolStore(get_results=[[-707], retry_result])
+    stats = MooncakeStoreConnectorStats()
+    receiver = _protocol_transfer_thread(store, stats=stats)
+    _process_queued_job(receiver, _make_load_req("read", [b"a0"], token_len=16))
+    assert receiver.get_and_clear_finished_requests() == {"read"}
+    assert receiver.get_and_clear_block_ids_with_load_errors() == {0}
+    assert len(store.reads) == 2
+    assert stats.data["load_get_retry"][0]["num_failed_keys"] == 1
+    assert len(stats.data["load_get"]) == 1
+
+
+@pytest.mark.cpu_test
+def test_failed_staging_batch_also_invalidates_unattempted_tail(monkeypatch):
+    monkeypatch.setenv("VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO", "1.0")
+    store = _ProtocolStore(get_results=[[-10]])
+    receiver = _protocol_transfer_thread(store, budget=_DISK_OFFLOAD_SINGLE_KEY_BYTES)
+    _process_queued_job(receiver, _make_load_req("read", [b"a0", b"a1"], token_len=32))
+    assert receiver.get_and_clear_finished_requests() == {"read"}
+    assert receiver.get_and_clear_block_ids_with_load_errors() == {0, 1}
+    assert len(store.reads) == 1
+
+
+@pytest.mark.cpu_test
+def test_incomplete_group_plan_fails_closed_without_hanging():
+    store = _ProtocolStore()
+    receiver = _protocol_transfer_thread(store)
+    request = ReqMeta(
+        req_id="bad",
+        token_len_chunk=16,
+        block_ids=(),
+        block_hashes=[b"a0"],
+        load_spec=LoadSpec(0, 16, True, token_len=16),
+    )
+    _process_queued_job(receiver, request)
+    assert receiver.get_and_clear_finished_requests() == {"bad"}
+    # A malformed plan has no reliable block ID to send to the scheduler.
+    assert receiver.get_and_clear_failed_requests() == {"bad"}
+    assert store.reads == []
+
+
+@pytest.mark.cpu_test
+def test_put_pressure_recovers_for_the_same_live_request(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(worker.time, "monotonic", lambda: now[0])
+    store = _ProtocolStore(put_results=[[-200, -200], [256, 256]])
+    sender = _protocol_transfer_thread(store, sending=True)
+    for job in range(1, 4):
+        if job == 3:
+            now[0] += worker._STORE_PRESSURE_PROBE_INTERVAL_S
+        request = ReqMeta(
+            req_id="same",
+            token_len_chunk=32,
+            block_ids=([1, 2],),
+            block_hashes=[b"a0", b"a1"],
+            can_save=True,
+            store_job_id=job,
+        )
+        _process_queued_job(sender, request)
+        assert sender.take_completed_saves() == {job: 1}
+        if job < 3:
+            assert store.persisted == set()
+            assert len(store.writes) == 1
+    assert len(store.persisted) == 2
+    assert len(store.writes) == 2
+    assert store.writes[0] == store.writes[1]
+
+
+@pytest.mark.cpu_test
+def test_truncated_put_response_cannot_advance_the_save_high_watermark():
+    store = _ProtocolStore(put_results=[[256], [256, 256]])
+    sender = _protocol_transfer_thread(store, sending=True)
+    for job in (1, 2):
+        request = ReqMeta(
+            req_id="same",
+            token_len_chunk=32,
+            block_ids=([1, 2],),
+            block_hashes=[b"a0", b"a1"],
+            can_save=True,
+            store_job_id=job,
+        )
+        _process_queued_job(sender, request)
+        assert sender.take_completed_saves() == {job: 1}
+    assert len(store.persisted) == 2
+    assert len(store.writes) == 2
+    assert store.writes[0] == store.writes[1]
+
+
+@pytest.mark.cpu_test
+def test_compact_registration_covers_every_group_layer_and_state_view():
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    group = KVCacheGroupSpec(["layer0", "layer1"], spec)
+    first = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    second = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    third = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+    views = worker._compact_group_cache_tensors(
+        group, {"layer0": (first, second), "layer1": third}, 3
+    )
+    assert len(views) == 3
+    assert views[0].shape == (3, 2, 4)
+    assert torch.equal(views[0].flatten(), first.flatten())
+    assert torch.equal(views[1], second)
+    assert torch.equal(views[2], third)
+    assert [view.data_ptr() for view in views] == [
+        first.data_ptr(),
+        second.data_ptr(),
+        third.data_ptr(),
+    ]
+    with pytest.raises(ValueError, match="layer1"):
+        worker._compact_group_cache_tensors(group, {"layer0": first}, 3)
+    with pytest.raises(TypeError, match="non-empty"):
+        worker._compact_group_cache_tensors(group, {"layer0": (), "layer1": third}, 3)

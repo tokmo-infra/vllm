@@ -220,6 +220,11 @@ if TYPE_CHECKING:
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
+    VLLM_GLM53_TOKENIZER_CACHE_GIB: float = 0
+    VLLM_GLM53_TOKENIZER_CACHE_EPOCH_FILE: str | None = None
+    VLLM_GLM53_TOKENIZER_SHARED_PATH: str | None = None
+    VLLM_GLM53_TOKENIZER_SHARED_GIB: float = 8
+    VLLM_GLM53_TOKENIZER_LOCAL_L1_MIB: float = 64
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
@@ -1792,6 +1797,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "MOONCAKE_REQUESTER_LOCAL_HOSTNAME"
     ),
     # Override the directory for the FlashInfer autotune config cache.
+    "VLLM_GLM53_TOKENIZER_CACHE_GIB": lambda: float(
+        os.getenv("VLLM_GLM53_TOKENIZER_CACHE_GIB", "0")
+    ),
+    "VLLM_GLM53_TOKENIZER_CACHE_EPOCH_FILE": lambda: os.getenv(
+        "VLLM_GLM53_TOKENIZER_CACHE_EPOCH_FILE"
+    ),
+    "VLLM_GLM53_TOKENIZER_SHARED_PATH": lambda: os.getenv(
+        "VLLM_GLM53_TOKENIZER_SHARED_PATH"
+    ),
+    "VLLM_GLM53_TOKENIZER_SHARED_GIB": lambda: float(
+        os.getenv("VLLM_GLM53_TOKENIZER_SHARED_GIB", "8")
+    ),
+    "VLLM_GLM53_TOKENIZER_LOCAL_L1_MIB": lambda: float(
+        os.getenv("VLLM_GLM53_TOKENIZER_LOCAL_L1_MIB", "64")
+    ),
     "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": lambda: os.getenv(
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR", None
     ),
@@ -2400,6 +2420,11 @@ def compile_factors() -> dict[str, object]:
         "VLLM_LOGGING_CONFIG_PATH",
         "VLLM_LOGGING_COLOR",
         "VLLM_LOG_STATS_INTERVAL",
+        "VLLM_GLM53_TOKENIZER_CACHE_GIB",
+        "VLLM_GLM53_TOKENIZER_CACHE_EPOCH_FILE",
+        "VLLM_GLM53_TOKENIZER_SHARED_PATH",
+        "VLLM_GLM53_TOKENIZER_SHARED_GIB",
+        "VLLM_GLM53_TOKENIZER_LOCAL_L1_MIB",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",

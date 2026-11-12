@@ -1,0 +1,67 @@
+{
+  "name": "glm5.3-nvfp4-1113",
+  "base_vllm_version": "0.33.0",
+  "base_commit": "4ba787ec9959e566d3b587a796dff07673324da5",
+  "base_image": "vllm/vllm-openai:v0.33.0@sha256:d825baf9ce4b1b6bfc5ecc7b79880c7e6748c65a72d697ce3d47607aafa84c6e",
+  "torch_version": "2.14.0+cu130",
+  "flashinfer_version": "0.7.2.post1",
+  "model_architecture": "GlmMoeDsaForCausalLM",
+  "tokenizer_sha256": "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d",
+  "files": [
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py",
+      "sha256": "bd860cada8f5e753f57a844d8f2f9dee6169da051d4a4ae5ed934f5394ce0569",
+      "base_sha256": "969e70fe152be0a01364c79cf1b2e64d63b2df5d98a19f80aef3050aa1cc1f80"
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/lease.py",
+      "sha256": "8827b170b4552eef7a9cc1745a4e91327b84f18f957c50a3b601555471df78cc",
+      "base_sha256": null
+    },
+    {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py",
+      "sha256": "a5c75405d6b6f4e0c568ffb00c37abb6291759aaef29ffa658a86284641a7f13",
+      "base_sha256": "892af8c84b949651618d90edffd6b52f858f8a43f470efd6216224a5f835c149"
+    },
+    {
+      "path": "vllm/envs.py",
+      "sha256": "9c6f456892ff4e4887740bcf3a765531de9084bb206b64ec9e8a8037309fbd05",
+      "base_sha256": "a9f665c49da1d8852c19a192f5d5848f0e38f4f56c76b5fafe0c17398945b357"
+    },
+    {
+      "path": "vllm/model_executor/warmup/flashinfer_autotune_cache.py",
+      "sha256": "510fb45a074ac91d6fdb0126ca35a2831bc3a5f48bdc51724bcaf33922390299",
+      "base_sha256": "45e7c58238ca18054736be12459b1c40cfcc98b429ec7ea1e7caeb49cd419bba"
+    },
+    {
+      "path": "vllm/model_executor/warmup/kernel_warmup.py",
+      "sha256": "12d314723b3c01dd3bb251a3f2ce7ad6fe7bf9f5187ca8f3ebbee1a24ce8b3fc",
+      "base_sha256": "135a9005b5ab98038587588458499091a43a48f8baadbc0a8feb504f8ca8f937"
+    },
+    {
+      "path": "vllm/renderers/base.py",
+      "sha256": "038b240400e301eb9260585cc7dd689a1d593516f2f1589501729ded781ac4ed",
+      "base_sha256": "949a5f1030650aea39f45ef58a1b0b71a490500e789dfad28fb664c8020b709f"
+    },
+    {
+      "path": "vllm/renderers/hf.py",
+      "sha256": "abab05297c84d2cf6ddcf6b1b2b2cb3866bb38d19a1a4f7b46d4b8f365e607cb",
+      "base_sha256": "3c84c86b348b539fc741085327b165f4b6bf958cc6c0e19fb5dc0f54430432d2"
+    },
+    {
+      "path": "vllm/tokenizers/glm53_native_cache.py",
+      "sha256": "d3da505acbd960989650e653a9e45fe14cc7993b7879d00b7603538648aeef7f",
+      "base_sha256": null
+    },
+    {
+      "path": "vllm/tokenizers/glm53_segment_cache_core.py",
+      "sha256": "f8b8e890af94068c81bfcc82771214b9970e727dbbbcb23d6de3c118fdfd77a9",
+      "base_sha256": null
+    },
+    {
+      "path": "vllm/tokenizers/glm53_shared_segment_store.py",
+      "sha256": "9e43e45a5c5c9b07176a7533af9d1e11bf62e2154bdb68a854c7e9ca8bc533f7",
+      "base_sha256": null
+    }
+  ]
+}

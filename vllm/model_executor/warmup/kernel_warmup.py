@@ -365,8 +365,9 @@ def _run_flashinfer_autotune_dummy_runs(
                 max_tuning_tokens, num_draft_reqs * num_query_per_req
             )
 
+        # MoE dispatch gathers DP rows; attention and dummy allocations stay local.
         tuning_buckets = fi_utils.flashinfer_get_hybrid_num_tokens_buckets(
-            max_tuning_tokens
+            max_tuning_tokens * runner.vllm_config.parallel_config.data_parallel_size
         )
         logger.info(
             "Running FlashInfer autotune with %d tokens and token buckets %s.",

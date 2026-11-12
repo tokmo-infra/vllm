@@ -1142,6 +1142,12 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
                 mm_data = None
 
         chat_template_kwargs = params.get_apply_chat_template_kwargs()
+        if (
+            self._glm53_native_cache is not None
+            and not model_config.enable_prompt_embeds
+        ):
+            # Let BaseRenderer encode the exact rendered text through its cache.
+            chat_template_kwargs["tokenize"] = False
         if prompt_embeds_tensors:
             visibility_check_kwargs = chat_template_kwargs.copy()
             visibility_check_kwargs["tokenize"] = False
@@ -1262,6 +1268,11 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
                 mm_data = None
 
         chat_template_kwargs = params.get_apply_chat_template_kwargs()
+        if (
+            self._glm53_native_cache is not None
+            and not model_config.enable_prompt_embeds
+        ):
+            chat_template_kwargs["tokenize"] = False
         if prompt_embeds_tensors:
             visibility_check_kwargs = chat_template_kwargs.copy()
             visibility_check_kwargs["tokenize"] = False

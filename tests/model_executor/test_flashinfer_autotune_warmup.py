@@ -16,6 +16,7 @@ import torch
 
 import vllm.model_executor.warmup.kernel_warmup as warmup
 import vllm.utils.flashinfer as fi_utils
+from vllm.config import ParallelConfig
 from vllm.model_executor.warmup.kernel_warmup import (
     _flashinfer_autotune_token_counts,
     _run_flashinfer_autotune_dummy_runs,
@@ -41,17 +42,15 @@ def _make_moe(*, max_deferred_tokens: int = 128, enabled: bool = True):
     return moe
 
 
-def _make_runner(modules, *, max_tokens: int = 8192):
+def _make_runner(modules, *, max_tokens: int = 8192, dp_size: int = 1):
     """Create a runner carrying only the state used by FlashInfer warmup."""
     return SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=max_tokens),
         vllm_config=SimpleNamespace(
             attention_config=SimpleNamespace(hisparse_config=None),
-            parallel_config=SimpleNamespace(
-                enable_elastic_ep=False,
-                nnodes=1,
-                pipeline_parallel_size=1,
-                data_parallel_rank=0,
+            parallel_config=ParallelConfig(
+                data_parallel_size=dp_size,
+                distributed_executor_backend="mp",
             ),
         ),
         get_model=Mock(
@@ -91,11 +90,12 @@ def test_flashinfer_autotune_token_counts_are_bounded_and_deduplicated():
 
 
 @pytest.mark.parametrize("skip_attn", [False, True])
-def test_flashinfer_autotune_uses_token_buckets_for_each_dummy_run(skip_attn):
+@pytest.mark.parametrize("dp_size", [1, 4, 8, 16])
+def test_flashinfer_autotune_uses_token_buckets_for_each_dummy_run(skip_attn, dp_size):
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner as V2Runner
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner as V1Runner
 
-    runner = _make_runner([])
+    runner = _make_runner([], dp_size=dp_size)
     dummy_run_signature = signature((V2Runner if skip_attn else V1Runner)._dummy_run)
     runner._dummy_run.side_effect = lambda **kwargs: dummy_run_signature.bind(
         None, **kwargs
@@ -117,7 +117,7 @@ def test_flashinfer_autotune_uses_token_buckets_for_each_dummy_run(skip_attn):
     ):
         _run_flashinfer_autotune_dummy_runs(runner, skip_attn=skip_attn)
 
-    assert get_buckets.call_args_list == [call(8192), call(128)]
+    assert get_buckets.call_args_list == [call(8192 * dp_size), call(128 * dp_size)]
     assert autotune.call_args_list == [
         call(tuning_buckets=max_buckets, round_up=True),
         call(tuning_buckets=deferred_buckets, round_up=True),
@@ -395,9 +395,10 @@ def test_sparse_autotune_respects_cache_selection(
     assert runner._dummy_run.call_count == (0 if mixed.called else 1)
 
 
-def test_flashinfer_autotune_buckets_cover_drafter_tokens():
+@pytest.mark.parametrize("dp_size", [1, 4, 8, 16])
+def test_flashinfer_autotune_buckets_cover_drafter_tokens(dp_size):
     """The drafter's M can exceed the pass size; buckets must include it."""
-    runner = _make_runner([])
+    runner = _make_runner([], dp_size=dp_size)
     runner.max_num_reqs = 256
     runner.max_num_tokens = 8192
     runner.speculator = SimpleNamespace(num_query_per_req=6)
@@ -415,7 +416,10 @@ def test_flashinfer_autotune_buckets_cover_drafter_tokens():
     ):
         _run_flashinfer_autotune_dummy_runs(runner)
 
-    assert get_buckets.call_args_list == [call(8192), call(128 * 6)]
+    assert get_buckets.call_args_list == [
+        call(8192 * dp_size),
+        call(128 * 6 * dp_size),
+    ]
     assert [c.kwargs["num_tokens"] for c in runner._dummy_run.call_args_list] == [
         8192,
         128,

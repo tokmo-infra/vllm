@@ -17,9 +17,12 @@ steps:
     - tests/tools/test_kernel_symbol_map.py
     - tools/ci/kernel_symbol_map.py
     - tools/ci/rocm_kernel_symbol_map.py
+    - integrations/glm53nvfp4/
+    - tests/tools/test_glm53_overlay.py
   commands:
     - pytest -v -s tools/test_docker_build_metadata_args.py
     - pytest -v -s tools/test_kernel_symbol_map.py
+    - pytest -v -s tools/test_glm53_overlay.py
   mirror:
     amd:
       label: ":amd: (MI250) Docker Build Metadata"

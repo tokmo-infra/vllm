@@ -178,3 +178,98 @@ def test_tp_shared_layout_round_trip_across_tp_sizes(
 
         expected = torch.cat(producer_tensors[tp_rank * 2 : tp_rank * 2 + 2], dim=1)
         torch.testing.assert_close(tensor, expected)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("producer_strides", [(48, 24, 6, 2), (3, 72, 18, 1)])
+def test_compact_group_payload_round_trip_omits_padding_and_other_groups(
+    producer_strides,
+):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+        CompactGroupStoreLayout,
+    )
+
+    shape = (3, 2, 4, 3)
+    source_storage = torch.full((512,), 0xEE, dtype=torch.uint8)
+    source = source_storage.as_strided(shape, producer_strides, storage_offset=5)
+    source.copy_(torch.arange(source.numel(), dtype=torch.uint8).reshape(shape))
+    target_storage = torch.full((512,), 0xDD, dtype=torch.uint8)
+    target = target_storage.as_strided(shape, (80, 32, 6, 1), storage_offset=7)
+    metadata = KeyMetadata("test-model", 0, 0, 0, 0)
+    producer = CompactGroupStoreLayout(metadata, 16, 4)
+    consumer = CompactGroupStoreLayout(metadata, 16, 4)
+    producer.register_kv_caches([source], 3)
+    consumer.register_kv_caches([target], 3)
+
+    # The partial block deliberately retains every logical state element.
+    chunks = [(0, 16), (16, 20)]
+    source_addrs, source_sizes, selected = producer.prepare_values(
+        chunks, [2, 0], [0, 0]
+    )
+    target_addrs, target_sizes, _ = consumer.prepare_values(chunks, [1, 2], [0, 0])
+    assert selected == [2, 0]
+    assert producer.compact_block_bytes == source[0].numel()
+    assert [sum(sizes) for sizes in source_sizes] == [24, 24]
+    touched: set[int] = set()
+    for source_block, addrs, sizes, dst_addrs, dst_sizes in zip(
+        [2, 0], source_addrs, source_sizes, target_addrs, target_sizes, strict=True
+    ):
+        payload = b"".join(
+            ctypes.string_at(addr, size)
+            for addr, size in zip(addrs, sizes, strict=True)
+        )
+        assert payload == bytes(source[source_block].flatten().tolist())
+        offset = 0
+        for addr, size in zip(dst_addrs, dst_sizes, strict=True):
+            ctypes.memmove(addr, payload[offset : offset + size], size)
+            touched.update(
+                range(
+                    addr - target_storage.data_ptr(),
+                    addr - target_storage.data_ptr() + size,
+                )
+            )
+            offset += size
+        assert offset == len(payload)
+    assert torch.equal(target[1], source[2])
+    assert torch.equal(target[2], source[0])
+    # Neither padding, adjacent group storage, nor the unused page is written.
+    assert all(
+        value == 0xDD
+        for i, value in enumerate(target_storage.tolist())
+        if i not in touched
+    )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("invalid_stride", [(0, 1), (1, 1)])
+def test_compact_group_layout_rejects_aliasing_views(invalid_stride):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+        CompactGroupStoreLayout,
+    )
+
+    tensor = torch.empty(16, dtype=torch.uint8).as_strided((3, 4), invalid_stride)
+    layout = CompactGroupStoreLayout(KeyMetadata("test-model", 0, 0, 0, 0), 16, 4)
+    with pytest.raises(ValueError, match="strides|non-overlapping"):
+        layout.register_kv_caches([tensor], 3)
+
+
+@pytest.mark.cpu_test
+def test_compact_group_layout_keeps_all_state_views_in_payload_order():
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+        CompactGroupStoreLayout,
+    )
+
+    first = torch.arange(12, dtype=torch.int32).reshape(3, 4)
+    second = torch.arange(18, dtype=torch.int16).reshape(3, 6)
+    layout = CompactGroupStoreLayout(KeyMetadata("test-model", 0, 0, 0, 0), 16, 4)
+    layout.register_kv_caches([first, second], 3)
+    addrs, sizes = layout.prepare_value_for_block(1)
+    assert addrs == [first[1].data_ptr(), second[1].data_ptr()]
+    assert sizes == [16, 12]
+    assert layout.compact_block_bytes == 28
+    with pytest.raises(IndexError, match="capacity"):
+        layout.prepare_value_for_block(3)
+    with pytest.raises(ValueError, match="boundary"):
+        layout.prepare_values([(4, 8)], [1], [0])
+    with pytest.raises(ValueError, match="shard"):
+        layout.prepare_values([(0, 16)], [1], [1])

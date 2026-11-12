@@ -1,4 +1,17 @@
 <!-- markdownlint-disable MD001 MD041 -->
+## GLM5.3 NVFP4 · vLLM 0.33
+
+`glm5.3-nvfp4-1113` 以官方 `v0.33.0` 为基线，面向完整 GLM5.3 NVFP4。
+包含精确分词缓存、Mooncake Store 读写恢复与紧凑 KV 载荷，以及覆盖
+DP 汇聚批量的 FlashInfer 调优；保留原生异步、CUDA 图、默认后端和完整 MTP。
+
+部署及配置见 [GLM5.3 NVFP4 部署文档](docs/deployment/glm53_nvfp4.md)。
+镜像从固定 digest 的官方 0.33 构建，不继承旧 GLM Flash 引擎；安装时
+核验版本及源文件指纹。Flash 专用融合 kernel 与 P 侧 MTP 精简按模型
+结构分别验收，不直接作为跨机 DEP16 耦合路径。
+
+---
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
