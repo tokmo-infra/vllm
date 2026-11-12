@@ -1,10 +1,18 @@
 {
-  "branch": "kimi31-b300-xinhao",
-  "runtime_source_commit": "a79a8889f8d750243361bdc93849bb61711ab848",
-  "base_source_commit": "266e88c051ca46607fd9de20216bd58426f80052",
-  "base_image_id": "sha256:1a8a702f2bfeded3c90259ae60fefbd9e4ca014241946e7d5f3396badce99e76",
-  "deployed_image_id": "sha256:c0c11bb4c2b0c5e8dcc4c8542c1152d8e2ac535c2613ad25a03589b02c651601",
-  "payload_files": ["vllm/renderers/kimi_k3.py", "vllm/tokenizers/kimi_k3_cache.py"],
-  "validation": {"native_chat_cases": 3, "text_piece_mode_cases": 10, "concurrent_renders": 48, "result": "passed"},
-  "source_note": "The archived runtime commit preserves the exact deployed Python files. Later source cleanup only normalizes formatting and narrows the already-checked cache-hit Optional type."
+  "upstream_commit": "78e9a0c28093d71d2805f9acc74d3c08c88a4314",
+  "base_image": "vllm/vllm-openai:kimi-k31-mc@sha256:f81998764e8594d71b40788c5285ae112acf9230129d5d0d238b5df83da5acf6",
+  "amd64_image_id": "sha256:5a259407d16d003765361f98e9178c83915dc615287f37d525efdb4012642f21",
+  "base_vllm_version": "0.1.dev24218+g78e9a0c28",
+  "runtime_payload_sha256": {
+    "vllm/renderers/kimi_k3.py": "c6bee4c292e04a4cf1b18f614c16c223cd829c92a2542e052a6b734d505f6940",
+    "vllm/tokenizers/kimi_k3_cache.py": "26b6e6d415cad52ce46a69b78c9cd47ad188ab56db312e1bad939f090fbe4b00"
+  },
+  "validation": {
+    "native_checkpoint_tokenizer_exact_vectors": 32,
+    "renderer_pytest_passed": 31,
+    "new_cache_tests_fail_on_unmodified_base": 3,
+    "model_performance_benchmark": "not run"
+  },
+  "initial_deployment_cache_sha256": "7c31239ee15100f05124d92d2308b844752995d7985aa5009b8e7b6435e1faf9",
+  "initial_deployment_vs_source": "AST identical; source adds Linux-specific typing comments only. No runtime restart for comment changes."
 }

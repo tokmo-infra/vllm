@@ -1109,7 +1109,6 @@ class precompiled_wheel_utils:
                 print(f"Using existing wheel at {wheel_path}")
 
             package_data_patch = {}
-            source_docker_build = os.getenv("VLLM_DOCKER_SOURCE_BUILD") == "1"
 
             with zipfile.ZipFile(wheel_path) as wheel:
                 exact_members = set()
@@ -1173,18 +1172,6 @@ class precompiled_wheel_utils:
                     if not extract_extensions:
                         continue
 
-                    # The Docker source-build stage assembles a wheel from a
-                    # csrc wheel produced in the same build. Include newly
-                    # added native modules, not only the published-wheel list.
-                    native_name = os.path.basename(member.filename)
-                    if (
-                        source_docker_build
-                        and member.filename.startswith("vllm/")
-                        and (native_name.endswith(".so") or ".so." in native_name)
-                    ):
-                        file_members.append(member)
-                        continue
-
                     if (
                         (
                             flash_attn_regex.match(member.filename)
@@ -1202,23 +1189,14 @@ class precompiled_wheel_utils:
                     print(f"[extract] {file.filename}")
                     target_path = os.path.join(".", file.filename)
                     os.makedirs(os.path.dirname(target_path), exist_ok=True)
-                    native_name = os.path.basename(file.filename)
-                    is_native = native_name.endswith(".so") or ".so." in native_name
-                    if (
-                        source_docker_build
-                        and not is_native
-                        and os.path.isfile(target_path)
+                    with (
+                        wheel.open(file.filename) as src,
+                        open(target_path, "wb") as dst,
                     ):
-                        print(f"[preserve source] {file.filename}")
-                    else:
-                        with (
-                            wheel.open(file.filename) as src,
-                            open(target_path, "wb") as dst,
-                        ):
-                            shutil.copyfileobj(src, dst)
-                        mode = file.external_attr >> 16
-                        if mode:
-                            os.chmod(target_path, mode)
+                        shutil.copyfileobj(src, dst)
+                    mode = file.external_attr >> 16
+                    if mode:
+                        os.chmod(target_path, mode)
 
                     pkg = os.path.dirname(file.filename).replace("/", ".")
                     package_data_patch.setdefault(pkg, []).append(
@@ -1647,7 +1625,6 @@ package_data = {
         "libs/*.so*",
         # Launched by NUMA binding (utils/numa_utils.py); not a Python module.
         "utils/numa_wrapper.sh",
-        "models/deepseek_v41/amd/ops/*.cu",
         "model_executor/layers/fused_moe/configs/*.json",
         # Tuned kernel configs must be explicit: the setuptools-scm git
         # file-finder is inactive when building from a .git-less tree

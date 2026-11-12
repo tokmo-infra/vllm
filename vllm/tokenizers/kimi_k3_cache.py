@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Exact CPU reuse of Kimi's native XTML text-piece tokenization."""
 
+import hashlib
 import os
 import sys
 import threading
@@ -35,8 +36,55 @@ _LIMIT = Gauge(
     multiprocess_mode="livesum",
 )
 _EVICTIONS = Counter("vllm:tokenizer_cache_evictions", "Kimi cache evictions", _LABELS)
+_EPOCH = Gauge(
+    "vllm:tokenizer_cache_epoch",
+    "48-bit SHA256 of the active cache epoch",
+    _LABELS,
+    multiprocess_mode="livemostrecent",
+)
 _CACHE = None
 _INIT_LOCK = threading.Lock()
+
+
+def _bind_api_threads(api_process):
+    if os.environ.get("KIMI31_API_NUMA_BIND", "0") != "1":
+        return
+    import pynvml
+
+    pynvml.nvmlInit()
+    try:
+        device = int(api_process) % pynvml.nvmlDeviceGetCount()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device)
+        # This opt-in path runs on Linux with a validated NVML CPU topology.
+        masks = pynvml.nvmlDeviceGetCpuAffinity(
+            handle,
+            (os.cpu_count() + 63) // 64,  # type: ignore[operator]
+        )
+        cpus = {
+            word * 64 + bit
+            for word, mask in enumerate(masks)
+            for bit in range(64)
+            if mask & (1 << bit)
+        } & os.sched_getaffinity(0)  # type: ignore[attr-defined]
+        if not cpus:
+            raise RuntimeError("No GPU-local CPUs available for Kimi API process")
+        for task in Path("/proc/self/task").iterdir():
+            try:
+                os.sched_setaffinity(int(task.name), cpus)  # type: ignore[attr-defined]
+                if os.sched_getaffinity(int(task.name)) != cpus:  # type: ignore[attr-defined]
+                    raise RuntimeError("Kimi API thread affinity verification failed")
+            except ProcessLookupError:
+                continue
+        from vllm.logger import init_logger
+
+        init_logger(__name__).info(
+            "Kimi API %s GPU-local CPU affinity applied: device=%d cpus=%s",
+            api_process,
+            device,
+            sorted(cpus),
+        )
+    finally:
+        pynvml.nvmlShutdown()
 
 
 class TextPieceCache:
@@ -51,11 +99,44 @@ class TextPieceCache:
         self.entries = OrderedDict()
         self.bytes = 0
         self.lock = threading.Lock()
+        self.stop = threading.Event()
         _LIMIT.labels(self.rank).set(max_bytes)
         _BYTES.labels(self.rank).set(0)
+        self._record_epoch()
+        if self.epoch_path:
+            threading.Thread(
+                target=self._watch_epoch, name="kimi-token-cache-epoch", daemon=True
+            ).start()
 
     def _epoch(self):
         return self.epoch_path.read_text().strip() if self.epoch_path else None
+
+    def _record_epoch(self):
+        value = int(hashlib.sha256((self.epoch or "").encode()).hexdigest()[:12], 16)
+        _EPOCH.labels(self.rank).set(value)
+
+    def _refresh_epoch(self):
+        epoch = self._epoch()
+        if epoch != self.epoch:
+            self.entries.clear()
+            self.bytes = 0
+            self.epoch = epoch
+            _BYTES.labels(self.rank).set(0)
+            self._record_epoch()
+
+    def _watch_epoch(self):
+        # Idle APIs must also clear and acknowledge the epoch before a cold run.
+        while not self.stop.wait(1):
+            try:
+                with self.lock:
+                    self._refresh_epoch()
+            except OSError:
+                from vllm.logger import init_logger
+
+                init_logger(__name__).exception("Cannot read tokenizer cache epoch")
+
+    def close(self):
+        self.stop.set()
 
     def encode(self, namespace, original, text, allow_special, special_ids):
         key = (namespace, allow_special, text)
@@ -63,12 +144,7 @@ class TextPieceCache:
         with self.lock:
             now = time.monotonic()
             if now >= self.next_epoch_check:
-                epoch = self._epoch()
-                if epoch != self.epoch:
-                    self.entries.clear()
-                    self.bytes = 0
-                    self.epoch = epoch
-                    _BYTES.labels(self.rank).set(0)
+                self._refresh_epoch()
                 self.next_epoch_check = now + 1.0
             epoch = self.epoch
             item = self.entries.get(key)
@@ -114,6 +190,7 @@ def attach_cache(config, tokenizer):
     rank = config.parallel_config._api_process_rank
     with _INIT_LOCK:
         if _CACHE is None:
+            _bind_api_threads(rank)
             epoch_path = os.environ.get("KIMI31_TOKENIZER_CACHE_EPOCH_FILE", "")
             _CACHE = TextPieceCache(int(gib * 1024**3), rank, epoch_path)
         elif _CACHE.max_bytes != int(gib * 1024**3):

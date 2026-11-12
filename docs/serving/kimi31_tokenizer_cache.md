@@ -1,33 +1,43 @@
-# Kimi K3.1 CPU tokenizer cache
+# Kimi K3 text-piece tokenization cache
 
-The Kimi renderer can reuse native XTML text-piece tokenization with a bounded,
-process-private cache. Set `KIMI31_TOKENIZER_CACHE_GIB=12` to allow up to 12 GiB
-per API process. The default is `0` (disabled). This budget grows on demand;
-it is separate from GPU prefix KV caching and Mooncake L2.
+This branch starts from upstream commit
+`78e9a0c28093d71d2805f9acc74d3c08c88a4314`, recorded in the vLLM package in
+`vllm/vllm-openai:kimi-k31-mc@sha256:f81998764e8594d71b40788c5285ae112acf9230129d5d0d238b5df83da5acf6`.
+The previous deployment and its build scripts remain in Git history.
 
-The cache calls the original Kimi `_encode_text_piece` on misses and keeps its
-chunking and ordinary/control-token policy. The key includes that policy and
-the tokenizer backend identity. Returned token lists are independent copies.
-One shared LRU budget covers tokenizer instances in an API process.
+Set `KIMI31_TOKENIZER_CACHE_GIB=12` on each model API process to enable a
+process-private, bounded LRU cache of Kimi's native text-piece tokenization.
+Unset or zero disables the cache. Eight API processes have a combined charged
+cache limit of 96 GiB; actual process RSS requires additional headroom.
+Coupled, prefill, and decode servers can all enable this cache.
 
-Prometheus metrics use the `api_process` label:
+For the eight-GPU B300 deployments, `KIMI31_API_NUMA_BIND=1` binds each API
+process's existing threads to the CPUs local to GPU `api_process % gpu_count`
+through NVML, then verifies the applied masks. Later threads inherit the mask.
+This does not change the CUDA container's cgroup or set a memory policy.
+Check actual thread masks and page placement after startup.
 
-- `vllm:tokenizer_cache_bytes`, `vllm:tokenizer_cache_max_bytes`
-- `vllm:tokenizer_cache_tokens_total{source="reused_tokens"|"encoded_tokens"|"special_tokens"}`
-- `vllm:tokenizer_cache_requests_total{path="hit"|"miss"|"fallback"}`
-- `vllm:tokenizer_cache_evictions_total`
+The cache preserves the original tokenizer on misses. Its key separates
+tokenizer instances and the ordinary/control-token policy. Returned lists are
+independent of cached storage. It does not replace GPU prefix caching, Mooncake
+KV caching, or P-to-D prompt-token-ID forwarding.
 
-Bytes are a conservative charge for retained strings, ID arrays and LRU entries;
-monitor API RSS as well. Token reuse is `reused / (reused + encoded + special)`
-over counter deltas. These counters cover native text-piece encoding, including
-structural tokens. They measure CPU tokenization reuse, independently of KV hits.
+For cold-run resets, set `KIMI31_TOKENIZER_CACHE_EPOCH_FILE` to a writable shared
+file visible to every API process of the instance. After requests drain,
+atomically replace that file with a fresh epoch. Each API acknowledges the epoch
+and clears its cache within its next background poll, including idle APIs.
+Wait for every API's active epoch to match and charged bytes to reach zero.
+Resetting during active requests does not provide a cold-run boundary.
 
-`KIMI31_TOKENIZER_CACHE_EPOCH_FILE` optionally names a shared epoch file. Change
-it only after ingress is stopped and requests drain. Each process checks the
-file at most once per second while encoding; the next encoding clears entries
-when the epoch changes. Clearing is lazy, so a changed file alone does not prove
-that the byte gauge has already reached zero.
+Metrics labeled by `api_process`:
 
-A Kimi tokenizer that lacks `_encode_text_piece` fails explicitly when the cache
-is requested. The cache does not change renderer concurrency or implement P/D
-token-ID forwarding. The current TP8/DP1/DCP8 deployment is coupled.
+- `vllm:tokenizer_cache_tokens_total`: encoded, reused, and special tokens.
+- `vllm:tokenizer_cache_requests_total`: hit, miss, and fallback calls.
+- `vllm:tokenizer_cache_bytes` and `vllm:tokenizer_cache_max_bytes`.
+- `vllm:tokenizer_cache_evictions_total`.
+- `vllm:tokenizer_cache_epoch`: the first 12 hexadecimal digits of the active
+  epoch's SHA256 interpreted as an integer.
+
+The existing Kimi renderer tests cover exact control-token behavior, mutation
+isolation, bounded eviction, and an idle API's epoch reset. Deployment also
+requires checking the real tokenizer, API metrics, and end-to-end requests.

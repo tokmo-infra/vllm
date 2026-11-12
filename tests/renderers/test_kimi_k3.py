@@ -438,3 +438,43 @@ def test_text_piece_cache_keeps_exact_ids_after_budget_eviction():
         assert 0 <= cache.bytes <= 4096
     first = ("value 0 " * 16) + "中文"
     assert cache.encode("native", native, first, False, frozenset()) == native(first)
+
+
+def test_text_piece_cache_clears_an_idle_api_on_epoch_change(tmp_path):
+    """A cold-run reset must not wait for the API's next request."""
+    import time
+
+    import tiktoken
+
+    from vllm.tokenizers.kimi_k3_cache import TextPieceCache
+
+    epoch_path = tmp_path / "epoch"
+    epoch_path.write_text("before")
+    cache = TextPieceCache(4096, "idle-epoch-test", str(epoch_path))
+    encoding = tiktoken.Encoding(
+        name="kimi-cache-epoch-test",
+        pat_str=r"\s+|[^\s]+",
+        mergeable_ranks={bytes([i]): i for i in range(256)},
+        special_tokens={},
+    )
+
+    def native(text, allow_special_tokens=True):
+        return encoding.encode_ordinary(text)
+
+    try:
+        assert cache.encode("native", native, "缓存🙂", False, frozenset())
+        assert cache.bytes > 0
+        replacement = tmp_path / "new-epoch"
+        replacement.write_text("after")
+        replacement.replace(epoch_path)
+        deadline = time.monotonic() + 5
+        while cache.epoch != "after" and time.monotonic() < deadline:
+            cache.stop.wait(0.01)
+        assert cache.epoch == "after"
+        assert cache.bytes == 0
+        assert not cache.entries
+        assert cache.encode("native", native, "缓存🙂", False, frozenset()) == native(
+            "缓存🙂"
+        )
+    finally:
+        cache.close()

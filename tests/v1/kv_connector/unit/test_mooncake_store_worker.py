@@ -341,7 +341,7 @@ def _make_vllm_config(
 
 def _make_kv_cache_config(
     *, block_size: int = 16, prefix_cache_retention_interval: int | None = 0
-) -> object:
+) -> KVCacheConfig:
     """Minimal single-group KVCacheConfig for topology tests."""
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
@@ -3742,6 +3742,7 @@ def _make_bare_worker(
     worker.kv_role = kv_role
     worker.can_put = kv_role in ("kv_producer", "kv_both") or save_decode_cache
     worker._capacity_only = False
+    worker._selective_lease = None
     worker.block_size = block_size
     worker._is_hma_required = False
     worker.tp_rank = 0

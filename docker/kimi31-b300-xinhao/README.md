@@ -1,49 +1,32 @@
-# Kimi31 B300 Xinhao
+# Kimi31 B300: official image with tokenizer caching
 
-Branch: `kimi31-b300-xinhao`, based on `kimi-3.1-1110` / `3c1cbff4e`.
-The installed runtime baseline is `266e88c051ca46607fd9de20216bd58426f80052`.
+Source baseline: upstream `78e9a0c28093d71d2805f9acc74d3c08c88a4314`, as
+recorded by the vLLM package in the pinned image. The native Kimi renderer was
+compared byte for byte with that commit before adding the cache hook.
 
-The deployed image is a Python-only derivative of the pinned Kimi runtime.
-It adds exact native text-piece tokenization caching through the Kimi renderer;
-the original C++/CUDA/Rust libraries and serving dependencies are retained.
-The full source build remains available through `docker/Dockerfile --target kimi-k31`.
+Base image:
+`vllm/vllm-openai:kimi-k31-mc@sha256:f81998764e8594d71b40788c5285ae112acf9230129d5d0d238b5df83da5acf6`
 
-```bash
-test "$(docker image inspect vllm/vllm-openai:kimi-k31 --format '{{.Id}}')" = \
-  sha256:1a8a702f2bfeded3c90259ae60fefbd9e4ca014241946e7d5f3396badce99e76
-docker build --pull=false -f docker/kimi31-b300-xinhao/Dockerfile.runtime \
-  -t tokmo-vllm:kimi31-b300-xinhao-u095 .
-```
+Its linux/amd64 Docker image ID is
+`sha256:5a259407d16d003765361f98e9178c83915dc615287f37d525efdb4012642f21`.
+The two Python files in `Dockerfile.runtime` are the only private runtime
+changes. C++/CUDA/Rust binaries come from the official image.
 
-Current deployment: node 93, TP8 / DP1 / DCP8, expert parallel disabled,
-DSpark 5, `nvfp4_ds_mla`, GPU memory utilization 0.95, 12 GiB tokenizer cache per
-API. Mooncake L2 is sized after model initialization, retaining 256 GiB for the
-system, API/Router growth and a 64 GiB CPU benchmark client. L3 is disabled.
-
-The tokenizer cache keeps Kimi's structural and ordinary text policies separate.
-See [configuration and metrics](../../docs/serving/kimi31_tokenizer_cache.md).
-Native renderer checks used the actual Kimi tokenizer: 3 chat cases, 10
-text-piece/mode cases, 48 concurrent renders, mutable return isolation and bounded
-LRU eviction all passed. No benchmark corpus was preloaded for those checks.
-
-Deployment scripts and compact C64/A128 and C96/A192 configurations are retained
-with the local deployment notes. C64 is authorized after service readiness;
-C96 requires a separate instruction. Draft KV observation reads per-rank backing
-storage and active group block ownership, deduplicating aliases and keeping
-physical TP replicas distinct. No draft SWA behavior has been enabled.
-
-## Deployed source identity
-
-[The source record](runtime-source.json) identifies image
-`sha256:c0c11bb4c2b0c5e8dcc4c8542c1152d8e2ac535c2613ad25a03589b02c651601`.
-Its exact two-file Python payload is archived in commit
-`a79a8889f8d750243361bdc93849bb61711ab848` on this branch. Subsequent source cleanup
-normalizes formatting and narrows the cache-hit Optional type; the native encoding
-and cache policy are unchanged. To reproduce that deployed payload, use:
+To package the same files, from the repository root:
 
 ```bash
-bash docker/kimi31-b300-xinhao/build-runtime.sh
+docker build -f docker/kimi31-b300-xinhao/Dockerfile.runtime -t kimi31-b300:tokenizer-cache .
 ```
 
-`SOURCE_COMMIT=HEAD` instead builds the current source. Image IDs can differ across
-builds; compare the installed Python file hashes with the selected source commit.
+Set `KIMI31_TOKENIZER_CACHE_GIB=12` and, for the eight-GPU deployment,
+`KIMI31_API_NUMA_BIND=1`. Set the cache epoch file to an instance-specific
+shared writable path. See the [cache documentation](../../docs/serving/kimi31_tokenizer_cache.md).
+
+The initial 93 deployment uses the pinned base image with the cache files
+mounted read-only, allowing startup without an image build. This does not mean
+the base image itself contains this cache. Deployment receipts record the
+base image ID, mount paths, and patch SHA256 values. The initial deployed
+cache module differs from the final source only in typing comments; its AST
+is identical, and both hashes are recorded in `runtime-source.json`.
+The optional Dockerfile
+packages that same payload; a packaged image requires its own image-ID receipt.

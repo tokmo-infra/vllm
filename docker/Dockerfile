@@ -25,9 +25,6 @@
 ARG CUDA_VERSION=13.0.3
 ARG PYTHON_VERSION=3.12
 ARG UBUNTU_VERSION=24.04
-# The current Kimi B300 runtime. Verify the local tag's image ID before building,
-# or pass a registry image reference pinned by manifest digest.
-ARG KIMI_RUNTIME_IMAGE=vllm/vllm-openai:kimi-k31
 ARG INSTALL_RUBIN_PRERELEASE=false
 ARG TRITON_INSTALL_FROM_SOURCE_REPO=
 ARG TRITON_INSTALL_FROM_SOURCE_REVISION=
@@ -461,9 +458,6 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
         python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38; \
     fi
 
-COPY docker/kimi-k31/source-wheel.py /tmp/kimi-source-wheel.py
-RUN python3 /tmp/kimi-source-wheel.py fingerprint /workspace/dist/csrc-abi.json
-
 #################### CSRC BUILD IMAGE ####################
 
 #################### EXTENSIONS BUILD IMAGE ####################
@@ -595,7 +589,7 @@ RUN --mount=type=bind,source=requirements,target=/tmp/vllm-requirements,ro \
 #################### EXTENSIONS BUILD IMAGE ####################
 
 #################### WHEEL BUILD IMAGE ####################
-FROM base AS build-wheel
+FROM base AS build
 ARG TARGETPLATFORM
 ARG INSTALL_RUBIN_PRERELEASE
 
@@ -642,17 +636,10 @@ WORKDIR /workspace
 COPY --from=csrc-build /workspace/dist /precompiled-wheels
 COPY . .
 
-# Generated vendor trees from a previous local build must not silently
-# override the dependencies compiled in this build.
-RUN --mount=type=bind,source=.git,target=.git \
-    python3 docker/kimi-k31/source-context.py
-
 # Drop the pre-built Rust artifacts into the source tree. setup.py detects
 # them and ships them as-is, skipping the local Rust build.
-COPY --from=rust-build /workspace/vllm/ vllm/
-
-RUN python3 docker/kimi-k31/source-wheel.py snapshot vllm /tmp/kimi-source.json \
-    && python3 docker/kimi-k31/source-wheel.py snapshot-native vllm /tmp/kimi-rust.json
+COPY --from=rust-build /workspace/vllm/vllm-rs vllm/vllm-rs
+COPY --from=rust-build /workspace/vllm/_rust_*.so vllm/
 
 ARG GIT_REPO_CHECK=0
 RUN --mount=type=bind,source=.git,target=.git \
@@ -677,25 +664,12 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     if [ "${vllm_target_device}" = "cuda" ]; then \
         export VLLM_USE_PRECOMPILED=1; \
         export VLLM_PRECOMPILED_WHEEL_LOCATION=$(ls /precompiled-wheels/*.whl); \
-        export VLLM_DOCKER_SOURCE_BUILD=1; \
     fi && \
     python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38
 
 # Record the wheel checksum so downstream stages can bust their layer cache
 # when the wheel changes, without copying the wheel itself into the image.
 RUN sha256sum dist/*.whl > dist/wheel.sha256
-
-# Record the build-side Torch ABI for the optional Kimi runtime target.
-RUN if [ "${vllm_target_device}" = "cuda" ]; then \
-        python3 docker/kimi-k31/source-wheel.py verify \
-          /tmp/kimi-source.json /tmp/kimi-rust.json /precompiled-wheels dist; \
-    fi \
-    && cp /precompiled-wheels/csrc-abi.json dist/csrc-abi.json \
-    && python3 docker/kimi-k31/source-wheel.py fingerprint dist/build-abi.json
-
-# Keep the wheel-only target independent of the release-only EP kernels and
-# PyPI size check. Existing vLLM targets continue to depend on `build` below.
-FROM build-wheel AS build
 
 # Copy extension wheels from extensions-build stage for later use
 COPY --from=extensions-build /tmp/ep_kernels_workspace/dist /tmp/ep_kernels_workspace/dist
@@ -1388,36 +1362,6 @@ FROM vllm-openai-base AS vllm-openai
 # USER vllm
 ENTRYPOINT ["vllm", "serve"]
 #################### OPENAI API SERVER ####################
-
-#################### KIMI B300 SOURCE-BUILT IMAGE ####################
-# Use the ordinary source-built vLLM wheel, not binaries from the runtime
-# image. Other runtime dependencies and the entrypoint remain unchanged.
-FROM ${KIMI_RUNTIME_IMAGE} AS kimi-k31
-ARG VLLM_USE_PRECOMPILED=""
-ARG VLLM_BUILD_COMMIT
-ARG VLLM_BUILD_PIPELINE
-ARG VLLM_BUILD_URL
-ARG VLLM_IMAGE_TAG
-ENV VLLM_BUILD_COMMIT=${VLLM_BUILD_COMMIT:-unknown} \
-    VLLM_BUILD_PIPELINE=${VLLM_BUILD_PIPELINE:-local} \
-    VLLM_BUILD_URL=${VLLM_BUILD_URL:-} \
-    VLLM_IMAGE_TAG=${VLLM_IMAGE_TAG:-local/vllm-kimi-k31:dev}
-LABEL org.opencontainers.image.source="https://github.com/tokmo-infra/vllm" \
-      org.opencontainers.image.revision="${VLLM_BUILD_COMMIT}" \
-      org.opencontainers.image.version="${VLLM_IMAGE_TAG}" \
-      org.opencontainers.image.url="${VLLM_BUILD_URL}" \
-      ai.vllm.build.commit="${VLLM_BUILD_COMMIT}" \
-      ai.vllm.build.pipeline="${VLLM_BUILD_PIPELINE}" \
-      ai.vllm.build.url="${VLLM_BUILD_URL}" \
-      ai.vllm.image.tag="${VLLM_IMAGE_TAG}"
-RUN if [ -n "${VLLM_USE_PRECOMPILED}" ] && [ "${VLLM_USE_PRECOMPILED}" != "0" ]; then \
-        echo "kimi-k31 requires a source build; do not set VLLM_USE_PRECOMPILED" >&2; exit 1; \
-    fi
-COPY docker/kimi-k31/source-wheel.py /tmp/kimi-source-wheel.py
-RUN --mount=type=bind,from=build-wheel,source=/workspace/dist,target=/tmp/kimi-wheel,ro \
-    python3 /tmp/kimi-source-wheel.py install /tmp/kimi-wheel \
-    && rm /tmp/kimi-source-wheel.py
-#################### KIMI B300 SOURCE-BUILT IMAGE ####################
 
 #################### OPENAI API SERVER (NON-ROOT, OPT-IN) ####################
 # Non-root-ready variant of `vllm-openai`. Built via:
