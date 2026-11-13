@@ -1271,6 +1271,21 @@ class SpecDecodeBaseProposer:
         spec_cfg = self.speculative_config
         base = self.vllm_config
 
+        if (
+            base.attention_config.hisparse_config is not None
+            and base.parallel_config.decode_context_parallel_size > 1
+            and spec_cfg.draft_model_config is not None
+            and getattr(spec_cfg.draft_model_config.hf_text_config, "dsa_config", None)
+            is None
+        ):
+            # Dense draft KV stays on GPU. Its config must not inherit the
+            # target's HiSparse connector, which would re-enable the host tier.
+            base = replace(
+                base,
+                kv_transfer_config=None,
+                attention_config=replace(base.attention_config, hisparse_config=None),
+            )
+
         if spec_cfg.moe_backend is not None:
             base = replace(
                 base,

@@ -11,6 +11,24 @@ from vllm.v1.hisparse.types import SparseKVRowMirror
 pytestmark = pytest.mark.cpu_test
 
 
+@pytest.mark.parametrize("interleave", [1, 4, 64])
+def test_localized_topk_is_a_contiguous_prefix_for_sparse_decode(interleave):
+    positions = torch.tensor([[7, 0, 65, 9, 1, 520, -1, 64, 511, 3]])
+    original = positions.clone()
+    for rank in range(8):
+        shard = HiSparseDCPShard(8, rank, interleave)
+        localized = shard.localize(positions)
+        expected = [
+            p // (8 * interleave) * interleave + p % interleave
+            for p in positions[0].tolist()
+            if p >= 0 and p // interleave % 8 == rank
+        ]
+        # Sparse MLA reads only valid_count entries; holes lose owned KV rows.
+        assert localized[0, : len(expected)].tolist() == expected
+        assert torch.all(localized[0, len(expected) :] == -1)
+    assert torch.equal(positions, original)
+
+
 @pytest.mark.parametrize("size", [1, 2, 4, 8, 16])
 @pytest.mark.parametrize("interleave", [1, 4, 64])
 def test_owned_rows_partition_history_and_verification_topk(size, interleave):
@@ -19,7 +37,13 @@ def test_owned_rows_partition_history_and_verification_topk(size, interleave):
     for rank in range(size):
         shard = HiSparseDCPShard(size, rank, interleave)
         local = shard.localize(positions)
-        owners += local >= 0
+        valid = local[local >= 0]
+        global_positions = (
+            valid // interleave * size * interleave
+            + rank * interleave
+            + valid % interleave
+        )
+        owners[0, global_positions + 1] += 1
         expected = [
             p
             for p in positions[0].tolist()
@@ -65,7 +89,9 @@ def test_mirrors_preserve_physical_block_ids_and_partial_interleaves(interleave)
         assert total == count
 
 
-@pytest.mark.parametrize("source_ratio,destination_ratio", [(32, 1), (1, 32), (32, 32)])
+@pytest.mark.parametrize(
+    "source_ratio,destination_ratio", [(32, 1), (1, 32), (32, 32), (32, 64)]
+)
 @pytest.mark.parametrize("rows", [1, 63, 64, 65, 2047, 2048, 2049])
 def test_import_copies_only_computed_pages_and_preserves_cached_prefix(
     source_ratio, destination_ratio, rows
@@ -154,11 +180,16 @@ def test_import_addresses_manager_pages_with_padding(registered_rows, manager_ra
 
 def test_hybrid_hma_hot_rows_do_not_consume_one_ssm_lease_per_64_rows():
     from vllm.config import DeviceConfig, VllmConfig
+    from vllm.config.attention import HiSparseConfig
     from vllm.v1.core.kv_cache_planning import (
         _get_kv_cache_bytes_per_block,
         _get_packed_kv_cache_groups,
     )
-    from vllm.v1.hisparse.layout import _lay_out_dcp_groups, is_hisparse_mla_spec
+    from vllm.v1.hisparse.layout import (
+        _lay_out_dcp_groups,
+        get_hisparse_kv_cache_groups,
+        is_hisparse_mla_spec,
+    )
     from vllm.v1.hisparse.runtime import ResolvedHiSparseConfig
     from vllm.v1.kv_cache_interface import (
         HiSparseHotSpec,
@@ -256,6 +287,78 @@ def test_hybrid_hma_hot_rows_do_not_consume_one_ssm_lease_per_64_rows():
     )
     assert second[1].kv_cache_spec.block_size == 4096
     assert second[3].kv_cache_spec.block_size == 768
+    # Worker spec discovery precedes the engine's physical-layout resolution.
+    early = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    early.attention_config.hisparse_config = HiSparseConfig(device_buffer_size=12288)
+    early.parallel_config.decode_context_parallel_size = 8
+    early.scheduler_config.disable_hybrid_kv_cache_manager = False
+    early_groups = get_hisparse_kv_cache_groups(
+        early, sources | indexers | regular_specs
+    )
+    assert early.cache_config.kv_cache_layout is None
+    assert early_groups is not None
+    assert early_groups[1].kv_cache_spec.block_size == 4096
+    assert early_groups[3].kv_cache_spec.blocks_per_request == 16
+
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.core.kv_cache_utils import (
+        generate_scheduler_kv_cache_config,
+        resolve_kv_cache_block_sizes,
+    )
+    from vllm.v1.hisparse.coordinator import get_hisparse_coordinator
+    from vllm.v1.kv_cache_interface import KVCacheConfig
+
+    cache = generate_scheduler_kv_cache_config(
+        [
+            KVCacheConfig(
+                num_blocks=256,
+                kv_cache_tensors=[],
+                kv_cache_groups=groups,
+                hisparse_host_num_blocks=4096,
+            )
+        ]
+    )
+    early.cache_config.block_size = 64
+    early.cache_config.prefix_match_unit = 128
+    early.cache_config.enable_prefix_caching = True
+    scheduler_block, hash_block = resolve_kv_cache_block_sizes(cache, early)
+    manager = KVCacheManager(
+        cache,
+        max_model_len=1048576,
+        max_in_flight_tokens=32768,
+        scheduler_block_size=scheduler_block,
+        hash_block_size=hash_block,
+        dcp_world_size=8,
+    )
+    coordinator = get_hisparse_coordinator(manager)
+    assert coordinator.host_manager.block_size == 512
+    assert coordinator.resident_managers[0].block_size == 512
+    assert coordinator.resident_managers[0].max_admission_blocks_per_request == 64
+    assert coordinator.hot_managers[0].block_size == 768
+
+    from vllm import SamplingParams
+    from vllm.v1.request import Request
+
+    request = Request(
+        "pd-dcp",
+        prompt_token_ids=list(range(513)),
+        sampling_params=SamplingParams(max_tokens=32),
+        pooling_params=None,
+    )
+    blocks = manager.allocate_slots(
+        request,
+        num_new_tokens=1,
+        num_external_computed_tokens=512,
+        num_lookahead_tokens=4,
+        delay_cache_blocks=True,
+    )
+    assert blocks is not None
+    held = manager.get_blocks(request.request_id)
+    assert len(held.blocks[0]) == 2
+    assert len(held.blocks[1]) == 1
+    manager.free(request)
+    assert coordinator.host_manager.block_pool.get_num_free_blocks() == 4095
+    assert manager.block_pool.get_num_free_blocks() == 255
 
 
 def test_hot_view_preserves_row_stride_with_partial_lease_padding():

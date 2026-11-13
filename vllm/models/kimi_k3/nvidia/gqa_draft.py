@@ -44,6 +44,9 @@ class GQADraftKVCacheGrouping(SupportsKVCacheGrouping):
     layers (20 groups instead of 4 + 1 for a 5-layer draft).
     """
 
+    # Block-outer layouts delegate to the default planner, including HiSparse.
+    supports_hisparse_kv_cache_grouping = True
+
     @classmethod
     def get_kv_cache_groups(
         cls,

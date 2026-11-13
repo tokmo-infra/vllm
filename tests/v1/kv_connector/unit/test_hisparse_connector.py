@@ -228,7 +228,9 @@ class _FakeEvent:
 
 
 @pytest.mark.parametrize("cg_mode", [CUDAGraphMode.FULL, CUDAGraphMode.NONE])
-def test_draft_layer_rows_mirrored_after_drafter(monkeypatch, cg_mode):
+def test_draft_layer_rows_mirrored_after_drafter(
+    monkeypatch, cg_mode, kv_transfer_group
+):
     """Draft-layer host rows must hold the drafter's writes before page release.
 
     The drafter writes its layers' rows after the target forward. Mirroring

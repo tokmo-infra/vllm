@@ -2152,6 +2152,28 @@ def test_triton_convert_returns_valid_counts(num_topk_tokens: int, reuse_buffers
         assert torch.all(result[row, num_valid:] == -1)
 
 
+def test_hisparse_dcp_localized_topk_stays_packed_on_graph_replay():
+    from vllm.v1.hisparse.dcp import HiSparseDCPShard
+
+    shard = HiSparseDCPShard(8, 3)
+    positions = torch.arange(2048, dtype=torch.int32, device="cuda").repeat(5, 1)
+    positions[0].fill_(-1)
+    shard.localize(positions)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        localized = shard.localize(positions)
+    for offset in (0, 7):
+        inputs = torch.arange(2048, dtype=torch.int32).repeat(5, 1) + offset
+        inputs[0].fill_(-1)
+        positions.copy_(inputs)
+        graph.replay()
+        expected = torch.full_like(inputs, -1)
+        for row, values in enumerate(inputs.tolist()):
+            owned = [p // 8 for p in values if p >= 0 and p % 8 == 3]
+            expected[row, : len(owned)] = torch.tensor(owned, dtype=torch.int32)
+        torch.testing.assert_close(localized.cpu(), expected, rtol=0, atol=0)
+
+
 def test_hisparse_generic_stream_orders_ipc_event():
     """Generic copy streams must record IPC events and restore the compute stream."""
     from vllm.v1.hisparse.backend import CUDAHiSparseBackend
@@ -2407,6 +2429,30 @@ def _make_hisparse_cache_handle(
 
 def _valid_rows(num_rows: int) -> torch.Tensor:
     return torch.tensor([num_rows], dtype=torch.int32, device=DEVICE_TYPE)
+
+
+@requires_hisparse_ops
+def test_hisparse_warmup_does_not_submit_connector_mirrors(kv_transfer_group):
+    """Warmup disables the connector while attention still writes resident KV."""
+    from vllm.config import VllmConfig
+    from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector
+
+    config = VllmConfig()
+    connector = ActiveKVConnector(config, {})
+    handle = _make_hisparse_cache_handle()
+    submitted = []
+    handle.submit_layer_mirror = lambda: submitted.append(True)
+    try:
+        with set_forward_context(None, config):
+            connector.set_disabled(True)
+            for _ in range(2):
+                handle.finish_kv_update()
+            assert submitted == []
+            connector.set_disabled(False)
+            handle.finish_kv_update()
+            assert submitted == [True]
+    finally:
+        connector.set_disabled(False)
 
 
 @requires_hisparse_ops

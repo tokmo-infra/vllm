@@ -31,7 +31,11 @@ class HiSparseDCPShard:
         )
 
     def localize(self, positions: "torch.Tensor") -> "torch.Tensor":
-        """Keep owned top-k positions, preserving -1 padding for empty ranks."""
+        """Pack owned positions into a stable prefix, then pad with -1.
+
+        Sparse decode reads only valid_count entries, so filtering other
+        ranks must not leave holes among those entries.
+        """
         import torch
 
         owned = (positions >= 0) & (
@@ -41,7 +45,9 @@ class HiSparseDCPShard:
             positions // (self.interleave * self.size) * self.interleave
             + positions % self.interleave
         )
-        return torch.where(owned, local, -1)
+        local = torch.where(owned, local, -1)
+        order = torch.argsort((~owned).to(torch.int32), dim=-1, stable=True)
+        return local.gather(-1, order)
 
     def mirror(
         self, mirror: SparseKVRowMirror, block_size: int

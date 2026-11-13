@@ -631,16 +631,11 @@ class PreparedDsa:
             # instead of interpreting host block IDs as GPU cache rows.
             if topk is None:
                 if self.indexer_stage.local_topk:
-                    from vllm.v1.attention.backends.mla.sparse_utils import (
-                        flat_kv_row_view,
-                    )
-
-                    _, stride = flat_kv_row_view(
-                        self.hisparse_cache.view.cache, md.block_size
-                    )
                     stage = self.query_stage
+                    # Only global IDs are consumed here. Keep the discarded
+                    # row conversion in host geometry for large host block IDs.
                     merged = self.indexer_stage.merge_rows(
-                        stage.q_fp8, stage.head_w, md, stride, batch, q
+                        stage.q_fp8, stage.head_w, md, md.block_size, batch, q
                     )
                     if merged is not None:
                         topk = self.indexer_stage.dcp_ids

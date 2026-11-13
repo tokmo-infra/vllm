@@ -17,6 +17,7 @@ import torch
 
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import get_tp_group
+from vllm.distributed.kv_transfer import has_kv_transfer_group
 from vllm.forward_context import get_forward_context, in_piecewise_cudagraph
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -1243,6 +1244,7 @@ class HiSparseCacheHandle:
             return
         if (
             self.submit_layer_mirror is not None
+            and has_kv_transfer_group()
             and not self.decode_batch
             and get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.FULL
         ):

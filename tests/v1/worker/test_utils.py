@@ -205,7 +205,7 @@ def test_hisparse_appends_reference_slots_within_a_mirror_phase(monkeypatch):
     [(CUDAGraphMode.PIECEWISE, 1), (CUDAGraphMode.FULL, 0)],
 )
 def test_hisparse_submits_layer_mirror_at_replayed_attention_boundary(
-    monkeypatch, mode, expected_calls
+    monkeypatch, mode, expected_calls, kv_transfer_group
 ):
     """Piecewise replay must pipeline DMA; FULL replay uses the batch fallback."""
     handle = object.__new__(hisparse_runtime_module.HiSparseCacheHandle)

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections import defaultdict
+from copy import copy
 from dataclasses import dataclass
 from typing import cast
 
@@ -79,8 +80,16 @@ def get_hisparse_kv_cache_groups(
 
     from vllm.v1.core.kv_cache_planning import get_kv_cache_groups
 
+    regular_config = vllm_config
+    if other_specs and vllm_config.cache_config.kv_cache_layout is None:
+        # Workers derive the hot/indexer specs before the engine resolves the
+        # physical layout. Plan with HiSparse's required block-outer layout
+        # without finalizing the worker's global layout ahead of the engine.
+        regular_config = copy(vllm_config)
+        regular_config.cache_config = copy(vllm_config.cache_config)
+        regular_config.cache_config.kv_cache_layout = "BLHNC"
     regular_groups = (
-        get_kv_cache_groups(vllm_config, other_specs) if other_specs else []
+        get_kv_cache_groups(regular_config, other_specs) if other_specs else []
     )
     return _lay_out_hisparse_groups(vllm_config, mla_specs, regular_groups)
 

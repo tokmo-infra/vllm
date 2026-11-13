@@ -1682,16 +1682,18 @@ class DefaultKVCacheConfigBuilder(KVCacheConfigBuilder):
         """
         if not vllm_config.model_config.supports_kv_cache_grouping:
             return get_kv_cache_groups(vllm_config, kv_cache_spec)
-        if vllm_config.attention_config.hisparse_config is not None:
+        model_cls, _ = vllm_config.model_config.registry.resolve_model_cls(
+            vllm_config.model_config.architectures,
+            vllm_config.model_config,
+        )
+        if vllm_config.attention_config.hisparse_config is not None and not getattr(
+            model_cls, "supports_hisparse_kv_cache_grouping", False
+        ):
             raise ValueError(
                 "A model-declared get_kv_cache_groups cannot be combined "
                 "with HiSparse, which owns its own KV cache grouping. "
                 "Remove one of them."
             )
-        model_cls, _ = vllm_config.model_config.registry.resolve_model_cls(
-            vllm_config.model_config.architectures,
-            vllm_config.model_config,
-        )
         return model_cls.get_kv_cache_groups(vllm_config, kv_cache_spec)
 
     def get_kv_cache_config_from_groups(

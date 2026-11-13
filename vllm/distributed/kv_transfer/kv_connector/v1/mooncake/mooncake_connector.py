@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import itertools
 import logging
+import math
 import os
 import queue
 import secrets
@@ -1914,7 +1915,8 @@ class MooncakeConnectorWorker:
                 or meta.remote_pp_size != 1
                 or parallel.prefill_context_parallel_size != 1
                 or meta.dcp_interleave != parallel.cp_kv_cache_interleave_size
-                or meta.kernel_block_size != self.block_size
+                or meta.kernel_block_size <= 0
+                or self.block_size % meta.kernel_block_size
                 or meta.hisparse_cache_dtype != self.cache_config.cache_dtype
             ):
                 return (
@@ -2001,16 +2003,17 @@ class MooncakeConnectorWorker:
             for i, group in enumerate(block_ids)
         ]
 
-    def _group_kernel_ratios(self) -> list[int]:
+    def _group_kernel_ratios(self, kernel_block_size: int | None = None) -> list[int]:
+        kernel_block_size = kernel_block_size or self.block_size
         ratios = []
         for group in self.kv_cache_config.transfer_groups:
             spec = self._layer_specs[group.layer_names[0]]
             if isinstance(spec, (MambaSpec, CircularBufferSpec)):
                 ratios.append(1)
             else:
-                if spec.block_size % self.block_size:
+                if spec.block_size % kernel_block_size:
                     raise ValueError("Mooncake group is not aligned to kernel pages")
-                ratios.append(spec.block_size // self.block_size)
+                ratios.append(spec.block_size // kernel_block_size)
         return ratios
 
     def _build_hisparse_dcp_transfer_params(
@@ -2033,7 +2036,8 @@ class MooncakeConnectorWorker:
         error_message = self._validate_hetero_layout(meta)
         if error_message:
             return [], [], [], [key for key, _ in ready_reqs], error_message
-        source_ratios = self._group_kernel_ratios()
+        kernel_block_size = meta.kernel_block_size
+        source_ratios = self._group_kernel_ratios(kernel_block_size)
         for request_id, send in ready_reqs:
             request_descriptors: list[tuple[int, int, int]] = []
             try:
@@ -2069,8 +2073,8 @@ class MooncakeConnectorWorker:
                             destination_ratio=meta.group_kernel_ratios[
                                 remote.group_index
                             ],
-                            num_rows=local_rows,
-                            kernel_block_size=self.block_size,
+                            num_rows=local_rows if spec.dcp_sharded else tokens,
+                            kernel_block_size=kernel_block_size,
                         )
                     else:
                         raise ValueError(
@@ -2086,7 +2090,7 @@ class MooncakeConnectorWorker:
                                 page,
                                 manager_ratio=ratio,
                                 registered_rows=region.kv_block_len // row_bytes,
-                                kernel_rows=self.block_size,
+                                kernel_rows=kernel_block_size,
                                 row_bytes=row_bytes,
                                 registered_stride=region.block_len,
                             )
@@ -2101,7 +2105,7 @@ class MooncakeConnectorWorker:
                                     remote,
                                     meta.group_kernel_ratios[remote.group_index],
                                 ),
-                                self.block_size * row_bytes,
+                                kernel_block_size * row_bytes,
                             )
                             for src, dst in pairs
                         )
@@ -2803,20 +2807,22 @@ class MooncakeConnectorWorker:
         # Each pass either returns or breaks out of the recv loop to resend
         # the layout after a LAYOUT_MISS.
         while True:
-            metadata = self._build_pull_metadata(
-                pull_metas, include_layout=include_layout
-            )
-            encoded_data = self._encoder.encode(metadata)
-            logger.debug(
-                "MooncakeXferMetadata to %s is %d bytes (%s).",
-                worker_addr,
-                len(encoded_data),
-                "layout" if include_layout else "blocks",
-            )
-            logger.debug(
-                "Sending kv transfer request for %s on path: %s", req_ids, worker_addr
-            )
             try:
+                metadata = self._build_pull_metadata(
+                    pull_metas, include_layout=include_layout
+                )
+                encoded_data = self._encoder.encode(metadata)
+                logger.debug(
+                    "MooncakeXferMetadata to %s is %d bytes (%s).",
+                    worker_addr,
+                    len(encoded_data),
+                    "layout" if include_layout else "blocks",
+                )
+                logger.debug(
+                    "Sending kv transfer request for %s on path: %s",
+                    req_ids,
+                    worker_addr,
+                )
                 with make_zmq_socket(
                     self.async_zmq_ctx, worker_addr, zmq.DEALER, bind=False, linger=0
                 ) as sock:
@@ -3313,10 +3319,21 @@ class MooncakeConnectorWorker:
         if self.vllm_config.attention_config.hisparse_config is not None:
             parallel = self.vllm_config.parallel_config
             if parallel.decode_context_parallel_size > 1:
+                # The host source, coarse indexer and dense draft groups use
+                # different pages. Copy in their common row quantum without
+                # changing the registered cache views or the native PD path.
+                kernel_block_size = math.gcd(
+                    *(
+                        s.block_size
+                        for s in self._layer_specs.values()
+                        if isinstance(s, MLAAttentionSpec)
+                    )
+                )
                 hetero_layout.update(
+                    kernel_block_size=kernel_block_size,
                     hisparse_dcp_size=parallel.decode_context_parallel_size,
                     dcp_interleave=parallel.cp_kv_cache_interleave_size,
-                    group_kernel_ratios=self._group_kernel_ratios(),
+                    group_kernel_ratios=self._group_kernel_ratios(kernel_block_size),
                     hisparse_cache_dtype=self.cache_config.cache_dtype,
                     registered_row_bytes={
                         name: spec.state_content_size_bytes

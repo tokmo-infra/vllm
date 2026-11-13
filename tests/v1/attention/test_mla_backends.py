@@ -1265,6 +1265,59 @@ def test_tokenspeed_mla_decode_contract(
     AttentionBackendEnum.TOKENSPEED_MLA not in BACKENDS_TO_TEST,
     reason="TokenSpeed MLA requires an SM100-family GPU and tokenspeed-mla",
 )
+def test_tokenspeed_large_batch_preserves_forced_split_floor():
+    """C256 DCP draft queries keep split=16 without overflowing int32 scratch."""
+    from tokenspeed_mla import tokenspeed_mla_decode
+
+    batch, query_len, heads, rank = 256, 4, 128, 512
+    device = torch.device(DEVICE_TYPE)
+    query = torch.zeros(
+        (batch, query_len, heads, rank + 64),
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    pages = torch.arange(batch, dtype=torch.float32, device=device)[:, None, None]
+    rows = torch.arange(64, dtype=torch.float32, device=device)[None, :, None]
+    kv = (pages / 256 + rows / 128).expand(batch, 64, rank + 64)
+    kv = kv.contiguous().to(torch.float8_e4m3fn)
+    lengths = torch.tensor(
+        [8, 16, 32, 64] * (batch // 4), dtype=torch.int32, device=device
+    )
+    kwargs = dict(
+        query=query,
+        kv_cache=kv,
+        workspace_buffer=torch.empty((1 << 31) - 256, dtype=torch.int8, device=device),
+        kv_lora_rank=rank,
+        qk_rope_head_dim=64,
+        block_tables=torch.arange(batch, dtype=torch.int32, device=device)[:, None],
+        seq_lens=lengths,
+        max_seq_len=1048576,
+        softmax_scale=1.0,
+        output_scale=1.0,
+        enable_pdl=False,
+        return_lse=True,
+        causal_mask=False,
+        causal_seqs=lengths * 8,
+        cp_world=8,
+        cp_rank=0,
+        cp_interleave_size=1,
+        min_split_kv=16,
+    )
+    with pytest.raises(ValueError, match="workspace beyond the Int32 offset limit"):
+        tokenspeed_mla_decode(**kwargs)
+    output, lse = tokenspeed_mla_module._tokenspeed_decode(**kwargs)
+    prefix = kv[..., :rank].float().cumsum(dim=1)
+    expected = prefix[torch.arange(batch, device=device), lengths.long() - 1]
+    expected = (expected / lengths[:, None]).to(output.dtype)
+    expected = expected[:, None, None].expand_as(output)
+    assert torch.equal(output, expected)
+    assert torch.equal(lse, torch.log2(lengths.float())[:, None, None].expand_as(lse))
+
+
+@pytest.mark.skipif(
+    AttentionBackendEnum.TOKENSPEED_MLA not in BACKENDS_TO_TEST,
+    reason="TokenSpeed MLA requires an SM100-family GPU and tokenspeed-mla",
+)
 @pytest.mark.parametrize(
     ("cp_interleave_size", "seq_len"),
     [

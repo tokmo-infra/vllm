@@ -22,6 +22,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
+    HiSparseResidentSpec,
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
@@ -682,9 +683,12 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     isinstance(spec, AttentionSpec) and replicated
                 ), "PCP only supports full attention and replicated draft groups."
             if dcp_world_size > 1:
-                assert isinstance(spec, FullAttentionSpec) or replicated, (
+                assert isinstance(spec, (FullAttentionSpec, HiSparseResidentSpec)) or (
+                    replicated
+                ), (
                     "DCP with hybrid KV cache layouts only supports "
-                    "full-attention, Mamba, and replicated draft groups, got: "
+                    "full-attention, HiSparse resident, Mamba, and replicated "
+                    "draft groups, got: "
                     f"{type(spec).__name__}."
                 )
         # Fine-grained hash hits require Mamba "align" and compatible cache

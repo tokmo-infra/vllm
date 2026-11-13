@@ -240,7 +240,10 @@ class HiSparseMLAIndexGroup(SparseMLAIndexGroup):
         num_tokens = logical_topk_indices.shape[0]
         req_id_per_token = attn_metadata.req_id_per_token[:num_tokens]
         if self.dcp_size > 1:
-            if cache.num_decode_tokens < cache.num_actual_tokens:
+            if (
+                cache.num_decode_tokens < cache.num_actual_tokens
+                and not cache.all_context_pages_resident
+            ):
                 raise ValueError("DCP HiSparse requires PD decode-only batches")
             interleave = attn_metadata.cp_kv_cache_interleave_size
             shard = HiSparseDCPShard(self.dcp_size, self.dcp_rank, interleave)

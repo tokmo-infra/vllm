@@ -251,6 +251,31 @@ def dist_init():
 
 
 @pytest.fixture
+def kv_transfer_group(dist_init):
+    """A real single-rank connector without an external transfer service."""
+    from vllm.config import KVTransferConfig, VllmConfig
+    from vllm.distributed.kv_transfer.kv_transfer_state import (
+        ensure_kv_transfer_initialized,
+        ensure_kv_transfer_shutdown,
+        get_kv_transfer_group,
+    )
+    from vllm.v1.kv_cache_interface import KVCacheConfig
+
+    config = VllmConfig(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="ExampleConnector", kv_role="kv_both"
+        )
+    )
+    ensure_kv_transfer_initialized(
+        config, KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
+    )
+    try:
+        yield get_kv_transfer_group()
+    finally:
+        ensure_kv_transfer_shutdown()
+
+
+@pytest.fixture
 def default_vllm_config(monkeypatch):
     """Set a default VllmConfig for tests that directly test CustomOps or pathways
     that use get_current_vllm_config() outside of a full engine context.

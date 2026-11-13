@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """TokenSpeed CuTe DSL MLA decode backend (Blackwell, FP8 KV cache only)."""
 
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 
@@ -38,6 +38,47 @@ logger = init_logger(__name__)
 # EAGLE3 / MTP-2 spec decoding query lengths; larger q_len fails the kernel's
 # own buffer check.
 _TOKENSPEED_MAX_Q_LEN = 8
+_TOKENSPEED_WORKSPACE_LIMIT = (1 << 31) - 256
+
+
+def _tokenspeed_decode(
+    **kwargs: Any,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    from tokenspeed_mla import tokenspeed_mla_decode
+
+    try:
+        return tokenspeed_mla_decode(**kwargs)
+    except ValueError as error:
+        # TokenSpeed checks this shape-only limit before launching any kernels.
+        # Preserve the split floor and split independent requests into calls
+        # whose scratch offsets fit the kernel's int32 addressing.
+        query = kwargs["query"]
+        if (
+            str(error)
+            != "min_split_kv requires workspace beyond the Int32 offset limit"
+            or query.shape[0] <= 1
+        ):
+            raise
+    outputs: list[torch.Tensor] = []
+    lses: list[torch.Tensor] = []
+    chunk = (query.shape[0] + 1) // 2
+    for start in range(0, query.shape[0], chunk):
+        stop = start + chunk
+        call = kwargs | {
+            "query": query[start:stop],
+            "block_tables": kwargs["block_tables"][start:stop],
+            "seq_lens": kwargs["seq_lens"][start:stop],
+        }
+        if kwargs.get("causal_seqs") is not None:
+            call["causal_seqs"] = kwargs["causal_seqs"][start:stop]
+        result = _tokenspeed_decode(**call)
+        if isinstance(result, tuple):
+            outputs.append(result[0])
+            lses.append(result[1])
+        else:
+            outputs.append(result)
+    output = torch.cat(outputs, dim=0)
+    return (output, torch.cat(lses, dim=0)) if lses else output
 
 
 def _get_workspace(
@@ -67,6 +108,7 @@ def _get_workspace(
             * (kv_lora_rank + 1)
             * 4,
         )
+        needed = min(needed, _TOKENSPEED_WORKSPACE_LIMIT)
         logger.info_once(
             "TokenSpeed MLA decode workspace: %.2f GiB", needed / (1 << 30)
         )
@@ -270,8 +312,6 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
         attn_metadata: MLACommonMetadata,
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        from tokenspeed_mla import tokenspeed_mla_decode
-
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
 
@@ -329,7 +369,7 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
         # vLLM kv_c_and_k_pe_cache is already (num_blocks, block_size, head_size).
         # tokenspeed_mla_decode wants 3D — pass as-is (no unsqueeze, unlike trtllm).
         return_lse = self.need_to_return_lse_for_decode
-        kernel_out = tokenspeed_mla_decode(
+        kernel_out = _tokenspeed_decode(
             query=q,
             kv_cache=kv_c_and_k_pe_cache,
             workspace_buffer=workspace,

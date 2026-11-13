@@ -89,9 +89,19 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         speculative_config.attention_backend,
         vllm_config.attention_config.backend,
     )
+    dense_draft_hisparse = (
+        vllm_config.attention_config.hisparse_config is not None
+        and vllm_config.parallel_config.decode_context_parallel_size > 1
+        and getattr(draft_model_config.hf_text_config, "dsa_config", None) is None
+    )
 
     draft_vllm_config = replace(
         vllm_config,
+        # Dense draft KV stays on GPU. Inheriting the target connector would
+        # re-enable HiSparse while validating the draft's FP8 cache config.
+        kv_transfer_config=(
+            None if dense_draft_hisparse else vllm_config.kv_transfer_config
+        ),
         parallel_config=_get_dspark_parallel_config(
             vllm_config.parallel_config,
             speculative_config.draft_parallel_config.tensor_parallel_size,
@@ -101,6 +111,11 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             vllm_config.attention_config,
             use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),
             backend=draft_attention_backend,
+            hisparse_config=(
+                None
+                if dense_draft_hisparse
+                else vllm_config.attention_config.hisparse_config
+            ),
         ),
         cache_config=(
             replace(

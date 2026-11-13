@@ -12,6 +12,11 @@ exchange, query mailbox, sparse decode, and DcpValue merge. The indexer also
 emits global token IDs for HiSparse's residency resolver. No generic model
 decode fallback is enabled by this configuration.
 
+Rank filtering packs owned top-k positions into a stable, contiguous prefix:
+the sparse decode kernel reads only `valid_count` entries. Leaving masked
+positions between valid ones silently drops owned KV rows. The localization
+path is covered by CPU ownership tests and CUDA Graph replay tests.
+
 Each DCP worker owns a private host shard. `host_pool_gib` remains the logical
 budget of one DP replica and is divided across its DCP ranks. Indexer and dense
 DSpark draft KV stay on GPU. Source pages stay small, while indexer and hot
@@ -23,6 +28,11 @@ Decoder Store lookup and `save_decode_cache` must be disabled in this version:
 the ordinary producer and HiSparse decoder use different group/block layouts.
 The producer can retain its ordinary Store cache. Do not reuse the original
 shared P/D Store namespace for decoder writes.
+
+Imports use a copy quantum common to the host, indexer and draft pages,
+independently of the registered GPU view's block size. Only caches whose
+specification has `dcp_sharded=True` divide the prompt across ranks. Dense
+draft caches replicated at DCP1 must import the full computed prefix.
 
 A decoder transfer configuration, with a 512-GiB logical host budget, is:
 
@@ -62,9 +72,39 @@ The source-based Kimi capacity estimate uses the coupled receipt as a proxy:
 admission window, the planned cold, unshared-history bounds are approximately
 91 to 96 requests at 134096 tokens, 75 to 88 at 207413, 58 to 78 at 295517,
 and 22 to 43 at 1048576. These are estimates, not PD measurements or throughput
-claims. CUDA rebuild, mixed resident/host graph replay, real-weight PD content
-checks, long-history concurrency, cancellations, failed transfers, and B300
-TPOT/throughput evaluation are required before deployment.
+claims. The full-model C256 deployment reserved 38.874 GiB of device KV per
+rank. Its allocator-derived steady-state bounds were 88.13, 80.99, 72.20 and
+39.95 requests at those four lengths. These bounds include one admission
+window; they are not measured long-context concurrency or throughput gains.
+
+### B300 functional verification
+
+The 2026-11-13 check used the full 93-layer model on separate 8-GPU producer
+and HiSparse decoder nodes with DCP8, EP8, DSpark4 and `latency_specialized`.
+Both endpoints allowed 256 sequences. It covered:
+
+- Four known answers and a 240,051-token recovery-code request.
+- Exact known check codes at 13 input lengths from 63 through 1,048,531.
+- 256 concurrent requests with distinct check codes, all correct, generating
+  256 tokens each. The sampled decoder running peak was 195, not 256.
+- Repeated 32,769-token PD requests with identical 32-token output sequences.
+- Exact bytes for 76,322 active host/hot KV row samples over all eight ranks.
+- Bit-identical NVFP4 sparse attention output and LSE through direct GPU KV
+  and HiSparse, using five verification queries, 128 heads, DCP ranks 0/7,
+  lengths 513/32,769 and the padded 768-row hot layout.
+- Request-level failure for an unknown producer engine and cancellation after
+  the first streaming response, followed by successful routed generation.
+
+The CPU geometry suite passed 56 cases; the new CUDA Graph localization test
+also passed. This is functional and lossless-cache evidence, not a full model
+accuracy evaluation. A synthetic 513-token request selected a different first
+token between the producer's prefill and the decoder's five-query verification
+shape; the decoder's one-token request matched the producer. That observation
+is retained and does not establish numerical equivalence across backends or
+batch shapes. Independent cold references are required: a producer-warmed
+normal-prefill reference also changed output in the synthetic 32K check.
+Formal long-history concurrency, model accuracy, and B300 TPOT/throughput
+evaluation remain outstanding.
 
 ## The short version
 
