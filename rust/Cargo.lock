@@ -5943,11 +5943,13 @@ dependencies = [
  "criterion",
  "fastokens",
  "hf-hub",
+ "parking_lot",
  "reqwest 0.12.28",
  "riptoken",
  "rustc-hash 1.1.0",
  "serde",
  "serde_json",
+ "sha2",
  "smallvec",
  "tekken",
  "tempfile",
@@ -5957,6 +5959,7 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tracing",
+ "vllm-metrics",
 ]
 
 [[package]]

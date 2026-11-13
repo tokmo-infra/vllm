@@ -43,6 +43,22 @@ For example:
 VLLM_USE_RUST_FRONTEND=1 vllm serve Qwen/Qwen3-0.6B
 ```
 
+For the native Kimi K3/K3.1 renderer, `KIMI31_TOKENIZER_CACHE_GIB=12`
+enables a model-scoped tokenizer segment cache with a 12 GiB charged byte
+limit per frontend process. It is disabled when the variable is absent or
+zero. The cache keeps ordinary text separate from added-token encoding and
+returns independent token-ID vectors. Its charged size includes UTF-8 text,
+token IDs, and conservative entry bookkeeping; it is not a process RSS limit.
+
+`KIMI31_TOKENIZER_CACHE_EPOCH_FILE` optionally points to an epoch file. An
+atomic content change clears the cache within the one-second polling interval.
+Drain requests before resetting it. `/metrics` exposes
+`vllm:tokenizer_cache_bytes`, `vllm:tokenizer_cache_max_bytes`,
+`vllm:tokenizer_cache_epoch` (the first 48 bits of SHA256 of the trimmed epoch),
+and `vllm:tokenizer_cache_tokens_total` with `source` values `reused_tokens`,
+`encoded_tokens`, and `special_tokens`. The single Rust frontend uses
+`api_process="0"`. These measure CPU tokenization reuse, not KV-cache hits.
+
 To also expose the Rust frontend's gRPC inference and control services, add
 `--grpc-port`. The HTTP listener remains on `--port`:
 

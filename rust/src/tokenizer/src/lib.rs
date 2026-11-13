@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::incremental::DecodeStream;
 
 mod byte_level_decode;
+mod cache;
 #[macro_use]
 mod error;
 mod hf;
@@ -15,6 +16,7 @@ mod tekken;
 pub mod test_utils;
 mod tiktoken;
 
+pub use cache::CachedTokenizer;
 pub use error::{Result, TokenizerError};
 pub use hf::HuggingFaceTokenizer;
 pub use incremental::{DecodedText, IncrementalDecoder, TokenAnchor, TokenAttribution};

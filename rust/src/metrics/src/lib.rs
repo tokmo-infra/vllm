@@ -18,12 +18,14 @@ mod buckets;
 mod histogram;
 mod request;
 mod scheduler;
+mod tokenizer_cache;
 
 pub use api_server::*;
 pub use buckets::{BucketFamily, CustomHistogramBuckets, FamilyHistogram};
 pub use histogram::Histogram;
 pub use request::*;
 pub use scheduler::*;
+pub use tokenizer_cache::*;
 
 // Note: `prometheus-client` appends the `_total` suffix automatically when
 // encoding counters, so all counter family registration names in this crate
@@ -46,6 +48,7 @@ pub struct Metrics {
     pub scheduler: SchedulerMetrics,
     pub request: RequestMetrics,
     pub api_server: ApiServerMetrics,
+    pub tokenizer_cache: TokenizerCacheMetrics,
 }
 
 impl Metrics {
@@ -56,6 +59,7 @@ impl Metrics {
         let scheduler = SchedulerMetrics::register(&mut registry, &buckets);
         let request = RequestMetrics::register(&mut registry, &buckets);
         let api_server = ApiServerMetrics::register(&mut registry);
+        let tokenizer_cache = TokenizerCacheMetrics::register(&mut registry);
 
         Self {
             registry,
@@ -63,6 +67,7 @@ impl Metrics {
             scheduler,
             request,
             api_server,
+            tokenizer_cache,
         }
     }
 

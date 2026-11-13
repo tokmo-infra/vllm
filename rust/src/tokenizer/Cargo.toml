@@ -10,10 +10,12 @@ test-utils = []
 [dependencies]
 base64.workspace = true
 fastokens.workspace = true
+parking_lot.workspace = true
 riptoken.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 smallvec.workspace = true
 tekken.workspace = true
 thiserror.workspace = true
@@ -21,6 +23,7 @@ thiserror-ext.workspace = true
 tiktoken-rs.workspace = true
 tokenizers.workspace = true
 tracing.workspace = true
+vllm-metrics.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
