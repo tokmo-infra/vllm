@@ -234,7 +234,10 @@ impl ChatRequestProcessor {
         .await
         .map_err(|e| Error::ChatTemplate(format!("render task join error: {e}")))??;
         let chat_template_kwargs = std::mem::take(&mut rendered.effective_template_kwargs);
-        let (prompt, mm_features) = self.finalize_rendered_prompt(&request, rendered).await?;
+        let (mut prompt, mm_features) = self.finalize_rendered_prompt(&request, rendered).await?;
+        if let Some(token_ids) = request.prompt_token_ids {
+            prompt = Prompt::TokenIds(token_ids);
+        }
         Ok(TextRequest {
             request_id: request.request_id,
             prompt,

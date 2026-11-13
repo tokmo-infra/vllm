@@ -67,7 +67,7 @@ pub(super) struct ResponseOptions {
 /// `lora_resolution.model_names` must be non-empty; the first entry is used as
 /// the base `model` field in responses when no LoRA adapter is selected.
 pub(super) fn prepare_chat_request(
-    request: ChatCompletionRequest,
+    mut request: ChatCompletionRequest,
     lora_resolution: &LoraModelResolution,
     ctx: ResolvedRequestContext,
 ) -> Result<PreparedRequest, ApiError> {
@@ -91,6 +91,28 @@ pub(super) fn prepare_chat_request(
         .then(|| extract_last_assistant_content(&request.messages))
         .flatten();
     let messages: Vec<_> = request.messages.into_iter().map(convert_message).try_collect()?;
+    // Consume the large ID array before building engine sampling metadata.
+    // Like Python, echo and multimodal requests render their messages instead.
+    let forwarded_ids = request
+        .kv_transfer_params
+        .as_mut()
+        .and_then(|params| params.remove("prompt_token_ids"));
+    let prompt_token_ids = if request.echo || messages.iter().any(VllmChatMessage::has_multimodal) {
+        None
+    } else {
+        forwarded_ids
+            .filter(|ids| !ids.is_null())
+            .map(|ids| {
+                serde_json::from_value::<Vec<u32>>(ids)
+                    .ok()
+                    .filter(|ids| !ids.is_empty())
+                    .ok_or_else(|| ApiError::invalid_request(
+                        "kv_transfer_params.prompt_token_ids must be a non-empty list of non-negative token IDs",
+                        Some("kv_transfer_params.prompt_token_ids"),
+                    ))
+            })
+            .transpose()?
+    };
     let generation_prompt_mode = normalize_generation_prompt_mode(
         request.add_generation_prompt,
         request.continue_final_message,
@@ -156,6 +178,7 @@ pub(super) fn prepare_chat_request(
     let chat_request = ChatRequest {
         request_id: request_id.clone(),
         messages,
+        prompt_token_ids,
         sampling_params: SamplingParams {
             temperature: request.temperature,
             watermarking: request.watermarking,

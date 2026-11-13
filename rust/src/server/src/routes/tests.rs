@@ -4874,6 +4874,74 @@ async fn non_stream_completions_echo_prepends_prompt_text() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn chat_decode_reuses_prefill_ids_without_forwarding_them_as_sampling_metadata() {
+    let (sent, received) = tokio::sync::oneshot::channel();
+    let (mut app, engine_task) = test_app_with_backend_and_engine_request_check(
+        Arc::new(FakeChatBackend::new()),
+        move |request| {
+            sent.send((
+                request.prompt_token_ids.clone(),
+                request.sampling_params.clone(),
+            ))
+            .unwrap();
+        },
+    )
+    .await;
+    let (status, response) = post_json(
+        &mut app,
+        "/v1/chat/completions",
+        json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "messages": [{"role": "user", "content": "this must not become the engine prompt"}],
+            "kv_transfer_params": {"do_remote_prefill": true, "prompt_token_ids": [11, 22, 33]},
+            "return_token_ids": true
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    engine_task.await.expect("mock engine task");
+    let (prompt, params) = received.await.unwrap();
+    assert_eq!(prompt.as_deref(), Some(&[11, 22, 33][..]));
+    assert_eq!(
+        params.unwrap().extra_args.unwrap()["kv_transfer_params"],
+        json!({"do_remote_prefill": true})
+    );
+    assert_eq!(response["usage"]["prompt_tokens"], 3);
+    assert_eq!(response["prompt_token_ids"], json!([11, 22, 33]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn chat_decode_rejects_malformed_prefill_ids_before_engine_submission() {
+    for ids in [
+        json!([]),
+        json!([true]),
+        json!([-1]),
+        json!([1.5]),
+        json!("ids"),
+    ] {
+        let (mut app, engine_task) = test_app_with_backend_and_engine_request_check(
+            Arc::new(FakeChatBackend::new()),
+            |_| {},
+        )
+        .await;
+        let (status, response) = post_json(
+            &mut app,
+            "/v1/chat/completions",
+            json!({
+                "model": "Qwen/Qwen1.5-0.5B-Chat",
+                "messages": [{"role": "user", "content": "hello"}],
+                "kv_transfer_params": {"prompt_token_ids": ids}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        engine_task.abort_and_join().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn non_stream_completions_echo_decodes_token_id_prompt_text() {
     let prompt_token_ids = bytes_to_token_ids(b"hello");
     let expected_prompt_token_ids = prompt_token_ids.clone();

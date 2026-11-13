@@ -3,6 +3,7 @@
 
 //! Golden fixtures generated from HF remote-code `encoding_k3.py`.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -26,6 +27,24 @@ const CLOSE_ID: u32 = 257;
 const SEP_ID: u32 = 258;
 const END_OF_MSG_ID: u32 = 259;
 const MEDIA_ID: u32 = 260;
+
+#[test]
+fn decode_reuses_prefill_ids_and_preserves_effective_reasoning_controls() {
+    let renderer = KimiK3ChatRenderer::new(
+        Arc::new(test_tokenizer()),
+        HashMap::new(),
+        KimiK3Variant::K31,
+    );
+    let mut request = crate::ChatRequest::for_test();
+    request.prompt_token_ids = Some(vec![OPEN_ID, 42, SEP_ID, 17]);
+    request.chat_options.reasoning_effort = Some(EffortValue::from("low"));
+    let rendered = renderer.render(&request).unwrap();
+    assert_eq!(
+        rendered.prompt,
+        Prompt::TokenIds(vec![OPEN_ID, 42, SEP_ID, 17])
+    );
+    assert_eq!(rendered.effective_template_kwargs["thinking_effort"], "low");
+}
 
 fn test_tokenizer() -> TestTokenizer {
     TestTokenizer::new()

@@ -100,11 +100,11 @@ impl ChatRenderer for KimiK3ChatRenderer {
         } else {
             effective_template_kwargs.remove("thinking_effort");
         }
-        let (token_ids, media_order) = encoding::render_request_with_media_order(
-            request,
-            self.tokenizer.as_ref(),
-            &reasoning,
-        )?;
+        let (token_ids, media_order) = if let Some(token_ids) = &request.prompt_token_ids {
+            (token_ids.clone(), Vec::new())
+        } else {
+            encoding::render_request_with_media_order(request, self.tokenizer.as_ref(), &reasoning)?
+        };
 
         Ok(RenderedPrompt {
             prompt: Prompt::TokenIds(token_ids),
