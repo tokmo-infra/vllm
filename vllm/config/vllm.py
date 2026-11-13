@@ -1902,9 +1902,51 @@ class VllmConfig:
             if self.parallel_config.pipeline_parallel_size > 1:
                 raise ValueError("HiSparse does not support pipeline parallelism.")
             if self.parallel_config.decode_context_parallel_size > 1:
-                raise ValueError(
-                    "HiSparse does not support decode context parallelism."
+                parallel = self.parallel_config
+                if self.cache_config.cache_dtype != "nvfp4_ds_mla":
+                    raise ValueError("DCP HiSparse currently requires NVFP4 sparse MLA")
+                if (
+                    parallel.decode_context_parallel_size
+                    != parallel.tensor_parallel_size
+                    or parallel.prefill_context_parallel_size != 1
+                ):
+                    raise ValueError("DCP HiSparse requires DCP=TP and PCP=1")
+                transfer = self.kv_transfer_config
+                connectors = (
+                    transfer.kv_connector_extra_config.get("connectors", [])
+                    if transfer is not None
+                    and transfer.kv_connector == "MultiConnector"
+                    else []
                 )
+                if (
+                    transfer is not None
+                    and transfer.kv_connector == "MooncakeConnector"
+                ):
+                    connectors = [
+                        {
+                            "kv_connector": "MooncakeConnector",
+                            "kv_role": transfer.kv_role,
+                        }
+                    ]
+                if not any(
+                    c.get("kv_connector") == "MooncakeConnector"
+                    and c.get("kv_role") == "kv_consumer"
+                    for c in connectors
+                ):
+                    raise ValueError(
+                        "DCP HiSparse requires a Mooncake PD consumer; "
+                        "prefill must run on the producer"
+                    )
+                for connector in connectors:
+                    if connector.get("kv_connector") == "MooncakeStoreConnector":
+                        extra = connector.get("kv_connector_extra_config", {})
+                        if extra.get("enable_lookup", True) or extra.get(
+                            "save_decode_cache", False
+                        ):
+                            raise ValueError(
+                                "DCP HiSparse requires decoder Store lookup and "
+                                "save_decode_cache disabled; P/D group layouts differ"
+                            )
             if self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL:
                 raise ValueError(
                     "HiSparse does not support cudagraph_mode=FULL; use "

@@ -593,7 +593,11 @@ def _get_kv_cache_bytes_per_block(
     )
     assert bytes_per_block > 0
     alignments = [
-        group.kv_cache_spec.page_size_bytes
+        (
+            group.kv_cache_spec.get_block_stride_alignment()
+            if group.kv_cache_spec.block_stride_alignment is not None
+            else group.kv_cache_spec.page_size_bytes
+        )
         for group in kv_cache_groups
         if isinstance(group.kv_cache_spec, HiSparseHotSpec)
     ]

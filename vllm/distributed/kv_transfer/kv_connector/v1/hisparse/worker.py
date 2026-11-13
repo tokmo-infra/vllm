@@ -24,6 +24,7 @@ from vllm.distributed.parallel_state import (
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.hisparse.backend import get_hisparse_backend
+from vllm.v1.hisparse.dcp import HiSparseDCPShard
 from vllm.v1.hisparse.layout import HISPARSE_HOT_SUFFIX
 from vllm.v1.hisparse.runtime import (
     HiSparseCacheHandle,
@@ -79,6 +80,7 @@ def _allocate_dma_descriptors(size: int) -> _DMADescriptors:
 
 
 _METRICS_INTERVAL = 2000
+_UNSHARDED_DCP = HiSparseDCPShard()
 
 
 def _get_hisparse_cache(
@@ -192,6 +194,8 @@ def _create_hisparse_host_events(
 class HiSparseConnectorWorker:
     """Own HiSparse host/hot state and execute its worker-side transfers."""
 
+    dcp_shard = _UNSHARDED_DCP
+
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig) -> None:
         self.backend = get_hisparse_backend()
         self.vllm_config = vllm_config
@@ -245,6 +249,12 @@ class HiSparseConnectorWorker:
                 pinned_host_pools,
                 shared_host_region=shared_host_region,
                 is_host_writer=is_host_writer,
+                dcp_shard=HiSparseDCPShard(
+                    self.vllm_config.parallel_config.decode_context_parallel_size,
+                    get_tensor_model_parallel_rank()
+                    % self.vllm_config.parallel_config.decode_context_parallel_size,
+                    self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
+                ),
             )
         except Exception:
             release_pinned_state(
@@ -267,12 +277,14 @@ class HiSparseConnectorWorker:
         *,
         shared_host_region: SharedOffloadRegion | None = None,
         is_host_writer: bool = True,
+        dcp_shard: HiSparseDCPShard | None = None,
     ) -> None:
         if self._initialized:
             raise RuntimeError("HiSparse connector worker is already initialized.")
         resident = cache_handles[0].view
         assert resident is not None
         self.kernel_block_size = resident.block_size
+        self.dcp_shard = dcp_shard or HiSparseDCPShard()
         self.host_num_blocks = host_num_blocks
         self.pinned_host_pools = pinned_host_pools
         self.shared_host_region = shared_host_region
@@ -423,6 +435,13 @@ class HiSparseConnectorWorker:
         self._release_completed_dma_descriptors()
         self._dma_submitted = False
         mirrors = _flatten_row_mirrors(metadata.row_mirrors, request_ids)
+        if self.dcp_shard.size > 1:
+            mirrors = tuple(
+                local
+                for mirror in mirrors
+                if (local := self.dcp_shard.mirror(mirror, self.kernel_block_size))
+                is not None
+            )
         if self._slot_mapping_staging is not None:
             self._slot_mapping_staging.candidates = mirrors
         self._set_row_mirrors(mirrors)

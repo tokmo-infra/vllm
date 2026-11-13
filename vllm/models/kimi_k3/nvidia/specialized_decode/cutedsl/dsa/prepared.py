@@ -31,6 +31,7 @@ The packed projection row is [q_a 1536 | kv_a 576 | gate H*128 | wk 128 | wv 32]
 
 import math
 from functools import cache
+from typing import TYPE_CHECKING, Any, cast
 
 import cutlass.cute as cute
 import torch
@@ -86,6 +87,9 @@ __all__ = [
     "dsa_on_flashinfer",
     "gate_columns",
 ]
+
+if TYPE_CHECKING:
+    from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 
 
 # FlashInfer sparse MLA kernels that read their inputs (prims_ts: query and rows;
@@ -183,7 +187,13 @@ def compile_core(
             if fp8 and value_bmm(heads, batch):  # W_UV bmm, then MlaGate
                 values = fake((heads, batch, 128), (batch * 128, 128, 1))
                 gated = MlaGate(heads, batch, q)
-                v_args = (values, gate, lengths, output, make_fake_stream())
+                v_args: tuple[Any, ...] = (
+                    values,
+                    gate,
+                    lengths,
+                    output,
+                    make_fake_stream(),
+                )
                 value_kernel = cute.compile(gated, *v_args)
             else:
                 value = MlaValue(heads, batch, q)
@@ -245,6 +255,7 @@ class PreparedDsa:
         wrapper = attention.mla_attn
         self.layer = layer = wrapper.mla_attn
         self.impl, self.indexer = layer.impl, attention.dsa_indexer
+        self.hisparse_cache = layer.hisparse_cache
         # The KV format: fp8_ds_mla (FlashMLA sparse), else FlashInfer
         # sparse's per-tensor FP8 query over a per-tensor FP8 cache (trtllm-gen or
         # prims_ts) or an nvfp4_ds_mla one (prims_ts).
@@ -276,6 +287,8 @@ class PreparedDsa:
         # Under DCP on FlashInfer: the #63 merge's owned-row outputs (indexer_stage).
         merge_rows = max(pitches) if self.dcp > 1 and self.fp8 else 0
         self.indexer_stage = IndexerStage(self.indexer, merge_rows)
+        if self.hisparse_cache is not None:
+            self.indexer_stage.dcp_ids = self.indexer.topk_indices_buffer
         # ... and the NVLink candidate exchange that replaces its all-gather
         # (topk_exchange; symmetric over the DCP group: collective, every rank
         # builds its DSA layers in the same order).
@@ -364,8 +377,8 @@ class PreparedDsa:
             # the specialized decode is built before vLLM profiles its memory for
             # the KV cache (only where prepare_cache can run it: its cache layout
             # aside, the same checks).
-            args = self.indexer, self.device, max(pitches), local_topk
-            reserve_fused_indexer(*args, blocks=kv_cache_blocks())
+            reserve_args = self.indexer, self.device, max(pitches), local_topk
+            reserve_fused_indexer(*reserve_args, blocks=kv_cache_blocks())
         # DCP "proj" partials: every gathered head's W_UV (collective), and the
         # rows of its bmm (dcp_stage.projected_rows).
         self.uv_gathered = dcp.value_weights(layer.W_UV) if dcp else None
@@ -385,12 +398,20 @@ class PreparedDsa:
         return self.query_stage.query
 
     def prepare_cache(self, kv):
+        if self.hisparse_cache is not None:
+            assert self.hisparse_cache.view is not None
+            kv = self.hisparse_cache.view.cache
         caches = kv.view(torch.uint8), self.indexer.k_cache.kv_cache
         weights = self.query_stage.weights
         specs = tuple(layout(w) for w in (*weights, *caches))
         sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         unsupported = [fused_indexer_unsupported(self.indexer, *s) for s in self.shapes]
-        fused = self.box is None and self.fp8 and not self.stock_indexer
+        fused = (
+            self.box is None
+            and self.fp8
+            and not self.stock_indexer
+            and self.hisparse_cache is None
+        )
         fused = fused and not any(unsupported)
         if not fused:  # the late query follows the fused indexer's select
             # Without it (fp8_ds_mla, unsupported shapes) the TP default is the
@@ -490,11 +511,15 @@ class PreparedDsa:
         from vllm.forward_context import get_forward_context
         from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
 
-        assert self.fused is not None and metadata.block_size == self.fused.page, (
+        assert self.fused is not None
+        assert metadata.block_size == self.fused.page, (
             metadata.block_size,
             self.fused.page,
         )
-        decode = get_forward_context().attn_metadata[self.indexer.k_cache.prefix]
+        decode = cast(
+            "DeepseekV32IndexerMetadata",
+            get_forward_context().attn_metadata[self.indexer.k_cache.prefix],
+        )
         _, block_rows = flat_kv_row_view(cache, metadata.block_size)
         stage = self.query_stage
         args = stage.q_fp8, stage.head_w, decode.decode, metadata.block_table
@@ -534,13 +559,18 @@ class PreparedDsa:
                 weight = self.query_stage.index_projection.weight
                 specs = layout(weight), index_spec
                 normalized = mode not in FRONT
-                args = batch, self.heads, pitch, *specs, device.index, normalized
-                first = compile_front(*args)
+                front_args = batch, self.heads, pitch, *specs, device.index, normalized
+                first = compile_front(*front_args)
         return first, wait, norm
 
     def run_query(self, projected, cache, slots, q, publish=()):
         """MlaQuery and the q_c rows per the overlap mode. Returns what makes the
         sparse core wait for the query (None: it is already in stream order)."""
+        if self.hisparse_cache is not None:
+            assert self.hisparse_cache.view is not None
+            assert self.hisparse_cache.slot_mapping is not None
+            cache = self.hisparse_cache.view.cache
+            slots = self.hisparse_cache.slot_mapping[: slots.numel()]
         stage, batch = self.query_stage, projected.shape[0]
         query, mode = self.kernels[batch, q][0], self.overlaps[batch, q]
         if mode == "serial":
@@ -595,6 +625,44 @@ class PreparedDsa:
 
         indexer, md = self.indexer, metadata
         query = self.box.q[self.parity, :batch]
+        if self.hisparse_cache is not None:
+            # Keep the specialized projection, query mailbox and DcpValue
+            # merge. Resolve global top-k through the sharded host/hot tier
+            # instead of interpreting host block IDs as GPU cache rows.
+            if topk is None:
+                if self.indexer_stage.local_topk:
+                    from vllm.v1.attention.backends.mla.sparse_utils import (
+                        flat_kv_row_view,
+                    )
+
+                    _, stride = flat_kv_row_view(
+                        self.hisparse_cache.view.cache, md.block_size
+                    )
+                    stage = self.query_stage
+                    merged = self.indexer_stage.merge_rows(
+                        stage.q_fp8, stage.head_w, md, stride, batch, q
+                    )
+                    if merged is not None:
+                        topk = self.indexer_stage.dcp_ids
+                if topk is None:
+                    topk = self.indexer_core(projected, batch)
+            group = self.impl.index_group
+            self.impl.record_logical_topk_ready()
+            slots, valid = group.convert_logical_to_physical_topk(
+                self.impl.index_group_index,
+                topk[:batch],
+                md,
+                block_stride_rows=None,
+                return_valid_counts=True,
+            )
+            if join is not None:
+                join()
+            hot = self.hisparse_cache.runtime.hot
+            assert self.fi is not None
+            latent, lse = self.fi.decode(
+                query, hot.attention_cache, slots, valid, hot.block_size
+            )
+            return latent, lse, valid
         if self.fi is not None:
             kv, stride_rows = self.fi.rows(cache, md.block_size)
             sparse = self.cores[batch, q] == "sparse"
@@ -611,11 +679,12 @@ class PreparedDsa:
                 merged = self.fi.convert(*args)
             if join is not None:
                 join()
+            slots, valid = merged
             if sparse:
-                latent, lse = self.sparse_decode(kv, *merged, batch, q)
-                return latent, lse, merged[1]
-            latent, lse = self.fi.decode(query, cache, *merged, md.block_size)
-            return latent, lse, merged[1]
+                latent, lse = self.sparse_decode(kv, slots, valid, batch, q)
+                return latent, lse, valid
+            latent, lse = self.fi.decode(query, cache, slots, valid, md.block_size)
+            return latent, lse, valid
         if topk is None:
             topk = self.indexer_core(projected, batch)
         pages, stride_rows = _fp8_kv_pages(cache, md.block_size)
@@ -670,6 +739,7 @@ class PreparedDsa:
         core = self.dcp_core(cache, None, metadata, batch, projected, join, q)
         uv, w_uv = stage.views[4], None
         if box.mailbox(batch).format == PROJECTED:
+            assert self.uv_gathered is not None
             uv, w_uv = self.uv_gathered[1], self.uv_gathered[0]
         args = value, box, p, publish, self.heads, core, lengths[:reqs], uv
         return run_value(*args, projected, out, w_uv)

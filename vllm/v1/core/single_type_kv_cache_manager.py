@@ -2643,10 +2643,16 @@ def get_manager_for_kv_cache_spec(
         kv_cache_spec,
         (SlidingWindowSpec, ChunkedLocalAttentionSpec, HiSparseResidentSpec),
     ):
+        resident_dcp = (
+            kwargs.get("dcp_world_size", 1)
+            if isinstance(kv_cache_spec, HiSparseResidentSpec)
+            and kv_cache_spec.dcp_sharded
+            else 1
+        )
         kwargs["max_admission_blocks_per_request"] = (
             kv_cache_spec.max_admission_blocks_per_request(
-                max_in_flight_tokens=max_in_flight_tokens,
-                max_model_len=max_model_len,
+                max_in_flight_tokens=cdiv(max_in_flight_tokens, resident_dcp),
+                max_model_len=cdiv(max_model_len, resident_dcp),
             )
         )
     manager = manager_class(kv_cache_spec, **kwargs)

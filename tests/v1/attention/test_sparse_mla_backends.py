@@ -2778,7 +2778,8 @@ def test_hisparse_rejects_union_bound_beyond_shared_memory():
 
 
 @requires_hisparse_ops
-def test_hisparse_resident_rows_bypass_hot_lru():
+@pytest.mark.parametrize("hot_block_size", [64, 128, 768])
+def test_hisparse_resident_rows_bypass_hot_lru(hot_block_size):
     device = torch.device(DEVICE_TYPE)
     block_size, row_width = 64, 8
     cache_handle = _make_hisparse_cache_handle(
@@ -2786,7 +2787,7 @@ def test_hisparse_resident_rows_bypass_hot_lru():
         device_buffer_size=5,
         max_num_reqs=1,
         row_width=row_width,
-        block_size=block_size,
+        block_size=hot_block_size,
     )
     raw = cache_handle.runtime.hot.cache.view(torch.int8)
     resident_table = torch.tensor([[1]], dtype=torch.int32, device=device)
@@ -2794,7 +2795,7 @@ def test_hisparse_resident_rows_bypass_hot_lru():
     cache_handle.bind_cache(
         raw,
         byte_offset=0,
-        block_stride=block_size * row_width * torch.float32.itemsize,
+        block_stride=hot_block_size * row_width * torch.float32.itemsize,
         num_blocks=2,
         block_size=block_size,
         block_table=resident_table,
@@ -2804,7 +2805,7 @@ def test_hisparse_resident_rows_bypass_hot_lru():
     host = torch.randn(1, block_size, row_width).pin_memory()
     cache_handle.runtime.bind_source_cache(host)
     resident_rows = host[0].to(device).add(7)
-    cache_handle.runtime.hot.cache[1].copy_(resident_rows)
+    cache_handle.runtime.hot.cache[1, :block_size].copy_(resident_rows)
     source_table = torch.tensor([[5]], dtype=torch.int32, device=device)
     request_ids = torch.zeros(1, dtype=torch.int32, device=device)
     topk = torch.tensor([[1, 2, 3, 4]], dtype=torch.int32, device=device)
@@ -2821,7 +2822,7 @@ def test_hisparse_resident_rows_bypass_hot_lru():
     )
     torch.accelerator.synchronize()
 
-    expected_indices = topk + block_size
+    expected_indices = topk + hot_block_size
     torch.testing.assert_close(indices, expected_indices)
     torch.testing.assert_close(
         valid_counts, torch.tensor([topk.shape[1]], dtype=torch.int32, device=device)
@@ -2838,7 +2839,7 @@ def test_hisparse_resident_rows_bypass_hot_lru():
 @requires_hisparse_ops
 @pytest.mark.parametrize(
     ("row_width", "kv_dtype"),
-    [(64, torch.float32), (528, torch.uint8), (656, torch.uint8)],
+    [(64, torch.float32), (352, torch.uint8), (528, torch.uint8), (656, torch.uint8)],
 )
 def test_hisparse_swap_in_preserves_rows_across_eviction(row_width, kv_dtype):
     device = torch.device(DEVICE_TYPE)

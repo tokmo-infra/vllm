@@ -14,6 +14,7 @@ from vllm.v1.hisparse.layout import (
     HISPARSE_HOT_SUFFIX,
     HISPARSE_RESIDENT_SUFFIX,
     get_hisparse_kv_cache_groups,
+    is_hisparse_mla_spec,
 )
 from vllm.v1.hisparse.runtime import (
     HiSparseCacheHandle,
@@ -27,9 +28,9 @@ from vllm.v1.kv_cache_interface import (
     HiSparseHotSpec,
     HiSparseResidentSpec,
     KVCacheConfig,
+    KVCacheGroupRole,
     KVCacheLayout,
     KVCacheSpec,
-    MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
     create_kv_cache_views,
 )
@@ -48,9 +49,7 @@ def resolve_hisparse_specs(
     """Resolve a common kernel block size for HiSparse MLA specs, and add the
     resident/hot specs HiSparse derives from them."""
     mla_specs = {
-        name: spec
-        for name, spec in kv_cache_spec.items()
-        if isinstance(spec, MLAAttentionSpec)
+        name: spec for name, spec in kv_cache_spec.items() if is_hisparse_mla_spec(spec)
     }
     if not mla_specs:
         return kv_cache_spec
@@ -66,6 +65,12 @@ def resolve_hisparse_specs(
             "HiSparse requires a GPU block size supported by every sparse "
             f"attention and indexer backend: {error}"
         ) from error
+    parallel = vllm_config.parallel_config
+    if (
+        parallel.decode_context_parallel_size > 1
+        and block_size % parallel.cp_kv_cache_interleave_size
+    ):
+        raise ValueError("HiSparse kernel pages must contain whole DCP interleaves")
     kv_cache_spec = kv_cache_spec | {
         name: spec.copy_with_new_block_size(block_size)
         for name, spec in mla_specs.items()
@@ -73,9 +78,14 @@ def resolve_hisparse_specs(
     groups = get_hisparse_kv_cache_groups(vllm_config, kv_cache_spec)
     assert groups is not None
     return kv_cache_spec | {
-        layer_name: group.kv_cache_spec
+        layer_name: (
+            group.kv_cache_spec.kv_cache_specs[layer_name]
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+            else group.kv_cache_spec
+        )
         for group in groups
         if isinstance(group.kv_cache_spec, (HiSparseResidentSpec, HiSparseHotSpec))
+        or group.role is KVCacheGroupRole.HISPARSE_INDEXER
         for layer_name in group.layer_names
     }
 

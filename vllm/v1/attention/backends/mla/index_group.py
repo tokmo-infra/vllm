@@ -16,6 +16,7 @@ from vllm.v1.attention.backend import max_decode_query_len
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
 )
+from vllm.v1.hisparse.dcp import HiSparseDCPShard
 from vllm.v1.hisparse.runtime import (
     HiSparseCacheHandle,
     HiSparsePrefillStagingPlan,
@@ -169,6 +170,8 @@ class HiSparseMLAIndexGroup(SparseMLAIndexGroup):
     hisparse_group: Any | None = None
     prefill_stream: torch.Stream | None = None
     prefill_ready_events: list[torch.Event] = field(default_factory=list)
+    dcp_size: int = 1
+    dcp_rank: int = 0
 
     def _current_stream(self) -> Any:
         return torch.accelerator.current_stream()
@@ -183,10 +186,15 @@ class HiSparseMLAIndexGroup(SparseMLAIndexGroup):
         assert vllm_config is not None
         assert row_width is not None
         assert kv_cache_dtype is not None
+        self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+        if self.dcp_size > 1:
+            from vllm.distributed import get_dcp_group
+
+            self.dcp_rank = get_dcp_group().rank_in_group
         layer_index = super().register_layer()
         if self.prefill_stream is None:
             self.prefill_stream = torch.Stream(device=self.logical_topk_indices.device)
-        if kv_cache_dtype == "fp8_ds_mla":
+        if kv_cache_dtype in ("fp8_ds_mla", "nvfp4_ds_mla"):
             kv_dtype = torch.uint8
         else:
             from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
@@ -231,6 +239,14 @@ class HiSparseMLAIndexGroup(SparseMLAIndexGroup):
         cache = self.cache(layer_index)
         num_tokens = logical_topk_indices.shape[0]
         req_id_per_token = attn_metadata.req_id_per_token[:num_tokens]
+        if self.dcp_size > 1:
+            if cache.num_decode_tokens < cache.num_actual_tokens:
+                raise ValueError("DCP HiSparse requires PD decode-only batches")
+            interleave = attn_metadata.cp_kv_cache_interleave_size
+            shard = HiSparseDCPShard(self.dcp_size, self.dcp_rank, interleave)
+            logical_topk_indices = shard.localize(logical_topk_indices)
+            if not in_piecewise_cudagraph():
+                self.logical_topk_ready.record(self._current_stream())
         if num_tokens > cache.runtime.max_swap_rows or (
             cache.all_context_pages_resident
             and cache.num_decode_tokens < cache.num_actual_tokens

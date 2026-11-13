@@ -14,11 +14,16 @@ With the fused DCP indexer (``fused``, indexer.py) the scoring is its scorer (th
 same logits layout) and, packed, its select also takes the local top-N (the
 merge's B' rows), so the merge only all-gathers and selects."""
 
+from typing import TYPE_CHECKING, cast
+
 import torch
 
 from vllm.utils.torch_utils import _encode_layer_name
 
 from .index import DIM, fp4_query_views, is_fp4_cache
+
+if TYPE_CHECKING:
+    from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 
 
 class IndexerStage:
@@ -120,7 +125,10 @@ class IndexerStage:
         )
 
         indexer, n = self.indexer, self.local_topk
-        index_md = get_forward_context().attn_metadata[indexer.k_cache.prefix]
+        index_md = cast(
+            "DeepseekV32IndexerMetadata",
+            get_forward_context().attn_metadata[indexer.k_cache.prefix],
+        )
         decode, rows = index_md.decode, index_md.num_decode_tokens
         if (
             decode is None
@@ -162,8 +170,8 @@ class IndexerStage:
             assert metadata.block_size == fused.page, (metadata.block_size, fused.page)
             ids = None if self.dcp_ids is None else self.dcp_ids[:batch, : self.topk]
             args = metadata.req_id_per_token, metadata.block_table, stride_rows
-            merge = (*args, slots, valid, max_local_len)
-            fused.run_exchange(q_fp8, head_w, decode, batch, q, merge, ids)
+            exchange_args = (*args, slots, valid, max_local_len)
+            fused.run_exchange(q_fp8, head_w, decode, batch, q, exchange_args, ids)
             return slots, valid
         if fused is not None and decode.seq_lens.numel() == rows:
             # The logits stay valid until the merge returns (stream order): a
@@ -179,6 +187,8 @@ class IndexerStage:
             if rows < batch:  # rows past the requests attend nothing
                 slots[rows:].fill_(-1)
                 valid[rows:].zero_()
+                if self.dcp_ids is not None:
+                    self.dcp_ids[rows:batch].fill_(-1)
             return slots, valid
         # As the stock op's decode branch (uniform rows; FP8 or MXFP4 cache and
         # query).
@@ -211,6 +221,8 @@ class IndexerStage:
         if rows < batch:  # rows past the requests attend nothing
             slots[rows:].fill_(-1)
             valid[rows:].zero_()
+            if self.dcp_ids is not None:
+                self.dcp_ids[rows:batch].fill_(-1)
         return slots, valid
 
     # -------------------------------------------------------------------------------

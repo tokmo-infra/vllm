@@ -45,6 +45,8 @@ steps:
   timeout_in_minutes: 80
   device: b200-k8s
   source_file_dependencies:
+    - csrc/hisparse_kernels.cu
+    - vllm/v1/hisparse/
     - vllm/config/attention.py
     - vllm/model_executor/layers/attention
     - vllm/v1/attention

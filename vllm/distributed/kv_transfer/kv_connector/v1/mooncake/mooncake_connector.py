@@ -72,6 +72,7 @@ from vllm.utils.torch_utils import is_non_overlapping_and_dense
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.hisparse.dcp import import_page_offset, pair_import_pages
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CircularBufferSpec,
@@ -454,6 +455,7 @@ def _align_transfer_regions(
     remote_regions: list[TransferRegion],
     *,
     allow_partial_layers: bool = False,
+    allow_group_remap: bool = False,
 ) -> tuple[list[TransferRegion], list[TransferRegion], str | None]:
     """Align KV transfer regions by registered layer-name occurrence.
 
@@ -506,7 +508,10 @@ def _align_transfer_regions(
                     f"{remote_region.layer_index}."
                 ),
             )
-        if local_region.group_index != remote_region.group_index:
+        if (
+            not allow_group_remap
+            and local_region.group_index != remote_region.group_index
+        ):
             return (
                 [],
                 [],
@@ -518,7 +523,8 @@ def _align_transfer_regions(
                 ),
             )
         if (
-            local_region.shared_group_ids
+            not allow_group_remap
+            and local_region.shared_group_ids
             and remote_region.shared_group_ids
             and local_region.shared_group_ids != remote_region.shared_group_ids
         ):
@@ -717,6 +723,12 @@ class MooncakeXferMetadata(
     kernel_block_size: int = 0
     physical_blocks_per_logical: int = 0
     prefix_caching: bool = False
+    hisparse_dcp_size: int = 0
+    dcp_interleave: int = 1
+    group_kernel_ratios: list[int] = msgspec.field(default_factory=list)
+    import_token_counts: dict[str, int] = msgspec.field(default_factory=dict)
+    registered_row_bytes: dict[str, int] = msgspec.field(default_factory=dict)
+    hisparse_cache_dtype: str = ""
 
 
 class MooncakeXferResponseStatus(IntEnum):
@@ -758,6 +770,7 @@ class PullReqMeta:
     # A failure is sticky; still settle later peer results before releasing
     # destination blocks to prevent write-after-free from delayed peer writes.
     failed: bool = False
+    import_tokens: int = 0
 
 
 @dataclass
@@ -786,6 +799,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         local_block_ids: list[list[int]],
         kv_transfer_params: dict[str, Any],
         load_remote_cache: bool = True,
+        import_tokens: int = 0,
     ):
         transfer_id = kv_transfer_params["transfer_id"]
         if load_remote_cache:
@@ -796,6 +810,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
                 remote_engine_id=remote_engine_id,
                 remote_bootstrap_addr=kv_transfer_params["remote_bootstrap_addr"],
                 transfer_id=transfer_id,
+                import_tokens=import_tokens,
             )
         else:
             self.reqs_to_send[request_id] = (transfer_id, local_block_ids)
@@ -1230,6 +1245,9 @@ class MooncakeConnectorScheduler:
                     request_id=req_id,
                     local_block_ids=block_ids,
                     kv_transfer_params=req.kv_transfer_params,
+                    import_tokens=self._get_remote_prefill_token_count(
+                        len(req.prompt_token_ids or [])
+                    ),
                 )
             self._reqs_need_recv.clear()
 
@@ -1733,7 +1751,11 @@ class MooncakeConnectorWorker:
                 else self.transfer_topo.total_num_kv_heads
             ),
         )
-        if validation_err is None:
+        if meta.hisparse_dcp_size:
+            # This path validates row formats and maps differently sized
+            # registered pages itself; whole-region byte lengths may differ.
+            validation_err = self._validate_hetero_layout(meta)
+        elif validation_err is None:
             validation_err = self._validate_hetero_layout(meta)
         if validation_err is not None:
             logger.error(validation_err)
@@ -1881,6 +1903,25 @@ class MooncakeConnectorWorker:
 
     def _validate_hetero_layout(self, meta: MooncakeXferMetadata) -> str | None:
         """Reject consumer layouts that differ from ours in ways we cannot map."""
+        if meta.hisparse_dcp_size:
+            parallel = self.vllm_config.parallel_config
+            if (
+                meta.hisparse_dcp_size != parallel.decode_context_parallel_size
+                or self.tp_size != meta.remote_tp_size
+                or self.tp_size != meta.hisparse_dcp_size
+                or self.tp_rank != meta.remote_tp_rank
+                or self.pp_size != 1
+                or meta.remote_pp_size != 1
+                or parallel.prefill_context_parallel_size != 1
+                or meta.dcp_interleave != parallel.cp_kv_cache_interleave_size
+                or meta.kernel_block_size != self.block_size
+                or meta.hisparse_cache_dtype != self.cache_config.cache_dtype
+            ):
+                return (
+                    "HiSparse imports require matching TP=DCP, rank, "
+                    "PCP1/PP1 and kernel geometry"
+                )
+            return None
         local_ppl = self._physical_blocks_per_logical_kv_block
         remote_ppl = meta.physical_blocks_per_logical or local_ppl
         if remote_ppl != local_ppl:
@@ -1960,6 +2001,134 @@ class MooncakeConnectorWorker:
             for i, group in enumerate(block_ids)
         ]
 
+    def _group_kernel_ratios(self) -> list[int]:
+        ratios = []
+        for group in self.kv_cache_config.transfer_groups:
+            spec = self._layer_specs[group.layer_names[0]]
+            if isinstance(spec, (MambaSpec, CircularBufferSpec)):
+                ratios.append(1)
+            else:
+                if spec.block_size % self.block_size:
+                    raise ValueError("Mooncake group is not aligned to kernel pages")
+                ratios.append(spec.block_size // self.block_size)
+        return ratios
+
+    def _build_hisparse_dcp_transfer_params(
+        self,
+        ready_reqs: list[tuple[ReqId, SendBlockMeta]],
+        meta: MooncakeXferMetadata,
+        local_regions: list[TransferRegion],
+        remote_regions: list[TransferRegion],
+    ) -> tuple[list[int], list[int], list[int], list[ReqId], str | None]:
+        """Import sharded source KV into host and indexer/draft/SSM into GPU.
+
+        Endpoints use their own group IDs and scheduler block geometry. The
+        logical import length aligns differently packed source/destination
+        pages without selecting uncomputed padding from the producer's tail.
+        """
+        sources: list[int] = []
+        destinations: list[int] = []
+        lengths: list[int] = []
+        failed: list[ReqId] = []
+        error_message = self._validate_hetero_layout(meta)
+        if error_message:
+            return [], [], [], [key for key, _ in ready_reqs], error_message
+        source_ratios = self._group_kernel_ratios()
+        for request_id, send in ready_reqs:
+            request_descriptors: list[tuple[int, int, int]] = []
+            try:
+                remote_blocks = meta.req_blocks[request_id][1]
+                if not any(remote_blocks):
+                    continue
+                tokens = meta.import_token_counts[request_id]
+                if tokens <= 0 or len(meta.group_kernel_ratios) != len(remote_blocks):
+                    raise ValueError("Missing HiSparse import length or group geometry")
+                # Round up for the rank with the longest partial interleave.
+                stripe = meta.hisparse_dcp_size * meta.dcp_interleave
+                local_rows = cdiv(tokens, stripe) * meta.dcp_interleave
+                for local, remote in zip(local_regions, remote_regions, strict=True):
+                    source_ids = send.local_block_ids[local.group_index]
+                    destination_ids = remote_blocks[remote.group_index]
+                    spec = self._layer_specs[local.layer_name]
+                    if isinstance(spec, MambaSpec):
+                        source_ids = [b for b in source_ids if b != NULL_BLOCK_ID]
+                        destination_ids = [
+                            b for b in destination_ids if b != NULL_BLOCK_ID
+                        ]
+                        count = len(destination_ids)
+                        if len(source_ids) < count:
+                            raise ValueError("Producer is missing imported SSM states")
+                        pairs = list(
+                            zip(source_ids[-count:] if count else [], destination_ids)
+                        )
+                    elif isinstance(spec, MLAAttentionSpec):
+                        pairs = pair_import_pages(
+                            source_ids,
+                            destination_ids,
+                            source_ratio=source_ratios[local.group_index],
+                            destination_ratio=meta.group_kernel_ratios[
+                                remote.group_index
+                            ],
+                            num_rows=local_rows,
+                            kernel_block_size=self.block_size,
+                        )
+                    else:
+                        raise ValueError(
+                            "Unsupported cache kind in DCP HiSparse import"
+                        )
+                    if isinstance(spec, MLAAttentionSpec):
+                        row_bytes = spec.state_content_size_bytes
+                        if meta.registered_row_bytes[remote.layer_name] != row_bytes:
+                            raise ValueError("HiSparse MLA/indexer row formats differ")
+
+                        def offset(page, region, ratio, *, row_bytes=row_bytes):
+                            return import_page_offset(
+                                page,
+                                manager_ratio=ratio,
+                                registered_rows=region.kv_block_len // row_bytes,
+                                kernel_rows=self.block_size,
+                                row_bytes=row_bytes,
+                                registered_stride=region.block_len,
+                            )
+
+                        request_descriptors.extend(
+                            (
+                                local.base_addr
+                                + offset(src, local, source_ratios[local.group_index]),
+                                remote.base_addr
+                                + offset(
+                                    dst,
+                                    remote,
+                                    meta.group_kernel_ratios[remote.group_index],
+                                ),
+                                self.block_size * row_bytes,
+                            )
+                            for src, dst in pairs
+                        )
+                        continue
+                    if local.kv_block_len != remote.kv_block_len:
+                        raise ValueError(
+                            "HiSparse import source/destination formats differ"
+                        )
+                    request_descriptors.extend(
+                        (
+                            local.base_addr + src * local.block_len,
+                            remote.base_addr + dst * remote.block_len,
+                            local.kv_block_len,
+                        )
+                        for src, dst in pairs
+                    )
+            except (ValueError, IndexError, KeyError) as error:
+                # Do not publish any descriptor from a partially valid request.
+                failed.append(request_id)
+                error_message = str(error)
+                continue
+            for src, dst, size in request_descriptors:
+                sources.append(src)
+                destinations.append(dst)
+                lengths.append(size)
+        return sources, destinations, lengths, failed, error_message
+
     async def _build_transfer_params(
         self,
         ready_reqs: list[tuple[ReqId, SendBlockMeta]],
@@ -1967,6 +2136,10 @@ class MooncakeConnectorWorker:
         local_regions: list[TransferRegion],
         remote_regions: list[TransferRegion],
     ) -> tuple[list[int], list[int], list[int], list[ReqId], str | None]:
+        if agent_meta.hisparse_dcp_size:
+            return self._build_hisparse_dcp_transfer_params(
+                ready_reqs, agent_meta, local_regions, remote_regions
+            )
         src_ptrs = []
         dst_ptrs = []
         lengths = []
@@ -2944,6 +3117,8 @@ class MooncakeConnectorWorker:
         layout does not change until the next ``register_kv_caches``.
         """
         cache_key = (
+            meta.hisparse_dcp_size,
+            tuple(sorted(meta.registered_row_bytes.items())),
             meta.remote_hostname,
             meta.remote_port,
             meta.remote_tp_size,
@@ -3025,9 +3200,30 @@ class MooncakeConnectorWorker:
             local_regions,
             remote_regions,
             allow_partial_layers=meta.remote_pp_size != self.pp_size,
+            allow_group_remap=bool(meta.hisparse_dcp_size),
         )
         if align_err is not None:
             return finish([], [], align_err)
+        if meta.hisparse_dcp_size:
+            for local, remote in zip(local_regions, remote_regions, strict=True):
+                if len(local.shared_group_ids) > 1 or len(remote.shared_group_ids) > 1:
+                    return finish(
+                        [], [], "HiSparse imports require per-layer transfer regions"
+                    )
+                spec = self._layer_specs[local.layer_name]
+                if isinstance(spec, MLAAttentionSpec):
+                    row_bytes = spec.state_content_size_bytes
+                    if (
+                        meta.registered_row_bytes.get(remote.layer_name) != row_bytes
+                        or local.kv_block_len % row_bytes
+                        or remote.kv_block_len % row_bytes
+                    ):
+                        return finish([], [], "HiSparse import row formats differ")
+                elif local.kv_block_len != remote.kv_block_len:
+                    return finish(
+                        [], [], "HiSparse import cache payload formats differ"
+                    )
+            return finish(local_regions, remote_regions, None)
         # Head checks must see every layer name. Coalesce keeps only the first.
         head_err = self._validate_head_resharding_layout(
             meta.remote_tp_size, local_regions
@@ -3114,6 +3310,25 @@ class MooncakeConnectorWorker:
             physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
             prefix_caching=self.cache_config.enable_prefix_caching,
         )
+        if self.vllm_config.attention_config.hisparse_config is not None:
+            parallel = self.vllm_config.parallel_config
+            if parallel.decode_context_parallel_size > 1:
+                hetero_layout.update(
+                    hisparse_dcp_size=parallel.decode_context_parallel_size,
+                    dcp_interleave=parallel.cp_kv_cache_interleave_size,
+                    group_kernel_ratios=self._group_kernel_ratios(),
+                    hisparse_cache_dtype=self.cache_config.cache_dtype,
+                    registered_row_bytes={
+                        name: spec.state_content_size_bytes
+                        for name in self.registered_layer_names
+                        if isinstance(
+                            (spec := self._layer_specs[name]), MLAAttentionSpec
+                        )
+                    },
+                    import_token_counts={
+                        key: value.import_tokens for key, value in pull_metas.items()
+                    },
+                )
         if not include_layout:
             return MooncakeXferMetadata(
                 remote_hostname=self.hostname,

@@ -530,6 +530,7 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
             self._prefill_backend.prepare_metadata(prefill)
 
         shardq = None
+        split: ShardQSplit | None
         if self.dcp_shardq is not None:
             # A DCP ShardQ step shards every token after its leading decode
             # rows, short prefill pieces that this backend classifies as
@@ -858,6 +859,8 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
                     row_width=(
                         self.get_fp8_ds_mla_row_bytes()
                         if kv_cache_dtype == "fp8_ds_mla"
+                        else 352
+                        if kv_cache_dtype == "nvfp4_ds_mla"
                         else head_size
                     ),
                     kv_cache_dtype=kv_cache_dtype,
@@ -1019,12 +1022,10 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
                 is_decode=num_decode_tokens >= num_tokens,
             )
 
-        assert self.dcp_world_size == 1
         layer_index = self.index_group_index
         hot_cache = index_group.physical_kv_cache(layer_index).view(
             kv_c_and_k_pe_cache.dtype
         )
-        assert hot_cache.is_contiguous(), "HiSparse hot buffer must be contiguous"
         if (
             num_decode_tokens >= num_tokens
             or index_group.cache(layer_index).all_context_pages_resident

@@ -476,7 +476,12 @@ __global__ __launch_bounds__(1024) void hisparse_resolve_residency_kernel(
     if (miss_mask != nullptr)
       miss_mask[static_cast<int64_t>(row) * top_k + i] = 0;
     if (resident_row >= 0) {
-      store_hot_index(row_out, row_attention, i, resident_row, hot_block_size,
+      // Resident pages occupy the beginning of a larger hot lease. Both
+      // views share its per-layer offset and physical block stride.
+      const int32_t hot_row =
+          block_div(resident_row, resident_block_size) * hot_block_size +
+          block_mod(resident_row, resident_block_size);
+      store_hot_index(row_out, row_attention, i, hot_row, hot_block_size,
                       attention_block_stride);
     } else if (g < 0) {
       store_hot_index(row_out, row_attention, i, -1, hot_block_size,
@@ -1206,8 +1211,9 @@ void hisparse_resolve_residency(
             table.scalar_type() == torch::headeronly::ScalarType::Int &&
             table.dim() == 2 && table.stride(1) == 1,
         "resident_block_table must be a row-major 2D int32 CUDA tensor");
-    STD_TORCH_CHECK(resident_block_size == hot_block_size,
-                    "resident and hot block sizes must match");
+    STD_TORCH_CHECK(
+        resident_block_size > 0 && resident_block_size <= hot_block_size,
+        "resident pages must fit inside hot leases");
     STD_TORCH_CHECK(resident_null_block >= 0,
                     "resident null block must be non-negative");
     resident_block_table_ptr = table.const_data_ptr<int32_t>();

@@ -2,6 +2,70 @@
 
 Status: experimental
 
+## Experimental Kimi DCP PD decoder
+
+The DCP PD prototype supports a Mooncake consumer with TP=DCP, PP=PCP=1,
+NVFP4 sparse MLA, and Model Runner V2. Both endpoints must run this revision;
+the immutable `9139` image does not contain these changes. Prefill remains on
+the producer. `latency_specialized` keeps its projection, indexer candidate
+exchange, query mailbox, sparse decode, and DcpValue merge. The indexer also
+emits global token IDs for HiSparse's residency resolver. No generic model
+decode fallback is enabled by this configuration.
+
+Each DCP worker owns a private host shard. `host_pool_gib` remains the logical
+budget of one DP replica and is divided across its DCP ranks. Indexer and dense
+DSpark draft KV stay on GPU. Source pages stay small, while indexer and hot
+leases pack more rows into an HMA block to avoid paying an SSM-sized allocation
+for every 64 hot rows. Resident and hot views share per-layer offsets and the
+physical block stride, but may have different logical page sizes.
+
+Decoder Store lookup and `save_decode_cache` must be disabled in this version:
+the ordinary producer and HiSparse decoder use different group/block layouts.
+The producer can retain its ordinary Store cache. Do not reuse the original
+shared P/D Store namespace for decoder writes.
+
+A decoder transfer configuration, with a 512-GiB logical host budget, is:
+
+```json
+{
+  "kv_connector": "MultiConnector",
+  "kv_role": "kv_both",
+  "kv_load_failure_policy": "fail",
+  "kv_connector_extra_config": {
+    "connectors": [
+      {
+        "kv_connector": "HiSparseConnector",
+        "kv_role": "kv_both",
+        "kv_connector_extra_config": {"host_pool_gib": 512}
+      },
+      {
+        "kv_connector": "MooncakeConnector",
+        "kv_role": "kv_consumer",
+        "kv_load_failure_policy": "fail",
+        "kv_connector_extra_config": {"mooncake_protocol": "rdma"}
+      }
+    ]
+  }
+}
+```
+
+Retain the deployment's HCA selection on the Mooncake entry. Configure
+`hisparse_config.device_buffer_size=12288` for top-k 2048 and DSpark4. The
+per-rank buffer covers the worst-case verification union; dividing its size by
+DCP assumes a balanced top-k distribution and is not safe for skewed selections.
+Host memory is an additional budget; re-budget or remove the decoder Store
+allocation before deploying.
+
+The source-based Kimi capacity estimate uses the coupled receipt as a proxy:
+42.424 GiB of KV storage per rank, 24 target DSA layers, 24 MXFP4 indexers,
+5 FP8 dense draft layers, and 69 KDA states. Including HMA padding and one
+admission window, the planned cold, unshared-history bounds are approximately
+91 to 96 requests at 134096 tokens, 75 to 88 at 207413, 58 to 78 at 295517,
+and 22 to 43 at 1048576. These are estimates, not PD measurements or throughput
+claims. CUDA rebuild, mixed resident/host graph replay, real-weight PD content
+checks, long-history concurrency, cancellations, failed transfers, and B300
+TPOT/throughput evaluation are required before deployment.
+
 ## The short version
 
 There are three different jobs:

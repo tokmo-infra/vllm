@@ -129,6 +129,14 @@ def unsupported(vllm_config) -> str | None:
     tp1 = parallel.tensor_parallel_size == 1
     ep = parallel.enable_expert_parallel
     checks = (
+        (
+            vllm_config.attention_config.hisparse_config is not None
+            and (
+                parallel.decode_context_parallel_size <= 1
+                or vllm_config.cache_config.cache_dtype != "nvfp4_ds_mla"
+            ),
+            "HiSparse outside the DCP NVFP4 PD path",
+        ),
         (not current_platform.is_device_capability_family(100), "this GPU (SM100/103)"),
         (
             moe != ("situ", 4.0, 25.0, 896, 16, 1, 1, "sigmoid"),
@@ -193,8 +201,10 @@ def unsupported(vllm_config) -> str | None:
         # in both).
         (
             kda_dtypes(vllm_config) not in kda_allowed,
-            "KDA cache dtypes other than a BF16 or FP32 conv state and an FP32 "
-            "recurrent state (mamba cache dtype)",
+            (
+                "KDA cache dtypes other than a BF16 or FP32 conv state and an FP32 "
+                "recurrent state (mamba cache dtype)"
+            ),
         ),
         # The verify kernels take at most 8 tokens per request (KdaSplit's barriers).
         (
@@ -219,9 +229,12 @@ def unsupported(vllm_config) -> str | None:
             dsa
             and vllm_config.cache_config.cache_dtype
             not in ("fp8_ds_mla", "fp8", "fp8_e4m3", "nvfp4_ds_mla"),
-            "DSA layers on KV cache dtypes other than fp8_ds_mla (FlashMLA sparse), "
-            "per-tensor fp8 (FlashInfer sparse) or nvfp4_ds_mla (FlashInfer sparse "
-            "prims_ts)",
+            (
+                "DSA layers on KV cache dtypes other than fp8_ds_mla "
+                "(FlashMLA sparse), "
+                "per-tensor fp8 (FlashInfer sparse) or nvfp4_ds_mla (FlashInfer sparse "
+                "prims_ts)"
+            ),
         ),
     )
     reason = next((reason for failed, reason in checks if failed), None)

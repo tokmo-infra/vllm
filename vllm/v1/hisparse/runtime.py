@@ -46,8 +46,7 @@ def is_hisparse_decode_batch(attn_metadata: Any | None) -> bool:
     return (
         attn_metadata is not None
         and attn_metadata.num_decode_tokens == attn_metadata.num_actual_tokens
-        and attn_metadata.max_query_len == 1
-        and attn_metadata.num_reqs == attn_metadata.num_actual_tokens
+        and attn_metadata.num_actual_tokens > 0
     )
 
 
@@ -89,7 +88,8 @@ class PagedCacheView:
         )
         row_bytes = row_width * itemsize
         if block_stride % (block_size * row_bytes):
-            return cls(cache, cache, block_size, block_size)
+            assert block_stride % row_bytes == 0
+            return cls(cache, cache, block_size, block_stride // row_bytes)
         attention_cache = (
             raw_tensor[byte_offset:].view(dtype).view(-1, block_size, row_width)
         )
@@ -936,7 +936,6 @@ class HiSparseRuntime:
         num_tokens = topk_indices.shape[0]
         hot = self.hot
         host_cache = self.host_cache
-        assert hot.block_size == block_size
         request_state_indices = self.request_state_indices
         assert request_state_indices is not None
         group = self.index_group
@@ -1081,7 +1080,6 @@ class HiSparseRuntime:
         shared_rows = self._step_rows(num_tokens)
         group = self.index_group
         hot = self.hot
-        assert hot.block_size == block_size
         assert hot.attention_block_stride == group.leader.hot.attention_block_stride
 
         if self.is_group_leader:
@@ -1237,7 +1235,7 @@ class HiSparseCacheHandle:
         assert self.view is not None and self.slot_mapping is not None
         num_rows = min(num_input_rows, num_slot_rows, self.num_actual_tokens)
         if self.decode_batch:
-            num_rows = min(num_rows, self.runtime.max_num_reqs)
+            num_rows = min(num_rows, self.runtime.max_swap_rows)
         return self.view.cache, self.slot_mapping[:num_rows], num_rows
 
     def finish_kv_update(self) -> None:
