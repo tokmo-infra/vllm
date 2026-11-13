@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 use vllm_text::Prompt;
 use vllm_text::tokenizer::DynTokenizer;
+use vllm_tokenizer::CachedTokenizer;
 
 use super::{ChatRenderer, RenderedPrompt, RendererSelection};
 use crate::Result;
@@ -60,6 +61,23 @@ impl KimiK3ChatRenderer {
         default_template_kwargs: HashMap<String, Value>,
         variant: KimiK3Variant,
     ) -> Self {
+        let gib = std::env::var("KIMI31_TOKENIZER_CACHE_GIB")
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .expect("KIMI31_TOKENIZER_CACHE_GIB must be a nonnegative integer")
+            })
+            .unwrap_or(0);
+        let tokenizer = if gib > 0 {
+            let bytes = gib.checked_mul(1 << 30).expect("Tokenizer cache byte limit overflow");
+            std::sync::Arc::new(CachedTokenizer::new(
+                tokenizer,
+                bytes,
+                std::env::var_os("KIMI31_TOKENIZER_CACHE_EPOCH_FILE").map(Into::into),
+            )) as DynTokenizer
+        } else {
+            tokenizer
+        };
         Self {
             tokenizer,
             default_template_kwargs,
