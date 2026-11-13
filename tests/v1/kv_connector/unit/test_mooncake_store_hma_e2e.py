@@ -4,6 +4,7 @@
 (SWA + Full) attention config, using a dict-backed mock store."""
 
 import ctypes
+import queue
 import sys
 import threading
 import types
@@ -103,7 +104,9 @@ def _minimal_vllm_config(cache_block_size=16):
     return cfg
 
 
-def _build_worker_with_dict_store(vllm_config, kv_cache_config, store):
+def _build_worker_with_dict_store(
+    vllm_config, kv_cache_config, store, *, tp_size=1, dcp_size=1
+):
     """Build a MooncakeStoreWorker patching all distributed dependencies."""
     fake_mooncake_store = types.ModuleType("mooncake.store")
     fake_mooncake_store.MooncakeDistributedStore = lambda: store  # type: ignore[attr-defined]
@@ -131,7 +134,7 @@ def _build_worker_with_dict_store(vllm_config, kv_cache_config, store):
             patch(
                 "vllm.distributed.kv_transfer.kv_connector.v1.mooncake"
                 ".store.worker.get_tensor_model_parallel_world_size",
-                return_value=1,
+                return_value=tp_size,
             ),
             patch(
                 "vllm.distributed.kv_transfer.kv_connector.v1.mooncake"
@@ -148,7 +151,8 @@ def _build_worker_with_dict_store(vllm_config, kv_cache_config, store):
             ),
         ):
             mock_pcp.return_value.world_size = 1
-            mock_dcp.return_value.world_size = 1
+            mock_dcp.return_value.world_size = dcp_size
+            mock_dcp.return_value.rank_in_group = 0
             worker = mooncake_store_worker.MooncakeStoreWorker(
                 vllm_config, kv_cache_config=kv_cache_config
             )
@@ -164,6 +168,7 @@ def _register_with_fake_threads(worker, kv_caches):
             if isinstance(v, threading.Event):
                 v.set()
         m = MagicMock()
+        m.request_queue = queue.Queue()
         m.start = lambda: None
         return m
 
@@ -1189,3 +1194,169 @@ def test_ring_scratch_group_is_never_stored_and_does_not_block_hits():
 
     assert worker.lookup(num_tokens=65, block_hashes=hs).hit_length == 64
     assert not any("@group:1" in key for key in store._data)
+
+
+class _ByteStore(_DictStore):
+    """External SDK double that copies exactly the requested PUT/GET extents."""
+
+    def __init__(self):
+        super().__init__()
+        self.sizes = {}
+        self.probed = []
+        self.leased = []
+        self.puts = []
+        self.gets = []
+
+    def batch_probe_key(self, keys):
+        self.probed.extend(keys)
+        return [int(key in self._data) for key in keys]
+
+    def batch_is_exist(self, keys):
+        self.leased.extend(keys)
+        return super().batch_is_exist(keys)
+
+    def batch_put_from_multi_buffers(self, keys, addrs, sizes, *_args):
+        for key, addresses, lengths in zip(keys, addrs, sizes, strict=True):
+            self._data[key] = b"".join(
+                ctypes.string_at(addr, size)
+                for addr, size in zip(addresses, lengths, strict=True)
+            )
+            self.sizes[key] = list(lengths)
+            self.puts.append((key, sum(lengths)))
+        return [0] * len(keys)
+
+    def batch_get_into_multi_buffers(self, keys, addrs, sizes):
+        for key, addresses, lengths in zip(keys, addrs, sizes, strict=True):
+            assert lengths == self.sizes[key]
+            offset = 0
+            for addr, size in zip(addresses, lengths, strict=True):
+                ctypes.memmove(addr, self._data[key][offset : offset + size], size)
+                offset += size
+            self.gets.append((key, offset))
+        return [len(self._data[key]) for key in keys]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("compact", [False, True])
+def test_compact_put_and_selective_load_use_registered_namespace(monkeypatch, compact):
+    """Real worker lookup leases a nonempty hit after the layout namespace changes."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+        LoadSpec,
+        PoolKey,
+    )
+
+    monkeypatch.setenv("VLLM_MOONCAKE_STORE_SELECTIVE_LEASE", "1")
+    mla = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=352,
+        dtype=torch.uint8,
+        dcp_sharded=True,
+    )
+    mamba = MambaSpec(
+        block_size=32,
+        shapes=((8,),),
+        dtypes=(torch.uint8,),
+        mamba_cache_mode="align",
+    )
+    groups = [KVCacheGroupSpec(["mla"], mla), KVCacheGroupSpec(["mamba"], mamba)]
+    cfg = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+        hash_block_size=32,
+        cache_hit_alignment_tokens=32,
+    )
+    vc = _minimal_vllm_config(cache_block_size=16)
+    vc.cache_config.num_gpu_blocks = cfg.num_blocks
+    vc.parallel_config.decode_context_parallel_size = 8
+    vc.parallel_config.cp_kv_cache_interleave_size = 1
+    vc.kv_transfer_config.kv_connector_extra_config = {
+        "compact_partial_blocks": compact
+    }
+    store = _ByteStore()
+    w = _build_worker_with_dict_store(vc, cfg, store, tp_size=8, dcp_size=8)
+    old_prefixes = w._selective_lease.lookup_key_prefixes
+    caches = {
+        "mla": torch.arange(2 * 16 * 352).to(torch.uint8).reshape(2, 1, 16, 352),
+        "mamba": torch.arange(16).to(torch.uint8).reshape(2, 1, 1, 8),
+    }
+    originals = {name: tensor.clone() for name, tensor in caches.items()}
+    _register_with_fake_threads(w, caches)
+    assert w._selective_lease.lookup_key_prefixes == w._lookup_key_prefixes
+    assert (old_prefixes != w._lookup_key_prefixes) == compact
+    hashes = [BlockHash(b"a000")]
+    sender = KVCacheStoreSendingThread(
+        store,
+        w.coord,
+        w.token_dbs,
+        w.block_size,
+        0,
+        [1, 1],
+        "kv_both",
+        threading.Event(),
+        record_operation=w._record_kv_connector_operation,
+    )
+    sender.add_request(
+        ReqMeta(
+            req_id="save",
+            token_len_chunk=0,
+            block_ids=([1], [1]),
+            block_hashes=hashes,
+            can_save=True,
+            store_job_id=1,
+            boundary_puts=[(0, 1, 32), (1, 1, 32)],
+        )
+    )
+    sender._handle_request(sender.request_queue.get_nowait())
+    expected_rows = 4 if compact else 16
+    assert sorted(size for _, size in store.puts) == [8, expected_rows * 352]
+    # Stand in for the other required DCP ranks, not real GPU transfers.
+    for group_id, prefixes in enumerate(w._lookup_key_prefixes):
+        local_key = w.token_dbs[group_id].key_for(hashes[0])
+        for prefix in prefixes:
+            key = PoolKey.build_key_string(prefix, hashes[0].hex())
+            store._data[key] = store._data[local_key]
+            store.sizes[key] = store.sizes[local_key]
+    store.leased.clear()
+    hit = w.lookup(33, hashes)
+    assert hit.hit_length == 32
+    assert len(store.probed) == len(store.leased) == 16
+    assert set(store.probed) == set(store.leased)
+    for tensor in caches.values():
+        tensor.fill_(197)
+    receiver = KVCacheStoreRecvingThread(
+        store,
+        w.coord,
+        w.token_dbs,
+        w.block_size,
+        0,
+        threading.Event(),
+        is_hma_required=True,
+    )
+    receiver.add_request(
+        ReqMeta(
+            req_id="load",
+            token_len_chunk=32,
+            block_ids=([1], [1]),
+            block_hashes=hashes,
+            load_spec=LoadSpec(
+                vllm_cached_tokens=0,
+                kvpool_cached_tokens=32,
+                can_load=True,
+                token_len=32,
+                tail_key_boundaries=hit.tail_key_boundaries,
+            ),
+        )
+    )
+    receiver._handle_request(receiver.request_queue.get_nowait())
+    assert sorted(store.gets) == sorted(store.puts)
+    assert set(key for key, _ in store.gets) <= set(store.leased)
+    assert torch.equal(
+        caches["mla"][1, :, :expected_rows], originals["mla"][1, :, :expected_rows]
+    )
+    assert torch.all(caches["mla"][1, :, expected_rows:] == 197)
+    assert torch.equal(caches["mamba"][1], originals["mamba"][1])
+    assert all(torch.all(tensor[0] == 197) for tensor in caches.values())
+    assert receiver.get_and_clear_failed_requests() == set()
+    w.close()

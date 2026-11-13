@@ -5,8 +5,11 @@
 # (vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/).
 """Data classes for MooncakeStoreConnector."""
 
+import hashlib
+import json
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from dataclasses import replace as dataclass_replace
 from typing import NamedTuple, cast
 
 import numpy as np
@@ -405,6 +408,134 @@ class RankLocalStoreLayout(StoreLayout):
         )
 
 
+class DCPPartialStoreLayout(RankLocalStoreLayout):
+    """Lossless prefix extents for dense, single-head attention pages.
+
+    DCP1 also covers rank-local TP/DP/DEP caches without context sharding.
+    """
+
+    def __init__(
+        self,
+        metadata: KeyMetadata,
+        block_size: int,
+        hash_block_size: int,
+        *,
+        dcp_size: int,
+        dcp_rank: int,
+        interleave: int,
+    ) -> None:
+        super().__init__(metadata, block_size, hash_block_size)
+        if (
+            block_size <= 0
+            or hash_block_size <= 0
+            or block_size % hash_block_size
+            or dcp_size < 1
+            or not 0 <= dcp_rank < dcp_size
+            or interleave <= 0
+            or block_size % dcp_size
+            or hash_block_size % (dcp_size * interleave)
+        ):
+            raise ValueError("Partial DCP values require rank-complete hash boundaries")
+        self.dcp_size = dcp_size
+        self.dcp_rank = dcp_rank
+        self.interleave = interleave
+        self._namespace = metadata.store_namespace
+        self._row_regions: list[tuple[int, int, int]] = []
+        self._num_blocks = 0
+
+    def register_kv_caches(
+        self, kv_caches: Sequence[torch.Tensor], num_blocks: int
+    ) -> None:
+        rows = self.block_size // self.dcp_size
+        regions = []
+        signature = []
+        for cache in kv_caches:
+            if (
+                num_blocks <= 0
+                or cache.ndim != 4
+                or tuple(cache.shape[:3]) != (num_blocks, 1, rows)
+                or cache.shape[-1] <= 0
+                or cache.stride(-1) != 1
+                or cache.stride(-2) != cache.shape[-1]
+                or cache.stride(0) < rows * cache.shape[-1]
+            ):
+                raise ValueError(
+                    "Partial DCP values require dense manager-block token rows"
+                )
+            width = cache.shape[-1] * cache.element_size()
+            stride = cache.stride(0) * cache.element_size()
+            regions.append((cache.data_ptr(), stride, width))
+            signature.append((tuple(cache.shape[1:]), str(cache.dtype)))
+        if not regions:
+            raise ValueError("Partial DCP values require attention cache views")
+        super().register_kv_caches(kv_caches, num_blocks)
+        self._row_regions = regions
+        self._num_blocks = num_blocks
+        layout_hash = hashlib.sha256(
+            json.dumps(
+                [
+                    self.block_size,
+                    self.hash_block_size,
+                    self.dcp_size,
+                    self.interleave,
+                    signature,
+                ]
+            ).encode()
+        ).hexdigest()[:24]
+        self.metadata = dataclass_replace(
+            self.metadata,
+            store_namespace=(self._namespace + f"@partial_layout_v2:{layout_hash}"),
+        )
+        self._key_prefix = PoolKey.build_prefix(self.metadata)
+
+    def prepare_value_for_block(
+        self, block_id: int, *, num_tokens: int | None = None
+    ) -> tuple[list[int], list[int]]:
+        if not 0 <= block_id < self._num_blocks:
+            raise ValueError("Partial DCP block is not registered or is out of range")
+        if num_tokens is not None and num_tokens <= 0:
+            raise ValueError("Partial DCP value boundary must be positive")
+        end = self.block_size if num_tokens is None else num_tokens % self.block_size
+        if end == 0:
+            end = self.block_size
+        if end % self.hash_block_size:
+            raise ValueError("Partial DCP value boundary must be hash-aligned")
+        cycle = self.dcp_size * self.interleave
+        rows = (end // cycle) * self.interleave + min(
+            self.interleave, max(0, end % cycle - self.dcp_rank * self.interleave)
+        )
+        segments: list[tuple[int, int]] = []
+        # Full and partial values concatenate logical views in registration order.
+        for base, stride, width in self._row_regions:
+            start = base + block_id * stride
+            stop = start + rows * width
+            if segments and start == segments[-1][1]:
+                segments[-1] = (segments[-1][0], stop)
+            else:
+                segments.append((start, stop))
+        return (
+            [start for start, _ in segments],
+            [stop - start for start, stop in segments],
+        )
+
+    def prepare_values(
+        self,
+        chunks: Sequence[tuple[int, int]],
+        block_ids: list[int],
+        shard_ids: Sequence[StoreShardId],
+    ) -> tuple[list[list[int]], list[list[int]], list[int]]:
+        assert len(chunks) == len(shard_ids) and all(x == 0 for x in shard_ids)
+        addrs, sizes, selected = [], [], []
+        for start, end in chunks:
+            assert start % self.block_size == 0 and 0 < end - start <= self.block_size
+            block_id = block_ids[start // self.block_size]
+            addr, size = self.prepare_value_for_block(block_id, num_tokens=end)
+            addrs.append(addr)
+            sizes.append(size)
+            selected.append(block_id)
+        return addrs, sizes, selected
+
+
 class TPShardedStoreLayout(StoreLayout):
     """Store layout shared by divisible TP sizes."""
 
@@ -662,7 +793,7 @@ class ChunkedTokenDatabase:
     def process_tokens(
         self,
         token_len: int,
-        block_hashes: list[BlockHash],
+        block_hashes: Sequence[BlockHash],
         mask_num: int = 0,
         *,
         chunk_mask: list[bool] | None = None,

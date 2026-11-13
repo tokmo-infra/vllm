@@ -1,0 +1,25 @@
+ARG BASE_IMAGE=vllm/vllm-openai@sha256:f81998764e8594d71b40788c5285ae112acf9230129d5d0d238b5df83da5acf6
+FROM ${BASE_IMAGE}
+ARG SOURCE_REVISION=uncommitted
+ARG SOURCE_PATCH_SHA256=unknown
+LABEL io.tokmo.base.index-digest="sha256:f81998764e8594d71b40788c5285ae112acf9230129d5d0d238b5df83da5acf6"
+LABEL io.tokmo.source.revision="${SOURCE_REVISION}"
+LABEL io.tokmo.source.patch-sha256="${SOURCE_PATCH_SHA256}"
+LABEL io.tokmo.source.mode="python-overlay-native-binaries-retained"
+COPY vllm/envs.py /usr/local/lib/python3.12/dist-packages/vllm/envs.py
+COPY vllm/renderers/kimi_k3.py /usr/local/lib/python3.12/dist-packages/vllm/renderers/kimi_k3.py
+COPY vllm/tokenizers/kimi_k3_cache.py /usr/local/lib/python3.12/dist-packages/vllm/tokenizers/kimi_k3_cache.py
+COPY vllm/tokenizers/kimi_k3_cache_shared.py /usr/local/lib/python3.12/dist-packages/vllm/tokenizers/kimi_k3_cache_shared.py
+COPY vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
+COPY vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
+COPY vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+COPY vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/lease.py /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/lease.py
+COPY vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/selective_lease.py /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/selective_lease.py
+COPY vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts_runtime.py /usr/local/lib/python3.12/dist-packages/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts_runtime.py
+COPY vllm/models/kimi_k3/nvidia/specialized_decode/runtime/hybrid.py /usr/local/lib/python3.12/dist-packages/vllm/models/kimi_k3/nvidia/specialized_decode/runtime/hybrid.py
+COPY vllm/models/kimi_k3/nvidia/specialized_decode/runtime/hybrid_shared_moe.py /usr/local/lib/python3.12/dist-packages/vllm/models/kimi_k3/nvidia/specialized_decode/runtime/hybrid_shared_moe.py
+RUN uv venv --system-site-packages --python "$(uv python find --system)" /opt/kimi-mc-check/.venv && /opt/kimi-mc-check/.venv/bin/python -c "import importlib.metadata as m; assert m.version('mooncake-transfer-engine-cuda13') == '0.3.14rc3'"
+ENV KIMI31_TOKENIZER_CACHE_GIB=16
+ENV KIMI31_TOKENIZER_CACHE_L1_MIB=64
+ENV KIMI31_TOKENIZER_CACHE_SHARED_PATH=/tmp/kimi31-mc-tokenizer-cache
+ENV VLLM_MOONCAKE_STORE_SELECTIVE_LEASE=1

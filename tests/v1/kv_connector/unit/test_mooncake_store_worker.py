@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import contextlib
+import ctypes
+import dataclasses
 import itertools
 import json
 import logging
@@ -9,7 +11,9 @@ import math
 import queue
 import sys
 import threading
+import time
 import types
+from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -32,6 +36,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     BlobBlockHashes,
     BoundaryPut,
     ChunkedTokenDatabase,
+    DCPPartialStoreLayout,
     KeyMetadata,
     LBHNCStoreLayout,
     LBNHCStoreLayout,
@@ -56,7 +61,9 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
+    MLAAttentionSpec,
     RSWASpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
@@ -152,6 +159,8 @@ def _make_store_sending_thread(
     replicate_config: object | None = None,
     enable_group_semantics: bool = False,
     supports_group_ids: bool = False,
+    record_operation: Callable[..., None] | None = None,
+    mock_task_done: bool = True,
 ) -> mooncake_store_worker.KVCacheStoreSendingThread:
     if coord is None:
         coord = _default_send_coord()
@@ -172,8 +181,10 @@ def _make_store_sending_thread(
         replicate_config=replicate_config,
         enable_group_semantics=enable_group_semantics,
         supports_group_ids=supports_group_ids,
+        record_operation=record_operation,
     )
-    thread.request_queue.task_done = MagicMock()
+    if mock_task_done:
+        thread.request_queue.task_done = MagicMock()
     return thread
 
 
@@ -183,6 +194,8 @@ def _make_store_recving_thread(
     tp_rank: int = 0,
     disk_offload_buffer_budget_bytes: int | None = None,
     is_hma_required: bool = False,
+    record_operation: Callable[..., None] | None = None,
+    mock_task_done: bool = True,
 ) -> mooncake_store_worker.KVCacheStoreRecvingThread:
     from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
 
@@ -206,8 +219,10 @@ def _make_store_recving_thread(
         coord=coord,
         disk_offload_buffer_budget_bytes=disk_offload_buffer_budget_bytes,
         is_hma_required=is_hma_required,
+        record_operation=record_operation,
     )
-    thread.request_queue.task_done = MagicMock()
+    if mock_task_done:
+        thread.request_queue.task_done = MagicMock()
     return thread
 
 
@@ -341,7 +356,7 @@ def _make_vllm_config(
 
 def _make_kv_cache_config(
     *, block_size: int = 16, prefix_cache_retention_interval: int | None = 0
-) -> object:
+) -> KVCacheConfig:
     """Minimal single-group KVCacheConfig for topology tests."""
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
@@ -900,13 +915,8 @@ def test_tp_sharded_group_saves_every_block_on_every_rank():
 def test_store_sending_thread_retries_skipped_range_after_pressure():
     store = MagicMock()
     store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
-    store.batch_put_from_multi_buffers.side_effect = lambda keys, *a: [256] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = [[-200], [256, 256]]
     thread = _make_store_sending_thread(store, tp_rank=0, put_step=2)
-
-    # Under pressure the request is skipped without persisting anything, so the
-    # saved offset stays at 0.
-    thread._store_pressure_active = True
-    thread._skip_store_requests.add("req-a")
 
     _run_store_req(
         thread,
@@ -919,11 +929,22 @@ def test_store_sending_thread_retries_skipped_range_after_pressure():
         ),
     )
 
-    store.batch_is_exist.assert_not_called()
+    _run_store_req(
+        thread,
+        ReqMeta(
+            req_id="req-a",
+            token_len_chunk=16,
+            block_ids=([1],),
+            block_hashes=[b"a0"],
+            can_save=True,
+        ),
+    )
+
+    assert store.batch_is_exist.call_count == 1
+    assert store.batch_put_from_multi_buffers.call_count == 1
     assert thread._saved_offset.get("req-a", 0) == 0
 
-    thread._store_pressure_active = False
-    thread._skip_store_requests.clear()
+    _wait_for_store_pressure_probe(thread)
 
     # The next batch resumes from offset 0, re-covering the chunk skipped under
     # pressure (chunk 0) rather than losing it.
@@ -1250,20 +1271,24 @@ def test_partial_tail_offload_replaces_stale_group_ids_after_filtering():
 
 def test_partial_tail_offload_honors_active_pressure_gate():
     store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.return_value = [-200]
     thread = _make_partial_tail_send_thread(store)
-    thread._store_pressure_active = True
-    thread._skip_store_requests.add("req-a")
 
     _run_store_req(thread, _make_partial_tail_req([1, 2, 3]))
 
-    store.batch_is_exist.assert_not_called()
-    store.batch_put_from_multi_buffers.assert_not_called()
+    _run_store_req(thread, _make_partial_tail_req([1, 2, 3]))
+
+    assert store.batch_is_exist.call_count == 1
+    assert store.batch_put_from_multi_buffers.call_count == 2
 
 
 def test_partial_tail_put_failure_activates_pressure_gate():
     store = MagicMock()
     store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
-    store.batch_put_from_multi_buffers.return_value = [256, -200, 256]
+    store.batch_put_from_multi_buffers.side_effect = lambda keys, *args: [
+        -200 if key.endswith("@6131") else 256 for key in keys
+    ]
     thread = _make_partial_tail_send_thread(store)
 
     _run_store_req(
@@ -1277,7 +1302,7 @@ def test_partial_tail_put_failure_activates_pressure_gate():
     _run_store_req(
         thread, _resolve_partial_tail(thread, _make_partial_tail_req([1, 2, 3]))
     )
-    assert store.batch_put_from_multi_buffers.call_count == 1
+    assert store.batch_put_from_multi_buffers.call_count == 2
 
 
 def test_normal_save_excludes_mamba_group_and_null_blocks():
@@ -2771,6 +2796,164 @@ def test_resolve_store_tp_size(extra_config: dict[str, object], expected: int | 
     assert worker.resolve_store_tp_size(extra_config) == expected
 
 
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "dcp_size,hash_size,interleave,expected",
+    [
+        (1, 4, 1, True),
+        (4, 4, 1, True),
+        (8, 4, 1, False),
+        (8, 8, 2, False),
+        (8, 16, 2, True),
+    ],
+)
+def test_compact_auto_checks_resolved_hash_and_interleave(
+    dcp_size, hash_size, interleave, expected
+):
+    spec = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=4,
+        dtype=torch.uint8,
+        dcp_sharded=dcp_size > 1,
+    )
+    config = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["layer0"], spec)],
+        hash_block_size=hash_size,
+    )
+    assert (
+        worker.resolve_compact_partial_blocks(
+            {}, config, dcp_size, interleave=interleave
+        )
+        is expected
+    )
+    assert worker.resolve_compact_partial_blocks(
+        {"compact_partial_blocks": True}, config, dcp_size, interleave=interleave
+    )
+    if not expected:
+        with pytest.raises(ValueError, match="rank-complete"):
+            DCPPartialStoreLayout(
+                KeyMetadata("model", 0, 0, 0, 0),
+                16 * dcp_size,
+                hash_size,
+                dcp_size=dcp_size,
+                dcp_rank=0,
+                interleave=interleave,
+            )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("forced", [False, True])
+def test_compact_registration_handles_split_kernel_views_before_publication(forced):
+    """Auto restores legacy keys; explicit true preserves the layout error."""
+    metadata = KeyMetadata("model", 0, 0, 0, 0)
+    partial_metadata = KeyMetadata(
+        "model", 0, 0, 0, 0, store_namespace="@store_format:mla_partial_v1"
+    )
+    layout = DCPPartialStoreLayout(
+        partial_metadata, 8, 4, dcp_size=1, dcp_rank=0, interleave=1
+    )
+    databases = [ChunkedTokenDatabase(partial_metadata, 8, 4, store_layout=layout)]
+    shared_reference = databases
+    cache = torch.arange(96, dtype=torch.uint8).reshape(6, 1, 4, 4)
+
+    def legacy():
+        return [ChunkedTokenDatabase(metadata, 8, 4)]
+
+    if forced:
+        with pytest.raises(ValueError, match="dense manager-block"):
+            worker._register_store_layouts(databases, [[cache]], 3)
+        assert databases[0].store_layout is layout
+        return
+    worker._register_store_layouts(databases, [[cache]], 3, fallback=legacy)
+    assert shared_reference is databases
+    db = databases[0]
+    assert type(db.store_layout) is RankLocalStoreLayout
+    assert db.metadata == metadata
+    assert "partial" not in db.key_for(BlockHash(b"hash"))
+    assert db.store_layout.lookup_key_prefixes([(0, 0, 0, 0)]) == (
+        PoolKey.build_prefix(metadata),
+    )
+    addrs, sizes = db.prepare_value_for_block(1)
+    saved = b"".join(
+        ctypes.string_at(addr, size) for addr, size in zip(addrs, sizes, strict=True)
+    )
+    assert saved == cache[2:4].contiguous().numpy().tobytes()
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("extra_config", "dcp_size", "wrapped", "hisparse_blocks", "expected"),
+    [
+        ({}, 8, False, None, True),
+        ({}, 8, True, None, True),
+        ({"compact_partial_blocks": False}, 8, True, None, False),
+        ({"compact_partial_blocks": True}, 8, True, None, True),
+        ({}, 1, False, None, True),
+        ({}, 1, True, None, True),
+        ({"compact_partial_blocks": False}, 1, True, None, False),
+        ({"compact_partial_blocks": True}, 1, True, None, True),
+        ({}, 0, True, None, False),
+        ({"store_tp_size": 4}, 8, True, None, False),
+        ({"enable_store_tp_lcm": True}, 8, True, None, False),
+        ({}, 8, True, 1, False),
+    ],
+)
+def test_partial_dcp_store_default_respects_topology_and_opt_out(
+    extra_config, dcp_size, wrapped, hisparse_blocks, expected
+):
+    spec = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=4,
+        dtype=torch.uint8,
+        dcp_sharded=dcp_size > 1,
+    )
+    if wrapped:
+        spec = UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs={"layer0": spec})
+    config = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["layer0"], spec)],
+        hisparse_host_num_blocks=hisparse_blocks,
+    )
+    assert (
+        worker.resolve_compact_partial_blocks(extra_config, config, dcp_size)
+        is expected
+    )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("spec_cls", "dcp_sharded", "transfer_enabled"),
+    [
+        (FullAttentionSpec, True, True),
+        (MLAAttentionSpec, False, True),
+        (MLAAttentionSpec, True, False),
+    ],
+)
+def test_partial_dcp_store_does_not_default_enable_for_other_groups(
+    spec_cls, dcp_sharded, transfer_enabled
+):
+    spec = spec_cls(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=4,
+        dtype=torch.uint8,
+        dcp_sharded=dcp_sharded,
+    )
+    config = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["layer0"], spec, enable_kv_transfer=transfer_enabled)
+        ],
+    )
+    assert not worker.resolve_compact_partial_blocks({}, config, 8)
+
+
 def test_lcm_store_tp_gives_prefill_and_decode_common_namespace(tmp_path, monkeypatch):
     store = MagicMock()
     store.setup.return_value = 0
@@ -3797,6 +3980,8 @@ def _make_bare_worker(
     worker.hash_block_size = block_size
     # Pre-build a single-group token_dbs so lookup-only tests don't have to
     # call register_kv_caches.
+    worker._selective_lease = None
+    worker._compact_partial_blocks = False
     worker.token_dbs = [
         ChunkedTokenDatabase(
             KeyMetadata("test-model", 0, 0, 0, 0, group_id=0),
@@ -5336,3 +5521,655 @@ def test_blob_block_hashes_empty():
     view = BlobBlockHashes(memoryview(b""), 0)
     assert len(view) == 0
     assert list(view) == []
+
+
+def _wait_for_store_pressure_probe(thread):
+    # Poll the real policy deadline; do not mock clocks or vLLM internals.
+    deadline = getattr(thread, "_store_pressure_probe_at", time.monotonic() + 1.0)
+    wakeup = threading.Event()
+    while (remaining := deadline - time.monotonic()) > 0:
+        wakeup.wait(min(remaining, 0.01))
+
+
+def _make_boundary_pressure_job(store, stats):
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((64,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        [KVCacheGroupSpec(["state"], spec)], 16, 16
+    )
+    source = torch.arange(256, dtype=torch.float32).view(4, 64)
+    db = ChunkedTokenDatabase(KeyMetadata("test-model", 0, 0, 0, 0), 16)
+    db.set_kv_caches_base_addr([source.data_ptr()])
+    db.set_block_len([256])
+    thread = _make_store_sending_thread(
+        store,
+        coord=coord,
+        token_databases=[db],
+        replicate_config=MagicMock(group_ids=["stale"]),
+        enable_group_semantics=True,
+        supports_group_ids=True,
+        record_operation=stats.record_operation,
+        mock_task_done=False,
+    )
+    req = ReqMeta(
+        req_id="req-a",
+        token_len_chunk=0,
+        block_ids=([NULL_BLOCK_ID] * 3,),
+        block_hashes=[b"a0", b"a1", b"a2"],
+        can_save=True,
+        boundary_puts=[(0, 1, 16), (0, 2, 32), (0, 3, 48)],
+    )
+    return thread, req, source
+
+
+@contextlib.contextmanager
+def _observe_store_waits():
+    waits = []
+
+    def observe_wait(frame, event, arg):
+        if event == "c_call" and arg is time.sleep:
+            waits.append(True)
+
+    previous = sys.getprofile()
+    sys.setprofile(observe_wait)
+    try:
+        yield waits
+    finally:
+        sys.setprofile(previous)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "initial,retry,retry_status",
+    [
+        ([0, -200, -200], [0, 0], "ok"),
+        ([0, -200, -200], [-200, -200], "partial_failure"),
+        ([0, -500, -200], [0], "ok"),
+        ([0, -200, 0], [-500], "partial_failure"),
+        ([0, -200, 0], RuntimeError("retry failed"), "error"),
+        ([0, -500, 0], None, None),
+        (RuntimeError("put failed"), None, None),
+        ([0, 0, 0], None, None),
+    ],
+    ids=[
+        "recovered",
+        "pressure",
+        "mixed",
+        "retry-other",
+        "retry-exception",
+        "other",
+        "exception",
+        "success",
+    ],
+)
+def test_boundary_pressure_retry_preserves_keys_metrics_and_completion(
+    initial, retry, retry_status
+):
+    """A boundary recovery publishes only -200 keys from this pinned job."""
+    store = MagicMock()
+    stats = MooncakeStoreConnectorStats()
+    thread, req, source = _make_boundary_pressure_job(store, stats)
+    db = thread.token_databases[0]
+    expected_keys = [db.key_for(h) for h in req.block_hashes]
+    stored = {}
+    calls = []
+    store.batch_is_exist.side_effect = lambda keys: [int(k in stored) for k in keys]
+
+    def put(keys, addrs, sizes, config):
+        assert thread.is_live_store_job(req)
+        assert thread.take_completed_saves() == {}
+        assert thread.request_queue.unfinished_tasks == 1
+        calls.append((keys, addrs, sizes, list(config.group_ids)))
+        result = initial if len(calls) == 1 else retry
+        if isinstance(result, Exception):
+            raise result
+        assert len(result) == len(keys)
+        for key, addr, size, code in zip(keys, addrs, sizes, result, strict=True):
+            if code >= 0:
+                stored[key] = ctypes.string_at(addr[0], size[0])
+        return result
+
+    store.batch_put_from_multi_buffers.side_effect = put
+    with _observe_store_waits() as waits:
+        _run_store_req(thread, req)
+
+    assert len(waits) == (1 if retry_status else 0)
+    assert len(calls) == (2 if retry_status else 1)
+    assert store.batch_is_exist.call_count == 1
+    assert calls[0][:3] == (
+        expected_keys,
+        [[source[i].data_ptr()] for i in range(1, 4)],
+        [[256]] * 3,
+    )
+    assert thread.replicate_config.group_ids == calls[0][3]
+    first = stats.data["save_put"]
+    assert len(first) == 1
+    assert first[0]["num_keys"] == 3
+    assert first[0]["num_bytes"] == 768
+    assert first[0]["num_failed_keys"] == (
+        3 if isinstance(initial, Exception) else sum(code < 0 for code in initial)
+    )
+    assert first[0]["status"] == (
+        "error"
+        if isinstance(initial, Exception)
+        else "partial_failure"
+        if any(code < 0 for code in initial)
+        else "ok"
+    )
+    if retry_status:
+        indices = [i for i, code in enumerate(initial) if code == -200]
+        assert calls[1] == tuple([column[i] for i in indices] for column in calls[0])
+        assert all(calls[1][1][j] is calls[0][1][i] for j, i in enumerate(indices))
+        retried = stats.data["save_put_retry"]
+        assert len(retried) == 1
+        assert retried[0]["status"] == retry_status
+        assert retried[0]["num_keys"] == len(indices)
+        assert retried[0]["num_bytes"] == 256 * len(indices)
+        assert retried[0]["num_failed_keys"] == (
+            len(indices)
+            if isinstance(retry, Exception)
+            else sum(code < 0 for code in retry)
+        )
+        final = list(initial)
+        for index, code in zip(
+            indices,
+            [-200] * len(indices) if isinstance(retry, Exception) else retry,
+            strict=True,
+        ):
+            final[index] = code
+        assert thread._store_pressure_active == any(code < 0 for code in final)
+    else:
+        assert "save_put_retry" not in stats.data
+
+    if not isinstance(initial, Exception):
+        final = final if retry_status else initial
+        assert set(stored) == {k for k, code in zip(expected_keys, final) if code >= 0}
+        for i, key in enumerate(expected_keys):
+            if key in stored:
+                assert stored[key] == source[i + 1].numpy().tobytes()
+        # A successful retry makes the latest complete state visible to lookup.
+        exists = {
+            (0, bytes(h))
+            for h, k in zip(req.block_hashes, expected_keys)
+            if k in stored
+        }
+        _, hit = thread.coord.find_longest_cache_hit(
+            req.block_hashes,
+            48,
+            mooncake_store_worker.ExternalCachedBlockPool(16, exists),
+        )
+        assert hit == max(
+            (16 * (i + 1) for i, k in enumerate(expected_keys) if k in stored),
+            default=0,
+        )
+    assert thread.take_completed_saves() == {req.store_job_id: 1}
+    assert thread.take_completed_saves() == {}
+    assert thread.request_queue.unfinished_tasks == 0
+
+
+@pytest.mark.cpu_test
+def test_boundary_pressure_retry_does_not_cross_request_generation():
+    store = MagicMock()
+    stats = MooncakeStoreConnectorStats()
+    thread, stale, _source = _make_boundary_pressure_job(store, stats)
+    entered, release = threading.Event(), threading.Event()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+
+    def put(keys, *args):
+        entered.set()
+        assert release.wait(5)
+        return [-200] * len(keys)
+
+    store.batch_put_from_multi_buffers.side_effect = put
+    runner = threading.Thread(target=_run_store_req, args=(thread, stale))
+    runner.start()
+    try:
+        assert entered.wait(5)
+        assert thread.is_live_store_job(stale)
+        assert thread.take_completed_saves() == {}
+        thread.delete_finished_stored_request(stale.req_id)
+        live = dataclasses.replace(stale, store_job_id=next(_TEST_SAVE_SEQ))
+        thread.add_request(live)
+    finally:
+        release.set()
+        runner.join(5)
+    assert not runner.is_alive()
+    assert store.batch_put_from_multi_buffers.call_count == 1
+    assert "save_put_retry" not in stats.data
+    assert thread.is_live_store_job(live)
+    assert thread.take_completed_saves() == {stale.store_job_id: 1}
+    assert thread.take_completed_saves() == {}
+    assert thread._skip_store_requests == set()
+    assert thread.request_queue.unfinished_tasks == 1
+    thread._handle_request(thread.request_queue.get_nowait())
+    assert thread.take_completed_saves() == {live.store_job_id: 1}
+    assert thread.take_completed_saves() == {}
+    assert thread.request_queue.unfinished_tasks == 0
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("recovers", [False, True])
+def test_boundary_pressure_retry_throttles_different_requests(recovers):
+    """Permanent pressure waits once per probe interval, not once per request."""
+    store = MagicMock()
+    stats = MooncakeStoreConnectorStats()
+    thread, req, _source = _make_boundary_pressure_job(store, stats)
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    responses = itertools.cycle([-200, 0] if recovers else [-200])
+    store.batch_put_from_multi_buffers.side_effect = lambda keys, *args: [
+        next(responses)
+    ] * len(keys)
+
+    with _observe_store_waits() as waits:
+        for i in range(3):
+            _run_store_req(thread, dataclasses.replace(req, req_id=f"req-{i}"))
+        assert len(waits) == (3 if recovers else 1)
+        assert len(stats.data["save_put_retry"]) == len(waits)
+        assert store.batch_put_from_multi_buffers.call_count == 3 + len(waits)
+        if not recovers:
+            _wait_for_store_pressure_probe(thread)
+            _run_store_req(thread, dataclasses.replace(req, req_id="after-probe"))
+            assert len(waits) == 2
+            assert store.batch_put_from_multi_buffers.call_count == 6
+    assert thread.request_queue.unfinished_tasks == 0
+    assert len(thread.take_completed_saves()) == (3 if recovers else 4)
+
+
+@pytest.mark.cpu_test
+def test_boundary_pressure_retry_does_not_apply_to_normal_mla_puts():
+    store = MagicMock()
+    stats = MooncakeStoreConnectorStats()
+    coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        [
+            KVCacheGroupSpec(
+                ["mla"],
+                MLAAttentionSpec(
+                    block_size=16, num_kv_heads=1, head_size=64, dtype=torch.float32
+                ),
+            )
+        ],
+        16,
+        16,
+    )
+    thread = _make_store_sending_thread(
+        store,
+        coord=coord,
+        record_operation=stats.record_operation,
+        mock_task_done=False,
+    )
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = lambda keys, *args: [-200] * len(
+        keys
+    )
+    req = _make_store_req("normal-mla", [b"a0", b"a1"])
+    with _observe_store_waits() as waits:
+        _run_store_req(thread, req)
+    assert waits == []
+    assert store.batch_put_from_multi_buffers.call_count == 1
+    assert stats.data["save_put"][0]["num_failed_keys"] == 2
+    assert "save_put_retry" not in stats.data
+    assert thread._store_pressure_active
+    assert thread.take_completed_saves() == {req.store_job_id: 1}
+    assert thread.request_queue.unfinished_tasks == 0
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("selective_lease", [False, True])
+def test_store_pressure_same_request_retries_after_space_recovers(selective_lease):
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = [[-200, -200], [256, 256]]
+    stats = MooncakeStoreConnectorStats()
+    thread = _make_store_sending_thread(
+        store, record_operation=stats.record_operation, mock_task_done=False
+    )
+    first = _make_store_req("req-a", [b"a0", b"a1"])
+    _run_store_req(thread, first)
+    assert thread.take_completed_saves() == {first.store_job_id: 1}
+    assert thread.request_queue.unfinished_tasks == 0
+
+    _wait_for_store_pressure_probe(thread)
+    retry = _make_store_req("req-a", [b"a0", b"a1"])
+    _run_store_req(thread, retry)
+    assert thread.take_completed_saves() == {retry.store_job_id: 1}
+    assert thread.request_queue.unfinished_tasks == 0
+    puts = store.batch_put_from_multi_buffers.call_args_list
+    assert len(puts) == 2
+    assert puts[0].args == puts[1].args
+    assert puts[1].args[1:3] == ([[0x1100], [0x1200]], [[256], [256]])
+    assert [row["status"] for row in stats.data["save_put"]] == [
+        "partial_failure",
+        "ok",
+    ]
+    if selective_lease:
+        _lease_thread_hit(thread, [b"a0", b"a1"], stats)
+
+    # A later job on the persisted range must not write it again.
+    next_job = _make_store_req("req-a", [b"a0", b"a1"])
+    _run_store_req(thread, next_job)
+    assert store.batch_put_from_multi_buffers.call_count == 2
+    assert thread.take_completed_saves() == {next_job.store_job_id: 1}
+    assert thread.take_completed_saves() == {}
+    assert thread.request_queue.unfinished_tasks == 0
+
+
+@pytest.mark.cpu_test
+def test_store_pressure_stale_job_does_not_consume_due_probe():
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = [[-200, -200], [256, 256]]
+    thread = _make_store_sending_thread(store, mock_task_done=False)
+    stale = _make_store_req("req-a", [b"a0", b"a1"])
+    stale.store_job_id = next(_TEST_SAVE_SEQ)
+    thread.add_request(stale)
+    stale = thread.request_queue.get_nowait()
+    thread.delete_finished_stored_request("req-a")
+
+    live = _make_store_req("req-a", [b"a0", b"a1"])
+    _run_store_req(thread, live)
+    assert thread.take_completed_saves() == {live.store_job_id: 1}
+    assert thread.request_queue.unfinished_tasks == 1
+    _wait_for_store_pressure_probe(thread)
+    due = getattr(thread, "_store_pressure_probe_at", None)
+    thread._handle_request(stale)
+    assert getattr(thread, "_store_pressure_probe_at", None) == due
+    assert store.batch_put_from_multi_buffers.call_count == 1
+    assert thread.take_completed_saves() == {stale.store_job_id: 1}
+    assert thread.request_queue.unfinished_tasks == 0
+
+    retry = _make_store_req("req-a", [b"a0", b"a1"])
+    _run_store_req(thread, retry)
+    assert store.batch_put_from_multi_buffers.call_count == 2
+    assert thread.take_completed_saves() == {retry.store_job_id: 1}
+    assert thread.take_completed_saves() == {}
+    assert thread.request_queue.unfinished_tasks == 0
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("selective_lease", [False, True])
+@pytest.mark.parametrize(
+    "initial_code,retry_result,retry_status,failed",
+    [
+        (-707, [256], "ok", False),
+        (-707, [-707], "partial_failure", True),
+        (-500, None, None, True),
+        (-707, RuntimeError("lease retry failed"), "error", True),
+    ],
+    ids=["lease-success", "lease-still-expired", "nonlease", "retry-exception"],
+)
+def test_recv_lease_retry_preserves_failure_metrics_and_completion(
+    initial_code, retry_result, retry_status, failed, selective_lease
+):
+    store = MagicMock()
+    store.batch_get_replica_desc.return_value = {}
+    responses = [[initial_code, 256]]
+    if retry_status is not None:
+        responses.append(retry_result)
+    store.batch_get_into_multi_buffers.side_effect = responses
+    stats = MooncakeStoreConnectorStats()
+    thread = _make_store_recving_thread(
+        store,
+        is_hma_required=True,
+        record_operation=stats.record_operation,
+        mock_task_done=False,
+    )
+    req = _make_load_req("req-a", [b"a0", b"a1"], token_len=32)
+    if selective_lease:
+        _lease_thread_hit(thread, req.block_hashes, stats)
+    thread.add_request(req)
+    thread._handle_request(thread.request_queue.get_nowait())
+
+    calls = store.batch_get_into_multi_buffers.call_args_list
+    assert len(calls) == (2 if retry_status is not None else 1)
+    assert calls[0].args[1:3] == ([[0x1000], [0x1100]], [[256], [256]])
+    if retry_status is not None:
+        keys, buffers, sizes = calls[0].args
+        assert calls[1].args == ([keys[0]], [buffers[0]], [sizes[0]])
+        assert calls[1].args[1][0] is buffers[0]
+        assert len(stats.data["load_get_retry"]) == 1
+        retried = stats.data["load_get_retry"][0]
+        assert retried["status"] == retry_status
+        assert retried["num_keys"] == 1
+        assert retried["num_bytes"] == 256
+        assert retried["num_failed_keys"] == int(failed)
+    else:
+        assert "load_get_retry" not in stats.data
+    assert len(stats.data["load_get"]) == 1
+    initial = stats.data["load_get"][0]
+    assert initial["status"] == "partial_failure"
+    assert initial["num_keys"] == 2
+    assert initial["num_bytes"] == 512
+    assert initial["num_failed_keys"] == 1
+    assert thread.get_and_clear_block_ids_with_load_errors() == set()
+    assert thread.get_and_clear_failed_requests() == ({"req-a"} if failed else set())
+    assert thread.get_and_clear_failed_requests() == set()
+    assert thread.get_and_clear_finished_requests() == {"req-a"}
+    assert thread.get_and_clear_finished_requests() == set()
+    assert thread.request_queue.empty()
+    assert thread.request_queue.unfinished_tasks == 0
+
+
+def _lease_thread_hit(thread, hashes, stats):
+    """A successful selective lookup can still outlive its native GET lease."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.selective_lease import (  # noqa: E501
+        SelectiveLookupLease,
+    )
+
+    store = thread.store
+    previous = store.batch_is_exist.side_effect
+    store.batch_is_exist.side_effect = lambda keys: [1] * len(keys)
+    db = thread.token_databases[0]
+    lease = SelectiveLookupLease(
+        store,
+        thread.coord,
+        [db],
+        thread.coord.kv_cache_groups,
+        [[PoolKey.build_prefix(db.metadata)]],
+        stats.record_operation,
+    )
+    hit = MooncakeLookupResult(len(hashes) * db.hash_block_size)
+    assert (
+        lease.lease_hit(
+            hashes,
+            hit,
+            {(0, bytes(h)) for h in hashes},
+            lambda _: MooncakeLookupResult(0),
+        )
+        == hit
+    )
+    assert stats.reduce()["lookup_lease_count"] == 1
+    store.batch_is_exist.side_effect = previous
+
+
+class _SelectiveLeaseStore:
+    """External Store double with eviction between probe and lease."""
+
+    def __init__(self):
+        self.keys: set[str] = set()
+        self.leased: list[list[str]] = []
+        self.evictions: list[set[str]] = []
+
+    def batch_probe_key(self, keys):
+        return [int(key in self.keys) for key in keys]
+
+    def batch_is_exist(self, keys):
+        if self.evictions:
+            self.keys.difference_update(self.evictions.pop(0))
+        self.leased.append(list(keys))
+        return [int(key in self.keys) for key in keys]
+
+
+def _hybrid_selective_lease(store, namespaces=1):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (  # noqa: E501
+        ExternalCachedBlockPool,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.selective_lease import (  # noqa: E501
+        SelectiveLookupLease,
+    )
+
+    groups = [
+        KVCacheGroupSpec(
+            ["full"],
+            FullAttentionSpec(block_size=16, num_kv_heads=8, head_size=64, dtype=None),
+        ),
+        KVCacheGroupSpec(
+            ["mamba"],
+            MambaSpec(
+                block_size=16,
+                shapes=((1, 1),),
+                dtypes=(torch.float32,),
+                mamba_cache_mode="align",
+            ),
+        ),
+    ]
+    coord = mooncake_store_worker.MooncakeStoreCoordinator(groups, 16, 16)
+    dbs = [
+        ChunkedTokenDatabase(KeyMetadata("test-model", 0, 0, 0, 0, group_id=g), 16)
+        for g in range(2)
+    ]
+    prefixes = [
+        [PoolKey.build_prefix(db.metadata, dcp_rank=r) for r in range(namespaces)]
+        for db in dbs
+    ]
+    stats = MooncakeStoreConnectorStats()
+    lease = SelectiveLookupLease(
+        store, coord, dbs, groups, prefixes, stats.record_operation
+    )
+    hashes = [BlockHash(bytes([i + 1]) * 4) for i in range(4)]
+    exists = {(g, bytes(h)) for g in range(2) for h in hashes}
+
+    def longest_hit(present):
+        _, length = coord.find_longest_cache_hit(
+            hashes, 64, ExternalCachedBlockPool(16, present)
+        )
+        return MooncakeLookupResult(length)
+
+    return lease, hashes, exists, longest_hit, stats
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("namespaces", [1, 8])
+def test_selective_lease_leaves_old_mamba_states_evictable(namespaces):
+    """Probe all history, but lease only the actual load in every namespace."""
+    store = _SelectiveLeaseStore()
+    lease, hashes, exists, longest_hit, stats = _hybrid_selective_lease(
+        store, namespaces
+    )
+    candidates = [
+        PoolKey.build_key_string(prefix, h.hex())
+        for prefixes in lease.lookup_key_prefixes
+        for h in hashes
+        for prefix in prefixes
+    ]
+    store.keys.update(candidates)
+    assert lease.probe(candidates) == [1] * len(candidates)
+    assert store.leased == []
+    hit = lease.lease_hit(hashes, longest_hit(exists), exists, longest_hit)
+    expected = [
+        PoolKey.build_key_string(prefix, h.hex())
+        for g, prefixes in enumerate(lease.lookup_key_prefixes)
+        for h in (hashes if g == 0 else hashes[-1:])
+        for prefix in prefixes
+    ]
+    assert hit.hit_length == 64
+    assert store.leased == [expected]
+    assert len(set(candidates) - set(expected)) == 3 * namespaces
+    assert stats.reduce()["lookup_lease_count"] == 1
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("eviction_rounds,expected_hit", [(1, 48), (2, 0)])
+def test_selective_lease_never_returns_an_unleased_shorter_hit(
+    eviction_rounds, expected_hit
+):
+    """A changed Mamba tail needs a new lease; bound repeated eviction races."""
+    store = _SelectiveLeaseStore()
+    lease, hashes, exists, longest_hit, _ = _hybrid_selective_lease(store)
+    for prefixes in lease.lookup_key_prefixes:
+        store.keys.update(
+            PoolKey.build_key_string(prefix, h.hex())
+            for h in hashes
+            for prefix in prefixes
+        )
+    prefix = lease.lookup_key_prefixes[1][0]
+    store.evictions = [
+        {PoolKey.build_key_string(prefix, hashes[-1 - i].hex())}
+        for i in range(eviction_rounds)
+    ]
+    hit = lease.lease_hit(hashes, longest_hit(exists), exists, longest_hit)
+    assert hit.hit_length == expected_hit
+    assert len(store.leased) == 2
+    assert PoolKey.build_key_string(prefix, hashes[2].hex()) in store.leased[1]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("response", [[-900] * 5, RuntimeError("master unreachable")])
+def test_selective_lease_failure_reports_miss_not_an_unleased_hit(response):
+    """Lease RPC errors must fail closed rather than masquerade as eviction."""
+    store = MagicMock()
+    lease, hashes, exists, longest_hit, stats = _hybrid_selective_lease(store)
+    if isinstance(response, Exception):
+        store.batch_is_exist.side_effect = response
+    else:
+        store.batch_is_exist.return_value = response
+    hit = lease.lease_hit(hashes, longest_hit(exists), exists, longest_hit)
+    assert hit.hit_length == 0
+    assert stats.reduce()["lookup_lease_error_count"] == 1
+
+
+@pytest.mark.cpu_test
+def test_compact_recv_restores_proof_rows_beyond_requested_hit(monkeypatch):
+    """A key at64 must restore64-token extents even for a32-token hit."""
+    monkeypatch.delenv("VLLM_MOONCAKE_STORE_TIER_LOG", raising=False)
+    tensor = torch.full((2, 1, 16, 4), 197, dtype=torch.uint8)
+    metadata = KeyMetadata("test-model", 0, 0, 0, 0)
+    layout = DCPPartialStoreLayout(
+        metadata, 128, 32, dcp_size=8, dcp_rank=0, interleave=1
+    )
+    layout.register_kv_caches([tensor], 2)
+    db = ChunkedTokenDatabase(metadata, 128, 32, store_layout=layout)
+    spec = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=4,
+        dtype=torch.uint8,
+        dcp_sharded=True,
+    )
+    coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        [KVCacheGroupSpec(["layer0"], spec)],
+        scheduler_block_size=128,
+        hash_block_size=32,
+        enable_partial_hash_hits=True,
+    )
+    store = MagicMock()
+
+    def get(keys, addrs, sizes):
+        assert keys == [layout.key_for(0, b"a1")]
+        assert sizes == [[32]]
+        ctypes.memmove(addrs[0][0], bytes(range(32)), 32)
+        return [32]
+
+    store.batch_get_into_multi_buffers.side_effect = get
+    receiver = mooncake_store_worker.KVCacheStoreRecvingThread(
+        store=store,
+        coord=coord,
+        token_databases=[db],
+        block_size=128,
+        tp_rank=0,
+        ready_event=threading.Event(),
+    )
+    req = _make_load_req(
+        "proof",
+        [b"a0", b"a1"],
+        token_len=32,
+        tail_key_boundaries=(TailKeyBoundary(group_id=0, num_tokens=64),),
+    )
+    receiver.add_request(req)
+    receiver._handle_request(receiver.request_queue.get())
+    assert tensor[0, :, :8].flatten().tolist() == list(range(32))
+    assert torch.all(tensor[0, :, 8:] == 197)
+    assert torch.all(tensor[1] == 197)

@@ -7,6 +7,13 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from vllm.config import (
+    CacheConfig,
+    DeviceConfig,
+    KVTransferConfig,
+    SchedulerConfig,
+    VllmConfig,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (
     MooncakeStoreCoordinator,
 )
@@ -23,17 +30,31 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler impor
     MooncakeStoreScheduler,
     _partial_tail_non_mamba_puts,
 )
+from vllm.sampling_params import SamplingParams
+from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
-from vllm.v1.core.sched.output import KVConnectorBlockState
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
+    get_request_block_hasher,
+    init_none_hash,
+)
+from vllm.v1.core.sched.output import (
+    CachedRequestData,
+    KVConnectorBlockState,
+    NewRequestData,
+    SchedulerOutput,
+)
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
+    UniformTypeKVCacheSpecs,
 )
+from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.request import Request
 
 
 def _make_bare_scheduler(
@@ -320,6 +341,173 @@ def test_scheduler_projects_nonprefix_groups_and_mamba_ids():
 
     assert scheduler._store_group_ids == (0, 2)
     assert scheduler._boundary_state_group_ids == frozenset({1})
+
+
+@pytest.fixture
+def checkpoint_scheduler():
+    def create(*, wrapped=True, modes=("align", "align"), save_decode_cache=None):
+        states = {
+            f"state{i}": MambaSpec(
+                block_size=16,
+                shapes=((1,),),
+                dtypes=(torch.float32,),
+                mamba_cache_mode=mode,
+            )
+            for i, mode in enumerate(modes)
+        }
+        state_spec = (
+            UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs=states)
+            if wrapped
+            else states["state0"]
+        )
+        kv_config = KVCacheConfig(
+            num_blocks=32,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["attention"],
+                    FullAttentionSpec(
+                        block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+                    ),
+                ),
+                KVCacheGroupSpec(list(states) if wrapped else ["state0"], state_spec),
+            ],
+        )
+        extra = (
+            {}
+            if save_decode_cache is None
+            else {"save_decode_cache": save_decode_cache}
+        )
+        config = VllmConfig(
+            cache_config=CacheConfig(
+                block_size=16, enable_prefix_caching=True, mamba_cache_mode="align"
+            ),
+            device_config=DeviceConfig(device="cpu"),
+            scheduler_config=SchedulerConfig(
+                max_model_len=128,
+                max_num_batched_tokens=128,
+                max_num_seqs=4,
+                is_encoder_decoder=False,
+                async_scheduling=False,
+            ),
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="MooncakeStoreConnector",
+                kv_role="kv_both",
+                kv_connector_extra_config=extra,
+            ),
+        )
+        with patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
+            "scheduler.LookupKeyClient"
+        ):
+            scheduler = MooncakeStoreScheduler(config, kv_config)
+        pool = BlockPool(num_gpu_blocks=32, enable_caching=True, hash_block_size=16)
+        scheduler.bind_gpu_block_pool(pool)
+        return scheduler, pool
+
+    return create
+
+
+def _start_checkpoint_request(scheduler, pool, *, offload=False):
+    init_none_hash(sha256)
+    request = Request(
+        request_id="req-0",
+        prompt_token_ids=list(range(16)),
+        sampling_params=SamplingParams(max_tokens=64),
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(16, sha256),
+    )
+    blocks = KVCacheBlocks((pool.get_new_blocks(2), pool.get_new_blocks(2)))
+    checkpoint = pool.get_new_blocks(1)[0]
+    block_ids = blocks.get_block_ids()
+    scheduler.update_state_after_alloc(request, blocks, num_external_tokens=0)
+    output = SchedulerOutput.make_empty()
+    output.scheduled_new_reqs = [NewRequestData.from_request(request, block_ids)]
+    output.num_scheduled_tokens = {request.request_id: 16}
+    output.total_num_scheduled_tokens = 16
+    output.kv_connector_block_state = _make_connector_block_state(
+        block_ids=block_ids,
+        offloads=[(1, checkpoint.block_id, 16)] if offload else None,
+    )
+    meta = scheduler.build_connector_meta(output)
+    return request, block_ids, checkpoint, meta
+
+
+def _complete_checkpoint_saves(scheduler, meta):
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=MooncakeStoreWorkerMetadata(
+                completed_saves={m.store_job_id: 1 for m in meta.requests if m.can_save}
+            )
+        )
+    )
+
+
+@pytest.mark.cpu_test
+def test_scheduler_claims_wrapped_mamba_checkpoint(checkpoint_scheduler):
+    """Wrapped states use the exact handoff, never their positional table."""
+    scheduler, pool = checkpoint_scheduler()
+    _, block_ids, checkpoint, meta = _start_checkpoint_request(
+        scheduler, pool, offload=True
+    )
+
+    assert checkpoint.block_id not in block_ids[1]
+    assert meta.requests[0].boundary_puts == [(1, checkpoint.block_id, 16)]
+    assert checkpoint.ref_cnt == 2
+    assert all(pool.blocks[bid].ref_cnt == 1 for bid in block_ids[1])
+    assert scheduler.has_pending_push_work()
+
+    _complete_checkpoint_saves(scheduler, meta)
+
+    assert checkpoint.ref_cnt == 1
+    assert not scheduler.has_pending_push_work()
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("modes", [("none", "align"), ("align", "none")])
+def test_scheduler_checks_every_wrapped_mamba_mode(checkpoint_scheduler, modes):
+    with pytest.raises(AssertionError, match="requires mamba_cache_mode='align'"):
+        checkpoint_scheduler(modes=modes)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("save_decode_cache", [None, False, True])
+@pytest.mark.parametrize("boundary", [16, 32, 48])
+def test_scheduler_decode_checkpoint_save_range(
+    checkpoint_scheduler, save_decode_cache, boundary
+):
+    """Decode opt-in claims committed states, but never a future checkpoint."""
+    scheduler, pool = checkpoint_scheduler(
+        wrapped=False, save_decode_cache=save_decode_cache
+    )
+    request, block_ids, checkpoint, initial = _start_checkpoint_request(scheduler, pool)
+    _complete_checkpoint_saves(scheduler, initial)
+    request.append_output_token_ids(list(range(16, 32)))
+    output = SchedulerOutput.make_empty()
+    output.scheduled_cached_reqs = CachedRequestData(
+        req_ids=[request.request_id],
+        resumed_req_ids=set(),
+        new_token_ids=[],
+        all_token_ids={},
+        new_block_ids=[None],
+        num_computed_tokens=[16],
+        num_output_tokens=[16],
+    )
+    output.num_scheduled_tokens = {request.request_id: 16}
+    output.total_num_scheduled_tokens = 16
+    output.kv_connector_block_state = _make_connector_block_state(
+        block_ids=block_ids, offloads=[(1, checkpoint.block_id, boundary)]
+    )
+
+    meta = scheduler.build_connector_meta(output)
+
+    accepted = boundary <= (32 if save_decode_cache else 16)
+    puts = [put for m in meta.requests for put in m.boundary_puts or []]
+    assert puts == ([(1, checkpoint.block_id, boundary)] if accepted else [])
+    assert checkpoint.ref_cnt == 1 + accepted
+    _complete_checkpoint_saves(scheduler, meta)
+    assert checkpoint.ref_cnt == 1
+    assert not scheduler.has_pending_push_work()
 
 
 def test_current_save_block_ids_use_store_group_projection():

@@ -92,8 +92,15 @@ DYNAMIC = "4-8:1"
 def compile_experts(tp, experts, batch, grid, device, publish=False, *knobs):
     """Only code and geometry are cached; no owner tensors or descriptors. ``knobs``:
     (B<=8 stream, pregrouped, steal, listed, ahead, static, dynamic)."""
-    defaults = (streamed(batch), False, False, False, False, static(batch))
-    defaults += (dynamic(batch),)
+    defaults = (
+        streamed(batch),
+        False,
+        False,
+        False,
+        False,
+        static(batch),
+        dynamic(batch),
+    )
     stream, grouped, steal, listed, ahead, walk, claims = knobs + defaults[len(knobs) :]
     capacity = 1 << (batch - 1).bit_length()
     moe = ExpertsKernel(
@@ -153,6 +160,11 @@ def scratch(tp, device, wide=False):
     return buffers
 
 
+# The wide engines fit one CTA per SM and every CTA must be resident: their grid is
+# the SM count, capped at the tuned 152 (the FC2 partial slots hold 160 CTAs).
+WIDE_GRID = 152
+
+
 class PersistentExperts:
     def __init__(self, w13, s13, w2, s2, *, beta=4.0, linear_beta=25.0):
         experts, rows, _ = w13.shape
@@ -162,7 +174,8 @@ class PersistentExperts:
         # TP8: B3-4 on 148 CTAs; B5-8 publish on 128-136 CTAs, leaving SMs for the
         # one-wave tail; grouped B9-64 on 152.
         grids = "3-4:148,5-6:128,7:132,9-64:152" if self.tp == 8 else ""
-        grids += f",65-{WIDE_ROWS}:152"  # wide: every SM
+        sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+        grids += f",65-{WIDE_ROWS}:{min(WIDE_GRID, sms)}"  # wide: one CTA per SM
         self.grids = batch_table(grids)
         scalars = (beta, linear_beta, 1 / beta, 1 / linear_beta)
         self.scalars = tuple(map(c.Float32, scalars))

@@ -99,15 +99,20 @@ steps:
     - |
       uv pip install --python .venv/bin/python "$(.venv/bin/python - <<'PY'
       from pathlib import Path
+      from packaging.requirements import Requirement
       import torch
 
       requirement = next(
-          line for line in Path("requirements/kv_connectors.txt").read_text().splitlines()
-          if line.startswith("mooncake-transfer-engine ")
+          requirement
+          for line in Path("requirements/kv_connectors.txt").read_text().splitlines()
+          if line.startswith("mooncake-transfer-engine")
+          if (requirement := Requirement(line)).marker is None
+          or requirement.marker.evaluate()
       )
-      if torch.version.cuda.split(".")[0] == "13":
-          requirement = requirement.replace("mooncake-transfer-engine", "mooncake-transfer-engine-cuda13")
-      print(requirement)
+      if torch.version.cuda and torch.version.cuda.split(".")[0] == "13":
+          if requirement.name == "mooncake-transfer-engine":
+              requirement.name = "mooncake-transfer-engine-cuda13"
+      print(str(requirement))
       PY
       )"
     - bash tests/v1/ec_connector/integration/run_epd_mooncake_ec_full_pipeline.sh

@@ -12,7 +12,8 @@ the o-projection, and the MoE runs on the rank's 1/G row shard with the shared
 expert replicated.
 
 The hybrid step keeps every row on every TP rank instead (the TP8 decode's
-layout) for attention, and runs the MLPs exactly as stock does:
+layout) for attention. Compatible TP-sharded shared experts reuse those rows and
+overlap their original compute with routed MegaMoE:
 
   AttnRes            stock, on the group's rows (as the TP8 wide step)
   attention          the TP-G specialized input projection and core (KDA, DSA; the
@@ -20,7 +21,8 @@ layout) for attention, and runs the MLPs exactly as stock does:
                      o_proj partial, one all-reduce
   MoE                the stock SP MoE module on this rank's row shard (stock
                      ``sp_shard``, zero padding marked as padding for MegaMoE),
-                     all-gathered back to the group rows
+                     all-gathered back to the group rows; compatible shared
+                     experts reuse the full input rather than gathering it again
   dense MLP          the stock (replicated) dense MLP on all rows
 
 Precision is the stock layer's at every stage (BF16 GEMMs with FP32 accumulation,
@@ -64,6 +66,8 @@ class HybridAttention(Attention):
     """One KDA / DSA layer's attention in a hybrid step: the TP-G specialized
     input projection and core of ``Attention`` (its wide-step path), then the
     stock o_proj partial and one TP all-reduce."""
+
+    output: Any
 
     def __init__(self, decoder, runtime):  # noqa: D107 (no super().__init__)
         attention, tp = decoder.self_attn, runtime.tp
@@ -145,6 +149,7 @@ class HybridStep:
         from .providers import ATTENTION_MAX, wide_caps
 
         self.runtime = runtime
+        self.shared_moe = None
         runtime.batches = ()
         q = runtime.q
         runtime.aux_layers = tuple(runtime.backbone.aux_hidden_state_layers)
@@ -156,7 +161,7 @@ class HybridStep:
         caps = wide_caps(runtime.dcp > 1, recoverssm)
         # Every verify step whose MoE shard fits MegaMoE's buffer is a hybrid step
         # (its rows are the KV capacity's point: past the cores' ATTENTION_MAX rows
-        # the attention layers run the stock module too; the MLPs are always stock).
+        # the attention layers run the stock module too).
         tokens = min(
             (
                 d.mlp.experts.max_num_tokens
@@ -188,9 +193,16 @@ class HybridStep:
             ):
                 runtime.attention[layer.layer_idx] = HybridAttention(layer, runtime)
 
+        from vllm.config import get_current_vllm_config
+
+        config = get_current_vllm_config()
+        from .hybrid_shared_moe import HybridSharedMoE
+
+        self.shared_moe = HybridSharedMoE.create(runtime, config)
+
     def run(self, step, input_ids, inputs_embeds):
         """A hybrid step: the stock decoder loop over the group's rows with the
-        specialized attention and the stock MLPs (module docstring)."""
+        specialized attention and layout-aware MLPs (module docstring)."""
         from ...ops import attn_res
 
         runtime = self.runtime
@@ -224,7 +236,11 @@ class HybridStep:
                     hidden, residual, prefix_sum
                 )
                 if layer.is_moe_layer:
-                    hidden = run_stock_moe(layer.mlp, hidden)
+                    hidden = (
+                        self.shared_moe.run(layer.mlp, hidden, q)
+                        if self.shared_moe is not None
+                        else run_stock_moe(layer.mlp, hidden)
+                    )
                 else:
                     hidden = run_dense(layer.mlp, hidden)
                 if index + 1 in runtime.aux_layers:

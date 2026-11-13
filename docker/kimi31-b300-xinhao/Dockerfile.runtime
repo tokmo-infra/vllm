@@ -1,6 +1,21 @@
 FROM vllm/vllm-openai:kimi-k31
+ARG YYF_SOURCE_COMMIT=unknown
 LABEL org.opencontainers.image.source="https://github.com/tokmo-infra/vllm" \
-      io.tokmo.source.branch="kimi31-b300-xinhao" \
+      org.opencontainers.image.revision="${YYF_SOURCE_COMMIT}" \
+      io.tokmo.source.branch="kimi-3.1-1110" \
+      io.tokmo.source.base.branch="kimi31-b300-xinhao" \
       io.tokmo.base.image-id="sha256:1a8a702f2bfeded3c90259ae60fefbd9e4ca014241946e7d5f3396badce99e76"
+ENV KIMI31_TOKENIZER_CACHE_GIB=16 \
+    KIMI31_TOKENIZER_CACHE_L1_MIB=64 \
+    KIMI31_TOKENIZER_CACHE_SHARED_PATH=/tmp/kimi31-tokenizer-cache-yyf
 COPY vllm/renderers/kimi_k3.py /usr/local/lib/python3.12/dist-packages/vllm/renderers/kimi_k3.py
 COPY vllm/tokenizers/kimi_k3_cache.py /usr/local/lib/python3.12/dist-packages/vllm/tokenizers/kimi_k3_cache.py
+COPY vllm/tokenizers/kimi_k3_cache_shared.py /usr/local/lib/python3.12/dist-packages/vllm/tokenizers/kimi_k3_cache_shared.py
+COPY vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+COPY vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/lease.py /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/lease.py
+RUN sha256sum /usr/local/lib/python3.12/dist-packages/vllm/renderers/kimi_k3.py \
+    /usr/local/lib/python3.12/dist-packages/vllm/tokenizers/kimi_k3_cache.py \
+    /usr/local/lib/python3.12/dist-packages/vllm/tokenizers/kimi_k3_cache_shared.py \
+    /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py \
+    /usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/lease.py \
+    > /opt/kimi31-yyf-source.sha256

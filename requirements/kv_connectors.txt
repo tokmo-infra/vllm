@@ -3,6 +3,9 @@ lmcache >= 0.5.6
 # images. 14.1.1 fixes the root cause, so only 14.1.0 is excluded.
 cupy-cuda13x != 14.1.0
 nixl == 1.5.0
-# CUDA 12 build. On the CUDA 13 image install-kv-connectors.sh swaps this for
-# the mooncake-transfer-engine-cuda13 variant of the same version.
-mooncake-transfer-engine >= 0.3.12
+# Pin (this branch only): Mooncake v0.3.14-pre-3 (= 0.3.14rc3) is NOT on PyPI,
+# so install the CUDA13 cp312 wheel straight from the GitHub release, per-arch.
+# Installing the cuda13 variant directly makes the Dockerfile's
+# mooncake-transfer-engine -> -cuda13 swap a no-op (the plain package is absent).
+mooncake-transfer-engine-cuda13 @ https://github.com/kvcache-ai/Mooncake/releases/download/v0.3.14-pre-3/mooncake_transfer_engine_cuda13-0.3.14rc3-cp312-cp312-manylinux_2_28_aarch64.whl ; platform_machine == "aarch64"
+mooncake-transfer-engine-cuda13 @ https://github.com/kvcache-ai/Mooncake/releases/download/v0.3.14-pre-3/mooncake_transfer_engine_cuda13-0.3.14rc3-cp312-cp312-manylinux_2_28_x86_64.whl ; platform_machine == "x86_64"

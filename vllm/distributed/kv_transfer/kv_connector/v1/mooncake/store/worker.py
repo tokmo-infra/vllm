@@ -11,6 +11,7 @@ and MooncakeDistributedStore integration.
 """
 
 import dataclasses
+import functools
 import math
 import os
 import queue
@@ -45,6 +46,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator imp
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  # noqa: E501
     BlobBlockHashes,
     ChunkedTokenDatabase,
+    DCPPartialStoreLayout,
     KeyMetadata,
     LBHNCStoreLayout,
     LBNHCStoreLayout,
@@ -58,6 +60,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
     TPShardedStoreLayout,
     group_compact_kernel_blocks,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.lease import (  # noqa: E501
+    LEASE_EXPIRED,
+    retry_expired_get_once,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.protocol import (  # noqa: E501
     LOOKUP_MSG,
     RESET_MSG,
@@ -65,6 +71,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.protocol import
     RESP_OK,
     decode_lookup_response,
     encode_lookup_response,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.selective_lease import (  # noqa: E501
+    SelectiveLookupLease,
 )
 from vllm.distributed.mooncake_store import MooncakeStoreConfig, setup_mooncake_store
 from vllm.logger import init_logger
@@ -75,6 +84,7 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     maybe_convert_block_hash,
+    resolve_dcp_kv_block_size,
     resolve_kv_cache_block_sizes,
 )
 from vllm.v1.kv_cache_interface import (
@@ -85,6 +95,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
+    iter_layer_specs,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
@@ -93,6 +104,8 @@ from .metrics import MooncakeStoreConnectorStats
 logger = init_logger(__name__)
 
 MOONCAKE_NO_AVAILABLE_HANDLE = -200
+_STORE_PRESSURE_PROBE_INTERVAL_S = 1.0
+_BOUNDARY_PRESSURE_RETRY_DELAY_S = 0.05
 _T = TypeVar("_T")
 
 
@@ -110,6 +123,78 @@ def resolve_store_tp_size(extra_config: dict[str, Any]) -> int | None:
 
     store_tp_size = extra_config.get("store_tp_size")
     return store_tp_size if type(store_tp_size) is int and store_tp_size > 0 else None
+
+
+def resolve_compact_partial_blocks(
+    extra_config: dict[str, Any],
+    kv_cache_config: KVCacheConfig,
+    dcp_size: int,
+    *,
+    hash_block_size: int | None = None,
+    interleave: int = 1,
+) -> bool:
+    """Resolve the partial-page Store format without changing GPU allocation."""
+    if "compact_partial_blocks" in extra_config:
+        return extra_config["compact_partial_blocks"] is True
+    if (
+        dcp_size < 1
+        or extra_config.get("store_tp_size") is not None
+        or extra_config.get("enable_store_tp_lcm") is True
+        or kv_cache_config.hisparse_host_num_blocks is not None
+    ):
+        return False
+    mla_groups = [
+        group
+        for group in kv_cache_config.prefix_cacheable_groups
+        if all(
+            isinstance(spec, MLAAttentionSpec) and (dcp_size == 1 or spec.dcp_sharded)
+            for spec in iter_layer_specs(group.kv_cache_spec)
+        )
+    ]
+    if not mla_groups:
+        return False
+    if hash_block_size is None:
+        hash_block_size = kv_cache_config.hash_block_size
+    if hash_block_size is None:
+        return True
+    return (
+        hash_block_size > 0
+        and interleave > 0
+        and hash_block_size % (dcp_size * interleave) == 0
+        and all(
+            (block_size := resolve_dcp_kv_block_size(group.kv_cache_spec, dcp_size)) > 0
+            and block_size % hash_block_size == 0
+            and block_size % dcp_size == 0
+            for group in mla_groups
+        )
+    )
+
+
+def _register_store_layouts(
+    token_dbs: list[ChunkedTokenDatabase],
+    group_caches: Sequence[Sequence[torch.Tensor]],
+    num_blocks: int,
+    *,
+    fallback: Callable[[], list[ChunkedTokenDatabase]] | None = None,
+) -> None:
+    for db, caches in zip(token_dbs, group_caches, strict=True):
+        try:
+            db.store_layout.register_kv_caches(caches, num_blocks)
+        except ValueError:
+            if fallback is None or not isinstance(
+                db.store_layout, DCPPartialStoreLayout
+            ):
+                raise
+            replacement = fallback()
+            for legacy_db, legacy_caches in zip(replacement, group_caches, strict=True):
+                legacy_db.store_layout.register_kv_caches(legacy_caches, num_blocks)
+            # SelectiveLookupLease already holds this list, so replace in place.
+            token_dbs[:] = replacement
+            logger.info("Mooncake compact views incompatible; using rank-local Store")
+            break
+    for db in token_dbs:
+        if isinstance(db.store_layout, DCPPartialStoreLayout):
+            db.metadata = db.store_layout.metadata
 
 
 def _rotate_list(values: list[_T], offset: int) -> list[_T]:
@@ -452,6 +537,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # Pause store requests when CPU/disk offloading is under pressure.
         self._store_pressure_active = False
         self._skip_store_requests: set[str] = set()
+        self._store_pressure_probe_at = 0.0
 
         # Per-request high-water mark of tokens actually persisted; the next
         # batch resumes here, so pressure-skipped or failed ranges are retried.
@@ -547,12 +633,31 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
     def _should_skip_request(self, req_id: str) -> bool:
         with self.done_task_lock:
-            return self._store_pressure_active and req_id in self._skip_store_requests
+            if (
+                not self._store_pressure_active
+                or req_id not in self._skip_store_requests
+            ):
+                return False
+            now = time.monotonic()
+            if now < self._store_pressure_probe_at:
+                return True
+            # All active requests may have failed allocation. Requiring another
+            # request's successful PUT to reopen the gate can then suppress every
+            # later checkpoint even after the Store has evicted enough data.
+            # Reserve one probe per sending thread; the caller uses only this
+            # job's pinned blocks and still retires it through the normal finally.
+            self._store_pressure_probe_at = now + _STORE_PRESSURE_PROBE_INTERVAL_S
+        logger.info("Mooncake store pressure recovery probe for request %s", req_id)
+        return False
 
     def _mark_request_skipped_for_pressure(self, req_meta: ReqMeta) -> bool:
         req_id = req_meta.req_id
         with self.done_task_lock:
             already_skipped = req_id in self._skip_store_requests
+            if not self._store_pressure_active:
+                self._store_pressure_probe_at = (
+                    time.monotonic() + _STORE_PRESSURE_PROBE_INTERVAL_S
+                )
             self._store_pressure_active = True
             # The pressure itself is global, but only a live job may sentence its
             # own request to being skipped.
@@ -566,6 +671,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 return False
             self._store_pressure_active = False
             self._skip_store_requests.clear()
+            self._store_pressure_probe_at = 0.0
         return True
 
     def _boundary_puts(
@@ -606,7 +712,12 @@ class KVCacheStoreSendingThread(KVTransferThread):
             put_step_rank = (self.tp_rank + group_id) % put_step
             if (cdiv(num_tokens, db.block_size) - 1) % put_step != put_step_rank:
                 continue
-            addr, size = db.prepare_value_for_block(block_id)
+            if isinstance(db.store_layout, DCPPartialStoreLayout):
+                addr, size = db.store_layout.prepare_value_for_block(
+                    block_id, num_tokens=num_tokens
+                )
+            else:
+                addr, size = db.prepare_value_for_block(block_id)
             puts.append(
                 (db.key_for(req_meta.block_hashes[hash_idx]), addr, size, db.metadata)
             )
@@ -713,9 +824,78 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 len(keys),
                 failed_codes,
             )
-            if MOONCAKE_NO_AVAILABLE_HANDLE in failed_codes:
-                self._mark_request_skipped_for_pressure(req_meta)
-            return False
+            retry_indices = [
+                i for i in failed if res[i] == MOONCAKE_NO_AVAILABLE_HANDLE
+            ]
+            if not retry_indices:
+                return False
+            with self.done_task_lock:
+                now = time.monotonic()
+                retry_allowed = (
+                    not self._store_pressure_active
+                    or now >= self._store_pressure_probe_at
+                )
+                if retry_allowed:
+                    self._store_pressure_probe_at = (
+                        now + _STORE_PRESSURE_PROBE_INTERVAL_S
+                    )
+            self._mark_request_skipped_for_pressure(req_meta)
+            if not retry_allowed:
+                return False
+
+            # Keep this job's sources pinned, but wait at most once per pressure
+            # probe interval. A later job may never see this checkpoint again.
+            time.sleep(_BOUNDARY_PRESSURE_RETRY_DELAY_S)
+            if not self.is_live_store_job(req_meta):
+                return False
+            retry_keys = [keys[i] for i in retry_indices]
+            retry_addrs = [addrs[i] for i in retry_indices]
+            retry_sizes = [sizes[i] for i in retry_indices]
+            retry_bytes = _sum_batch_bytes(retry_sizes)
+            retry_start = time.perf_counter()
+            try:
+                if group_ids is not None:
+                    self.replicate_config.group_ids = [
+                        group_ids[i] for i in retry_indices
+                    ]
+                retry_res = self.store.batch_put_from_multi_buffers(
+                    retry_keys, retry_addrs, retry_sizes, self.replicate_config
+                )
+            except Exception as e:
+                self._record_operation(
+                    "save_put_retry",
+                    retry_start,
+                    len(retry_keys),
+                    num_bytes=retry_bytes,
+                    status="error",
+                    num_failed_keys=len(retry_keys),
+                )
+                logger.error(
+                    "Failed to retry boundary-state keys for request %s: %s",
+                    req_meta.req_id,
+                    e,
+                )
+                return False
+            finally:
+                if group_ids is not None:
+                    self.replicate_config.group_ids = group_ids
+            retry_failed = sum(value < 0 for value in retry_res)
+            self._record_operation(
+                "save_put_retry",
+                retry_start,
+                len(retry_keys),
+                num_bytes=retry_bytes,
+                status="partial_failure" if retry_failed else "ok",
+                num_failed_keys=retry_failed,
+            )
+            logger.info(
+                "Boundary-state pressure retry for request %s: %d/%d keys recovered",
+                req_meta.req_id,
+                len(retry_keys) - retry_failed,
+                len(retry_keys),
+            )
+            if retry_failed or len(retry_indices) != len(failed):
+                return False
 
         if self._clear_store_pressure():
             logger.info(
@@ -1164,7 +1344,13 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     ]
                 for store_shard_id in db.store_layout.local_shard_ids:
                     key_list.append(db.store_layout.key_for(store_shard_id, block_hash))
-                    chunks.append((start, end))
+                    value_end = (
+                        boundary_tokens
+                        if boundary_tokens is not None
+                        and isinstance(db.store_layout, DCPPartialStoreLayout)
+                        else end
+                    )
+                    chunks.append((start, value_end))
                     store_shard_ids.append(store_shard_id)
             g_addrs, g_sizes, g_block_ids = db.store_layout.prepare_values(
                 chunks,
@@ -1243,6 +1429,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         current_batch_keys: list[str] = key_list_c
         current_batch_block_ids: list[int] = block_id_list_c
         batch_bytes = 0
+        load_get_recorded = False
         try:
             for (
                 batch_keys,
@@ -1252,6 +1439,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             ) in load_batches:
                 current_batch_keys = batch_keys
                 current_batch_block_ids = batch_block_ids
+                load_get_recorded = False
                 batch_bytes = _sum_batch_bytes(batch_sizes)
                 tiers_by_key: dict[str, str] | None = None
                 if envs.VLLM_MOONCAKE_STORE_TIER_LOG:
@@ -1280,6 +1468,48 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     status="partial_failure" if failed else "ok",
                     num_failed_keys=len(failed),
                 )
+                load_get_recorded = True
+                expired = [i for i, value in enumerate(res) if value == LEASE_EXPIRED]
+                if expired:
+                    logger.warning(
+                        "Refreshing expired Mooncake read leases once for "
+                        "%d/%d keys of request %s",
+                        len(expired),
+                        len(batch_keys),
+                        req_id,
+                    )
+                    retry_start = time.perf_counter()
+                    retry_bytes = _sum_batch_bytes([batch_sizes[i] for i in expired])
+                    try:
+                        res = retry_expired_get_once(
+                            self.store, batch_keys, batch_addrs, batch_sizes, res
+                        )
+                    except Exception:
+                        self._record_operation(
+                            "load_get_retry",
+                            retry_start,
+                            len(expired),
+                            num_bytes=retry_bytes,
+                            status="error",
+                            num_failed_keys=len(expired),
+                        )
+                        raise
+                    remaining = sum(res[i] < 0 for i in expired)
+                    self._record_operation(
+                        "load_get_retry",
+                        retry_start,
+                        len(expired),
+                        num_bytes=retry_bytes,
+                        status="partial_failure" if remaining else "ok",
+                        num_failed_keys=remaining,
+                    )
+                    failed = [
+                        (key, value, block_id)
+                        for key, value, block_id in zip(
+                            batch_keys, res, batch_block_ids, strict=True
+                        )
+                        if value < 0
+                    ]
                 if failed:
                     self._report_load_error(
                         req_id, [block_id for _, _, block_id in failed]
@@ -1294,14 +1524,15 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     break
         except Exception as e:
             self._report_load_error(req_id, current_batch_block_ids)
-            self._record_operation(
-                "load_get",
-                load_get_start,
-                len(current_batch_keys),
-                num_bytes=batch_bytes,
-                status="error",
-                num_failed_keys=len(current_batch_keys),
-            )
+            if not load_get_recorded:
+                self._record_operation(
+                    "load_get",
+                    load_get_start,
+                    len(current_batch_keys),
+                    num_bytes=batch_bytes,
+                    status="error",
+                    num_failed_keys=len(current_batch_keys),
+                )
             logger.warning(
                 "Failed to get Mooncake sub-batch %s, error: %s",
                 current_batch_keys[:3],
@@ -1391,6 +1622,43 @@ class MooncakeStoreWorker:
         assert kv_role is not None
         self.kv_role = kv_role
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+        self.cache_config = vllm_config.cache_config
+        self._is_hma_required = len(kv_cache_config.kv_cache_groups) > 1
+        self.block_size, self.hash_block_size = resolve_kv_cache_block_sizes(
+            kv_cache_config, vllm_config
+        )
+        # Use the engine core's hash unit for both format admission and keys;
+        # worker-only platform hooks may have changed prefix_match_unit.
+        if kv_cache_config.hash_block_size is not None:
+            self.hash_block_size = kv_cache_config.hash_block_size
+        self._compact_partial_blocks_auto = "compact_partial_blocks" not in extra_config
+        self._compact_partial_blocks = resolve_compact_partial_blocks(
+            extra_config,
+            kv_cache_config,
+            self.dcp_size,
+            hash_block_size=self.hash_block_size,
+        )
+        self._cp_interleave = (
+            parallel_config.cp_kv_cache_interleave_size
+            if self._compact_partial_blocks and self.dcp_size > 1
+            else 1
+        )
+        self._compact_partial_blocks = resolve_compact_partial_blocks(
+            extra_config,
+            kv_cache_config,
+            self.dcp_size,
+            hash_block_size=self.hash_block_size,
+            interleave=self._cp_interleave,
+        )
+        if self._compact_partial_blocks and (
+            self.dcp_size < 1
+            or extra_config.get("store_tp_size") is not None
+            or extra_config.get("enable_store_tp_lcm") is True
+            or kv_cache_config.hisparse_host_num_blocks is not None
+        ):
+            raise ValueError(
+                "compact_partial_blocks requires a rank-local MLA Store layout"
+            )
         self.can_put = self.kv_role in ("kv_producer", "kv_both") or (
             extra_config.get("save_decode_cache", False)
         )
@@ -1401,19 +1669,6 @@ class MooncakeStoreWorker:
             and not extra_config.get("enable_lookup", True)
             and not self.can_put
         )
-        self.cache_config = vllm_config.cache_config
-        self._is_hma_required = len(kv_cache_config.kv_cache_groups) > 1
-        self.block_size, self.hash_block_size = resolve_kv_cache_block_sizes(
-            kv_cache_config, vllm_config
-        )
-        # Request.block_hashes use the engine core's hash unit, which it
-        # resolved from its own config and passes down here. Re-resolving from
-        # the worker's config can disagree: platform hooks that run only in
-        # worker processes may set prefix_match_unit (Kimi K3.1 sets 64 while
-        # the core hashes per 1088-token block), and every key and chunk
-        # boundary would then index the wrong hash.
-        if kv_cache_config.hash_block_size is not None:
-            self.hash_block_size = kv_cache_config.hash_block_size
         self.num_layers = model_config.get_num_layers(parallel_config)
 
         self.num_kv_head = model_config.get_total_num_kv_heads()
@@ -1516,6 +1771,7 @@ class MooncakeStoreWorker:
 
         self._kv_cache_config = kv_cache_config
         self.token_dbs: list[ChunkedTokenDatabase] = []
+        self._selective_lease: SelectiveLookupLease | None = None
 
         # a capacity-only instance does not need below utils
         if self._capacity_only:
@@ -1546,11 +1802,42 @@ class MooncakeStoreWorker:
             ),
             store_namespace=store_namespace,
         )
+        self._store_layout_metadata = metadata
+        if self._compact_partial_blocks:
+            partial_format = "dcp_partial_v1" if self.dcp_size > 1 else "mla_partial_v1"
+            metadata = dataclasses.replace(
+                metadata,
+                store_namespace=store_namespace + f"@store_format:{partial_format}",
+            )
         self._group_tp_replication_factors: tuple[int, ...] = (
             self._compute_group_tp_replication_factors()
         )
         self.token_dbs = self._build_token_databases(metadata, store_layout_cls)
+        if self._compact_partial_blocks and not any(
+            isinstance(db.store_layout, DCPPartialStoreLayout) for db in self.token_dbs
+        ):
+            raise ValueError("compact_partial_blocks requires compatible MLA groups")
+        if self._compact_partial_blocks:
+            logger.info(
+                "Mooncake compact MLA Store enabled: dcp_size=%d, "
+                "(manager_block, hash_unit)=%s; full-page values keep full bytes",
+                self.dcp_size,
+                [
+                    (db.block_size, db.hash_block_size)
+                    for db in self.token_dbs
+                    if isinstance(db.store_layout, DCPPartialStoreLayout)
+                ],
+            )
         self._init_lookup_key_prefixes()
+        if envs.VLLM_MOONCAKE_STORE_SELECTIVE_LEASE:
+            self._selective_lease = SelectiveLookupLease(
+                self.store,
+                self.coord,
+                self.token_dbs,
+                self._kv_cache_groups,
+                self._lookup_key_prefixes,
+                self._record_kv_connector_operation,
+            )
 
     def _supports_tp_sharded_store_layout(
         self,
@@ -1644,8 +1931,15 @@ class MooncakeStoreWorker:
         self,
         metadata: KeyMetadata,
         layout_cls: type[TPShardedStoreLayout] | None,
+        *,
+        compact_partial_blocks: bool | None = None,
     ) -> list[ChunkedTokenDatabase]:
         """Construct token databases and their Store layouts."""
+        compact = (
+            self._compact_partial_blocks
+            if compact_partial_blocks is None
+            else compact_partial_blocks
+        )
         token_dbs: list[ChunkedTokenDatabase] = []
         for group_idx, group in enumerate(self._kv_cache_groups):
             hash_block_size = (
@@ -1661,7 +1955,7 @@ class MooncakeStoreWorker:
                 group_id=group_idx,
                 tp_rank=group_tp_rank,
             )
-            store_layout: TPShardedStoreLayout | None = None
+            store_layout: TPShardedStoreLayout | DCPPartialStoreLayout | None = None
             if layout_cls is not None:
                 assert self.store_tp_size is not None
                 store_layout = layout_cls(
@@ -1672,6 +1966,19 @@ class MooncakeStoreWorker:
                     store_tp_size=self.store_tp_size,
                     tp_rank=self.tp_rank,
                     num_kv_heads=self.num_kv_head,
+                )
+            elif compact and all(
+                isinstance(spec, MLAAttentionSpec)
+                and (self.dcp_size == 1 or spec.dcp_sharded)
+                for spec in iter_layer_specs(group.kv_cache_spec)
+            ):
+                store_layout = DCPPartialStoreLayout(
+                    group_metadata,
+                    group.kv_cache_spec.block_size,
+                    hash_block_size,
+                    dcp_size=self.dcp_size,
+                    dcp_rank=self.dcp_rank,
+                    interleave=self._cp_interleave,
                 )
             token_dbs.append(
                 ChunkedTokenDatabase(
@@ -1763,6 +2070,7 @@ class MooncakeStoreWorker:
 
         assert self.cache_config.num_gpu_blocks is not None
         self.num_blocks = self.cache_config.num_gpu_blocks
+        refresh_partial_layouts = self._compact_partial_blocks
         use_group_regions = self._kv_cache_config.hisparse_host_num_blocks is not None
 
         if not use_group_regions:
@@ -1794,6 +2102,7 @@ class MooncakeStoreWorker:
                     )
                 else:
                     self._device_regions[base_addr] = region_len
+            caches_by_group = []
             for group, db in zip(self._kv_cache_groups, self.token_dbs, strict=True):
                 # In a hybrid model each KV cache group registers only its own
                 # layers. A group with no layers on this PP rank registers all.
@@ -1805,8 +2114,23 @@ class MooncakeStoreWorker:
                     if layer_name in kv_caches
                     for view in _layer_views(kv_caches[layer_name])
                 ]
-                db.store_layout.register_kv_caches(
-                    group_caches or cache_tensors, self.num_blocks
+                if isinstance(db.store_layout, DCPPartialStoreLayout) and any(
+                    name not in kv_caches for name in group.layer_names
+                ):
+                    raise ValueError("Missing compact partial MLA cache layers")
+                caches_by_group.append(group_caches or cache_tensors)
+            fallback = None
+            if self._compact_partial_blocks and self._compact_partial_blocks_auto:
+                fallback = lambda: self._build_token_databases(
+                    self._store_layout_metadata, None, compact_partial_blocks=False
+                )
+            _register_store_layouts(
+                self.token_dbs, caches_by_group, self.num_blocks, fallback=fallback
+            )
+            if refresh_partial_layouts:
+                self._compact_partial_blocks = any(
+                    isinstance(db.store_layout, DCPPartialStoreLayout)
+                    for db in self.token_dbs
                 )
 
         registered_buffers: dict[int, int] = {}
@@ -1911,6 +2235,13 @@ class MooncakeStoreWorker:
             num_host_segments,
             num_device_segments,
         )
+
+        if refresh_partial_layouts:
+            for db in self.token_dbs:
+                db.metadata = db.store_layout.metadata
+            self._init_lookup_key_prefixes()
+            if self._selective_lease is not None:
+                self._selective_lease.lookup_key_prefixes = self._lookup_key_prefixes
 
         # Start transfer threads
         if self.can_put:
@@ -2197,9 +2528,14 @@ class MooncakeStoreWorker:
         if not candidate_keys:
             return MooncakeLookupResult(0)
 
+        exists_fn = (
+            self.store.batch_is_exist
+            if self._selective_lease is None
+            else self._selective_lease.probe
+        )
         lookup_start = time.perf_counter()
         try:
-            res = self.store.batch_is_exist(candidate_keys)
+            res = exists_fn(candidate_keys)
             self._record_kv_connector_operation(
                 "lookup_exists",
                 time.perf_counter() - lookup_start,
@@ -2227,6 +2563,24 @@ class MooncakeStoreWorker:
                 exists_set.add((g_idx, hash_bytes))
             pos += count
 
+        hit = self._longest_hit(num_tokens, token_len, block_hashes, exists_set)
+        if self._selective_lease is None:
+            return hit
+        return self._selective_lease.lease_hit(
+            block_hashes,
+            hit,
+            exists_set,
+            functools.partial(self._longest_hit, num_tokens, token_len, block_hashes),
+        )
+
+    def _longest_hit(
+        self,
+        num_tokens: int,
+        token_len: int,
+        block_hashes: Sequence[BlockHash],
+        exists_set: set[tuple[int, bytes]],
+    ) -> MooncakeLookupResult:
+        """Longest prefix hit over the ``(group, hash)`` pairs in the store."""
         cached_block_pool = ExternalCachedBlockPool(
             self.hash_block_size,
             exists_set,

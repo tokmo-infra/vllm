@@ -38,6 +38,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
     get_mamba_prefill_checkpoint_position,
+    iter_layer_specs,
 )
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
@@ -168,9 +169,15 @@ class MooncakeStoreScheduler:
             kv_cache_config, vllm_config
         )
         mamba_groups = {
-            group_id: group.kv_cache_spec
+            group_id: mamba_specs
             for group_id, group in enumerate(store_groups)
-            if isinstance(group.kv_cache_spec, MambaSpec)
+            if (
+                mamba_specs := tuple(
+                    spec
+                    for spec in iter_layer_specs(group.kv_cache_spec)
+                    if isinstance(spec, MambaSpec)
+                )
+            )
         }
         self._boundary_state_group_ids = frozenset(mamba_groups)
 
@@ -184,7 +191,9 @@ class MooncakeStoreScheduler:
         self.enable_partial_hash_hits = False
         if not self._capacity_only:
             assert all(
-                spec.mamba_cache_mode == "align" for spec in mamba_groups.values()
+                spec.mamba_cache_mode == "align"
+                for specs in mamba_groups.values()
+                for spec in specs
             ), "MooncakeStoreScheduler requires mamba_cache_mode='align'"
             self._store_coord = MooncakeStoreCoordinator.from_kv_cache_config(
                 kv_cache_config, vllm_config, self._block_size, self._hash_block_size
@@ -691,14 +700,16 @@ class MooncakeStoreScheduler:
                 # going away, so the offload is conservatively dropped.
                 logger.debug("Dropping boundary-state offload for request %s", req_id)
                 continue
+            save_end_tokens = (
+                tracker.token_len
+                if self.save_decode_cache
+                else tracker.prefill_end_tokens
+            )
             accepted: list[BoundaryPut] = []
             for group_id, block_id, boundary_tokens in entries:
-                # Every other group stops saving at the end of this prefill, so
-                # a mamba-only key past it can never complete a joint hybrid
-                # hit. `prefill_end_tokens` — not the original prompt length —
-                # is the boundary: a resumed request re-prefills and re-saves
-                # its previously generated tokens for every group.
-                if boundary_tokens > tracker.prefill_end_tokens:
+                # Match the other groups' save range, including decode only
+                # when enabled. Resumed prefill includes replayed output.
+                if boundary_tokens > save_end_tokens:
                     continue
                 if block_id == NULL_BLOCK_ID:
                     continue

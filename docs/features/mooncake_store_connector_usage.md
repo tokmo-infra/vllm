@@ -74,6 +74,19 @@ Set the config path via environment variable:
 export MOONCAKE_CONFIG_PATH=/path/to/mooncake_config.json
 ```
 
+### Recovering from Store pressure and expired read leases
+
+When a PUT returns `-200` (no available handle), affected requests pause further
+saves. Each sending thread permits at most one recovery probe per second while
+pressure persists; a successful PUT reopens the gate. Probes use the current
+job's pinned blocks, and failed or skipped ranges are not marked as saved.
+
+When a GET returns `-707` (expired read lease), the connector issues one fresh
+GET for only those keys, using the same destination buffers. Other errors and
+a failed retry retain the normal KV-load failure handling. Initial GET metrics
+and `load_get_retry` metrics are recorded separately. No additional configuration
+is required.
+
 ## Usage
 
 ### Single-Node KV Cache Offloading
@@ -154,6 +167,61 @@ Store. It also covers prompt KV delivered directly by `MooncakeConnector`.
     }
 }
 ```
+
+#### Compact partial MLA attention blocks
+
+`kv_connector_extra_config.compact_partial_blocks` defaults to enabled for
+rank-local MLA groups without heterogeneous Store TP or HiSparse, including
+non-DCP TP/DP/DEP deployments and DCP-sharded MLA groups.
+Set it to `false` to retain full-page Store values. Other layouts and groups
+keep the legacy format when the option is omitted; explicitly forcing `true`
+still rejects incompatible configurations. The compact Store format requires
+rank-complete hash boundaries and compatible manager-block views. Automatic
+selection checks the resolved block/hash sizes and DCP interleave, and falls
+back to the legacy layout and key namespace if registration finds incompatible
+views. Explicit `true` keeps these compatibility errors strict.
+
+The compact Store format requires
+dense, single-head MLA views. A partial-prefix key
+stores only its valid token rows from **every layer and every DCP rank**,
+including quantization scales and indexer bytes. Full-block values retain every
+valid row byte, and Mamba checkpoint contents are not shortened. This does not
+change KV precision or the physical GPU page size.
+
+The reader uses the stored key's boundary, including any lookahead proof,
+not merely the requested hit length. The format and a layout signature have
+separate key namespaces; legacy readers cannot consume these values. Use the
+same setting and compatible layouts on producers and consumers.
+Full and partial values both concatenate layer/state views in their stable
+logical registration order, not GPU-address order; physical page padding is not
+part of this wire format. The `partial_layout_v2` signature includes the ordered
+logical shapes and dtypes but not pool block counts, storage offsets or page
+strides. Compatible values can therefore be reused across different allocation
+sizes and physical layouts. This version deliberately uses different keys from
+the earlier `partial_layout` format, including for full-page values.
+
+This option requires manager-block dense `[blocks, 1, local_tokens, bytes]`
+views. With DCP greater than one, the hash unit must be divisible by
+`DCP * cp_kv_cache_interleave_size`; without DCP the rows are not context-sharded.
+EP does not change the MLA byte extent or remove required Mamba state. Existing
+pure-MLA TP replica deduplication remains unchanged; DP replicas do not increase
+its replication factor. Non-DCP compact values use `mla_partial_v1`, while
+the existing DCP `dcp_partial_v1` namespace is preserved.
+
+Space savings require a legal partial boundary inside a manager block. When the
+hash unit equals the manager-block size, values remain full-sized and this
+option produces no additional savings. It does not reduce the matching unit
+or enlarge the GPU KV pool. Heterogeneous-TP sharing and HiSparse
+host layouts are unsupported. Shortened values may use more transfer segments;
+measure actual Store bytes and transfer latency before enabling it in production.
+Unsupported shapes, overlapping manager blocks and padded token rows fail
+registration rather than guessing a byte extent. Grouped padded kernel-block
+views are not supported. The MC selective-lease helper is refreshed after
+registration so probe, lease and load use the same layout-signed namespace.
+当前分支的小批实际存储、回读与性能限制见
+[Kimi MC 验证记录](../../docker/kimi31-mc/VALIDATION.zh-CN.md)。
+本分支按用户要求默认启用适用布局的裁剪，保留显式关闭开关；
+实测节省空间不代表所有负载、所有延迟分位数均无回退。
 
 #### Sharing one Store across multiple Prefill TP sizes
 
@@ -264,7 +332,38 @@ Strict isolation requires a Mooncake master started with `--enable_multi_tenants
 | `MOONCAKE_PREFERRED_SEGMENT` | Pin this rank's replicas to a specific owner segment (`host:port`); used in `standalone-store` mode | — |
 | `MOONCAKE_REQUESTER_LOCAL_HOSTNAME` | Override the hostname the vLLM rank registers with Mooncake as a requester. Defaults to the rank's resolved IP. | — |
 | `VLLM_MOONCAKE_STORE_TIER_LOG` | When `1`, logs a per-batch tier summary (memory vs disk hits) for observability | disabled |
+| `VLLM_MOONCAKE_STORE_SELECTIVE_LEASE` | Probe prefix candidates without leasing them, then lease only the keys the selected hit loads. Requires SDK `batch_probe_key` support. | disabled in generic vLLM; enabled in the Kimi MC runtime image |
 | `VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO` | Fraction of the owner's DirectIO staging buffer that the requester will fill in a single `batch_get_into_multi_buffers` call. Lower → more conservative pre-split, more round trips. | 0.9 |
+
+### Selective read leases
+
+Set `VLLM_MOONCAKE_STORE_SELECTIVE_LEASE=1` to leave unused history evictable:
+lookups probe all candidate keys without granting leases, then lease only the
+selected hit's load mask across every rank namespace. This excludes old Mamba
+states and sliding-window blocks outside the load window. The default remains
+the existing `batch_is_exist` lookup. Enabling the flag without SDK
+`batch_probe_key` support fails at worker initialization.
+
+If a key disappears between probe and lease, the hit is recomputed and leased
+again, for at most two lease rounds. An RPC error or continuing eviction reports
+a cache miss, never an unleased hit. This does not extend native lease lifetimes:
+GET error `-707` still triggers exactly one fresh GET for only the expired keys.
+PUT allocation-pressure recovery retains its per-sending-thread rate limit.
+
+边界 checkpoint 的 PUT 若返回空间分配错误 `-200`，会保留原失败指标，
+仅对该错误的失败 key 等待 50 毫秒后补存一次；成功 key、其它错误及异常不重发。
+补存复用原 job 仍固定的状态块，等待后核验 job 存活，不重新查询可能已复用的块表。
+持续压力下复用每发送线程一秒的 probe 节流，避免每个新请求都等待；成功恢复后
+清除压力状态。正常成功路径和普通 MLA PUT 不增加 RPC 或等待。
+补存另记 `save_put_retry`（成功、部分失败或异常），不隐藏原始失败。
+容量始终不足时仍返回未保存，不能据此承诺无条件命中或无条件 98%。
+
+The `kimi-3.1-1110-mc` branch pins the CUDA 13 Mooncake SDK to `0.3.14rc3`
+release wheels for Linux x86_64/aarch64 and Python 3.12. This replaces, rather
+than co-installs with, the plain `mooncake-transfer-engine` requirement, since
+both distributions provide the `mooncake` Python package. CUDA 12 and ROCm
+requirements remain separate. The source changes do not establish native
+CUDA/SDK binary reproducibility; validate the deployed image separately.
 
 ## KV Transfer Config
 

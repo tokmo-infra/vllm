@@ -10,6 +10,7 @@ import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     ChunkedTokenDatabase,
+    DCPPartialStoreLayout,
     KeyMetadata,
     LBHNCStoreLayout,
     LBNHCStoreLayout,
@@ -150,6 +151,363 @@ def test_rank_local_layout_skips_block_padding():
         [view.data_ptr() + page for view in views],
         [state] * num_layers,
     )
+
+
+def _dcp_partial_layout(
+    raw,
+    *,
+    rank=0,
+    tp_rank=None,
+    interleave=1,
+    widths=(4, 8, 12),
+    dtypes=None,
+    dcp_size=8,
+    block_size=128,
+    hash_block_size=32,
+):
+    rows = block_size // dcp_size
+    stride = rows * sum(widths) + 16
+    views = []
+    offset = 0
+    for width in widths:
+        views.append(
+            raw.as_strided(
+                (3, 1, rows, width), (stride, rows * width, width, 1), offset
+            )
+        )
+        offset += rows * width
+    if dtypes is not None:
+        views = [view.view(dtype) for view, dtype in zip(views, dtypes, strict=True)]
+    layout = DCPPartialStoreLayout(
+        KeyMetadata("test-model", rank if tp_rank is None else tp_rank, 0, rank, 0),
+        block_size,
+        hash_block_size,
+        dcp_size=dcp_size,
+        dcp_rank=rank,
+        interleave=interleave,
+    )
+    layout.register_kv_caches(views, 3)
+    return layout, views
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("rank", range(8))
+@pytest.mark.parametrize("interleave", [1, 2])
+@pytest.mark.parametrize("boundary", [32, 64, 96, 128])
+@pytest.mark.parametrize("widths", [(4, 8, 12), (352, 4, 8)])
+def test_partial_dcp_values_roundtrip_every_valid_row(
+    rank, interleave, boundary, widths
+):
+    """All layer/scales bytes return; uncached rows and other slots do not."""
+    stride = 16 * sum(widths) + 16
+    raw = torch.arange(3 * stride, dtype=torch.int64).to(torch.uint8)
+    destination = torch.full_like(raw, 197)
+    writer, source_views = _dcp_partial_layout(
+        raw, rank=rank, interleave=interleave, widths=widths
+    )
+    reader, target_views = _dcp_partial_layout(
+        destination, rank=rank, interleave=interleave, widths=widths
+    )
+    addrs, sizes = writer.prepare_value_for_block(1, num_tokens=boundary)
+    targets, target_sizes, ids = reader.prepare_values(
+        [(128, 128 + boundary)], [0, 1, 2], [0]
+    )
+    assert sizes == target_sizes[0] and ids == [1]
+    assert sum(sizes) == boundary // 8 * sum(widths)
+    saved = [ctypes.string_at(addr, size) for addr, size in zip(addrs, sizes)]
+    for addr, data in zip(targets[0], saved):
+        ctypes.memmove(addr, data, len(data))
+    rows = boundary // 8
+    for source, target in zip(source_views, target_views):
+        assert torch.equal(target[1, :, :rows], source[1, :, :rows])
+        assert torch.all(target[1, :, rows:] == 197)
+        assert torch.all(target[0] == 197) and torch.all(target[2] == 197)
+    assert torch.all(destination[2 * stride - 16 : 2 * stride] == 197)
+    assert writer.key_for(0, b"hash") == reader.key_for(0, b"hash")
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "block_size,hash_block_size,boundary",
+    [(128, 32, 32), (128, 32, 96), (128, 32, 128), (32, 32, 32)],
+    ids=["quarter-tail", "three-quarter-tail", "full-page", "block-equals-hash"],
+)
+@pytest.mark.parametrize(
+    "widths,dtypes",
+    [
+        ((4, 8, 12), (torch.uint8,) * 3),
+        ((352, 4, 8), (torch.uint8, torch.float32, torch.float32)),
+    ],
+    ids=["dense-u8", "nvfp4-scale-f32"],
+)
+def test_partial_dcp1_roundtrip_preserves_rows_scales_and_replica_namespace(
+    block_size, hash_block_size, boundary, widths, dtypes
+):
+    """Independent replicas keep every valid row byte, not block padding."""
+    stride = block_size * sum(widths) + 16
+    namespaces, keys = set(), set()
+    for tp_rank in range(4):
+        raw = torch.arange(3 * stride, dtype=torch.int64).to(torch.uint8)
+        destination = torch.full_like(raw, 197)
+        kwargs = dict(
+            tp_rank=tp_rank,
+            widths=widths,
+            dtypes=dtypes,
+            dcp_size=1,
+            block_size=block_size,
+            hash_block_size=hash_block_size,
+        )
+        writer, source_views = _dcp_partial_layout(raw, **kwargs)
+        reader, target_views = _dcp_partial_layout(destination, **kwargs)
+        key = writer.key_for(0, b"hash")
+        assert key == reader.key_for(0, b"hash")
+        assert writer.metadata.store_namespace == reader.metadata.store_namespace
+        namespaces.add(writer.metadata.store_namespace)
+        keys.add(key)
+        writer.register_kv_caches(source_views, 3)
+        assert writer.key_for(0, b"hash") == key
+
+        legacy = RankLocalStoreLayout(
+            KeyMetadata("test-model", tp_rank, 0, 0, 0),
+            block_size,
+            hash_block_size,
+        )
+        legacy.register_kv_caches(source_views, 3)
+        assert legacy.key_for(0, b"hash") != key
+        assert writer.prepare_value_for_block(1) == legacy.prepare_value_for_block(1)
+        full_bytes = sum(legacy.prepare_value_for_block(1)[1])
+        assert full_bytes == block_size * sum(widths)
+
+        addrs, sizes = writer.prepare_value_for_block(
+            1, num_tokens=block_size + boundary
+        )
+        targets, target_sizes, ids = reader.prepare_values(
+            [(block_size, block_size + boundary)], [0, 1, 2], [0]
+        )
+        assert ids == [1] and sizes == target_sizes[0]
+        saved = [
+            ctypes.string_at(addr, size)
+            for addr, size in zip(addrs, sizes, strict=True)
+        ]
+        assert b"".join(saved) == b"".join(
+            view[1, :, :boundary].contiguous().numpy().tobytes()
+            for view in source_views
+        )
+        stored_bytes = sum(map(len, saved))
+        assert stored_bytes == boundary * sum(widths)
+        if boundary < block_size:
+            assert stored_bytes < full_bytes
+        else:
+            assert stored_bytes == full_bytes
+        for addr, payload in zip(targets[0], saved, strict=True):
+            ctypes.memmove(addr, payload, len(payload))
+        for source, target in zip(source_views, target_views, strict=True):
+            source_bytes, target_bytes = (
+                source.view(torch.uint8),
+                target.view(torch.uint8),
+            )
+            assert torch.equal(
+                target_bytes[1, :, :boundary], source_bytes[1, :, :boundary]
+            )
+            assert torch.all(target_bytes[1, :, boundary:] == 197)
+            assert torch.all(target_bytes[0] == 197)
+            assert torch.all(target_bytes[2] == 197)
+        for slot in range(3):
+            assert torch.all(
+                destination[(slot + 1) * stride - 16 : (slot + 1) * stride] == 197
+            )
+    assert len(namespaces) == 1
+    assert len(keys) == 4
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "boundary", [4, 8, None], ids=["partial", "full", "default-full"]
+)
+@pytest.mark.parametrize("dcp_size", [1, 4])
+@pytest.mark.parametrize("packed_source", [False, True])
+def test_partial_dcp_wire_preserves_logical_order_across_allocations(
+    boundary, dcp_size, packed_source
+):
+    """Store bytes follow layers, not sender/receiver address order."""
+    num_blocks, block_size, width = 3, 8, 4
+    rows = block_size // dcp_size
+    shape = (num_blocks, 1, rows, width)
+    if packed_source:
+        raw = torch.full((num_blocks, 2, 1, rows, width), 197, dtype=torch.uint8)
+        source = [raw[:, 1], raw[:, 0]]
+    else:
+        source = sorted(
+            [torch.empty(shape, dtype=torch.uint8) for _ in range(2)],
+            key=lambda cache: cache.data_ptr(),
+        )
+    target = sorted(
+        [torch.full(shape, 197, dtype=torch.uint8) for _ in range(2)],
+        key=lambda cache: cache.data_ptr(),
+        reverse=True,
+    )
+    for index, cache in enumerate(source):
+        cache.fill_(11 * (index + 1))
+
+    layouts = []
+    for caches in (source, target):
+        layout = DCPPartialStoreLayout(
+            KeyMetadata("test-model", 0, 0, 0, 0),
+            block_size,
+            4,
+            dcp_size=dcp_size,
+            dcp_rank=0,
+            interleave=1,
+        )
+        layout.register_kv_caches(caches, num_blocks)
+        layouts.append(layout)
+    writer, reader = layouts
+    assert writer.key_for(0, b"hash") == reader.key_for(0, b"hash")
+    addrs, sizes = writer.prepare_value_for_block(1, num_tokens=boundary)
+    end = block_size if boundary is None else boundary
+    targets, target_sizes, ids = reader.prepare_values(
+        [(block_size, block_size + end)], [0, 1, 2], [0]
+    )
+    assert ids == [1]
+    saved = b"".join(
+        ctypes.string_at(addr, size) for addr, size in zip(addrs, sizes, strict=True)
+    )
+    valid_rows = end // dcp_size
+    expected = b"".join(
+        cache[1, :, :valid_rows].contiguous().numpy().tobytes() for cache in source
+    )
+    assert saved == expected
+    offset = 0
+    for addr, size in zip(targets[0], target_sizes[0], strict=True):
+        ctypes.memmove(addr, saved[offset : offset + size], size)
+        offset += size
+    assert offset == len(saved)
+    for src, dst in zip(source, target, strict=True):
+        assert torch.equal(src[1, :, :valid_rows], dst[1, :, :valid_rows])
+        assert torch.all(dst[1, :, valid_rows:] == 197)
+        assert torch.all(dst[0] == 197) and torch.all(dst[2] == 197)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "boundary", [4, 8, None], ids=["partial", "full", "default-full"]
+)
+def test_partial_dcp_namespace_ignores_page_count_and_allocation_padding(boundary):
+    """The same logical wire format survives GPU pool size/layout changes."""
+    keys, payloads = set(), []
+    for num_blocks, padding in ((2, 0), (5, 16)):
+        rows, width = 8, 4
+        stride = rows * width + padding
+        raw = torch.full((2 * num_blocks * stride,), 197, dtype=torch.uint8)
+        caches = [
+            raw.as_strided(
+                (num_blocks, 1, rows, width),
+                (stride, rows * width, width, 1),
+                layer * num_blocks * stride,
+            )
+            for layer in range(2)
+        ]
+        for index, cache in enumerate(caches):
+            cache.fill_(11 * (index + 1))
+        layout = DCPPartialStoreLayout(
+            KeyMetadata("test-model", 0, 0, 0, 0),
+            8,
+            4,
+            dcp_size=1,
+            dcp_rank=0,
+            interleave=1,
+        )
+        layout.register_kv_caches(caches, num_blocks)
+        keys.add(layout.key_for(0, b"hash"))
+        addrs, sizes = layout.prepare_value_for_block(1, num_tokens=boundary)
+        payloads.append(
+            b"".join(
+                ctypes.string_at(addr, size)
+                for addr, size in zip(addrs, sizes, strict=True)
+            )
+        )
+    assert len(keys) == 1
+    assert payloads[0] == payloads[1]
+
+
+@pytest.mark.cpu_test
+def test_partial_dcp_namespace_is_stable_but_isolates_legacy_values():
+    raw = torch.zeros(1200, dtype=torch.uint8)
+    layout, views = _dcp_partial_layout(raw)
+    assert layout.metadata.store_namespace.startswith("@partial_layout_v2:")
+    key = layout.key_for(0, b"hash")
+    layout.register_kv_caches(views, 3)
+    assert layout.key_for(0, b"hash") == key
+    legacy = RankLocalStoreLayout(KeyMetadata("test-model", 0, 0, 0, 0), 128, 32)
+    legacy.register_kv_caches(views, 3)
+    assert legacy.key_for(0, b"hash") != key
+    old_partial = RankLocalStoreLayout(
+        KeyMetadata(
+            "test-model",
+            0,
+            0,
+            0,
+            0,
+            store_namespace="@partial_layout:fb966b02c66c38927243e74b",
+        ),
+        128,
+        32,
+    )
+    assert old_partial.key_for(0, b"hash") != key
+    assert sum(legacy.prepare_value_for_block(1)[1]) == 384
+    assert sum(layout.prepare_value_for_block(1, num_tokens=32)[1]) == 96
+    assert layout.prepare_value_for_block(1, num_tokens=128) == (
+        legacy.prepare_value_for_block(1)
+    )
+
+
+@pytest.mark.cpu_test
+def test_partial_dcp_rejects_incomplete_rank_boundaries_and_nonrow_layouts():
+    with pytest.raises(ValueError, match="rank-complete"):
+        DCPPartialStoreLayout(
+            KeyMetadata("model", 0, 0, 0, 0),
+            128,
+            8,
+            dcp_size=8,
+            dcp_rank=0,
+            interleave=2,
+        )
+    layout, _ = _dcp_partial_layout(torch.zeros(1200, dtype=torch.uint8))
+    with pytest.raises(ValueError, match="dense manager-block"):
+        layout.register_kv_caches([torch.zeros(3, 16, 4)], 3)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("kind", ["token_padding", "overlap", "multi_head"])
+def test_partial_dcp_rejects_unsupported_row_strides(kind):
+    layout, _ = _dcp_partial_layout(torch.zeros(1200, dtype=torch.uint8))
+    if kind == "token_padding":
+        cache = torch.zeros(3, 1, 16, 8, dtype=torch.uint8)[..., :4]
+    elif kind == "overlap":
+        cache = torch.zeros(1, 1, 16, 4, dtype=torch.uint8).expand(3, -1, -1, -1)
+    else:
+        cache = torch.zeros(3, 2, 16, 4, dtype=torch.uint8)
+    with pytest.raises(ValueError, match="dense manager-block"):
+        layout.register_kv_caches([cache], 3)
+
+
+@pytest.mark.cpu_test
+def test_partial_dcp_keys_isolate_interleave_and_hash_units():
+    raw = torch.zeros(1200, dtype=torch.uint8)
+    layout, views = _dcp_partial_layout(raw)
+    keys = {layout.key_for(0, b"hash")}
+    for hash_size, interleave in [(64, 1), (32, 2)]:
+        other = DCPPartialStoreLayout(
+            KeyMetadata("test-model", 0, 0, 0, 0),
+            128,
+            hash_size,
+            dcp_size=8,
+            dcp_rank=0,
+            interleave=interleave,
+        )
+        other.register_kv_caches(views, 3)
+        keys.add(other.key_for(0, b"hash"))
+    assert len(keys) == 3
 
 
 @pytest.mark.parametrize(
