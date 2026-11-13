@@ -19,8 +19,13 @@
       "base_sha256": null
     },
     {
+      "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py",
+      "sha256": "0bc29eefda09e28c1f9582b5796b03dcfb8103fcb0b532d76d3d852033c44e2d",
+      "base_sha256": "042e9b097c7880ac93239a87ebdfc782897ef5add96860afbb1cd13fb32c5c2e"
+    },
+    {
       "path": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py",
-      "sha256": "a5c75405d6b6f4e0c568ffb00c37abb6291759aaef29ffa658a86284641a7f13",
+      "sha256": "dadbc7e95b4f6e9639968ed20ca3e58823d25f744c08dc2595c890c2979afb5f",
       "base_sha256": "892af8c84b949651618d90edffd6b52f858f8a43f470efd6216224a5f835c149"
     },
     {

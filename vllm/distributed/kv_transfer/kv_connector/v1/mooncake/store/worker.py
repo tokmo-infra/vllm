@@ -17,6 +17,7 @@ import queue
 import socket
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager
@@ -2598,6 +2599,10 @@ class LookupKeyServer:
 # Lookup Key Client
 # ============================================================
 
+_LOOKUP_RESULT_TTL_S = 1.0
+_LOOKUP_RESULT_CACHE_SIZE = 1024
+_LookupInput = tuple[int, tuple[BlockHash, ...]]
+
 
 class LookupKeyClient:
     """ZMQ client for the LookupKey admin channel.
@@ -2622,6 +2627,10 @@ class LookupKeyClient:
             max_workers=1, thread_name_prefix="MooncakeLookupClient"
         )
         self.futures: dict[str, Future[MooncakeLookupResult]] = {}
+        self._lookup_inputs: dict[str, tuple[_LookupInput, float]] = {}
+        self._lookup_results: OrderedDict[
+            str, tuple[_LookupInput, float, MooncakeLookupResult]
+        ] = OrderedDict()
 
     def _lookup(
         self, num_tokens: int, block_hashes: list[BlockHash]
@@ -2644,27 +2653,60 @@ class LookupKeyClient:
         block_hashes: list[BlockHash],
         non_block: bool = False,
     ) -> MooncakeLookupResult | None:
-        """If non_block is True, will return None until the result is ready,
-        so the caller retries on a later step."""
+        """Poll asynchronously and briefly reuse results during allocation waits.
+
+        Both hits and misses expire: keys may be evicted or newly published.
+        Hits remain advisory; the receive path must still validate every GET.
+        """
+        inputs = (num_tokens, tuple(block_hashes))
+        cached = self._lookup_results.get(req_id)
+        if cached is not None:
+            cached_inputs, expires_at, result = cached
+            if inputs == cached_inputs and time.monotonic() < expires_at:
+                self._lookup_results.move_to_end(req_id)
+                return result
+            self._lookup_results.pop(req_id)
+
         future = self.futures.get(req_id)
+        if future is not None and self._lookup_inputs[req_id][0] != inputs:
+            self.discard(req_id)
+            future = None
         if future is None:
-            future = self.executor.submit(self._lookup, num_tokens, list(block_hashes))
+            # Age from submission, not consumption of a possibly delayed future.
+            expires_at = time.monotonic() + _LOOKUP_RESULT_TTL_S
+            future = self.executor.submit(self._lookup, num_tokens, list(inputs[1]))
+            self._lookup_inputs[req_id] = (inputs, expires_at)
             self.futures[req_id] = future
         if non_block and not future.done():
             return None
         try:
-            return future.result()
+            result = future.result()
         except Exception as e:
             logger.error("Async Mooncake lookup failed for %s: %s", req_id, e)
             return MooncakeLookupResult(0)
+        else:
+            _, expires_at = self._lookup_inputs[req_id]
+            if time.monotonic() < expires_at:
+                self._lookup_results[req_id] = (inputs, expires_at, result)
+                while len(self._lookup_results) > _LOOKUP_RESULT_CACHE_SIZE:
+                    self._lookup_results.popitem(last=False)
+            return result
         finally:
-            del self.futures[req_id]
+            self.futures.pop(req_id, None)
+            self._lookup_inputs.pop(req_id, None)
 
     def discard(self, req_id: str) -> None:
         """Drop any cached/in-flight lookup for ``req_id`` (e.g. on abort)."""
+        self._lookup_results.pop(req_id, None)
+        self._lookup_inputs.pop(req_id, None)
         future = self.futures.pop(req_id, None)
         if future is not None:
             future.cancel()
+
+    def _clear_lookups(self) -> None:
+        self._lookup_results.clear()
+        for req_id in list(self.futures):
+            self.discard(req_id)
 
     def _reset(self) -> bool:
         """Trigger ``store.remove_all(force=True)`` on worker rank 0.
@@ -2679,9 +2721,12 @@ class LookupKeyClient:
         return bytes(resp) == RESP_OK
 
     def reset(self) -> bool:
+        # A NACK or transport error must not preserve pre-reset candidates.
+        self._clear_lookups()
         return self.executor.submit(self._reset).result()
 
     def close(self):
+        self._clear_lookups()
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.socket.close(linger=0)
 

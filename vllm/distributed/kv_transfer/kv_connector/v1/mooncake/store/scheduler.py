@@ -220,12 +220,17 @@ class MooncakeStoreScheduler:
         if not self.enable_lookup:
             return 0, False
 
+        # A refreshed lookup (or changed prefix) must replace the old load plan,
+        # including when the new result is pending or has no external gain.
+        self.load_specs.pop(request.request_id, None)
+
         # Fine-grained hits may land on a hash boundary inside a block; without
         # partial hits, prefixes shorter than one physical block are skipped.
         align = (
             self._hash_block_size if self.enable_partial_hash_hits else self._block_size
         )
         if request.num_tokens < align:
+            self.client.discard(request.request_id)
             return 0, False
 
         lookup_result = self.client.lookup(
@@ -271,6 +276,9 @@ class MooncakeStoreScheduler:
         num_external_tokens: int,
     ):
         """Update state after block allocation."""
+        # The allocation wait is over. A failed GET/recompute or preemption
+        # must query again, rather than reuse this admission's candidate.
+        self.client.discard(request.request_id)
         local_block_ids: tuple[list[int], ...] = ()
         if num_external_tokens > 0:
             local_block_ids = blocks.get_block_ids(
@@ -317,6 +325,7 @@ class MooncakeStoreScheduler:
 
         preempted_ids = scheduler_output.preempted_req_ids or set()
         for req_id in preempted_ids:
+            self.client.discard(req_id)
             self.load_specs.pop(req_id, None)
             if request_tracker := self._request_trackers.get(req_id):
                 request_tracker.reset()
@@ -776,6 +785,7 @@ class MooncakeStoreScheduler:
 
         Returns True on ACK from worker, False on NACK or RPC error.
         """
+        self.load_specs.clear()
         try:
             ok = self.client.reset()
             if ok:

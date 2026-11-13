@@ -1,12 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import threading
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
+from vllm.config import CacheConfig, DeviceConfig, KVTransferConfig, VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
+    protocol,
+    worker,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (
     MooncakeStoreCoordinator,
 )
@@ -23,10 +29,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler impor
     MooncakeStoreScheduler,
     _partial_tail_non_mamba_puts,
 )
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
-from vllm.v1.core.sched.output import KVConnectorBlockState
+from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
+from vllm.v1.core.sched.output import KVConnectorBlockState, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
@@ -34,6 +41,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MambaSpec,
 )
+from vllm.v1.request import Request
 
 
 def _make_bare_scheduler(
@@ -49,6 +57,7 @@ def _make_bare_scheduler(
     scheduler.enable_kv_events = False
     scheduler.lookup_async = False
     scheduler.enable_lookup = True
+    scheduler.client = _StubLookupClient(hit_tokens=0)
     scheduler._capacity_only = False
     scheduler._block_size = 16
     scheduler._hash_block_size = hash_block_size
@@ -928,6 +937,9 @@ class _StubLookupClient:
         self._hit_tokens = hit_tokens
         self.num_tokens: list[int] = []
 
+    def discard(self, req_id: str) -> None:
+        pass
+
     def lookup(
         self,
         req_id: str,
@@ -1765,3 +1777,147 @@ def test_worker_metadata_aggregates_completions_across_ranks():
         MooncakeStoreWorkerMetadata(completed_saves={1: 1, 2: 1})
     )
     assert merged.completed_saves == {1: 2, 2: 1}
+
+
+@pytest.fixture
+def waiting_lookup_scheduler(monkeypatch, request):
+    config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        cache_config=CacheConfig(block_size=16),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="MooncakeStoreConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "lookup_async": getattr(request, "param", False)
+            },
+        ),
+    )
+    cache = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["attention"],
+                FullAttentionSpec(
+                    block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+                ),
+            )
+        ],
+    )
+    socket = MagicMock()
+    socket.recv.return_value = protocol.encode_lookup_response(MooncakeLookupResult(32))
+    monkeypatch.setattr(worker, "make_zmq_socket", lambda *args, **kwargs: socket)
+    now = [100.0]
+    monkeypatch.setattr(worker.time, "monotonic", lambda: now[0])
+    scheduler = MooncakeStoreScheduler(config, cache)
+    request = Request(
+        request_id="waiting",
+        prompt_token_ids=list(range(48)),
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        block_hasher=lambda _: [BlockHash(b"h0"), BlockHash(b"h1"), BlockHash(b"h2")],
+    )
+    try:
+        yield scheduler, request, socket, now
+    finally:
+        scheduler.client.close()
+        scheduler.client.ctx.term()
+
+
+@pytest.mark.cpu_test
+def test_allocation_wait_reuses_lookup_but_recomputes_local_gain(
+    waiting_lookup_scheduler,
+):
+    scheduler, request, socket, _ = waiting_lookup_scheduler
+    for local_tokens in [0, 16] * 16:
+        assert scheduler.get_num_new_matched_tokens(request, local_tokens) == (
+            32 - local_tokens,
+            True,
+        )
+        assert (
+            scheduler.load_specs[request.request_id].vllm_cached_tokens == local_tokens
+        )
+    assert socket.send_multipart.call_count == 1
+    assert scheduler.get_num_new_matched_tokens(request, 32) == (0, False)
+    assert request.request_id not in scheduler.load_specs
+
+
+@pytest.mark.cpu_test
+def test_expired_positive_lookup_cannot_leave_stale_load_spec(waiting_lookup_scheduler):
+    scheduler, request, socket, now = waiting_lookup_scheduler
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (32, True)
+    now[0] += worker._LOOKUP_RESULT_TTL_S
+    socket.recv.return_value = protocol.encode_lookup_response(MooncakeLookupResult(0))
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    assert request.request_id not in scheduler.load_specs
+    assert socket.send_multipart.call_count == 2
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("waiting_lookup_scheduler", [True], indirect=True)
+def test_async_refresh_clears_old_plan_without_duplicate_rpc(waiting_lookup_scheduler):
+    scheduler, request, socket, now = waiting_lookup_scheduler
+    assert (
+        scheduler.client.lookup(request.request_id, 48, request.block_hashes).hit_length
+        == 32
+    )
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (32, True)
+    now[0] += worker._LOOKUP_RESULT_TTL_S
+    gate = threading.Event()
+
+    def recv():
+        assert gate.wait(timeout=5)
+        return protocol.encode_lookup_response(MooncakeLookupResult(0))
+
+    socket.recv.side_effect = recv
+    try:
+        for _ in range(32):
+            assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+            assert request.request_id not in scheduler.load_specs
+        gate.set()
+        assert (
+            scheduler.client.lookup(
+                request.request_id, 48, request.block_hashes
+            ).hit_length
+            == 0
+        )
+        assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+        assert socket.send_multipart.call_count == 2
+    finally:
+        gate.set()
+        scheduler.client.executor.shutdown(wait=True)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "action", ["allocate_hit", "allocate_miss", "finish", "preempt", "reset"]
+)
+def test_lookup_candidate_does_not_survive_admission_lifecycle(
+    waiting_lookup_scheduler, action
+):
+    scheduler, request, socket, _ = waiting_lookup_scheduler
+    old_hit = 0 if action == "allocate_miss" else 32
+    socket.recv.return_value = protocol.encode_lookup_response(
+        MooncakeLookupResult(old_hit)
+    )
+    assert scheduler.get_num_new_matched_tokens(request, 0)[0] == old_hit
+    if action.startswith("allocate"):
+        blocks = KVCacheBlocks(([KVCacheBlock(1), KVCacheBlock(2)],))
+        scheduler.update_state_after_alloc(request, blocks, old_hit)
+    elif action == "reset":
+        socket.recv.return_value = protocol.RESP_OK
+        assert scheduler.reset_store()
+    else:
+        output = SchedulerOutput.make_empty()
+        if action == "finish":
+            # Both normal finish and abort arrive via finished_req_ids.
+            output.finished_req_ids.add(request.request_id)
+        else:
+            output.preempted_req_ids = {request.request_id}
+        scheduler.build_connector_meta(output)
+    new_hit = 32 - old_hit
+    socket.recv.return_value = protocol.encode_lookup_response(
+        MooncakeLookupResult(new_hit)
+    )
+    assert scheduler.get_num_new_matched_tokens(request, 0)[0] == new_hit
+    assert socket.send_multipart.call_count == 2

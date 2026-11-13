@@ -17,12 +17,14 @@ import pytest
 import torch
 
 from tests.v1.attention.utils import dense_kv_cache_views
+from vllm.config import DeviceConfig, KVTransferConfig, VllmConfig
 from vllm.distributed import mooncake_store
 from vllm.distributed.kv_events import KVEventAggregator
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import (
     rdma_utils,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
+    protocol,
     worker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
@@ -5397,3 +5399,175 @@ def test_compact_registration_covers_every_group_layer_and_state_view():
         worker._compact_group_cache_tensors(group, {"layer0": first}, 3)
     with pytest.raises(TypeError, match="non-empty"):
         worker._compact_group_cache_tensors(group, {"layer0": (), "layer1": third}, 3)
+
+
+@pytest.fixture
+def lookup_client(monkeypatch):
+    config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="MooncakeStoreConnector", kv_role="kv_both"
+        ),
+    )
+    socket = MagicMock()
+    socket.recv.return_value = protocol.encode_lookup_response(MooncakeLookupResult(32))
+    monkeypatch.setattr(worker, "make_zmq_socket", lambda *args, **kwargs: socket)
+    now = [100.0]
+    monkeypatch.setattr(worker.time, "monotonic", lambda: now[0])
+    client = worker.LookupKeyClient(config)
+    try:
+        yield client, socket, now
+    finally:
+        client.close()
+        client.ctx.term()
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("hit_tokens", [0, 32])
+def test_lookup_client_reuses_result_while_allocation_waits(lookup_client, hit_tokens):
+    """Repeated admission attempts must not each send the same prefix RPC."""
+    client, socket, _ = lookup_client
+    result = MooncakeLookupResult(hit_tokens, (TailKeyBoundary(0, 32),))
+    socket.recv.return_value = protocol.encode_lookup_response(result)
+    for _ in range(32):
+        assert client.lookup("waiting", 48, [b"h0", b"h1", b"h2"]) == result
+    assert socket.send_multipart.call_count == 1
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("old_hit,new_hit", [(0, 32), (32, 0)])
+def test_lookup_client_refreshes_without_extending_result_lifetime(
+    lookup_client, old_hit, new_hit
+):
+    client, socket, now = lookup_client
+    socket.recv.return_value = protocol.encode_lookup_response(
+        MooncakeLookupResult(old_hit)
+    )
+    assert client.lookup("waiting", 48, [b"h0"]).hit_length == old_hit
+    socket.recv.return_value = protocol.encode_lookup_response(
+        MooncakeLookupResult(new_hit)
+    )
+    now[0] += worker._LOOKUP_RESULT_TTL_S / 2
+    assert client.lookup("waiting", 48, [b"h0"]).hit_length == old_hit
+    now[0] += worker._LOOKUP_RESULT_TTL_S / 2
+    assert client.lookup("waiting", 48, [b"h0"]).hit_length == new_hit
+    assert socket.send_multipart.call_count == 2
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("change_length", [False, True])
+def test_lookup_client_rechecks_changed_prefix(lookup_client, change_length):
+    client, socket, _ = lookup_client
+    hashes = [b"h0", b"h1", b"h2"]
+    assert client.lookup("waiting", 48, hashes).hit_length == 32
+    socket.recv.return_value = protocol.encode_lookup_response(MooncakeLookupResult(0))
+    if not change_length:
+        # Same list, same length and same last hash: compare the whole prefix.
+        hashes[0] = b"xx"
+    assert client.lookup("waiting", 49 if change_length else 48, hashes).hit_length == 0
+    assert socket.send_multipart.call_count == 2
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("discard", [False, True])
+def test_lookup_client_does_not_resurrect_discarded_inflight_result(
+    lookup_client, discard
+):
+    client, socket, _ = lookup_client
+    gate = threading.Event()
+    started = threading.Event()
+    replies = iter([MooncakeLookupResult(32), MooncakeLookupResult(0)])
+
+    def recv():
+        started.set()
+        assert gate.wait(timeout=5)
+        return protocol.encode_lookup_response(next(replies))
+
+    socket.recv.side_effect = recv
+    try:
+        assert client.lookup("waiting", 48, [b"h0"], non_block=True) is None
+        assert started.wait(timeout=5)
+        if discard:
+            client.discard("waiting")
+        hashes = [b"h0"] if discard else [b"h1"]
+        assert client.lookup("waiting", 48, hashes, non_block=True) is None
+        gate.set()
+        assert client.lookup("waiting", 48, hashes).hit_length == 0
+        assert client.lookup("waiting", 48, hashes).hit_length == 0
+        assert socket.send_multipart.call_count == 2
+    finally:
+        gate.set()
+        client.executor.shutdown(wait=True)
+
+
+@pytest.mark.cpu_test
+def test_lookup_client_does_not_rejuvenate_delayed_future(lookup_client):
+    client, socket, now = lookup_client
+    gate = threading.Event()
+
+    def recv():
+        assert gate.wait(timeout=5)
+        return protocol.encode_lookup_response(MooncakeLookupResult(32))
+
+    socket.recv.side_effect = recv
+    try:
+        assert client.lookup("waiting", 48, [b"h0"], non_block=True) is None
+        now[0] += worker._LOOKUP_RESULT_TTL_S
+        gate.set()
+        assert client.lookup("waiting", 48, [b"h0"]).hit_length == 32
+        socket.recv.side_effect = None
+        socket.recv.return_value = protocol.encode_lookup_response(
+            MooncakeLookupResult(0)
+        )
+        assert client.lookup("waiting", 48, [b"h0"]).hit_length == 0
+        assert socket.send_multipart.call_count == 2
+    finally:
+        gate.set()
+        client.executor.shutdown(wait=True)
+
+
+@pytest.mark.cpu_test
+def test_lookup_client_does_not_cache_transport_errors(lookup_client):
+    client, socket, _ = lookup_client
+    socket.recv.side_effect = RuntimeError("lookup failed")
+    assert client.lookup("waiting", 48, [b"h0"]).hit_length == 0
+    socket.recv.side_effect = None
+    assert client.lookup("waiting", 48, [b"h0"]).hit_length == 32
+    assert socket.send_multipart.call_count == 2
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("action", ["discard", "reset", "reset_nack", "reset_error"])
+def test_lookup_client_lifecycle_drops_completed_result(lookup_client, action):
+    client, socket, _ = lookup_client
+    assert client.lookup("waiting", 48, [b"h0"]).hit_length == 32
+    if action == "discard":
+        client.discard("waiting")
+    else:
+        socket.recv.return_value = (
+            protocol.RESP_OK if action == "reset" else protocol.RESP_ERR
+        )
+        if action == "reset_error":
+            socket.recv.side_effect = RuntimeError("reset failed")
+            with pytest.raises(RuntimeError, match="reset failed"):
+                client.reset()
+            socket.recv.side_effect = None
+        else:
+            assert client.reset() is (action == "reset")
+    socket.recv.return_value = protocol.encode_lookup_response(MooncakeLookupResult(0))
+    assert client.lookup("waiting", 48, [b"h0"]).hit_length == 0
+    assert socket.send_multipart.call_count == 2
+    client.close()
+    with pytest.raises(RuntimeError, match="shutdown"):
+        client.lookup("waiting", 48, [b"h0"])
+
+
+@pytest.mark.cpu_test
+def test_lookup_client_result_cache_is_bounded_lru(lookup_client, monkeypatch):
+    client, socket, _ = lookup_client
+    monkeypatch.setattr(worker, "_LOOKUP_RESULT_CACHE_SIZE", 2)
+    for req_id in ("a", "b", "a", "c"):
+        assert client.lookup(req_id, 48, [b"h0"]).hit_length == 32
+    socket.recv.return_value = protocol.encode_lookup_response(MooncakeLookupResult(0))
+    assert client.lookup("b", 48, [b"h0"]).hit_length == 0
+    assert socket.send_multipart.call_count == 4
