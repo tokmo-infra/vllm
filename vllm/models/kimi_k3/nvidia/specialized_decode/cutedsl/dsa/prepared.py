@@ -331,6 +331,14 @@ class PreparedDsa:
                     if sparse_for(b, gathered, heads):
                         rows[b] = "sparse"
             self.cores = {(b, q): rows[b] for b, q in self.shapes}
+            query_chunks = []
+            if self.hisparse_cache is not None:
+                limit = self.hisparse_cache.runtime.queries_per_chunk
+                for b, q in self.shapes:
+                    for start in range(0, q, limit):
+                        part = b // q * min(limit, q - start)
+                        if part != b:
+                            query_chunks.append((b, part))
             sharding = dcp_size, self.indexer.dcp_rank
             # The merge's rows are narrower than the top-k: plan both widths.
             merged = self.indexer_stage.local_topk
@@ -344,6 +352,7 @@ class PreparedDsa:
                 *sharding,
                 widths=widths,
                 capacities=prims_ts_rows,
+                query_chunks=query_chunks,
             )
         elif self.dcp == 1:
             self.cores = dict.fromkeys(self.shapes, "flashmla")
@@ -643,21 +652,30 @@ class PreparedDsa:
                     topk = self.indexer_core(projected, batch)
             group = self.impl.index_group
             self.impl.record_logical_topk_ready()
-            slots, valid = group.convert_logical_to_physical_topk(
+            hot = self.hisparse_cache.runtime.hot
+            fi = self.fi
+            assert fi is not None
+
+            def decode(part_q, slots, valid):
+                if join is not None:
+                    join()
+                return fi.decode(
+                    part_q,
+                    hot.attention_cache,
+                    slots,
+                    valid,
+                    hot.block_size,
+                    plan_num_tokens=batch,
+                )
+
+            return group.run_hisparse_decode(
                 self.impl.index_group_index,
+                query,
                 topk[:batch],
                 md,
-                block_stride_rows=None,
+                decode,
                 return_valid_counts=True,
             )
-            if join is not None:
-                join()
-            hot = self.hisparse_cache.runtime.hot
-            assert self.fi is not None
-            latent, lse = self.fi.decode(
-                query, hot.attention_cache, slots, valid, hot.block_size
-            )
-            return latent, lse, valid
         if self.fi is not None:
             kv, stride_rows = self.fi.rows(cache, md.block_size)
             sparse = self.cores[batch, q] == "sparse"

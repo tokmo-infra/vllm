@@ -276,6 +276,16 @@ Strict isolation requires a Mooncake master started with `--enable_multi_tenants
 
 ### kv_connector_extra_config
 
+For SSD reads, `disk_offload_buffer_budget_bytes` can be set in the connector's
+`kv_connector_extra_config` to fit the actual owner's shared staging capacity. It
+must be positive; the default is 1280 MiB. The usable fraction is controlled
+by `VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO`. This budget applies to each
+receiving thread on each rank. Account for concurrent readers and their owner
+distribution when sizing it: giving every rank the entire owner buffer can
+overflow staging. For example, use `134217728` (128 MiB) as a starting budget
+for TP8 readers sharing a 1 GiB owner buffer, then verify the deployment's
+actual concurrent SSD reads.
+
 - `load_async` (bool): Enable asynchronous loading for better compute-I/O overlap. Default: `true`.
 - `lookup_async` (bool): Run the external prefix-cache lookup on a background thread so it never blocks the scheduler step. The request is held until the in-flight lookup completes, then resumed on a later step. Default: `false`.
 - `lookup_rpc_port` (int): Custom port for the ZMQ lookup RPC socket. Default: `0`.

@@ -207,7 +207,7 @@ class IndexerStage:
             seq_lens,
             decode.block_table,
             decode.schedule_metadata,
-            max_model_len=self.max_model_len,
+            max_model_len=max_local_len,
             indices=decode.indices,
         )
         # SM100 DeepGEMM emits bf16 at a 1 KiB row stride (DeepSelect's input).

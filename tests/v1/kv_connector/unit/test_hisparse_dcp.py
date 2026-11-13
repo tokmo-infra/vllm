@@ -11,6 +11,25 @@ from vllm.v1.hisparse.types import SparseKVRowMirror
 pytestmark = pytest.mark.cpu_test
 
 
+def test_kimi_layer_builders_share_one_workspace_without_cross_model_retention():
+    """Kimi creates per-layer builders around a single model-wide top-k tensor."""
+    import gc
+    import weakref
+
+    from vllm.v1.attention.backends.mla.index_group import SparseMLAIndexGroupBuilder
+
+    topk = torch.empty(10, 2048, dtype=torch.int32)
+    builders = [SparseMLAIndexGroupBuilder(topk, 10) for _ in range(24)]
+    workspace = builders[0].hisparse_decode_buffers
+    assert all(b.hisparse_decode_buffers is workspace for b in builders)
+    independent = SparseMLAIndexGroupBuilder(torch.empty_like(topk), 10)
+    assert independent.hisparse_decode_buffers is not workspace
+    topk_ref = weakref.ref(topk)
+    del builders, topk
+    gc.collect()
+    assert topk_ref() is None
+
+
 @pytest.mark.parametrize("interleave", [1, 4, 64])
 def test_localized_topk_is_a_contiguous_prefix_for_sparse_decode(interleave):
     positions = torch.tensor([[7, 0, 65, 9, 1, 520, -1, 64, 511, 3]])
@@ -178,7 +197,8 @@ def test_import_addresses_manager_pages_with_padding(registered_rows, manager_ra
             assert address == registered * stride + offset * row_bytes
 
 
-def test_hybrid_hma_hot_rows_do_not_consume_one_ssm_lease_per_64_rows():
+@pytest.mark.parametrize("hot_rows", [6144, 12288])
+def test_hybrid_hma_hot_rows_do_not_consume_one_ssm_lease_per_64_rows(hot_rows):
     from vllm.config import DeviceConfig, VllmConfig
     from vllm.config.attention import HiSparseConfig
     from vllm.v1.core.kv_cache_planning import (
@@ -265,16 +285,24 @@ def test_hybrid_hma_hot_rows_do_not_consume_one_ssm_lease_per_64_rows():
     )
     regular = planned_regular
     config = ResolvedHiSparseConfig(
-        top_k=2048, device_buffer_size=12288, max_union_rows=10240
+        top_k=2048, device_buffer_size=hot_rows, max_union_rows=min(hot_rows, 10240)
     )
     groups = _lay_out_dcp_groups(sources, indexers, regular, config)
+    state_groups = [
+        g
+        for g in groups
+        if isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs)
+        and isinstance(g.kv_cache_spec.first_spec, MambaSpec)
+    ]
+    assert len(state_groups) == 9
+    assert sorted(len(g.layer_names) for g in state_groups) == [5] + [8] * 8
     assert groups[0].host_resident and groups[0].kv_cache_spec.block_size == 64
     assert groups[1].kv_cache_spec.block_size == 4096
     resident, hot = groups[2:4]
     assert resident.kv_cache_spec.block_size == 64
     assert isinstance(hot.kv_cache_spec, HiSparseHotSpec)
     assert hot.kv_cache_spec.block_size == 768
-    assert hot.kv_cache_spec.blocks_per_request == 16
+    assert hot.kv_cache_spec.blocks_per_request == hot_rows // 768
     quantum = _get_kv_cache_bytes_per_block(groups[1:], KVCacheLayout.BLHNC)
     assert quantum == 6893568
     assert hot.kv_cache_spec.blocks_per_request * quantum < 110 * 2**20
@@ -289,7 +317,7 @@ def test_hybrid_hma_hot_rows_do_not_consume_one_ssm_lease_per_64_rows():
     assert second[3].kv_cache_spec.block_size == 768
     # Worker spec discovery precedes the engine's physical-layout resolution.
     early = VllmConfig(device_config=DeviceConfig(device="cpu"))
-    early.attention_config.hisparse_config = HiSparseConfig(device_buffer_size=12288)
+    early.attention_config.hisparse_config = HiSparseConfig(device_buffer_size=hot_rows)
     early.parallel_config.decode_context_parallel_size = 8
     early.scheduler_config.disable_hybrid_kv_cache_manager = False
     early_groups = get_hisparse_kv_cache_groups(
@@ -298,7 +326,7 @@ def test_hybrid_hma_hot_rows_do_not_consume_one_ssm_lease_per_64_rows():
     assert early.cache_config.kv_cache_layout is None
     assert early_groups is not None
     assert early_groups[1].kv_cache_spec.block_size == 4096
-    assert early_groups[3].kv_cache_spec.blocks_per_request == 16
+    assert early_groups[3].kv_cache_spec.blocks_per_request == hot_rows // 768
 
     from vllm.v1.core.kv_cache_manager import KVCacheManager
     from vllm.v1.core.kv_cache_utils import (
@@ -359,6 +387,69 @@ def test_hybrid_hma_hot_rows_do_not_consume_one_ssm_lease_per_64_rows():
     manager.free(request)
     assert coordinator.host_manager.block_pool.get_num_free_blocks() == 4095
     assert manager.block_pool.get_num_free_blocks() == 255
+
+
+@pytest.mark.parametrize("dcp", [1, 8])
+def test_small_hot_q5_requires_dcp_query_chunking(dcp):
+    from vllm.config import DeviceConfig, SpeculativeConfig, VllmConfig
+    from vllm.config.attention import HiSparseConfig
+    from vllm.v1.hisparse.runtime import ResolvedHiSparseConfig
+
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    config.speculative_config = SpeculativeConfig(
+        method="ngram",
+        num_speculative_tokens=4,
+        prompt_lookup_min=1,
+        prompt_lookup_max=5,
+    )
+    config.parallel_config.decode_context_parallel_size = dcp
+    config.attention_config.hisparse_config = HiSparseConfig(device_buffer_size=6144)
+    if dcp == 1:
+        with pytest.raises(ValueError, match="expected at least 10240"):
+            ResolvedHiSparseConfig.from_vllm_config(config, 2048)
+    else:
+        resolved = ResolvedHiSparseConfig.from_vllm_config(config, 2048)
+        assert resolved is not None
+        assert resolved.device_buffer_size == resolved.max_union_rows == 6144
+
+
+@pytest.mark.parametrize("world", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("interleave", [1, 4, 64])
+@pytest.mark.parametrize("length", [0, 1, 63, 64, 65, 130001, 1048576, 1048577])
+def test_decode_logits_width_covers_every_local_shard(length, world, interleave):
+    from vllm.v1.attention.ops.cp_common import max_dcp_local_seq_len
+
+    expected = max(
+        HiSparseDCPShard(world, rank, interleave).count_before(length)
+        for rank in range(world)
+    )
+    assert max_dcp_local_seq_len(length, world, interleave) == expected
+    if world == 8 and interleave == 1 and length == 1048576:
+        assert expected == 131072
+
+
+@pytest.mark.parametrize("lengths", [(5, 5), (1, 5, 2, 4, 3), (5, 3), (1,), (7, 2)])
+@pytest.mark.parametrize("limit", [1, 2, 3])
+def test_query_chunks_preserve_all_tokens_and_bound_each_request(lengths, limit):
+    from vllm.v1.hisparse.dcp import query_chunk_rows
+
+    requests = [r for r, count in enumerate(lengths) for _ in range(count)]
+    chunks = query_chunk_rows(len(requests), max(lengths), limit)
+    assert sorted(row for chunk in chunks for row in chunk) == list(
+        range(len(requests))
+    )
+    for chunk in chunks:
+        for r in range(len(lengths)):
+            assert sum(requests[row] == r for row in chunk) <= limit
+    # Five disjoint top-2048 selections concentrated on one rank exceed6144.
+    # Each chunk still retains every selected row, with at most3queries per request.
+    selected = [
+        set(range(row * 2048, (row + 1) * 2048)) for row in range(len(requests))
+    ]
+    for chunk in chunks:
+        for r in range(len(lengths)):
+            union = set().union(*(selected[row] for row in chunk if requests[row] == r))
+            assert len(union) <= limit * 2048
 
 
 def test_hot_view_preserves_row_stride_with_partial_lease_padding():

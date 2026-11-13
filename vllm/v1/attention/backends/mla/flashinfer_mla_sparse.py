@@ -965,6 +965,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         valid_counts: torch.Tensor,
         layer: AttentionLayer,
         block_size: int,
+        plan_num_tokens: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Sparse MLA of every row of ``q`` [T, H, 576] (E4M3, quantized by the
         layer with ``q_scale``) over its ``valid_counts`` leading physical rows
@@ -996,7 +997,8 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         for start in range(0, num_tokens, buckets[-1]):
             end = min(num_tokens, start + buckets[-1])
             n = end - start
-            capacity = buckets[bisect.bisect_left(buckets, n)]
+            planned_n = min(plan_num_tokens or n, buckets[-1])
+            capacity = buckets[bisect.bisect_left(buckets, max(n, planned_n))]
             plan, qo_indptr = plans[capacity]
             if n < capacity:
                 qo_indptr = qo_indptr.clamp(max=n)
@@ -1100,6 +1102,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         block_size: int,
         is_decode: bool,
         return_lse: bool | None = None,
+        plan_num_tokens: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if return_lse is None:
             return_lse = self.need_to_return_lse_for_decode
@@ -1112,7 +1115,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
 
         if self.use_prims_ts:
             return self._forward_prims_ts(
-                q, kv_cache, topk_indices, seq_lens, layer, block_size
+                q, kv_cache, topk_indices, seq_lens, layer, block_size, plan_num_tokens
             )
 
         self._prepare_mqa_kernel(layer, q.device)

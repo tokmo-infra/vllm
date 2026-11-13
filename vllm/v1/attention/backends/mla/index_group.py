@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
+from torch.utils.weak import WeakIdKeyDictionary
 
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig
@@ -172,6 +173,7 @@ class HiSparseMLAIndexGroup(SparseMLAIndexGroup):
     prefill_ready_events: list[torch.Event] = field(default_factory=list)
     dcp_size: int = 1
     dcp_rank: int = 0
+    decode_buffers: dict[tuple, torch.Tensor] = field(default_factory=dict)
 
     def _current_stream(self) -> Any:
         return torch.accelerator.current_stream()
@@ -235,10 +237,27 @@ class HiSparseMLAIndexGroup(SparseMLAIndexGroup):
         *,
         block_stride_rows: int | None,
         return_valid_counts: bool,
+        row_indices: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         cache = self.cache(layer_index)
         num_tokens = logical_topk_indices.shape[0]
-        req_id_per_token = attn_metadata.req_id_per_token[:num_tokens]
+        num_valid_rows = attn_metadata.query_start_loc[-1:]
+        if row_indices is None:
+            req_id_per_token = attn_metadata.req_id_per_token[:num_tokens]
+        else:
+            source_ids = attn_metadata.req_id_per_token
+            req_id_per_token = (
+                source_ids.index_select(
+                    0, row_indices.clamp(max=source_ids.numel() - 1)
+                )
+                if source_ids.numel()
+                else torch.full_like(row_indices, -1)
+            )
+            num_valid_rows = (
+                (row_indices < num_valid_rows).sum(dtype=torch.int32).view(1)
+            )
+            # A later chunk may recycle hot rows used by the previous attention.
+            cache.runtime.index_group.copy_stream.wait_stream(self._current_stream())
         if self.dcp_size > 1:
             if (
                 cache.num_decode_tokens < cache.num_actual_tokens
@@ -277,8 +296,89 @@ class HiSparseMLAIndexGroup(SparseMLAIndexGroup):
             logical_topk_indices=logical_topk_indices,
             block_size=attn_metadata.block_size,
             return_valid_counts=return_valid_counts,
-            num_valid_rows=attn_metadata.query_start_loc[-1:],
+            num_valid_rows=num_valid_rows,
         )
+
+    def run_hisparse_decode(
+        self,
+        layer_index,
+        query,
+        logical_topk_indices,
+        attn_metadata,
+        decode,
+        *,
+        return_valid_counts=False,
+    ):
+        """Materialize and attend each query chunk before recycling its hot rows."""
+        from vllm.v1.hisparse.dcp import query_chunk_rows
+
+        runtime = self.cache(layer_index).runtime
+        n = logical_topk_indices.shape[0]
+        q = max(attn_metadata.decode_max_query_len, 1)
+        limit = runtime.queries_per_chunk
+        if q <= limit:
+            slots, valid = self.convert_logical_to_physical_topk(
+                layer_index,
+                logical_topk_indices,
+                attn_metadata,
+                block_stride_rows=None,
+                return_valid_counts=True,
+            )
+            result = decode(query, slots, valid)
+            return (*result, valid) if return_valid_counts else result
+
+        key = n, q
+        indices = runtime.query_chunk_indices.get(key)
+        if indices is None:
+            indices = [
+                torch.tensor(
+                    rows, dtype=torch.int64, device=logical_topk_indices.device
+                )
+                for rows in query_chunk_rows(n, q, limit)
+                if rows
+            ]
+            runtime.query_chunk_indices[key] = indices
+        out = lse = counts = None
+
+        def assembled_buffer(kind, value):
+            key = kind, value.shape[1:], value.dtype, value.device
+            buffer = self.decode_buffers.get(key)
+            if buffer is None:
+                buffer = value.new_empty((runtime.max_swap_rows, *value.shape[1:]))
+                self.decode_buffers[key] = buffer
+            assert n <= buffer.shape[0]
+            return buffer[:n]
+
+        for rows in indices:
+            part_topk = logical_topk_indices.index_select(0, rows)
+            slots, valid = self.convert_logical_to_physical_topk(
+                layer_index,
+                part_topk,
+                attn_metadata,
+                block_stride_rows=None,
+                return_valid_counts=True,
+                row_indices=rows,
+            )
+            part_q = (
+                tuple(t.index_select(0, rows) for t in query)
+                if isinstance(query, tuple)
+                else query.index_select(0, rows)
+            )
+            part_out, part_lse = decode(part_q, slots, valid)
+            if out is None:
+                out = assembled_buffer("output", part_out)
+                if part_lse is not None:
+                    lse = assembled_buffer("lse", part_lse)
+                if return_valid_counts:
+                    counts = assembled_buffer("counts", valid)
+            out.index_copy_(0, rows, part_out)
+            if part_lse is not None:
+                assert lse is not None
+                lse.index_copy_(0, rows, part_lse)
+            if counts is not None:
+                counts.index_copy_(0, rows, valid)
+        assert out is not None
+        return (out, lse, counts) if return_valid_counts else (out, lse)
 
     def stage_prefill_rows(
         self, layer_index: int, kv_cache: torch.Tensor, attn_metadata: Any
@@ -363,6 +463,10 @@ class HiSparseMLAIndexGroup(SparseMLAIndexGroup):
 class SparseMLAIndexGroupBuilder:
     """Assign sparse MLA layers to their index-producing layer."""
 
+    _decode_workspaces: ClassVar[
+        WeakIdKeyDictionary[torch.Tensor, dict[tuple, torch.Tensor]]
+    ] = WeakIdKeyDictionary()
+
     def __init__(
         self, logical_topk_indices: torch.Tensor, max_decode_rows: int | None = None
     ) -> None:
@@ -373,6 +477,9 @@ class SparseMLAIndexGroupBuilder:
             else max_decode_rows
         )
         self.current_group: SparseMLAIndexGroup | None = None
+        self.hisparse_decode_buffers = self._decode_workspaces.setdefault(
+            logical_topk_indices, {}
+        )
 
     def register_layer(
         self,
@@ -408,6 +515,10 @@ class SparseMLAIndexGroupBuilder:
                 physical_topk_ready=torch.Event(),
                 has_indexer=is_index_producing_layer,
             )
+            if isinstance(self.current_group, HiSparseMLAIndexGroup):
+                # DCP consumes each layer's output before the next layer. Share
+                # fixed-capacity assembly storage across layers and graph sizes.
+                self.current_group.decode_buffers = self.hisparse_decode_buffers
         group = self.current_group
         group_index = group.register_layer(
             vllm_config,

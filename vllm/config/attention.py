@@ -27,6 +27,8 @@ class HiSparseConfig:
     Defaults to one top-k per decode query plus one top-k of LRU slack. The
     physical allocation is rounded up to the GPU cache block size selected
     from the active backends.
+    Under DCP, a buffer smaller than the joint verification top-k processes
+    queries in chunks while retaining each query's complete selection.
     """
 
     eager_host_mirror: bool = True

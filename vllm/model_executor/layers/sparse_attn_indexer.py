@@ -3,6 +3,7 @@
 """Custom Sparse Attention Indexer layers."""
 
 import math
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import torch
@@ -60,6 +61,7 @@ from vllm.utils.torch_utils import (
 )
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.attention.ops.cp_common import max_dcp_local_seq_len
 from vllm.v1.attention.ops.dcp_topk_merge import (
     dcp_topk_merge_fits,
     init_dcp_topk_merge,
@@ -67,6 +69,11 @@ from vllm.v1.attention.ops.dcp_topk_merge import (
 )
 from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
 from vllm.v1.worker.workspace import current_workspace_manager
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.attention.sparse_mla_attention import (
+        SparseMLACommonMetadata,
+    )
 
 logger = init_logger(__name__)
 
@@ -566,7 +573,13 @@ def sparse_attn_indexer(
             * (logits_dtype.itemsize + copy_bytes),
             _decode_logits_profile_bytes(
                 max_decode_tokens,
-                max_model_len,
+                (
+                    max_dcp_local_seq_len(
+                        max_model_len, dcp_world_size, cp_kv_cache_interleave_size
+                    )
+                    if dcp_world_size > 1 and not use_pcp
+                    else max_model_len
+                ),
                 logits_dtype,
                 row_align,
                 fp32_decode_logits,
@@ -687,7 +700,9 @@ def sparse_attn_indexer(
             mla_layer = forward_context.no_compile_layers[shardq_layer_name]
             prefill_kv_cache = shardq.gathered_context.gather(
                 mla_layer.kv_cache,
-                attn_metadata[shardq_layer_name].block_table,
+                cast(
+                    "SparseMLACommonMetadata", attn_metadata[shardq_layer_name]
+                ).block_table,
                 kv_cache,
                 attn_metadata_narrowed.block_table,
             )
@@ -1022,7 +1037,13 @@ def sparse_attn_indexer(
                 seq_lens,
                 decode_metadata.block_table,
                 decode_metadata.schedule_metadata,
-                max_model_len=max_model_len,
+                max_model_len=(
+                    max_dcp_local_seq_len(
+                        max_model_len, dcp_world_size, cp_kv_cache_interleave_size
+                    )
+                    if decode_metadata.global_seq_lens is not None
+                    else max_model_len
+                ),
                 indices=decode_metadata.indices,
             )
             use_dcp_topk_merge = use_dcp_topk_merge and _dcp_topk_merge_reads_logits(

@@ -1490,10 +1490,20 @@ class MooncakeStoreWorker:
             )
 
         self.disk_offload_buffer_budget_bytes = (
-            DEFAULT_MOONCAKE_DISK_STAGING_BUFFER_BYTES
+            int(
+                extra_config.get(
+                    "disk_offload_buffer_budget_bytes",
+                    DEFAULT_MOONCAKE_DISK_STAGING_BUFFER_BYTES,
+                )
+            )
             if store_config.enable_offload
             else None
         )
+        if (
+            self.disk_offload_buffer_budget_bytes is not None
+            and self.disk_offload_buffer_budget_bytes <= 0
+        ):
+            raise ValueError("disk_offload_buffer_budget_bytes must be positive")
 
         # Start lookup server on rank 0 for scheduler-side prefix queries
         self.lookup_server: LookupKeyServer | None = None

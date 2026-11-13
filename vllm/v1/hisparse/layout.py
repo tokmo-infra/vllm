@@ -3,7 +3,7 @@
 
 from collections import defaultdict
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import cast
 
 from vllm.config import VllmConfig
@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheTensor,
+    MambaSpec,
     MLAAttentionSpec,
     SparseCacheRole,
     UniformTypeKVCacheSpecs,
@@ -280,7 +281,7 @@ def _lay_out_dcp_groups(
     # Flat attention addresses need whole source-kernel rows between leases,
     # not an entire hot page (which needlessly enlarges the pool's LCM).
     alignment = source.page_size_bytes
-    return [
+    groups = [
         KVCacheGroupSpec(
             list(sources),
             source_spec,
@@ -312,6 +313,53 @@ def _lay_out_dcp_groups(
         ),
         *regular,
     ]
+    from vllm.v1.core.kv_cache_planning import _get_kv_cache_bytes_per_block
+
+    stride = _get_kv_cache_bytes_per_block(groups[1:], KVCacheLayout.BLHNC)
+
+    # Freeze indexer/hot geometry before filling the final stride with states.
+    def state_key(group: KVCacheGroupSpec, state: MambaSpec) -> tuple:
+        return (
+            state,
+            group.is_eagle_group,
+            group.host_resident,
+            group.enable_kv_transfer,
+            group.role,
+        )
+
+    buckets: dict[tuple, dict[str, KVCacheSpec]] = {}
+    for group in regular:
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs) and isinstance(
+            spec.first_spec, MambaSpec
+        ):
+            key = state_key(group, spec.first_spec)
+            buckets.setdefault(key, {}).update(spec.kv_cache_specs)
+
+    emitted: set[tuple] = set()
+    packed = groups[:4]
+    for group in regular:
+        spec = group.kv_cache_spec
+        if not isinstance(spec, UniformTypeKVCacheSpecs) or not isinstance(
+            spec.first_spec, MambaSpec
+        ):
+            packed.append(group)
+            continue
+        state = spec.first_spec
+        key = state_key(group, state)
+        if key in emitted:
+            continue
+        emitted.add(key)
+        layers = list(buckets[key].items())
+        width = max(stride // state.page_size_bytes, 1)
+        for start in range(0, len(layers), width):
+            chunk = dict(layers[start : start + width])
+            chunk_spec = UniformTypeKVCacheSpecs.from_specs(chunk)
+            assert chunk_spec is not None
+            packed.append(
+                replace(group, layer_names=list(chunk), kv_cache_spec=chunk_spec)
+            )
+    return packed
 
 
 def create_hisparse_layout(

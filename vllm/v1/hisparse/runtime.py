@@ -101,8 +101,7 @@ class PagedCacheView:
 class ResolvedHiSparseConfig:
     top_k: int
     device_buffer_size: int
-    # Most host rows one request's decode rows can select in a step: every
-    # verification row's top-k.
+    # Most host rows one request can select in one query chunk.
     max_union_rows: int
     eager_host_mirror: bool = True
 
@@ -118,7 +117,10 @@ class ResolvedHiSparseConfig:
             return None
 
         max_query_len = max_decode_query_len(vllm_config)
-        min_device_buffer_size = max_query_len * model_top_k
+        chunked_dcp = vllm_config.parallel_config.decode_context_parallel_size > 1
+        min_device_buffer_size = (
+            model_top_k if chunked_dcp else max_query_len * model_top_k
+        )
         # Retain the worst-case union of every speculative step's top-k and
         # leave one additional top-k of LRU slack.
         configured_size = config.device_buffer_size
@@ -129,7 +131,7 @@ class ResolvedHiSparseConfig:
 
         if device_buffer_size < min_device_buffer_size:
             raise ValueError(
-                "HiSparse device_buffer_size must cover every decode query's "
+                "HiSparse device_buffer_size must cover a decode chunk's "
                 "index_topk rows. Got "
                 f"device_buffer_size={device_buffer_size}, "
                 f"max_decode_query_len={max_query_len}, "
@@ -159,7 +161,8 @@ class ResolvedHiSparseConfig:
         return cls(
             top_k=model_top_k,
             device_buffer_size=device_buffer_size,
-            max_union_rows=min_device_buffer_size,
+            max_union_rows=min(max_query_len, device_buffer_size // model_top_k)
+            * model_top_k,
             eager_host_mirror=config.eager_host_mirror,
         )
 
@@ -745,6 +748,8 @@ class HiSparseRuntime:
         # block table and need not be contiguous in the shared slab.
         self.region_stride = config.device_buffer_size
         self.max_union_rows = config.max_union_rows
+        self.queries_per_chunk = config.device_buffer_size // config.top_k
+        self.query_chunk_indices: dict[tuple[int, int], list[torch.Tensor]] = {}
         if self.device.type == "cuda":
             _check_residency_shared_memory(self.device, config)
 
@@ -1338,7 +1343,12 @@ def create_hisparse_cache_handle(
 
     hisparse_group = (
         None
-        if is_index_group_leader or index_group is None
+        if (
+            is_index_group_leader
+            or index_group is None
+            or config.device_buffer_size
+            < max_decode_query_len(vllm_config) * model_top_k
+        )
         else index_group.hisparse_group
     )
     runtime = HiSparseRuntime(

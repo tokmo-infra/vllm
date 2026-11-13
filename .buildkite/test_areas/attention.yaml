@@ -46,6 +46,8 @@ steps:
   device: b200-k8s
   source_file_dependencies:
     - csrc/hisparse_kernels.cu
+    - vllm/model_executor/layers/sparse_attn_indexer.py
+    - vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/dsa/
     - vllm/v1/hisparse/
     - vllm/config/attention.py
     - vllm/model_executor/layers/attention

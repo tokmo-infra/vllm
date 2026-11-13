@@ -1030,6 +1030,23 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
             num_decode_tokens >= num_tokens
             or index_group.cache(layer_index).all_context_pages_resident
         ):
+            if num_decode_tokens >= num_tokens:
+                return index_group.run_hisparse_decode(
+                    layer_index,
+                    q,
+                    topk,
+                    attn_metadata,
+                    lambda part_q, slots, valid: self._forward_mqa_kernel(
+                        part_q,
+                        hot_cache,
+                        slots,
+                        valid,
+                        layer=layer,
+                        block_size=block_size,
+                        is_decode=True,
+                        plan_num_tokens=num_tokens,
+                    ),
+                )
             physical_topk, valid_counts = index_group.convert_logical_to_physical_topk(
                 layer_index,
                 topk,
@@ -1204,6 +1221,7 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
         block_size: int,
         is_decode: bool,
         return_lse: bool | None = None,
+        plan_num_tokens: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """``return_lse`` None means ``need_to_return_lse_for_decode``."""
         raise NotImplementedError

@@ -209,6 +209,7 @@ class FlashInferCore:
         rank=0,
         capacities=None,
         widths=(),
+        query_chunks=(),
     ):
         self.impl, self.layer, self.heads = impl, layer, heads
         self.slots, self.valid, self.latent, self.lse = buffers
@@ -221,6 +222,14 @@ class FlashInferCore:
         # {rows: (plan rows, packed-query offsets)}
         self.plan_rows = {
             m: (plan_rows[m], _offsets(plan_rows[m], m, self.device)) for m in batches
+        }
+        self.chunk_plan_rows = {
+            (batch, part): (
+                self.plan_rows[batch][0],
+                _offsets(self.plan_rows[batch][0], part, self.device),
+            )
+            for batch, part in query_chunks
+            if kernels[batch] == "prims_ts"
         }
         shapes = {(r, heads, dcp > 1) for r, _ in self.plan_rows.values()}
         self.widths = sorted({self.topk, *widths})
@@ -269,7 +278,7 @@ class FlashInferCore:
         view = torch.float8_e4m3fn if self.fmt == "native" else torch.uint8
         return flat_kv_row_view(cache.view(view), block_size)
 
-    def decode(self, query, cache, slots, valid, block_size):
+    def decode(self, query, cache, slots, valid, block_size, plan_num_tokens=None):
         """The sparse decode of ``query`` over this rank's flat rows ``slots`` of
         the packed ``cache`` (a compacted prefix of ``valid`` per row; e.g. from a
         fused top-k that emits them) -> as ``run``."""
@@ -281,15 +290,20 @@ class FlashInferCore:
         lse = None
         if self.dcp > 1:
             lse = self.lse[: rows * heads].view(rows, heads)
-        if self.kernels[rows] == "prims_ts":
-            self.prims_ts(query, kv, slots, valid, latent, lse)
+        if self.kernels[plan_num_tokens or rows] == "prims_ts":
+            self.prims_ts(query, kv, slots, valid, latent, lse, plan_num_tokens)
         else:
             self.trtllm(query, kv, stride_rows, slots, valid, latent, lse, block_size)
         return latent, lse
 
-    def prims_ts(self, query, kv, slots, valid, latent, lse):
+    def prims_ts(self, query, kv, slots, valid, latent, lse, plan_num_tokens=None):
         layer = self.layer
-        capacity, offsets = self.plan_rows[query.shape[0]]
+        n = query.shape[0]
+        capacity, offsets = (
+            self.chunk_plan_rows[plan_num_tokens, n]
+            if plan_num_tokens is not None and plan_num_tokens != n
+            else self.plan_rows[n]
+        )
         key = self.heads, lse is not None, self.fmt, slots.shape[1]
         plan = PLANS.get(self.device, capacity, *key)
         descale = layer._k_scale_float if self.fmt == "native" else 1.0

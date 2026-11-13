@@ -20,6 +20,17 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+def max_dcp_local_seq_len(
+    max_seq_len: int, world_size: int, interleave: int = 1
+) -> int:
+    """Largest rank-local prefix of an interleaved context shard."""
+    if max_seq_len < 0 or world_size < 1 or interleave < 1:
+        raise ValueError("Invalid context-parallel sequence geometry")
+    cycles, remainder = divmod(max_seq_len, world_size * interleave)
+    return cycles * interleave + min(remainder, interleave)
+
+
 try:
     import torch.distributed._symmetric_memory as symm_mem
 

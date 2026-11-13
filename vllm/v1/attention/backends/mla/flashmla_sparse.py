@@ -32,6 +32,7 @@ from vllm.v1.attention.backend import (
     AttentionLayer,
     CommonAttentionMetadata,
     MultipleOf,
+    max_decode_query_len,
 )
 from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
 from vllm.v1.attention.backends.mla.sparse_utils import (
@@ -772,6 +773,19 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         )
 
         vllm_config = get_current_vllm_config()
+        hisparse = vllm_config.attention_config.hisparse_config
+        if (
+            isinstance(self.index_group, HiSparseMLAIndexGroup)
+            and self.topk_indices_buffer is not None
+            and hisparse is not None
+            and hisparse.device_buffer_size is not None
+            and hisparse.device_buffer_size
+            < max_decode_query_len(vllm_config) * self.topk_indices_buffer.shape[1]
+        ):
+            raise ValueError(
+                "HiSparse query chunking requires FLASHINFER_MLA_SPARSE; "
+                "FlashMLA requires a buffer covering the full verification union"
+            )
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         q_concat_heads = num_heads
         if not is_quantized_kv_cache(kv_cache_dtype):

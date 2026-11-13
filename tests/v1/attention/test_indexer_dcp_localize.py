@@ -21,6 +21,242 @@ def _local_count(length: int, rank: int, world: int, interleave: int) -> int:
     return sum(1 for pos in range(length) if (pos // interleave) % world == rank)
 
 
+@pytest.mark.parametrize("valid_tokens", [8, 10])
+@pytest.mark.parametrize(
+    "kv_dtype",
+    [
+        torch.float32,
+        pytest.param(
+            torch.uint8,
+            marks=pytest.mark.skipif(
+                not current_platform.is_cuda()
+                or not current_platform.is_device_capability_family(100),
+                reason="NVFP4 sparse MLA requires SM100",
+            ),
+        ),
+    ],
+)
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="HiSparse requires CUDA")
+def test_hisparse_small_hot_preserves_saturated_q5_attention_and_graph(
+    valid_tokens, kv_dtype
+):
+    """A whole Q5 union exceeds 6144; chunks retain every key across replays."""
+    from vllm.model_executor.layers.attention.sparse_mla_attention import (
+        SparseMLACommonMetadata,
+    )
+    from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
+    from vllm.v1.hisparse.runtime import (
+        HiSparseCacheHandle,
+        HiSparseRuntime,
+        ResolvedHiSparseConfig,
+        initialize_hisparse_runtime_buffers,
+    )
+
+    device, requests, qlen, topk = "cuda", 2, 5, 2048
+    nvfp4 = kv_dtype == torch.uint8
+    dim = 352 if nvfp4 else 32
+    stride = 6893568 if nvfp4 else 768 * dim * 4
+    rows = requests * qlen
+    history = qlen * topk
+    pages = history // 64
+    torch.manual_seed(11)
+    if nvfp4:
+        host = torch.randint(
+            0, 256, (1 + requests * pages, 64, dim), dtype=kv_dtype, pin_memory=True
+        )
+        host[:, :, 256:320] = (
+            (torch.randn(*host.shape[:2], 64) * 0.2)
+            .to(torch.float8_e4m3fn)
+            .view(torch.uint8)
+        )
+        host[:, :, 320:] = torch.tensor(1.0, dtype=torch.float8_e4m3fn).view(
+            torch.uint8
+        )
+    else:
+        host = torch.randn(1 + requests * pages, 64, dim, pin_memory=True)
+    source_table = torch.arange(
+        1, 1 + requests * pages, device=device, dtype=torch.int32
+    ).reshape(requests, pages)
+    runtime = HiSparseRuntime(
+        ResolvedHiSparseConfig(topk, 6144, 6144),
+        requests,
+        dim,
+        kv_dtype,
+        device,
+        max_swap_rows=rows,
+    )
+    handle = HiSparseCacheHandle(runtime)
+    runtime.bind_source_cache(host)
+    hot_pages = 6144 // 768
+    hot_blocks = 1 + requests * hot_pages
+    backing = torch.empty(hot_blocks * stride, dtype=torch.uint8, device=device)
+    hot_table = torch.arange(1, hot_blocks, device=device, dtype=torch.int32).reshape(
+        requests, hot_pages
+    )
+    runtime.bind_hot_cache(
+        backing,
+        byte_offset=0,
+        block_stride=stride,
+        num_blocks=hot_blocks,
+        block_size=768,
+        block_table=hot_table,
+    )
+    handle.bind_cache(
+        backing,
+        byte_offset=0,
+        block_stride=stride,
+        num_blocks=hot_blocks,
+        block_size=768,
+        block_table=torch.zeros(
+            requests, (history + 767) // 768, device=device, dtype=torch.int32
+        ),
+        slot_mapping=torch.full((rows,), -1, device=device, dtype=torch.int64),
+    )
+    handle.source_block_table = source_table
+    initialize_hisparse_runtime_buffers([handle], max_num_reqs=requests)
+    assert runtime.request_state_indices is not None
+    runtime.request_state_indices.copy_(torch.arange(requests, device=device))
+    local = torch.arange(rows * topk, device=device).reshape(rows, topk) % history
+    # Every key belongs to rank0: no uniform-distribution assumption is valid.
+    logical = local.to(torch.int32) * 8
+    query = (
+        (torch.randn(rows, 128, 576, device=device) * 0.2).to(torch.float8_e4m3fn)
+        if nvfp4
+        else torch.randn(rows, dim, device=device)
+    )
+    req_ids = torch.tensor(
+        [0] * 5 + [1] * (valid_tokens - 5), device=device, dtype=torch.int32
+    )
+    metadata = SparseMLACommonMetadata(
+        num_reqs=requests,
+        max_query_len=qlen,
+        max_seq_len=history * 8,
+        num_actual_tokens=valid_tokens,
+        query_start_loc=torch.tensor(
+            [0, 5, valid_tokens], dtype=torch.int32, device=device
+        ),
+        slot_mapping=torch.full((rows,), -1, dtype=torch.int64, device=device),
+        num_decodes=requests,
+        num_decode_tokens=valid_tokens,
+        num_prefills=0,
+        block_table=source_table,
+        req_id_per_token=req_ids,
+        block_size=64,
+        decode_max_query_len=qlen,
+    )
+    group = HiSparseMLAIndexGroup(
+        logical,
+        torch.empty_like(logical),
+        torch.empty(rows, dtype=torch.int32, device=device),
+        runtime.index_group.copy_stream,
+        torch.cuda.Event(),
+        torch.cuda.Event(),
+        True,
+        caches=[handle],
+        dcp_size=8,
+        dcp_rank=0,
+    )
+    source = host.reshape(-1, dim).to(device)
+    plans = {}
+
+    def attend(q, cache, slots, lengths):
+        if nvfp4:
+            from flashinfer.attention.prims_ts import (
+                BatchSparseMLADecodePagedTSWrapper,
+                get_prims_ts_sparse_mla_decode_workspace_size,
+            )
+
+            from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
+                _PRIMS_TS_FORMATS,
+            )
+
+            n = q.shape[0]
+            if n not in plans:
+                kwargs = dict(
+                    max_q_len=1,
+                    q_dtype=torch.float8_e4m3fn,
+                    max_topk=topk,
+                    packed_query=True,
+                    qk_rope_head_dim=64,
+                    kv_cache_format=_PRIMS_TS_FORMATS["nvfp4_ds_mla"],
+                )
+                size = get_prims_ts_sparse_mla_decode_workspace_size(
+                    torch.device(device), rows, 128, return_lse=True, **kwargs
+                )
+                plan = BatchSparseMLADecodePagedTSWrapper(
+                    torch.empty(size, dtype=torch.uint8, device=device)
+                )
+                plan.plan(torch.device(device), rows, 128, return_lse=True, **kwargs)
+                plans[n] = plan
+            output = torch.empty(n, 128, 512, device=device, dtype=torch.bfloat16)
+            lse = torch.empty(n, 128, device=device, dtype=torch.float32)
+            plans[n].run(
+                q,
+                cache,
+                slots,
+                lengths,
+                qo_indptr=torch.arange(
+                    rows + 1, device=device, dtype=torch.int32
+                ).clamp(max=n),
+                softmax_scale=576**-0.5,
+                output_scale=1.0,
+                out=output,
+                lse=lse,
+                validate=False,
+            )
+            return output, lse
+        kv = cache[slots.clamp_min(0).long()]
+        mask = torch.arange(topk, device=device)[None, :] < lengths[:, None]
+        scores = (kv * q[:, None, :]).sum(-1) / dim**0.5
+        scores = scores.masked_fill(~mask, -torch.inf)
+        weights = scores.softmax(-1).masked_fill(~mask, 0)
+        return (weights[:, :, None] * kv).sum(1), scores.logsumexp(-1)
+
+    def decode(q, slots, lengths):
+        from vllm.v1.attention.backends.mla.sparse_utils import flat_kv_row_view
+
+        hot, _ = flat_kv_row_view(runtime.hot.attention_cache, 768)
+        return attend(q, hot, slots, lengths)
+
+    def run():
+        handle.prepare_group_for_batch(metadata)
+        return group.run_hisparse_decode(0, query, logical, metadata, decode)
+
+    def reference():
+        local_ids = logical // 8
+        owners = torch.arange(rows, device=device) // qlen
+        source_ids = (
+            source_table[owners[:, None], local_ids // 64] * 64 + local_ids % 64
+        )
+        lengths = torch.where(
+            torch.arange(rows, device=device) < valid_tokens, topk, 0
+        ).to(torch.int32)
+        return attend(query, source, source_ids, lengths)
+
+    # Retaining per-layer/per-graph assembly outputs exhausted HBM at capture.
+    initial_output = run()[0]
+    for _ in range(2):
+        actual = run()
+        assert actual[0].data_ptr() == initial_output.data_ptr()
+        for observed, wanted in zip(actual, reference()):
+            torch.testing.assert_close(
+                observed, wanted, rtol=0 if nvfp4 else 1e-6, atol=0 if nvfp4 else 1e-6
+            )
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+    assert captured[0].data_ptr() == initial_output.data_ptr()
+    for shift in (0, 128, 4096):
+        logical.copy_(((local + shift) % history).to(torch.int32) * 8)
+        graph.replay()
+        expected = reference()
+        for observed, wanted in zip(captured, expected):
+            torch.testing.assert_close(
+                observed, wanted, rtol=0 if nvfp4 else 1e-6, atol=0 if nvfp4 else 1e-6
+            )
+
+
 def _global_to_local_indices(
     global_indices: torch.Tensor,
     rank: int,

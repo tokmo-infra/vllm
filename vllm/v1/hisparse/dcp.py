@@ -11,6 +11,25 @@ if TYPE_CHECKING:
     import torch
 
 
+def query_chunk_rows(
+    num_tokens: int, max_query_len: int, queries_per_chunk: int
+) -> list[list[int]]:
+    """Partition packed queries, bounding each request's rows in every chunk."""
+    if num_tokens < 0 or max_query_len < 1 or queries_per_chunk < 1:
+        raise ValueError("Invalid HiSparse query chunk geometry")
+    return [
+        [
+            row
+            for base in range(0, num_tokens, max_query_len)
+            for row in range(
+                base + start,
+                min(base + start + queries_per_chunk, base + max_query_len, num_tokens),
+            )
+        ]
+        for start in range(0, min(max_query_len, num_tokens), queries_per_chunk)
+    ]
+
+
 @dataclass(frozen=True)
 class HiSparseDCPShard:
     size: int = 1

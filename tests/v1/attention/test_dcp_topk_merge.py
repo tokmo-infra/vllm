@@ -318,8 +318,8 @@ def test_pack_max_local_len_matches_narrow_logits():
 # --- Memory profile, host checks and the packed-mode contract -------------
 
 
-@pytest.mark.parametrize("merge", [False, True])
-def test_profile_reservation_matches_decode_peak(merge):
+@pytest.mark.parametrize("merge,world", [(False, 1), (False, 8), (True, 8)])
+def test_profile_reservation_matches_decode_peak(merge, world):
     """The memory-profile run reserves what one decode step's top-k inputs
     peak at: the DeepGEMM bf16 logits plus their FP32 copy for the generic
     path, or plus the packed merge's small buffers (no FP32 copy: its packed
@@ -348,7 +348,10 @@ def test_profile_reservation_matches_decode_peak(merge):
     if not has_deep_gemm():
         pytest.skip("DeepGEMM not available")
     torch.manual_seed(0)
-    world, num_rows, max_model_len = 8, 128 * 5, 1 << 20
+    from vllm.v1.attention.ops.cp_common import max_dcp_local_seq_len
+
+    num_rows, global_model_len = 128 * 5, 1 << 20
+    max_model_len = max_dcp_local_seq_len(global_model_len, world)
     heads, head_dim, block_size = 32, 128, 64
     # Same row alignment as the profile run on SM100 (bf16 logits).
     row_align = math.lcm(384, 1024 // torch.bfloat16.itemsize)
@@ -379,9 +382,9 @@ def test_profile_reservation_matches_decode_peak(merge):
     )
     row_ends = SparseIndexerTopk._row_ends(ctx, 1, num_rows)
     torch.accelerator.synchronize()
-    torch.cuda.empty_cache()
-    base = torch.cuda.memory_allocated()
-    torch.cuda.reset_peak_memory_stats()
+    torch.accelerator.empty_cache()
+    base = torch.accelerator.memory_allocated()
+    torch.accelerator.reset_peak_memory_stats()
     logits = fp8_fp4_paged_mqa_logits(
         (q, q_scale),
         kv_cache,
@@ -407,7 +410,7 @@ def test_profile_reservation_matches_decode_peak(merge):
     else:
         as_fp32_logits(logits, row_ends)
     torch.accelerator.synchronize()
-    peak = torch.cuda.max_memory_allocated() - base
+    peak = torch.accelerator.max_memory_allocated() - base
 
     reserved = _decode_logits_profile_bytes(
         num_rows,
@@ -422,6 +425,21 @@ def test_profile_reservation_matches_decode_peak(merge):
     # Within 1 MiB: allocator rounding and launch-time scratch (the FP32
     # upcast's launch peaks 768 KiB above its two tensors).
     assert abs(reserved - peak) <= 1 << 20, (peak, reserved)
+    if world > 1:
+        global_logits = fp8_fp4_paged_mqa_logits(
+            (q, q_scale),
+            kv_cache,
+            weights,
+            ctx,
+            block_table,
+            schedule,
+            global_model_len,
+            indices=indices,
+        )
+        valid = torch.arange(8192, device="cuda")[None, :] < ctx
+        torch.testing.assert_close(
+            logits[:, :8192][valid], global_logits[:, :8192][valid], rtol=0, atol=0
+        )
 
 
 def test_merge_requires_rescue_workspace(monkeypatch):

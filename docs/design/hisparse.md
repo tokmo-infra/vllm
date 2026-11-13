@@ -22,7 +22,18 @@ budget of one DP replica and is divided across its DCP ranks. Indexer and dense
 DSpark draft KV stay on GPU. Source pages stay small, while indexer and hot
 leases pack more rows into an HMA block to avoid paying an SSM-sized allocation
 for every 64 hot rows. Resident and hot views share per-layer offsets and the
-physical block stride, but may have different logical page sizes.
+physical block stride, but may have different logical page sizes. After this
+stride is fixed, compatible KDA groups are repacked to fill it: the 69-layer
+FP32 recurrent layout uses nine groups instead of twelve. Indexer logits use
+the maximum rank-local DCP length in decode, fallback and memory profiling;
+global model limits and token IDs remain unchanged.
+
+The Kimi specialized executor profiles the stock forward while its temporary
+profiling KV cache is unprepared. Verify complete target and DSpark graph
+capture against the real cache before admitting traffic. Size memory headroom
+from that capture; the profiled KV budget alone does not cover every prepared
+specialized allocation. Adjust GPU memory utilization or capture shapes when
+needed.
 
 Decoder Store lookup and `save_decode_cache` must be disabled in this version:
 the ordinary producer and HiSparse decoder use different group/block layouts.
@@ -60,9 +71,18 @@ A decoder transfer configuration, with a 512-GiB logical host budget, is:
 ```
 
 Retain the deployment's HCA selection on the Mooncake entry. Configure
-`hisparse_config.device_buffer_size=12288` for top-k 2048 and DSpark4. The
-per-rank buffer covers the worst-case verification union; dividing its size by
-DCP assumes a balanced top-k distribution and is not safe for skewed selections.
+`hisparse_config.device_buffer_size=6144` with `FLASHINFER_MLA_SPARSE` for
+top-k 2048 and DSpark4. Both the ordinary FlashInfer path and
+`latency_specialized` process verification queries in chunks of at most three
+queries per request. Each chunk loads its complete top-k union and finishes
+attention before the next chunk can reuse its hot rows. This remains correct
+when all selected keys belong to one DCP rank. Query rows are restored to their
+original order before the DCP output/LSE merge. FlashInfer retains the original
+whole-batch plan capacity for every query chunk, preserving its split-KV
+rounding schedule. Layers sharing indexer results
+keep independent replacement state when chunking is necessary. FlashMLA and
+non-DCP HiSparse still require the full verification union; the default buffer
+remains 12288 rows for this model.
 Host memory is an additional budget; re-budget or remove the decoder Store
 allocation before deploying.
 
@@ -356,8 +376,9 @@ ROCm does not currently provide a HiSparse backend.
 - A hot miss still copies directly from registered pinned host memory.
 - Top-K resolution stays inside the attention invocation and remains graph
   capturable.
-- Compatible layers still share one miss plan.
-- Index-sharing followers release their private LRU state before memory sizing.
+- Compatible layers share one miss plan when the complete verification union fits.
+- Index-sharing followers release private LRU state unless query chunking needs
+  independent per-layer replacement state.
 - Indexer KV is untouched by HiSparse unless a generic KV offloader is configured.
 - Resident and hot leases can still share one packed HMA allocation.
 - No device scalar readback or CPU/device metadata round trip is added.
