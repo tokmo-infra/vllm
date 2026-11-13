@@ -240,7 +240,10 @@ impl ChatRequestProcessor {
         // Taken before media placeholders are expanded, like Python.
         let prompt_text =
             request.return_prompt_text.then(|| rendered.prompt.as_text().cloned()).flatten();
-        let (prompt, mm_features) = self.finalize_rendered_prompt(&request, rendered).await?;
+        let (mut prompt, mm_features) = self.finalize_rendered_prompt(&request, rendered).await?;
+        if let Some(token_ids) = request.prompt_token_ids {
+            prompt = Prompt::TokenIds(token_ids);
+        }
         let text_request = TextRequest {
             request_id: request.request_id,
             prompt,
