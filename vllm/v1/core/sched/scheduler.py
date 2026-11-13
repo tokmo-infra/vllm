@@ -279,6 +279,7 @@ class Scheduler(SchedulerInterface):
         # Grammar compilation failures to finish as per-request errors in
         # update_from_output.
         self.grammar_compile_error_reqs: dict[str, RequestError] = {}
+        self.non_recomputable_kv_errors: dict[str, RequestError] = {}
         self.encoder_cache_mismatch_reqs: set[str] = set()
 
         # Encoder-related.
@@ -950,6 +951,7 @@ class Scheduler(SchedulerInterface):
             if (
                 context_pages
                 and prefill_context_pages
+                and self.max_prefill_context_pages is not None
                 and prefill_context_pages + context_pages
                 > self.max_prefill_context_pages
             ):
@@ -1453,6 +1455,7 @@ class Scheduler(SchedulerInterface):
                 if (
                     context_pages
                     and prefill_context_pages
+                    and self.max_prefill_context_pages is not None
                     and prefill_context_pages + context_pages
                     > self.max_prefill_context_pages
                 ):
@@ -1903,8 +1906,23 @@ class Scheduler(SchedulerInterface):
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
-        # Put the request back to the waiting queue.
-        self.waiting.prepend_request(request)
+        if (
+            self.dcp_world_size > 1
+            and self.kv_cache_config.hisparse_host_num_blocks is not None
+        ):
+            # A PD-only HiSparse decoder cannot reconstruct the lost state by
+            # local prefill. Fail this request before it reaches the worker.
+            request.drop_stale_output = True
+            self.non_recomputable_kv_errors[request.request_id] = RequestError(
+                code="kv_cache_capacity",
+                message=(
+                    "DCP HiSparse decode KV capacity exhausted; retry through "
+                    "the PD router to rebuild the prefill state."
+                ),
+                retryable=True,
+            )
+        else:
+            self.waiting.prepend_request(request)
         self.reset_preempted_req_ids.add(request.request_id)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
@@ -2617,6 +2635,8 @@ class Scheduler(SchedulerInterface):
 
         request_errors = self.grammar_compile_error_reqs
         self.grammar_compile_error_reqs = {}
+        request_errors.update(self.non_recomputable_kv_errors)
+        self.non_recomputable_kv_errors.clear()
         error_req_ids = set(request_errors)
         error_req_ids.update(self.encoder_cache_mismatch_reqs)
         self.encoder_cache_mismatch_reqs.clear()

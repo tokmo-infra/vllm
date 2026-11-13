@@ -2267,6 +2267,94 @@ def test_pending_hisparse_reclamation_defers_preemption(monkeypatch):
     assert request.num_preemptions == 0
 
 
+@pytest.mark.parametrize("dcp_size", [1, 2])
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_dcp_hisparse_preemption_fails_only_victim_without_recomputing(
+    dcp_size: int, async_scheduling: bool
+):
+    """A decode-only victim cannot restart local prefill and kill its peers."""
+    from tests.v1.core.test_prefix_caching import make_hisparse_kv_cache_config
+    from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+    from vllm.v1.kv_cache_interface import HiSparseResidentSpec
+    from vllm.v1.structured_output import StructuredOutputManager
+
+    config = dataclasses.replace(
+        create_scheduler(
+            max_num_seqs=2,
+            max_num_batched_tokens=64,
+            async_scheduling=async_scheduling,
+        ).vllm_config,
+        model_config=ModelConfig(
+            model="facebook/opt-125m",
+            hf_overrides={"num_key_value_heads": 1},
+            dtype="float16",
+            skip_tokenizer_init=True,
+        ),
+        parallel_config=ParallelConfig(
+            tensor_parallel_size=2, decode_context_parallel_size=dcp_size
+        ),
+    )
+    cache = make_hisparse_kv_cache_config(6, 128)
+    for group in cache.kv_cache_groups:
+        if isinstance(group.kv_cache_spec, HiSparseResidentSpec):
+            group.kv_cache_spec = dataclasses.replace(
+                group.kv_cache_spec, dcp_sharded=True
+            )
+    scheduler_cls = AsyncScheduler if async_scheduling else Scheduler
+    scheduler = scheduler_cls(
+        config,
+        cache,
+        StructuredOutputManager(config),
+        block_size=16,
+        log_stats=True,
+    )
+    get_hisparse_coordinator(scheduler.kv_cache_manager)
+    requests = create_requests(
+        num_requests=2, num_tokens=16 * dcp_size, max_tokens=4, ignore_eos=True
+    )
+    for request in requests:
+        scheduler.add_request(request)
+    first = scheduler.schedule()
+    assert len(first.scheduled_new_reqs) == 2
+    scheduler.update_from_output(
+        first,
+        ModelRunnerOutput(
+            req_ids=[request.request_id for request in requests],
+            req_id_to_index={
+                request.request_id: i for i, request in enumerate(requests)
+            },
+            sampled_token_ids=[[0], [0]],
+        ),
+    )
+
+    second = scheduler.schedule()
+    victim = requests[1]
+    assert victim.num_preemptions == 1
+    outputs = scheduler.update_from_output(
+        second,
+        ModelRunnerOutput(
+            req_ids=[requests[0].request_id],
+            req_id_to_index={requests[0].request_id: 0},
+            sampled_token_ids=[[1]],
+        ),
+    )
+    errors = [output for output in outputs[0].outputs if output.error is not None]
+    if dcp_size == 1:
+        assert not errors
+        assert victim.status == RequestStatus.PREEMPTED
+        assert list(scheduler.waiting) == [victim]
+        return
+    assert len(errors) == 1
+    assert errors[0].request_id == victim.request_id
+    assert errors[0].finish_reason == FinishReason.ERROR
+    assert errors[0].error.retryable
+    assert victim.status == RequestStatus.FINISHED_ERROR
+    assert victim.request_id not in scheduler.requests
+    assert list(scheduler.waiting) == []
+    assert scheduler.running == [requests[0]]
+    assert scheduler.schedule().num_scheduled_tokens == {requests[0].request_id: 1}
+
+
 def test_prefix_cache_query_not_inflated_by_connector_defer():
     """The GPU prefix-cache query is recorded at admission, so a request the
     connector defers several times is counted once, not once per retry."""

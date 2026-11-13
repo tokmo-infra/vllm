@@ -28,6 +28,13 @@ FP32 recurrent layout uses nine groups instead of twelve. Indexer logits use
 the maximum rank-local DCP length in decode, fallback and memory profiling;
 global model limits and token IDs remain unchanged.
 
+A DCP HiSparse decoder cannot locally prefill a preempted request after its
+GPU state has been released. Capacity preemption therefore terminates only
+that request with a retryable `kv_cache_capacity` error; it does not enqueue
+an unsupported recompute batch or terminate the decoder. Retry the request
+through the PD router so the producer rebuilds its state. Size admission and
+concurrency to avoid this error during normal operation.
+
 The Kimi specialized executor profiles the stock forward while its temporary
 profiling KV cache is unprepared. Verify complete target and DSpark graph
 capture against the real cache before admitting traffic. Size memory headroom
