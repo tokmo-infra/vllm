@@ -1,0 +1,61 @@
+{
+  "status": "full-model-and-cache-validation-passed",
+  "single_image_id": "sha256:7499b963a8ad69f2c20c5127b3a338bdd7297c7c0517be0f70e35f7d58140784",
+  "image_tag": "local/kimi31-pd-tc66040:verify-c80c339d60b6",
+  "engine_source_commit": "c80c339d60b665d9e5d0c040667c43fb7a24b994",
+  "base_image": "sha256:19bcda671d9ccc5d6c8775627bc3a88eed4cbb25032ac21af5075fae0c8e8b71",
+  "image_archive_sha256": "926ce664e71d1633017915c20d3b511d4b7b9b88489b52b138f54ff02ca72974",
+  "router_repository": "https://github.com/tokmo-infra/router",
+  "router_branch": "xinhao-vllm-router",
+  "router_commit": "4e4db92997074544577a33b97b579e535fd2a04b",
+  "comparison_reference_run": "run-8981355e37ed",
+  "P_additional_changes": {
+    "decode_backend": "latency_specialized",
+    "VLLM_ENABLE_GEMM_RS": 0
+  },
+  "caveat": "P backend also changes. Do not attribute the combined serving delta solely to PR66040. No new serving TPM yet.",
+  "quality": {
+    "baseline": {
+      "passed": 80,
+      "failed": 0,
+      "corpus_sha256": "3ab8e8ffae13de6868e05e7050b4296a1a4595df5ecd3510528eba23808c97f8"
+    },
+    "baseline-p": {
+      "passed": 80,
+      "failed": 0,
+      "corpus_sha256": "3ab8e8ffae13de6868e05e7050b4296a1a4595df5ecd3510528eba23808c97f8"
+    },
+    "candidate": {
+      "passed": 80,
+      "failed": 0,
+      "corpus_sha256": "3ab8e8ffae13de6868e05e7050b4296a1a4595df5ecd3510528eba23808c97f8"
+    },
+    "candidate-p": {
+      "passed": 80,
+      "failed": 0,
+      "corpus_sha256": "3ab8e8ffae13de6868e05e7050b4296a1a4595df5ecd3510528eba23808c97f8"
+    },
+    "candidate-both": {
+      "passed": 80,
+      "failed": 0,
+      "corpus_sha256": "3ab8e8ffae13de6868e05e7050b4296a1a4595df5ecd3510528eba23808c97f8"
+    }
+  },
+  "gpu_correctness": {
+    "baseline_passed": 51,
+    "candidate_original_passed": 85,
+    "candidate_expanded_passed": 93,
+    "failed": 0,
+    "thresholds_unchanged": true,
+    "prior_flush_failure_reproduced": false,
+    "evidence": "validation/candidate-expanded-full.log"
+  },
+  "single_image_verified_on_both_nodes": true,
+  "router_reloaded_after_P_replacement": true,
+  "setup_failure_preserved": "First integration attempt received80 native Router HTTP503 before inference while its health/bootstrap cache was stale. Router reload fixed setup; same model/corpus/thresholds pass80. Failed receipts retained with.invalid-stale-router suffix.",
+  "kv_pool_gib_per_rank": {
+    "P": 44.09349060058594,
+    "D": 44.8960075378418
+  },
+  "kv_pool_capacity_method": "Rust frontend CPU handshake snapshot num_gpu_blocks times prior verified physical block stride; no GPU RPC"
+}

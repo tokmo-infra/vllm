@@ -1,0 +1,26 @@
+{
+  "baseline-p": {
+    "known_answer_correct": 80,
+    "completed": 80,
+    "exact_output_token_sequences_vs_baseline": 80,
+    "receipt_sha256": "15bb01a6fa85630df6b86a7feb239c81a475b48089869212a92c6ad8aac4b8c1"
+  },
+  "candidate": {
+    "known_answer_correct": 80,
+    "completed": 80,
+    "exact_output_token_sequences_vs_baseline": 80,
+    "receipt_sha256": "3b4431e49b3489194a09f19060df7f4680ddf9d94920ae342877ac4cca97d49b"
+  },
+  "candidate-p": {
+    "known_answer_correct": 80,
+    "completed": 80,
+    "exact_output_token_sequences_vs_baseline": 80,
+    "receipt_sha256": "8e967b2393af2e559fe88467f18fd91db56cb572fc64c70bfdefff92b9b0f726"
+  },
+  "candidate-both": {
+    "known_answer_correct": 80,
+    "completed": 80,
+    "exact_output_token_sequences_vs_baseline": 80,
+    "receipt_sha256": "efa6599b82c73adfffca077f623551686fd1068cb52d1bb937121a9203e30ed0"
+  }
+}
