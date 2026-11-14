@@ -1,0 +1,13 @@
+{
+  "files": {
+    "pd_admin.py": "22aa774632f29f1f64928573b7613aa285b3c97843ddc9f5a588ed852b5da10a",
+    "clear_tokenizer_cache.py": "0da1edad8d806db5cbc4136b77621f90c23c0b5ad66ee8551e893616c69e933f"
+  },
+  "archive_sha256": "f4a396d297c1d355c62e7eaa437707b8acd477939267ec35771c484f319638bb",
+  "verified_identical_on_nodes": [
+    "92",
+    "93"
+  ],
+  "work_mount": "/data2/bench/eng-xinhao/hisparse-pd-correctness-20261113-ced31f9/full",
+  "sitecustomize_py_present": false
+}

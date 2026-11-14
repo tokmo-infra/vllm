@@ -1,5 +1,7 @@
 # B300 HiSparse PR66040候选：P/D统一镜像
 
+完整服务清单与逐节点启动命令见 [DEPLOYMENT.md](DEPLOYMENT.md)：两层Router、Mooncake Master、8个Store owner、P使用的Store配置及/work辅助文件。13个容器与实跑命令逐项核对，519项检查通过；默认dry-run。
+
 P、D启动脚本固定使用同一image digest，角色差异由参数、环境与挂载配置。镜像以原D底包为基线，只加入c80c339d6的三个KDA文件；相对原P还包含仅对DCP HiSparse生效的容量保护。原容器保留用于回退。
 
 P原来是通用decode，候选同时启用latency_specialized并关闭不兼容的GEMM_RS；保留P的prefix/align、Store及prefill批次。因此整体对比不等于单独66040收益。D保持原专用decode配置。

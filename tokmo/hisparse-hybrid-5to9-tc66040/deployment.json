@@ -65,5 +65,9 @@
   "formal_threshold_turn": 19696,
   "benchmark_results_pending": true,
   "cold_cache_acceptance_passed": true,
-  "latest_deployment_branch": "kimi31-dcp-hisparse-66040-verify"
+  "latest_deployment_branch": "kimi31-dcp-hisparse-66040-verify",
+  "deployment_services_manifest": "deployment-services.json",
+  "verified_service_count": 13,
+  "verified_command_checks": 519,
+  "commands_audited_at": "2026-11-14T21:10:16.120564+08:00"
 }
