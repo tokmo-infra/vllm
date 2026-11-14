@@ -1,0 +1,21 @@
+{
+  "run_id": "run-8981355e37ed",
+  "trial": "c288-a576-hybrid-5to9-o2048",
+  "container": "kimi31-hisparse-hybrid-5to9-c288-a576-o2048-benchmark",
+  "container_id": "7eca8504259c75404dbcfbda5e3e71c890a1c7c35f756ac698091806fb350d44",
+  "started_wall_ns": 1794650998233724919,
+  "concurrency": 288,
+  "active_sessions": 576,
+  "reference_turns": 49238,
+  "formal_threshold_turn": 19696,
+  "clock_basis": "b300-93 benchmark host",
+  "GPU_services_restarted": false,
+  "unchanged_original_containers": 13,
+  "cold_cache_accepted": true,
+  "cold_cache_acceptance_wall_ns": 1794650994894216346,
+  "cold_cache_receipt_sha256": "19703c1dc86612ab01a1ce4659d161387e85f56a08c68d95da39d3dad185aa95",
+  "hybrid_container": "d399c178279e9e430a728f0c3c5b2454de10047ce4667b7bbcf740773f58b959",
+  "hybrid_source_sha256": "148b8b3c61e8582c3fd418c568691cbdf17d9cb0f4dffe03088f6be25e4a207a",
+  "status": "running; no qualified performance result yet",
+  "watcher": "read-only metrics; stop client on sustained active KV P97%/D94%, inference/health failure, or requested length window completion"
+}

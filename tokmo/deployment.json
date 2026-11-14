@@ -188,9 +188,11 @@
     "Router_cases": 6,
     "model_source_changed": false,
     "next_trial": "c288-a576-hybrid-5to9-o2048",
-    "next_trial_started": false,
+    "next_trial_started": true,
     "D097_failure_preserved": true,
-    "archived_reference": "hisparse-hybrid-1to2/baseline-150-160k.json"
+    "archived_reference": "hisparse-hybrid-1to2/baseline-150-160k.json",
+    "next_trial_run_id": "run-8981355e37ed",
+    "next_trial_launch_receipt": "hisparse-hybrid-5to9/launch-receipt.json"
   },
   "latest_source_audit_wall_ns": 1794650547251331000,
   "latest_source_audit": "runtime-code-audit.json",
