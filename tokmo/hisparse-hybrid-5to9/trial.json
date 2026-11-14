@@ -51,7 +51,7 @@
     "router": "kimi31-pd-hisparse-92-router-full-c256-r14",
     "hybrid_router": "kimi31-hisparse-hybrid-92-router-5to9"
   },
-  "preparation_status": "awaiting_cold_cache_receipt",
+  "preparation_status": "cold_cache_accepted_benchmark_running",
   "comparison_note": "C288/A576,5:9 weighted inflight,expected103local/185PD; compare at150k..160k average input with original unchanged P/D images.",
   "archive_policy": {
     "minimum_average_input": 150000,
@@ -67,5 +67,9 @@
     "pressure_guard_after_seconds": 120
   },
   "router_source_commit": "4e4db92997074544577a33b97b579e535fd2a04b",
-  "engine_revert_commit": "75d25d6899f12fe928305940bcc87358734bfd1e"
+  "engine_revert_commit": "75d25d6899f12fe928305940bcc87358734bfd1e",
+  "run_id": "run-8981355e37ed",
+  "container_id": "7eca8504259c75404dbcfbda5e3e71c890a1c7c35f756ac698091806fb350d44",
+  "reference_turns": 49238,
+  "formal_threshold_turn": 19696
 }
