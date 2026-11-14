@@ -1,0 +1,306 @@
+{
+  "status": "cancelled",
+  "target_concurrency": 256,
+  "reference_turns": 42936,
+  "threshold_turn": 17175,
+  "terminal_turns": 38593,
+  "progress_percent": 89.88494503446991,
+  "full_status_counts": {
+    "succeeded": 38429,
+    "cancelled": 164
+  },
+  "full_error_counts": {
+    "HTTP 200: user_cancelled": 159,
+    "HTTP None: user_cancelled": 5
+  },
+  "formal_boundary": {
+    "threshold_turn": 17175,
+    "forty_percent_ns": 1272643607154409,
+    "start_ns": 1272643607154409,
+    "end_boundary_ns": 1276003796668747,
+    "confirmation_ns": 1276063796668747,
+    "complete_end_ns": 1276003607154409,
+    "reason": "concurrency_under_target_60s",
+    "minutes": 56
+  },
+  "report_type": "formal_user_requested_length_window",
+  "window": {
+    "start_ns": 1274923607154409,
+    "end_ns": 1275523607154409,
+    "start_wall_ns": 1794646240535989760,
+    "end_wall_ns": 1794646840535989760,
+    "minutes": 10.0
+  },
+  "successes": 3101,
+  "window_failures": 0,
+  "usage_missing": {
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "cached_tokens": 0
+  },
+  "usage_totals": {
+    "prompt_tokens": 482672324,
+    "completion_tokens": 4295492,
+    "cached_tokens": 475464576
+  },
+  "input_tpm": 48267232.4,
+  "output_tpm": 429549.2,
+  "total_tpm": 48696781.6,
+  "tps_per_rank": 50725.81416666667,
+  "average_input": 155650.53982586262,
+  "average_output": 1385.1957433086102,
+  "cached_usage_ratio": 0.9850669954716526,
+  "revenue_discounted": 20.077962575999997,
+  "latencies": {
+    "ttft": {
+      "samples": 3101,
+      "mean": 3.0574481835807803,
+      "min": 0.752090292,
+      "max": 57.987220192,
+      "p50": 2.701248934,
+      "p90": 4.339395123999999,
+      "p95": 5.9407181819999995,
+      "p99": 8.705533585
+    },
+    "tpot": {
+      "samples": 3047,
+      "mean": 38.40108395171928,
+      "min": 0.5703732799218368,
+      "max": 114.3537155033557,
+      "p50": 30.971220183006533,
+      "p90": 63.236537032352935,
+      "p95": 69.3105085911414,
+      "p99": 80.43318796296296
+    },
+    "decode_throughput": {
+      "samples": 3047,
+      "mean": 31.456820498048664,
+      "min": 8.744796752761873,
+      "max": 1753.237809697254,
+      "p50": 32.28804012535113,
+      "p90": 39.39437993205669,
+      "p95": 39.64241534246215,
+      "p99": 41.50413695633912
+    }
+  },
+  "actual_concurrency": {
+    "min": 255,
+    "max": 256,
+    "time_weighted_mean": 255.999773857845,
+    "time_at_target_percent": 99.9773857845,
+    "under_duration_s": 0.135685293,
+    "max_under_spell_s": 0.000159503,
+    "definition": "Native transition events; stop at first60s sustained underfill; transient turnover dips retained."
+  },
+  "monitoring": {
+    "preemptions": {
+      "P": 0.0,
+      "D": 0.0
+    },
+    "waiting_requests": {
+      "P": 6.167227038227143,
+      "D": 2.2515564054682846
+    }
+  },
+  "early_stop": {
+    "reason": "Natural first 60s sustained underfill closed the qualified formal window; stop remaining tail through native cancellation handler",
+    "user_average_input_cutoff": false,
+    "scoring_window": {
+      "start_ns": 1272643607154409,
+      "end_ns": 1276003607154409,
+      "start_wall_ns": 1794643960535989760,
+      "end_wall_ns": 1794647320535989760,
+      "minutes": 56.0
+    },
+    "average_input": 131683.7830635838,
+    "container_id": "141c0049a3b8b1620d453dc3e7bc36105801b4182cb4bee7d252b805c060c1e2",
+    "container": "kimi31-hisparse-hybrid-1to2-c256-a512-o2048-benchmark",
+    "before_stop_capture": "/data2/bench/eng-xinhao/vllm-pd/kimi3.1/b300-92-93-p8-d8-tp8-dcp8-ep8/hisparse-hybrid-1to2/performance/trials/c256-a512-hybrid-1to2-o2048/result/c256-a512-hisparse-hybrid-1to2-o2048/benchmark-evidence/run-001/snapshots/20261114-172421",
+    "formal_boundary": {
+      "threshold_turn": 17175,
+      "forty_percent_ns": 1272643607154409,
+      "start_ns": 1272643607154409,
+      "end_boundary_ns": 1276003796668747,
+      "confirmation_ns": 1276063796668747,
+      "complete_end_ns": 1276003607154409,
+      "reason": "concurrency_under_target_60s",
+      "minutes": 56
+    },
+    "signal": "SIGINT",
+    "wall_ns": 1794648263823289996
+  },
+  "configuration": {
+    "api_server_count": 2,
+    "active_sessions": 512,
+    "max_output_tokens": 2048,
+    "draft_tokens": 4,
+    "l2_gib_total": 3360,
+    "l3_gib_total": 19936,
+    "frontend": "Rust",
+    "expert_parallel": true,
+    "P_max_num_batched_tokens": 8192,
+    "D_max_num_batched_tokens": 2048,
+    "D_max_graph_tokens": 1280,
+    "D_graph_count": 21,
+    "source_revision": "5caa5d7f5c989783ba90ba92c57e521660e8fb9d",
+    "source_revision_by_role": {
+      "prefill": "bab602a8ab34dd29bb35ec1163e7f500d6dffa8e",
+      "decode": "5caa5d7f5c989783ba90ba92c57e521660e8fb9d"
+    },
+    "source_patch": "DCP local-width logits; final-stride KDA 9 groups; hot6144 Q5 query chunks preserving original FlashInfer plans",
+    "image_ids": {
+      "92": "sha256:dc18c152f9318756058df9dfd43124c4865e1ba392452be7195a1a28d5cbb3dd",
+      "93": "sha256:19bcda671d9ccc5d6c8775627bc3a88eed4cbb25032ac21af5075fae0c8e8b71"
+    },
+    "D_source_gib": 1024,
+    "D_hot_rows": 6144,
+    "D_prefix_caching": false,
+    "D_mamba_cache_mode": "none",
+    "D_watermark": 0.05,
+    "D_gpu_memory_utilization": 0.95,
+    "rust_binary_sha256": "f84744abd592ccde20a35d2abecfbeff68517f169b54cca39eb47c9e68fe0dea",
+    "P_gpu_memory_utilization": 0.97,
+    "P_KV_GiB_per_rank": 46.32769775390625,
+    "D_KV_GiB_per_rank": 44.8960075378418,
+    "hybrid_weights": {
+      "p_local": 1,
+      "pd": 2
+    },
+    "hybrid_ingress": "http://11.5.0.92:19510"
+  },
+  "tokenizer_full_round": {
+    "ratio": 0.9760123250240202,
+    "deltas": {
+      "encoded_tokens": 86170915.0,
+      "special_tokens": 3497965.0,
+      "reused_tokens": 3648454139.0
+    },
+    "scope": "Whole run; instrumented segment cache only; forwarded P token IDs excluded"
+  },
+  "kv_usage_coverage": {
+    "P_cached_usage_verified": true,
+    "L3_enabled": true,
+    "D_historical_prefix_counter_must_be_zero": true,
+    "coverage": "Client usage counts the producer historical GPU-prefix plus external Store L2/SSD union. Rust forwards remote_prefill_cached_tokens so fresh P-to-D transfer is excluded. Valid only while D historical-prefix hits remain zero.",
+    "live_validation": "R17 P097/D095 Router6 cases cached usage0/32768/32768 and D encoded-token delta0;131073/1048531 real PD known answers passed. Model images,Store protocol and read budget unchanged.",
+    "source_sha256": {
+      "vllm/v1/metrics/stats.py": "5c925d3c9ba8b81c52eac9cff74a2fe468d14cf710b581ab7eb5ca848450e4a6",
+      "vllm/v1/core/sched/scheduler.py": "3b53ce0e6d10b171dc57e30f3d28b5e7221bc5a3e2911a659f8c9db306de7712",
+      "rust/src/llm/src/output.rs": "516a2fe36676d591db20accd7b53cf6dbbd464f6b14b01cdfe6d4284f85dbb02"
+    },
+    "D_prefix_caching_enabled": false,
+    "run_id": "run-41d34bdac478",
+    "verified_at": "2026-11-14T16:22:26.381538+08:00",
+    "prior_evidence": {
+      "router": "export-93/post-validation-r15e.json",
+      "SSD_model": "export-92/full/deployment-evidence/r15d-store-model/restore.json",
+      "GPU_owner_matrix": "export-92/full/deployment-evidence/store-matrix-read128.json",
+      "R16_router": "post-validation-r16.json",
+      "R17_router": "post-validation-r17.json"
+    },
+    "evidence": {
+      "base-coverage.json": "kv-coverage-evidence/base-coverage.json",
+      "post-validation-r17.json": "kv-coverage-evidence/post-validation-r17.json",
+      "ssd-model-restore.json": "kv-coverage-evidence/ssd-model-restore.json",
+      "mixed-live-smoke.json": "kv-coverage-evidence/mixed-live-smoke.json",
+      "runtime-readonly-verification.json": "kv-coverage-evidence/runtime-readonly-verification.json"
+    },
+    "evidence_sha256": {
+      "ssd-model-restore.json": "ac9a173c95470b713e48b9ee4f09637a1341033175fe858162b9639927e41b07",
+      "base-coverage.json": "c6447b432b68dea72953b844f402293cf541615701d98f9988b3f4702e460adf",
+      "runtime-readonly-verification.json": "d5dc82b5e7de4ad803df7913f8bab9c1210de45056ac16172a1e11e4ac9eb003",
+      "post-validation-r17.json": "e3b6154a035e791ccea4a1e16b8b4150dd00328dd713d4057219ffd22eecc0bf",
+      "mixed-live-smoke.json": "ae08b0ef3b5c6d7cdb6bfb7050fe3c55df96182a795750e2844809a7624d2319"
+    },
+    "runtime_readonly_verification": {
+      "92": {
+        "wall_ns": 1794644549313242789,
+        "P_image": "sha256:dc18c152f9318756058df9dfd43124c4865e1ba392452be7195a1a28d5cbb3dd",
+        "router_image": "sha256:55b0495c0784ed15003156818c7a911dde678d3352ab791418df12de025b7981",
+        "P_source_sha256": {
+          "vllm/v1/metrics/stats.py": "5c925d3c9ba8b81c52eac9cff74a2fe468d14cf710b581ab7eb5ca848450e4a6",
+          "vllm/v1/core/sched/scheduler.py": "3b53ce0e6d10b171dc57e30f3d28b5e7221bc5a3e2911a659f8c9db306de7712"
+        },
+        "router_binary_sha256": "28b5ff2e37ce85761a31092673f36200017c2fb21c363087805ff032af794cde"
+      },
+      "93": {
+        "wall_ns": 1794644533915417236,
+        "D_image": "sha256:19bcda671d9ccc5d6c8775627bc3a88eed4cbb25032ac21af5075fae0c8e8b71",
+        "prefix_caching_disabled": true,
+        "historical_prefix_hits": 0.0
+      }
+    },
+    "route_coverage": {
+      "p_local": "Unchanged P Rust frontend uses prefill_stats.num_cached_tokens = local GPU prefix + external Store union. Actual P stats/scheduler hashes match R17 validation.",
+      "pd": "Same validated PD Router/model images forward measured P remote_prefill_cached_tokens, excluding fresh P-to-D transfer. D historical-prefix counter is zero.",
+      "Store": "Prior real GPU/L2 and SSD-only model-restore receipts retained; the same P Store protocol supplies both L2 and L3 hits."
+    },
+    "restoration_reason": "Coverage receipt was omitted when creating the sibling trial; native cached_tokens records were retained."
+  },
+  "D_historical_prefix_hits": {
+    "delta": 0.0,
+    "scope": "Whole run; zero excludes additional D historical prefix reuse"
+  },
+  "active_sessions_observed": {
+    "peak": 512,
+    "configured": 512
+  },
+  "run_id": "run-41d34bdac478",
+  "capture": "/Users/librua/PycharmProjects/ai-infra/notes/vllm-pd/kimi3.1/b300-92-93-p8-d8-tp8-dcp8-ep8/hisparse-hybrid-1to2/performance/trials/c256-a512-hybrid-1to2-o2048/result/c256-a512-hisparse-hybrid-1to2-o2048/benchmark-evidence/run-001/snapshots/20261114-172524",
+  "hbm_kv": {
+    "recorded_at": "2026-11-14T17:33:02+08:00",
+    "window": {
+      "start_wall_ns": 1794646240535989760,
+      "end_wall_ns": 1794646840535989760
+    },
+    "performance_report_type": "formal_user_requested_length_window",
+    "metric": "vllm:kv_cache_usage_perc",
+    "roles": {
+      "P": {
+        "pool_gib_per_rank": 46.32769775390625,
+        "usable_pool_gib_per_rank": 46.30201721191406,
+        "rank_count": 8,
+        "current_fraction": 0.0088740987243483,
+        "current_active_gib_per_rank": 0.4108886718749996,
+        "current_error": null,
+        "window": {
+          "mean_fraction": 0.6831264537029457,
+          "peak_fraction": 0.8602329450915142,
+          "coverage_percent": 100.0,
+          "samples_in_window": 120,
+          "covered_seconds": 600.0
+        },
+        "mean_active_gib_per_rank": 31.630132817267604,
+        "peak_active_gib_per_rank": 39.83052062988281,
+        "capacity_evidence_sha256": "1d96586357292460885d81c2b57fee86aaf82bf4ec3b79bf83b1723d61719c59"
+      },
+      "D": {
+        "pool_gib_per_rank": 44.8960075378418,
+        "usable_pool_gib_per_rank": 44.88958740234375,
+        "rank_count": 8,
+        "current_fraction": 0.0,
+        "current_active_gib_per_rank": 0.0,
+        "current_error": null,
+        "window": {
+          "mean_fraction": 0.7953952815659688,
+          "peak_fraction": 0.8502574370709381,
+          "coverage_percent": 100.0,
+          "samples_in_window": 120,
+          "covered_seconds": 600.0
+        },
+        "mean_active_gib_per_rank": 35.70496601126737,
+        "peak_active_gib_per_rank": 38.16770553588867,
+        "capacity_evidence_sha256": "9665fe1844c1708718a56459046e8f1eed7957e10a36e8ff29bc5c879e0d74d0"
+      }
+    },
+    "current_context": "Read-only metrics after benchmark stop; not the historical sample pressure."
+  },
+  "source_capture": "/data2/bench/eng-xinhao/vllm-pd/kimi3.1/b300-92-93-p8-d8-tp8-dcp8-ep8/hisparse-hybrid-1to2/performance/trials/c256-a512-hybrid-1to2-o2048/result/c256-a512-hisparse-hybrid-1to2-o2048/benchmark-evidence/run-001/snapshots/20261114-172524",
+  "selection_policy": "First complete minute in the original qualified interval whose success-weighted average input is within150000..160000; take the next10 continuous complete minutes. Selection uses input length, not TPM.",
+  "score_scope": "User-requested average150k..160k input window; recomputed maxtpm is sum of same-window input and output TPM. Does not replace original40%-onward formal result.",
+  "sample_progress_percent": {
+    "start": 67.19070244084219,
+    "end": 74.41307993292342
+  },
+  "source_turns_sha256": "83011afc3d026629001e53147fbf288a74d924cfd6790ffc215cbab4ed2fbf51"
+}

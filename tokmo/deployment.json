@@ -45,7 +45,7 @@
       "command_sha256": "8ff6d903aa632801b6e6d4b2d607e974df5606218149617c09f57f8d99870de4",
       "script_sha256": "9ab413c4a7af2e626cc6f4fc18c428d390e91913a078b36bcabd36701537dda7",
       "live_container_id": "24bdee636d9275aefb56205256cc7243d26004a10292b9d346d0f7eabebbd03c",
-      "started_at_utc": "2026-11-14T05:00:53.076734515Z",
+      "started_at_utc": "2026-11-14T05:46:47.403025219Z",
       "restart_count_at_capture": 0,
       "docker_inspect_checks_passed": 16
     },
@@ -187,8 +187,18 @@
     ],
     "Router_cases": 6,
     "model_source_changed": false,
-    "next_trial": "c176-a352-r17-p097-d095",
+    "next_trial": "c288-a576-hybrid-5to9-o2048",
     "next_trial_started": false,
-    "D097_failure_preserved": true
-  }
+    "D097_failure_preserved": true,
+    "archived_reference": "hisparse-hybrid-1to2/baseline-150-160k.json"
+  },
+  "latest_source_audit_wall_ns": 1794650547251331000,
+  "latest_source_audit": "runtime-code-audit.json",
+  "router_source": {
+    "native_commit": "96885611f4f7ab33d2661cb8aeffbabff44784b0",
+    "hybrid_repository": "https://github.com/tokmo-infra/router",
+    "hybrid_branch": "xinhao-vllm-router",
+    "hybrid_commit": "4e4db92997074544577a33b97b579e535fd2a04b"
+  },
+  "engine_revert_commit": "75d25d6899f12fe928305940bcc87358734bfd1e"
 }

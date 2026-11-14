@@ -1,0 +1,71 @@
+{
+  "trial": "c288-a576-hybrid-5to9-o2048",
+  "concurrency": 288,
+  "active_sessions": 576,
+  "remote_root": "/data2/bench/eng-xinhao/vllm-pd/kimi3.1/b300-92-93-p8-d8-tp8-dcp8-ep8/hisparse-hybrid-5to9/performance/trials/c288-a576-hybrid-5to9-o2048",
+  "run_directory": "/data2/bench/eng-xinhao/vllm-pd/kimi3.1/b300-92-93-p8-d8-tp8-dcp8-ep8/hisparse-hybrid-5to9/performance/trials/c288-a576-hybrid-5to9-o2048/result/c288-a576-hisparse-hybrid-5to9-o2048/benchmark-evidence/run-001",
+  "container": "kimi31-hisparse-hybrid-5to9-c288-a576-o2048-benchmark",
+  "physical_gpu_ranks": 16,
+  "configuration": {
+    "api_server_count": 2,
+    "active_sessions": 576,
+    "max_output_tokens": 2048,
+    "draft_tokens": 4,
+    "l2_gib_total": 3360,
+    "l3_gib_total": 19936,
+    "frontend": "Rust",
+    "expert_parallel": true,
+    "P_max_num_batched_tokens": 8192,
+    "D_max_num_batched_tokens": 2048,
+    "D_max_graph_tokens": 1280,
+    "D_graph_count": 21,
+    "source_revision": "5caa5d7f5c989783ba90ba92c57e521660e8fb9d",
+    "source_revision_by_role": {
+      "prefill": "bab602a8ab34dd29bb35ec1163e7f500d6dffa8e",
+      "decode": "5caa5d7f5c989783ba90ba92c57e521660e8fb9d"
+    },
+    "source_patch": "DCP local-width logits; final-stride KDA 9 groups; hot6144 Q5 query chunks preserving original FlashInfer plans",
+    "image_ids": {
+      "92": "sha256:dc18c152f9318756058df9dfd43124c4865e1ba392452be7195a1a28d5cbb3dd",
+      "93": "sha256:19bcda671d9ccc5d6c8775627bc3a88eed4cbb25032ac21af5075fae0c8e8b71"
+    },
+    "D_source_gib": 1024,
+    "D_hot_rows": 6144,
+    "D_prefix_caching": false,
+    "D_mamba_cache_mode": "none",
+    "D_watermark": 0.05,
+    "D_gpu_memory_utilization": 0.95,
+    "rust_binary_sha256": "f84744abd592ccde20a35d2abecfbeff68517f169b54cca39eb47c9e68fe0dea",
+    "P_gpu_memory_utilization": 0.97,
+    "P_KV_GiB_per_rank": 46.32769775390625,
+    "D_KV_GiB_per_rank": 44.8960075378418,
+    "hybrid_weights": {
+      "p_local": 5,
+      "pd": 9
+    },
+    "hybrid_ingress": "http://11.5.0.92:19511"
+  },
+  "runtime_containers": {
+    "P": "kimi31-pd-hisparse-92-prefill-c256-r17-gpu097",
+    "D": "kimi31-pd-hisparse-93-decode-c256-r17-gpu095",
+    "router": "kimi31-pd-hisparse-92-router-full-c256-r14",
+    "hybrid_router": "kimi31-hisparse-hybrid-92-router-5to9"
+  },
+  "preparation_status": "awaiting_cold_cache_receipt",
+  "comparison_note": "C288/A576,5:9 weighted inflight,expected103local/185PD; compare at150k..160k average input with original unchanged P/D images.",
+  "archive_policy": {
+    "minimum_average_input": 150000,
+    "maximum_average_input": 160000,
+    "window_minutes": 10,
+    "start_rule": "First complete qualified minute whose mean input is150k..160k, followed by10 consecutive complete minutes; no TPM-based selection.",
+    "stop_after_archive": true,
+    "kv_high_watermark": {
+      "P": 0.97,
+      "D": 0.94
+    },
+    "sustained_pressure_seconds": 30,
+    "pressure_guard_after_seconds": 120
+  },
+  "router_source_commit": "4e4db92997074544577a33b97b579e535fd2a04b",
+  "engine_revert_commit": "75d25d6899f12fe928305940bcc87358734bfd1e"
+}
