@@ -1,0 +1,176 @@
+{
+  "captured_at_utc": "2026-11-14T04:19:32.503078+00:00",
+  "source": {
+    "repository": "https://github.com/tokmo-infra/vllm",
+    "branch": "kimi31-dcp-hisparse-pd",
+    "commit_by_role": {
+      "prefill": "bab602a8ab34dd29bb35ec1163e7f500d6dffa8e",
+      "decode": "5caa5d7f5c989783ba90ba92c57e521660e8fb9d"
+    }
+  },
+  "scope": "Node-specific launch-parameter snapshot; existing local images, model weights and /work runtime files are prerequisites. No service or benchmark changes were made.",
+  "verification": {
+    "services": 12,
+    "docker_inspect_checks_passed": 220,
+    "dry_run_argv_equal_to_deployed_commands": true,
+    "inference_or_GPU_probes_run": false
+  },
+  "services": {
+    "prefill-92.sh": {
+      "node": 92,
+      "container": "kimi31-pd-hisparse-92-prefill-c256-r15",
+      "image_id": "sha256:dc18c152f9318756058df9dfd43124c4865e1ba392452be7195a1a28d5cbb3dd",
+      "command_sha256": "bba2b8cfa102b708fe8d8c11684fa4ca25bbc7a743353a339a44feddc85da6ca",
+      "script_sha256": "0dafaf657a43afb8306908bce2cd820cf3d32a45b425b28a383d51a5be0fdc21",
+      "live_container_id": "1f908f6a1db9a3830c2f10a99cb51edbe3959eddbc91a72752d4be590c32398d",
+      "started_at_utc": "2026-11-13T21:15:33.427678977Z",
+      "restart_count_at_capture": 0,
+      "docker_inspect_checks_passed": 17
+    },
+    "decode-93.sh": {
+      "node": 93,
+      "container": "kimi31-pd-hisparse-93-decode-c256-r16",
+      "image_id": "sha256:19bcda671d9ccc5d6c8775627bc3a88eed4cbb25032ac21af5075fae0c8e8b71",
+      "command_sha256": "6ce4f9e9e5d08730de375d335382d8c37a22c40af093255286734fd14e05730e",
+      "script_sha256": "7ba9e89c33c1172eb64a027f84e88ba80836327c48770dfc12be1c2473ff8d40",
+      "live_container_id": "9efd80c04d3e651363879a75653f0e7920c79e49029ffbcab85ceb6b9fcb98d2",
+      "started_at_utc": "2026-11-13T23:16:38.718026525Z",
+      "restart_count_at_capture": 0,
+      "docker_inspect_checks_passed": 17
+    },
+    "router-92.sh": {
+      "node": 92,
+      "container": "kimi31-pd-hisparse-92-router-full-c256-r14",
+      "image_id": "sha256:55b0495c0784ed15003156818c7a911dde678d3352ab791418df12de025b7981",
+      "command_sha256": "8ff6d903aa632801b6e6d4b2d607e974df5606218149617c09f57f8d99870de4",
+      "script_sha256": "9ab413c4a7af2e626cc6f4fc18c428d390e91913a078b36bcabd36701537dda7",
+      "live_container_id": "24bdee636d9275aefb56205256cc7243d26004a10292b9d346d0f7eabebbd03c",
+      "started_at_utc": "2026-11-14T02:29:29.789015568Z",
+      "restart_count_at_capture": 0,
+      "docker_inspect_checks_passed": 16
+    },
+    "mooncake-master-92.sh": {
+      "node": 92,
+      "container": "kimi31-hisparse-store-r15-master-92",
+      "image_id": "sha256:5a259407d16d003765361f98e9178c83915dc615287f37d525efdb4012642f21",
+      "command_sha256": "43f9953861e0f16101797c94e50287eb970d195214fb05b5592d4137a5d0c583",
+      "script_sha256": "5114a67edc5b450b2d6112892bd3edf3864f72385e28dc5238721431edd7d9fb",
+      "live_container_id": "cceb05211ad898bb208dd4076d176445c78d8f17a73b29c248cf9441a4428a9e",
+      "started_at_utc": "2026-11-13T19:22:42.524619688Z",
+      "restart_count_at_capture": 0,
+      "docker_inspect_checks_passed": 18
+    },
+    "store/mooncake-owner-92-0.sh": {
+      "node": 92,
+      "container": "kimi31-hisparse-store-r15-owner-92-0",
+      "image_id": "sha256:a2071779007d3e9d17c59afc4555eb0afa471f437858cd849026122e81add9fa",
+      "command_sha256": "862ace83febfaf5a161aa2e356cc7bff33629a1e15d8f32fb7ec9158a5867deb",
+      "script_sha256": "3afb8657f02692da5ce77a952bf5ff0833b66e172d41b75d4fe75701d544fad8",
+      "live_container_id": "756512bc0a27dd05d0a7eb4336390228c18b0f810181726a4851db00d3c1d88d",
+      "started_at_utc": "2026-11-13T19:59:48.424026385Z",
+      "restart_count_at_capture": 0,
+      "docker_inspect_checks_passed": 19,
+      "L2_GiB": 496,
+      "L3_quota_GiB": 1328,
+      "staging_GiB": 1
+    },
+    "store/mooncake-owner-92-1.sh": {
+      "node": 92,
+      "container": "kimi31-hisparse-store-r15-owner-92-1",
+      "image_id": "sha256:a2071779007d3e9d17c59afc4555eb0afa471f437858cd849026122e81add9fa",
+      "command_sha256": "dacb24b7eb4455d01e2d9f5ee0cbe2484e97d372fd5a285588144797ea93c2b4",
+      "script_sha256": "fce37c24b0c4790c7cdd048fee857d3a8baa54d12de30f880f9dc2729caae4d0",
+      "live_container_id": "c1e1dd4264e83c586f5acfd36d9ef8817960babf663154375c550ceade5aeb9e",
+      "started_at_utc": "2026-11-13T20:03:33.290220586Z",
+      "restart_count_at_capture": 0,
+      "docker_inspect_checks_passed": 19,
+      "L2_GiB": 496,
+      "L3_quota_GiB": 2272,
+      "staging_GiB": 1
+    },
+    "store/mooncake-owner-92-2.sh": {
+      "node": 92,
+      "container": "kimi31-hisparse-store-r15-owner-92-2",
+      "image_id": "sha256:a2071779007d3e9d17c59afc4555eb0afa471f437858cd849026122e81add9fa",
+      "command_sha256": "920c1cb6cecbe0c8b1d50c23d8908daf92f120aba050f429edfb75e0a065ff0b",
+      "script_sha256": "45f27c75c8a12947646a8b5a6fdca375a7f17d92c9e9b996c3caae320cabb833",
+      "live_container_id": "b53c96fd62ec11f9854bf32fcd05e38987391ad39b23ad6cbb35ccedbe80fc0a",
+      "started_at_utc": "2026-11-13T19:37:48.74254459Z",
+      "restart_count_at_capture": 0,
+      "docker_inspect_checks_passed": 19,
+      "L2_GiB": 560,
+      "L3_quota_GiB": 2800,
+      "staging_GiB": 1
+    },
+    "store/mooncake-owner-92-3.sh": {
+      "node": 92,
+      "container": "kimi31-hisparse-store-r15-owner-92-3",
+      "image_id": "sha256:a2071779007d3e9d17c59afc4555eb0afa471f437858cd849026122e81add9fa",
+      "command_sha256": "52965da6b5749f64cd139c21e068da4ca1c307d5bfed70b00b7bb82673de36bb",
+      "script_sha256": "8c37a715df6dc535bff024a1ac25eaeedea38799bb69476937c3fcff0367a1b9",
+      "live_container_id": "80b48e13069338c6131fade1cbbe10046453d578a24f9818bbf9618a915c2ce6",
+      "started_at_utc": "2026-11-13T19:42:23.695791229Z",
+      "restart_count_at_capture": 0,
+      "docker_inspect_checks_passed": 19,
+      "L2_GiB": 560,
+      "L3_quota_GiB": 3184,
+      "staging_GiB": 1
+    },
+    "store/mooncake-owner-93-0.sh": {
+      "node": 93,
+      "container": "kimi31-hisparse-store-r15-owner-93-0",
+      "image_id": "sha256:27ed3f34dbe3f231482eff23b1cdc6e4e2b624bfa4b10d1c5205194d8dd589b1",
+      "command_sha256": "86f9005e2d7362fc1c360328e7c98bc33fc3ac6a5d9782d48a2f69f8c8c95ad3",
+      "script_sha256": "3f2673a79accb9d600d0eea3ee5a742af5adabf8fd90f5db95197866c2d03139",
+      "live_container_id": "18cbd6aeb4edf0eb58fde2b93e81d5d6c5db6442d327cd1c3972d7574f5e4fee",
+      "started_at_utc": "2026-11-13T20:43:50.321935891Z",
+      "restart_count_at_capture": 0,
+      "docker_inspect_checks_passed": 19,
+      "L2_GiB": 320,
+      "L3_quota_GiB": 1680,
+      "staging_GiB": 1
+    },
+    "store/mooncake-owner-93-1.sh": {
+      "node": 93,
+      "container": "kimi31-hisparse-store-r15-owner-93-1",
+      "image_id": "sha256:27ed3f34dbe3f231482eff23b1cdc6e4e2b624bfa4b10d1c5205194d8dd589b1",
+      "command_sha256": "fbde99239ec656dde299cf9054991675a9453d5ba6c09b380161547357068b98",
+      "script_sha256": "91b2a9ce991c9e8f1f5c06c537ad7a264b8f0eb2db67285658969f40807cbd87",
+      "live_container_id": "2b0c415a8ed63ad5176ad8e219eb8c797fae20dfd83e768b2e6e8bbf43f5bc5d",
+      "started_at_utc": "2026-11-13T20:43:50.489687491Z",
+      "restart_count_at_capture": 0,
+      "docker_inspect_checks_passed": 19,
+      "L2_GiB": 320,
+      "L3_quota_GiB": 2304,
+      "staging_GiB": 1
+    },
+    "store/mooncake-owner-93-2.sh": {
+      "node": 93,
+      "container": "kimi31-hisparse-store-r15-owner-93-2",
+      "image_id": "sha256:27ed3f34dbe3f231482eff23b1cdc6e4e2b624bfa4b10d1c5205194d8dd589b1",
+      "command_sha256": "d798011bfe2f5eb10af037dbb7e5b327b867bc11b7caf638116853310b83bc9f",
+      "script_sha256": "485626475b33e0e632bf6756c1038054af49566750be4824dee0e66d3d2f3251",
+      "live_container_id": "5d638b78b589de308ed59afd83b289ab80bbb5ee6bc129993ac3a160b315aa7a",
+      "started_at_utc": "2026-11-13T20:43:50.631806758Z",
+      "restart_count_at_capture": 0,
+      "docker_inspect_checks_passed": 19,
+      "L2_GiB": 304,
+      "L3_quota_GiB": 3184,
+      "staging_GiB": 1
+    },
+    "store/mooncake-owner-93-3.sh": {
+      "node": 93,
+      "container": "kimi31-hisparse-store-r15-owner-93-3",
+      "image_id": "sha256:27ed3f34dbe3f231482eff23b1cdc6e4e2b624bfa4b10d1c5205194d8dd589b1",
+      "command_sha256": "742a92d407d22e36a3d58df0a998aebc00c43773afc742d3f5a3344f66bdd867",
+      "script_sha256": "6a9a6c2ccab5a02c210233f8306561d67891ac2744193736753b5804fe2b0fbf",
+      "live_container_id": "6e3a178a7a67c859f0db78dc12d90f82de42edab235d7d3917a3ab5d1c593fca",
+      "started_at_utc": "2026-11-13T20:43:50.800052136Z",
+      "restart_count_at_capture": 0,
+      "docker_inspect_checks_passed": 19,
+      "L2_GiB": 304,
+      "L3_quota_GiB": 3184,
+      "staging_GiB": 1
+    }
+  }
+}

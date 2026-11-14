@@ -1,0 +1,10 @@
+{
+  "mode": "standalone-store",
+  "global_segment_size": 0,
+  "local_buffer_size": 4294967296,
+  "metadata_server": "P2PHANDSHAKE",
+  "master_server_address": "11.5.0.92:51561",
+  "protocol": "rdma",
+  "device_name": "mlx5_0,mlx5_6,mlx5_8,mlx5_10,mlx5_12,mlx5_14,mlx5_18,mlx5_20",
+  "enable_offload": true
+}
