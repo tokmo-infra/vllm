@@ -10,21 +10,15 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_fake_stream
 
-from vllm.logger import init_logger
-
 from ..common.host import fake, layout, stream, to_cute
 from ..common.policy import batch_table
 from . import fused_ws, specialized
 from .fused import KdaFused
-from .fused_tc import KdaFusedTC
 from .fused_ws import KdaFusedWS
 from .kernel import KdaSplit
 from .specialized import KdaWS
 from .stream import KdaStream
-from .tc_policy import stream_layout, tensorcore_enabled, tensorcore_layout
 from .wide import KdaWide
-
-logger = init_logger(__name__)
 
 # KdaSplit schedule "early.lanes.occupancy.cluster.evict" per batch by heads (TP8 12,
 # TP16 6), from GB300 sweeps: early predecessor-independent loads (MMA gate modes only;
@@ -130,6 +124,25 @@ def wide(heads, requests, tokens, record):
     return heads * requests >= WIDE_ITEMS[kind_of(tokens, record)]
 
 
+def stream_layout(specs, tokens):
+    """(conv dim-first, window) when KdaStream can cp.async this step's operands
+    (16-byte aligned rows and slots), else None."""
+    (_, x_stride, _), conv = specs[0], specs[3]
+    shape, stride, dtype = conv
+    size = torch.empty((), dtype=dtype).element_size()
+    window = shape[-1]
+    if stride[-1] == 1 and stride[-2] == window:
+        dim_first = True
+    elif stride[-2] == 1:
+        dim_first = False
+    else:
+        return None
+    aligned = (stride[0] * size) % 16 == 0 and (x_stride[0] * 2) % 16 == 0
+    if not dim_first:
+        aligned = aligned and (stride[-1] * size) % 16 == 0
+    return (dim_first, window) if aligned and window >= tokens + 2 else None
+
+
 def stream_ctas(items, device):
     """Persistent CTAs (two per SM) with an equal item count each."""
     slots = 2 * torch.cuda.get_device_properties(device).multi_processor_count
@@ -137,17 +150,7 @@ def stream_ctas(items, device):
     return -(-items // per)
 
 
-def core(
-    specs,
-    heads,
-    gate_mode,
-    has_bias,
-    device,
-    tokens,
-    record,
-    fused=False,
-    tensorcore=False,
-):
+def core(specs, heads, gate_mode, has_bias, device, tokens, record, fused=False):
     """The KDA core for a step shape: KdaWS, KdaStream, KdaWide or KdaSplit by the
     per-kind (request, head) item thresholds above (DEP's 96-head RecoverSSM
     verify takes KdaStream below KdaWS: TP1 R1 split / wide / stream 14.3 / 13.0 /
@@ -156,21 +159,6 @@ def core(
     items, kind = heads * requests, kind_of(tokens, record)
     if replays(heads, requests, fused):
         streamed = stream_layout(specs, tokens)
-        if tensorcore:
-            sms = torch.cuda.get_device_properties(device).multi_processor_count
-            tc_layout = tensorcore_layout(specs, heads, requests, tokens, sms)
-            if tc_layout is not None:
-                dim_first, window = tc_layout
-                return KdaFusedTC(
-                    heads,
-                    tokens,
-                    gate_mode % 2,
-                    has_bias,
-                    dim_first,
-                    window,
-                    sms,
-                    requests,
-                )
         # q = 2 (k = 1): KdaFusedWS faults (open issue), KdaFused serves it.
         if streamed is not None and items >= FUSED_WS_ITEMS and tokens >= 3:
             conv_size = torch.empty((), dtype=specs[3][2]).element_size()
@@ -212,28 +200,11 @@ def core(
 
 @cache
 def executable(
-    specs,
-    heads,
-    gate_mode,
-    has_bias,
-    device,
-    tokens=1,
-    record=False,
-    fused=False,
-    tensorcore=False,
+    specs, heads, gate_mode, has_bias, device, tokens=1, record=False, fused=False
 ):
     args = tuple(fake(shape, stride, dtype) for shape, stride, dtype in specs)
     scalars = (cutlass.Float32(v) for v in (-5, 128**-0.5, 1e-6))
-    kernel = core(
-        specs, heads, gate_mode, has_bias, device, tokens, record, fused, tensorcore
-    )
-    if isinstance(kernel, KdaFusedTC):
-        logger.info_once(
-            "KDA tensor-core deferred verify: heads=%d, q=%d, conv_dim_first=%s",
-            heads,
-            tokens,
-            kernel.conv_dim_first,
-        )
+    kernel = core(specs, heads, gate_mode, has_bias, device, tokens, record, fused)
     with torch.accelerator.device_index(device):
         return cute.compile(
             kernel, *args[:13], *scalars, *args[13:], make_fake_stream()
@@ -259,16 +230,7 @@ def decode_conv_weight(weight):
 
 
 class PreparedKda:
-    def __init__(self, attention, policies, conv_dim_first, *, tensorcore=None):
-        if tensorcore is None:
-            from vllm.config import get_current_vllm_config_or_none
-
-            config = get_current_vllm_config_or_none()
-            extra = config.additional_config if config is not None else {}
-            tensorcore = tensorcore_enabled(extra)
-        if not isinstance(tensorcore, bool):
-            raise ValueError("additional_config.kda_fused_tc must be a boolean")
-        self.tensorcore = tensorcore
+    def __init__(self, attention, policies, conv_dim_first):
         bias, dt = attention.conv1d.bias, attention.dt_bias
         self.heads = attention.A_log.numel()
         self.dim, self.has_bias = self.heads * 128, bias is not None
@@ -282,9 +244,7 @@ class PreparedKda:
         self.conv_dim_first, self.kernels = conv_dim_first, {}
         # RecoverSSM: verify steps leave the state checkpoint and write the records.
         records = getattr(attention, "recoverssm_records", None)
-        self.records: tuple[torch.Tensor, ...] = (
-            (records.correction, records.key_gate) if records else ()
-        )
+        self.records = (records.correction, records.key_gate) if records else ()
         self.backend = getattr(attention, "recoverssm_backend", None)
         self.lower_bound = attention.gate_lower_bound
         self.fused = False  # set by prepare_caches (deferred_supported)
@@ -321,7 +281,7 @@ class PreparedKda:
             slots = torch.empty(shape, dtype=torch.int32, **meta)
             accepted = accepted if tokens > 1 else None
             fused = record and self.fused
-            deferred: tuple[torch.Tensor, ...] = ()
+            deferred = ()
             if fused and not replays(self.heads, requests, True):
                 self.flushes.add(key)
             if fused:
@@ -334,7 +294,6 @@ class PreparedKda:
                 *(self.heads, mode, self.has_bias, self.device.index, tokens),
                 record,
                 fused,
-                self.tensorcore,
             )
         return self
 
@@ -345,7 +304,7 @@ class PreparedKda:
         pending counts of a deferred RecoverSSM step."""
         batch = projected.shape[0]
         key, rows = batch, batch
-        extra: tuple[torch.Tensor, ...] = ()
+        extra = ()
         if accepted is not None:
             rows = batch // q
             key, accepted = (rows, q), accepted[:rows]
