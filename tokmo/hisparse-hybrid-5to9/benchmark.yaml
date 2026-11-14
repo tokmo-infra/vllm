@@ -1,0 +1,67 @@
+name: c288-a576-hisparse-hybrid-5to9-o2048
+case: B300 P8+D8 TP8/DCP8/EP8; weighted inflight5:9; C288/A576; output2048; cold start;
+  archive150k..160k input window
+seed: 42
+logging:
+  level: INFO
+  progress_interval_seconds: 30
+pipeline:
+  loader:
+    plugin: hf-datasets
+    settings:
+      dataset: json
+      data_files: /data2/perf/perf-benchmark/datasets/swe/swe-maxtpm-130k-candidate.jsonl
+      split: train[:576]
+  normalization:
+    plugin: open-swe-traces
+    settings:
+      missing_tool_call_id: empty
+  selector:
+    plugin: all
+    settings: {}
+  executor:
+    plugin: openai-chat
+    settings:
+      base_url: http://11.5.0.92:19511
+      model: kimi-k3.1-pro
+      stream: true
+      timeout_seconds: 3600
+      max_tokens: 2048
+      cache_salt_enabled: true
+      connection_scope: trial
+      extra_body:
+        temperature: 0.1
+        reasoning_effort: max
+        chat_template_kwargs:
+          thinking: true
+          enable_thinking: true
+          thinking_effort: max
+  scheduler:
+    plugin: multi-turn-closed-loop
+    settings:
+      max_active_sessions: 576
+      max_concurrency: 288
+      stop_on_underfill: false
+  metrics:
+    plugin: compact-performance
+    settings:
+      maxtpm: true
+      maxtpm_start_percent: 40
+      memory_limit: 4GB
+      pricing:
+        currency: CNY
+        per_tokens: 1000000
+        input_price: 2.6
+        cached_input_price: 0.26
+        output_price: 13.6
+        source: Inherited experimental Kimi CNY/1M rates after x0.2 once; not a current
+          price lookup; excludes separate cache-write/TTL charges
+  saver:
+    plugin: sqlite
+    settings:
+      path: result/c288-a576-hisparse-hybrid-5to9-o2048/benchmark-evidence/run-001/results.db
+      summary_only: true
+  exporter: {}
+observation:
+  enabled: false
+  trace_export: false
