@@ -182,7 +182,6 @@ class HybridSharedMoE:
             for m in modules:
                 self.expert_buffers[id(m.experts)] = m.experts.get_symm_buffer()
                 m.experts._synchronize_first_launch()
-        self.graph_keepalive = []
 
     def run(self, module, full, q):
         from .hybrid import run_stock_moe
@@ -260,10 +259,6 @@ class HybridSharedMoE:
             sp_reduce_scatter(partial) if shared.shard_sequence_parallel else partial
         )
         out = m.routed_output_transform(routed, residual=shared_local)
-        if capturing:
-            self.graph_keepalive.append(
-                (full, shared_input, local, partial, shared_local, out)
-            )
         return out
 
     def _routed(self, expert, hidden, weights, ids, *, tile32):
