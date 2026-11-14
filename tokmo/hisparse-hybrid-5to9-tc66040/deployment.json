@@ -1,5 +1,5 @@
 {
-  "status": "full-model-and-cache-validation-passed",
+  "status": "benchmark-running",
   "single_image_id": "sha256:7499b963a8ad69f2c20c5127b3a338bdd7297c7c0517be0f70e35f7d58140784",
   "image_tag": "local/kimi31-pd-tc66040:verify-c80c339d60b6",
   "engine_source_commit": "c80c339d60b665d9e5d0c040667c43fb7a24b994",
@@ -57,5 +57,13 @@
     "P": 44.09349060058594,
     "D": 44.8960075378418
   },
-  "kv_pool_capacity_method": "Rust frontend CPU handshake snapshot num_gpu_blocks times prior verified physical block stride; no GPU RPC"
+  "kv_pool_capacity_method": "Rust frontend CPU handshake snapshot num_gpu_blocks times prior verified physical block stride; no GPU RPC",
+  "benchmark_run_id": "run-d937e6f2d2b3",
+  "benchmark_container": "kimi31-hisparse-hybrid-5to9-tc66040-c288-a576-o2048-benchmark",
+  "benchmark_container_id": "75bbb2760f8e111b6981f7e8c9e2d5adde7cb71893436447455639d9b300a175",
+  "benchmark_reference_turns": 49238,
+  "formal_threshold_turn": 19696,
+  "benchmark_results_pending": true,
+  "cold_cache_acceptance_passed": true,
+  "latest_deployment_branch": "kimi31-dcp-hisparse-66040-verify"
 }
