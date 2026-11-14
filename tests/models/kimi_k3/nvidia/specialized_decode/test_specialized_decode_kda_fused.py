@@ -55,6 +55,122 @@ def _pitch(heads):
     return -(-(4 * heads * D + D + heads) // 16) * 16
 
 
+def _tc_operands(requests, q=5, dim_first=False, state_page_bytes=None):
+    """TP8 operands with padded state-page strides and permuted request slots."""
+    heads, dim, slots = 12, 12 * D, requests + 3
+    gen = torch.Generator(device=DEVICE).manual_seed(66040)
+    randn = lambda *shape: torch.randn(*shape, device=DEVICE, generator=gen)
+    projected = _step_inputs(heads, 66040, requests * q)
+    conv = randn(slots, 3 * dim, q + 2).bfloat16()
+    if not dim_first:
+        conv = conv.transpose(1, 2).contiguous().transpose(1, 2)
+    state = randn(slots, heads + 1, D, D)[:, :heads] * 0.1
+    # Preserve a physical gap between state slots, as in the shared KDA pool.
+    stride = state_page_bytes // 4 if state_page_bytes else heads * D * D + 256
+    padded = torch.empty_strided(
+        state.shape, (stride, D * D, D, 1), device=DEVICE, dtype=state.dtype
+    )
+    padded.copy_(state)
+    dt = randn(dim) * 0.5
+    table = torch.arange(requests, 0, -1, device=DEVICE, dtype=torch.int32)[:, None]
+    table[-1] = 0
+    rows = torch.arange(requests - 1, -1, -1, device=DEVICE, dtype=torch.int32)
+    pending = torch.arange(slots, device=DEVICE, dtype=torch.int32) % (q + 1)
+    return (
+        projected[:, :3 * dim], randn(3, 4, dim) * 0.5, dt, conv,
+        projected[:, 4 * dim:4 * dim + D],
+        projected[:, 4 * dim + D:4 * dim + D + heads],
+        randn(heads) * 0.5, dt, table, padded,
+        torch.empty(requests * q, dim, device=DEVICE, dtype=torch.bfloat16),
+        projected[:, 3 * dim:4 * dim], randn(D),
+        (randn(dim, D) * 3).round().clamp(-8, 8).bfloat16() / 64,
+        torch.ones(requests, device=DEVICE, dtype=torch.int32),
+        randn(slots, heads, q, D) * 0.1,
+        randn(slots, heads, q, 2 * D).bfloat16(), rows, pending,
+    )  # fmt: skip
+
+
+def _clone_tc_operands(operands):
+    result = []
+    for tensor in operands:
+        copy = torch.empty_strided(
+            tensor.shape, tensor.stride(), device=tensor.device, dtype=tensor.dtype
+        )
+        copy.copy_(tensor)
+        result.append(copy)
+    return tuple(result)
+
+
+def _tc_launch(operands, q=5, enabled=True, gate_mode=0):
+    specs = tuple(map(prepared.layout, operands))
+    kernel = prepared.executable(
+        specs, 12, gate_mode, False, DEVICE.index or 0, q, True, True, enabled
+    )
+    views = tuple(prepared.to_cute(t, 16) for t in operands)
+    scalars = tuple(map(prepared.cutlass.Float32, (LOWER_BOUND, D**-0.5, EPS)))
+    return lambda: kernel(*views[:13], *scalars, *views[13:], prepared.stream(DEVICE))
+
+
+@pytest.mark.parametrize("requests", [16, 64, 224, 256])
+@pytest.mark.parametrize("dim_first", [False, True])
+@pytest.mark.parametrize("gate_mode", [0, 1])
+@torch.inference_mode()
+def test_tensorcore_replay_matches_fused_ws(requests, dim_first, gate_mode):
+    """B300 TP8/Q5: retain state, conv and records with padded physical pages."""
+    operands = _tc_operands(requests, dim_first=dim_first)
+    reference = _clone_tc_operands(operands)
+    specs = tuple(map(prepared.layout, operands))
+    selected = prepared.core(specs, 12, gate_mode, False, 0, 5, True, True, True)
+    assert isinstance(selected, prepared.KdaFusedTC)
+    _tc_launch(reference, enabled=False, gate_mode=gate_mode)()
+    _tc_launch(operands, gate_mode=gate_mode)()
+    torch.accelerator.synchronize()
+    for index in (3, 9, 16, 18):
+        torch.testing.assert_close(operands[index], reference[index], atol=0, rtol=0)
+    corr, expected = operands[15], reference[15]
+    assert ((corr - expected).abs().max() / expected.abs().max()).item() < 1e-6
+    out, expected = operands[10], reference[10]
+    same = (out.view(torch.int16) == expected.view(torch.int16)).float().mean()
+    rms = expected.float().square().mean(-1, keepdim=True).sqrt().clamp_min(1e-6)
+    assert same.item() > 0.97
+    assert ((out.float() - expected.float()).abs() / rms).max().item() < 6e-2
+    assert (out.view(requests, 5, -1)[-1] == 0).all()
+
+
+@torch.inference_mode()
+def test_tensorcore_graph_reads_updated_slots_and_pending():
+    """Replay must read new request slots and accepted counts from device buffers."""
+    operands = _tc_operands(17)
+    saved = _clone_tc_operands(operands)
+    run = _tc_launch(operands, gate_mode=1)
+    run()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for dst, src in zip(operands, saved):
+        dst.copy_(src)
+    operands[8].copy_(operands[8].roll(3, 0))
+    operands[17].copy_(operands[17].roll(2))
+    operands[18].copy_((operands[18] + 2) % 6)
+    reference = _clone_tc_operands(operands)
+    graph.replay()
+    _tc_launch(reference, gate_mode=1)()
+    torch.accelerator.synchronize()
+    for index in (3, 9, 10, 15, 16, 18):
+        torch.testing.assert_close(operands[index], reference[index], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("q,dim_first", [(2, False), (6, True), (8, True)])
+def test_tensorcore_keeps_fallback_for_unsupported_layout(q, dim_first):
+    """Unsupported query/shared-memory shapes retain the existing fused path."""
+    operands = _tc_operands(16, q, dim_first)
+    selected = prepared.core(
+        tuple(map(prepared.layout, operands)), 12, 0, False, 0, q, True, True, True
+    )
+    assert not isinstance(selected, prepared.KdaFusedTC)
+
+
 def _layer(heads, seed, records, caches):
     dim = heads * D
     g = torch.Generator(device=DEVICE).manual_seed(seed)
@@ -109,7 +225,8 @@ def _stock_verify(layer, heads, projected, caches, table, q, record_indices=None
     )  # fmt: skip
     qkv = [x.reshape(1, n, heads, D) for x in mixed.split(dim, dim=-1)]
     core = kda_recoverssm_verify(
-        *qkv, g1, beta, layer.A_log, layer.dt_bias, LOWER_BOUND, state,
+        qkv[0], qkv[1], qkv[2], g1, beta, layer.A_log, layer.dt_bias,
+        LOWER_BOUND, state,
         layer.recoverssm_records, starts, table, q, record_indices=record_indices,
     )  # fmt: skip
     out = rms_norm_gated(
@@ -172,7 +289,7 @@ def split(request, monkeypatch):
     prepared.executable.cache_clear()
 
 
-@pytest.fixture(params=["ws", "fused", "flush"])
+@pytest.fixture(params=["ws", "fused", "flush", "tc"])
 def path(request, monkeypatch):
     """Deferred steps through KdaFusedWS or KdaFused (the replay in the verify), or
     the policy's small-batch path: the deferred commit (flush), then the regular
@@ -228,7 +345,9 @@ def test_fused_steps_match_stock(heads, requests, q, split, path, conv_dtype):
     stock_caches = (conv.clone(), state.clone())
     ours_layer = _layer(heads, seed, ours_records, ours_caches)
     stock_layer = _layer(heads, seed, stock_records, stock_caches)
-    kda = PreparedKda(ours_layer, {(requests, q): (_pitch(heads), 0)}, True)
+    kda = PreparedKda(
+        ours_layer, {(requests, q): (_pitch(heads), 0)}, True, tensorcore=path == "tc"
+    )
     kda.prepare_caches(ours_caches)
     assert kda.fused
     stock_ctx = KDARecoverSSMCommitContext.create(
@@ -349,7 +468,9 @@ def test_fused_ws_uneven_ctas(heads, requests, ctas, monkeypatch):
     monkeypatch.setattr(
         prepared,
         "KdaFusedWS",
-        lambda *args: ws(*args[:-1], ctas),
+        lambda h, q, mode, bias, dim_first, window, _: ws(
+            h, q, mode, bias, dim_first, window, ctas
+        ),
     )
     prepared.executable.cache_clear()
     try:
@@ -405,7 +526,7 @@ def test_padded_rows_and_graph(split, path):
                 recs[1].clone(),
             )
             fn()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 fn()
@@ -416,7 +537,7 @@ def test_padded_rows_and_graph(split, path):
             graph.replay()
         else:
             fn()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         return out, caches, recs, pending_buf
 
     rows = torch.tensor([4, 0, 6, 2, 3], dtype=torch.int32, device=DEVICE)
