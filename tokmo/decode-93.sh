@@ -4,7 +4,7 @@ set -euo pipefail
 
 command=(
   docker run -d
-  --name kimi31-pd-hisparse-93-decode-c256-r16
+  --name kimi31-pd-hisparse-93-decode-c256-r17-gpu095
   --pull=never
   --runtime=runc
   --network host
@@ -129,7 +129,7 @@ case "${1:---dry-run}" in
     ;;
   --execute)
     ip -o -4 addr show | grep -F '11.5.0.93/' >/dev/null || { echo 'Run on b300-93' >&2; exit 1; }
-    if docker inspect kimi31-pd-hisparse-93-decode-c256-r16 >/dev/null 2>&1; then
+    if docker inspect kimi31-pd-hisparse-93-decode-c256-r17-gpu095 >/dev/null 2>&1; then
       echo 'Container already exists; inspect it before starting another instance.' >&2
       exit 1
     fi

@@ -1,5 +1,5 @@
 {
-  "captured_at_utc": "2026-11-14T04:19:32.503078+00:00",
+  "captured_at_utc": "2026-11-14T05:06:25.316946+00:00",
   "source": {
     "repository": "https://github.com/tokmo-infra/vllm",
     "branch": "kimi31-dcp-hisparse-pd",
@@ -8,7 +8,7 @@
       "decode": "5caa5d7f5c989783ba90ba92c57e521660e8fb9d"
     }
   },
-  "scope": "Node-specific launch-parameter snapshot; existing local images, model weights and /work runtime files are prerequisites. No service or benchmark changes were made.",
+  "scope": "Read-only parameter export after validated P0.97/D0.95 budget change; existing local images, weights and runtime extensions remain prerequisites.",
   "verification": {
     "services": 12,
     "docker_inspect_checks_passed": 220,
@@ -18,23 +18,23 @@
   "services": {
     "prefill-92.sh": {
       "node": 92,
-      "container": "kimi31-pd-hisparse-92-prefill-c256-r15",
+      "container": "kimi31-pd-hisparse-92-prefill-c256-r17-gpu097",
       "image_id": "sha256:dc18c152f9318756058df9dfd43124c4865e1ba392452be7195a1a28d5cbb3dd",
-      "command_sha256": "bba2b8cfa102b708fe8d8c11684fa4ca25bbc7a743353a339a44feddc85da6ca",
-      "script_sha256": "0dafaf657a43afb8306908bce2cd820cf3d32a45b425b28a383d51a5be0fdc21",
-      "live_container_id": "1f908f6a1db9a3830c2f10a99cb51edbe3959eddbc91a72752d4be590c32398d",
-      "started_at_utc": "2026-11-13T21:15:33.427678977Z",
+      "command_sha256": "68b3ece9d6cc8654947bf4b695375ac4ddec692e7321d1b1741a4e37a05f5c75",
+      "script_sha256": "c507a050b998342bf6a683717425bfc79cb985ce63c9028830b1a78fcc1bc00e",
+      "live_container_id": "cc742e6f337835e365ba6de0a2ed4eaf4cdb4f75f99736f068ae203e1198f8de",
+      "started_at_utc": "2026-11-14T04:33:29.909204568Z",
       "restart_count_at_capture": 0,
       "docker_inspect_checks_passed": 17
     },
     "decode-93.sh": {
       "node": 93,
-      "container": "kimi31-pd-hisparse-93-decode-c256-r16",
+      "container": "kimi31-pd-hisparse-93-decode-c256-r17-gpu095",
       "image_id": "sha256:19bcda671d9ccc5d6c8775627bc3a88eed4cbb25032ac21af5075fae0c8e8b71",
-      "command_sha256": "6ce4f9e9e5d08730de375d335382d8c37a22c40af093255286734fd14e05730e",
-      "script_sha256": "7ba9e89c33c1172eb64a027f84e88ba80836327c48770dfc12be1c2473ff8d40",
-      "live_container_id": "9efd80c04d3e651363879a75653f0e7920c79e49029ffbcab85ceb6b9fcb98d2",
-      "started_at_utc": "2026-11-13T23:16:38.718026525Z",
+      "command_sha256": "badc9209cf1762f79056a3fdc9430f993dc6735a491aa039a3322f89f42b7503",
+      "script_sha256": "7af437bb5523ff1388fb02576f2c7b8278aa0b030e3101103cedd08298cdfc1d",
+      "live_container_id": "90c78231d275caaab352fd629b260096c43bd2577bedf41ac20a4686a15b000b",
+      "started_at_utc": "2026-11-14T04:49:21.871724664Z",
       "restart_count_at_capture": 0,
       "docker_inspect_checks_passed": 17
     },
@@ -45,7 +45,7 @@
       "command_sha256": "8ff6d903aa632801b6e6d4b2d607e974df5606218149617c09f57f8d99870de4",
       "script_sha256": "9ab413c4a7af2e626cc6f4fc18c428d390e91913a078b36bcabd36701537dda7",
       "live_container_id": "24bdee636d9275aefb56205256cc7243d26004a10292b9d346d0f7eabebbd03c",
-      "started_at_utc": "2026-11-14T02:29:29.789015568Z",
+      "started_at_utc": "2026-11-14T05:00:53.076734515Z",
       "restart_count_at_capture": 0,
       "docker_inspect_checks_passed": 16
     },
@@ -172,5 +172,23 @@
       "L3_quota_GiB": 3184,
       "staging_GiB": 1
     }
+  },
+  "runtime_validation": {
+    "status": "passed",
+    "P_gpu_memory_utilization": 0.97,
+    "D_gpu_memory_utilization": 0.95,
+    "P_KV_GiB_per_rank": 46.32769775390625,
+    "D_KV_GiB_per_rank": 44.8960075378418,
+    "P_blocks": 1804,
+    "D_blocks": 6993,
+    "known_lengths": [
+      131073,
+      1048531
+    ],
+    "Router_cases": 6,
+    "model_source_changed": false,
+    "next_trial": "c176-a352-r17-p097-d095",
+    "next_trial_started": false,
+    "D097_failure_preserved": true
   }
 }

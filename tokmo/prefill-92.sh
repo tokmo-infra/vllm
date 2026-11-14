@@ -4,7 +4,7 @@ set -euo pipefail
 
 command=(
   docker run -d
-  --name kimi31-pd-hisparse-92-prefill-c256-r15
+  --name kimi31-pd-hisparse-92-prefill-c256-r17-gpu097
   --pull=never
   --runtime=runc
   --network host
@@ -116,7 +116,7 @@ command=(
   --stream-interval 10
   --max-num-seqs 256
   --max-num-batched-tokens 8192
-  --gpu-memory-utilization 0.95
+  --gpu-memory-utilization 0.97
   --speculative-config '{"model":"/draft","method":"dspark","num_speculative_tokens":4,"draft_sample_method":"probabilistic","rejection_sample_method":"block","attention_backend":"TOKENSPEED_MLA","kv_cache_dtype":"fp8"}'
   --kv-transfer-config '{"kv_connector": "MultiConnector", "kv_role": "kv_both", "kv_load_failure_policy": "recompute", "kv_connector_extra_config": {"connectors": [{"kv_connector": "MooncakeConnector", "kv_role": "kv_producer", "kv_load_failure_policy": "fail", "kv_connector_extra_config": {"mooncake_protocol": "rdma", "device_name": "mlx5_0,mlx5_6,mlx5_8,mlx5_10,mlx5_12,mlx5_14,mlx5_18,mlx5_20"}}, {"kv_connector": "MooncakeStoreConnector", "kv_role": "kv_both", "kv_connector_extra_config": {"cache_prefix": "kimi31-pd-hisparse-store-r15-v1", "lookup_async": true, "load_async": true, "enable_lookup": true, "save_decode_cache": false, "enable_cross_layers_blocks": false, "enable_offload": true, "cpu_bytes_to_use_per_rank": 0, "disk_offload_buffer_budget_bytes": 134217728}}]}}'
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[4,8,12,16,20,24,32,40,48,64,80,96,128,160,256,384,512,640,768,896,1024,1152,1280,1408,1536,1664,1792,1920,2048,2304,2560,2816,3072,3328,3584,3840,4096,4608,5120,5632,6144,6656,7168,7680,8192]}'
@@ -129,7 +129,7 @@ case "${1:---dry-run}" in
     ;;
   --execute)
     ip -o -4 addr show | grep -F '11.5.0.92/' >/dev/null || { echo 'Run on b300-92' >&2; exit 1; }
-    if docker inspect kimi31-pd-hisparse-92-prefill-c256-r15 >/dev/null 2>&1; then
+    if docker inspect kimi31-pd-hisparse-92-prefill-c256-r17-gpu097 >/dev/null 2>&1; then
       echo 'Container already exists; inspect it before starting another instance.' >&2
       exit 1
     fi

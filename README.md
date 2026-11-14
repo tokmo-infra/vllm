@@ -23,8 +23,8 @@ Tokmo 的 Kimi3.1 Pro 推理分支，面向双机 B300 的 Prefill/Decode 分离
 | max model length | 1,048,576 | 1,048,576 |
 | max num seqs | 256 | 256 |
 | max batched tokens | 8192 | 2048 |
-| GPU memory utilization | 0.95 | 0.95 |
-| 实测 HBM KV 池 / 卡 | 40.986 GiB，1596 块 | 44.896 GiB，6993 块 |
+| GPU memory utilization | 0.97 | 0.95 |
+| 实测 HBM KV 池 / 卡 | 46.328 GiB，1804 块 | 44.896 GiB，6993 块 |
 | HiSparse hot / source | — | 6144 行 / 1024 GiB 逻辑主存池 |
 | Prefix caching / Mamba mode | 开启 / `align` | 关闭 / `none` |
 | 目标 KV / indexer KV | NVFP4 / MXFP4 | NVFP4 / MXFP4 |
@@ -105,7 +105,7 @@ for i in 0 1 2 3; do
 done
 bash tokmo/platform-profile.sh --apply
 bash tokmo/prefill-92.sh --execute
-bash tokmo/bind-api-numa.sh kimi31-pd-hisparse-92-prefill-c256-r15 http://11.5.0.92:19580/health
+bash tokmo/bind-api-numa.sh kimi31-pd-hisparse-92-prefill-c256-r17-gpu097 http://11.5.0.92:19580/health
 ```
 
 93 上执行；NUMA 绑定脚本会等待 D 的 health 就绪，再启动 owner：
@@ -113,7 +113,7 @@ bash tokmo/bind-api-numa.sh kimi31-pd-hisparse-92-prefill-c256-r15 http://11.5.0
 ```bash
 bash tokmo/platform-profile.sh --apply
 bash tokmo/decode-93.sh --execute
-bash tokmo/bind-api-numa.sh kimi31-pd-hisparse-93-decode-c256-r16 http://11.5.0.93:19581/health
+bash tokmo/bind-api-numa.sh kimi31-pd-hisparse-93-decode-c256-r17-gpu095 http://11.5.0.93:19581/health
 for i in 0 1 2 3; do
   bash "tokmo/store/mooncake-owner-93-$i.sh" --execute
 done
@@ -135,7 +135,7 @@ bash tokmo/router-92.sh --execute
 
 性能目标为 **Mean TTFT ≤ 5 秒、Mean TPOT ≤ 50 毫秒**，活跃用户 A=2C。以本轮 40% 进度后的连续完整、并发达标分钟统计，平均输入约 130k 或自然欠载时冻结；分母为 P8+D8 共 16 个物理 ranks。更改 A 会改变有限语料 cohort，不能只用最高并发认定最高合格 TPM。已完成的 C256/A512、平均输入 130,112 的正式窗口为 27.485M TPM，但 Mean TTFT 24.188 秒，未满足 SLO；最高合格 TPM 仍在调优。
 
-本次参数归档通过 12 个运行容器的 220 项只读 Docker 检查，12 份脚本 dry-run 的 argv 与部署命令逐项一致。归档与文档修改不执行服务启动、GPU 探针或推理。
+本次参数归档通过 12 个运行容器的 220 项只读 Docker 检查，12 份脚本 dry-run 的 argv 与部署命令逐项一致。参数导出本身只读。当前 P0.97/D0.95 已重新 profile 和完成 CUDA Graph 捕获，131073 / 1048531 token 的真实 PD 已知答案及 Router 六项检查通过。D0.97 在 DSpark logits all-gather 额外分配300MiB时 OOM，按用户选择保持 D0.95；FP32、hot6144 和专用后端保持不变。
 
 ## 上游与许可
 
