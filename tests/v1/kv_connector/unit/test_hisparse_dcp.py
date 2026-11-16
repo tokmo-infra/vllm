@@ -5,10 +5,41 @@
 import pytest
 import torch
 
-from vllm.v1.hisparse.dcp import HiSparseDCPShard, import_page_offset, pair_import_pages
+from vllm.v1.hisparse.dcp import (
+    HiSparseDCPShard,
+    coalesce_import_descriptors,
+    import_page_offset,
+    pair_import_pages,
+)
 from vllm.v1.hisparse.types import SparseKVRowMirror
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.parametrize("max_bytes", [16, 64, 1024])
+def test_import_coalescing_preserves_byte_copies_and_fragmented_gaps(max_bytes):
+    """Reduce RDMA descriptors without copying padding or moving destinations."""
+    descriptors = [(0, 8, 16), (16, 24, 16), (48, 56, 16), (64, 88, 16)]
+    source = bytes(range(128))
+    expected = bytearray([255] * 128)
+    actual = expected.copy()
+    for src, dst, size in descriptors:
+        expected[dst : dst + size] = source[src : src + size]
+    merged = coalesce_import_descriptors(descriptors, max_bytes=max_bytes)
+    for src, dst, size in merged:
+        actual[dst : dst + size] = source[src : src + size]
+    assert actual == expected
+    assert sum(size for _, _, size in merged) == 64
+    assert all(size <= max_bytes for _, _, size in merged)
+    assert len(merged) == (4 if max_bytes == 16 else 3)
+
+
+def test_import_coalescing_keeps_registration_boundaries_separate():
+    # Callers submit each registered region separately, even if adjacent.
+    first = coalesce_import_descriptors([(0, 64, 16), (16, 80, 16)])
+    second = coalesce_import_descriptors([(32, 96, 16)])
+    assert first + second == [(0, 64, 32), (32, 96, 16)]
+    assert coalesce_import_descriptors([]) == []
 
 
 def test_kimi_layer_builders_share_one_workspace_without_cross_model_retention():

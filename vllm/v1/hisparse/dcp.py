@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Position geometry for rank-private, context-sharded HiSparse caches."""
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -9,6 +10,29 @@ from vllm.v1.hisparse.types import SparseKVRowMirror
 
 if TYPE_CHECKING:
     import torch
+
+
+def coalesce_import_descriptors(
+    descriptors: Iterable[tuple[int, int, int]], *, max_bytes: int = 1 << 20
+) -> list[tuple[int, int, int]]:
+    """Merge adjacent byte copies within one request and registered region."""
+    result: list[tuple[int, int, int]] = []
+    for source, destination, size in descriptors:
+        if result:
+            previous_source, previous_destination, previous_size = result[-1]
+            if (
+                previous_source + previous_size == source
+                and previous_destination + previous_size == destination
+                and previous_size + size <= max_bytes
+            ):
+                result[-1] = (
+                    previous_source,
+                    previous_destination,
+                    previous_size + size,
+                )
+                continue
+        result.append((source, destination, size))
+    return result
 
 
 def query_chunk_rows(

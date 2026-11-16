@@ -73,7 +73,11 @@ from vllm.utils.torch_utils import is_non_overlapping_and_dense
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.hisparse.dcp import import_page_offset, pair_import_pages
+from vllm.v1.hisparse.dcp import (
+    coalesce_import_descriptors,
+    import_page_offset,
+    pair_import_pages,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CircularBufferSpec,
@@ -2040,6 +2044,7 @@ class MooncakeConnectorWorker:
         source_ratios = self._group_kernel_ratios(kernel_block_size)
         for request_id, send in ready_reqs:
             request_descriptors: list[tuple[int, int, int]] = []
+            attention_spans: dict[tuple[int, ...], list[tuple[int, int, int]]] = {}
             try:
                 remote_blocks = meta.req_blocks[request_id][1]
                 if not any(remote_blocks):
@@ -2066,6 +2071,25 @@ class MooncakeConnectorWorker:
                             zip(source_ids[-count:] if count else [], destination_ids)
                         )
                     elif isinstance(spec, MLAAttentionSpec):
+                        row_bytes = spec.state_content_size_bytes
+                        if meta.registered_row_bytes[remote.layer_name] != row_bytes:
+                            raise ValueError("HiSparse MLA/indexer row formats differ")
+                        span_key = (
+                            local.group_index,
+                            remote.group_index,
+                            int(spec.dcp_sharded),
+                            row_bytes,
+                            local.kv_block_len,
+                            remote.kv_block_len,
+                            local.block_len,
+                            remote.block_len,
+                        )
+                        if span_key in attention_spans:
+                            request_descriptors.extend(
+                                (local.base_addr + src, remote.base_addr + dst, size)
+                                for src, dst, size in attention_spans[span_key]
+                            )
+                            continue
                         pairs = pair_import_pages(
                             source_ids,
                             destination_ids,
@@ -2081,9 +2105,6 @@ class MooncakeConnectorWorker:
                             "Unsupported cache kind in DCP HiSparse import"
                         )
                     if isinstance(spec, MLAAttentionSpec):
-                        row_bytes = spec.state_content_size_bytes
-                        if meta.registered_row_bytes[remote.layer_name] != row_bytes:
-                            raise ValueError("HiSparse MLA/indexer row formats differ")
 
                         def offset(page, region, ratio, *, row_bytes=row_bytes):
                             return import_page_offset(
@@ -2095,12 +2116,10 @@ class MooncakeConnectorWorker:
                                 registered_stride=region.block_len,
                             )
 
-                        request_descriptors.extend(
+                        spans = coalesce_import_descriptors(
                             (
-                                local.base_addr
-                                + offset(src, local, source_ratios[local.group_index]),
-                                remote.base_addr
-                                + offset(
+                                offset(src, local, source_ratios[local.group_index]),
+                                offset(
                                     dst,
                                     remote,
                                     meta.group_kernel_ratios[remote.group_index],
@@ -2108,6 +2127,11 @@ class MooncakeConnectorWorker:
                                 kernel_block_size * row_bytes,
                             )
                             for src, dst in pairs
+                        )
+                        attention_spans[span_key] = spans
+                        request_descriptors.extend(
+                            (local.base_addr + src, remote.base_addr + dst, size)
+                            for src, dst, size in spans
                         )
                         continue
                     if local.kv_block_len != remote.kv_block_len:
