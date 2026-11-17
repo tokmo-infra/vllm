@@ -14,6 +14,7 @@ from vllm.utils.import_utils import PlaceholderModule, check_torchcodec_availabl
 from .base import (
     VideoSourceMetadata,
     VideoTargetMetadata,
+    charge_sampled_frames,
     check_frame_pixel_limit,
 )
 
@@ -55,6 +56,7 @@ def decode_torchcodec(
         target=target,
         **{**sampling_kwargs, "frame_size": (width, height)},
     )
+    charge_sampled_frames(len(frame_idx), width, height)
     frames, valid = TorchCodecVideoBackendMixin.decode_torchcodec_frames(
         decoder, frame_idx, device=device
     )

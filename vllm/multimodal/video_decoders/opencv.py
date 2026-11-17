@@ -12,6 +12,7 @@ from vllm.utils.import_utils import PlaceholderModule
 from .base import (
     VideoSourceMetadata,
     VideoTargetMetadata,
+    charge_sampled_frames,
     check_frame_pixel_limit,
 )
 
@@ -45,6 +46,8 @@ def decode_opencv(
         target=target,
         **{**sampling_kwargs, "frame_size": (width, height)},
     )
+    # OpenCV reads each distinct index once.
+    charge_sampled_frames(len(set(frame_idx)), width, height)
     frames, valid = loader_cls.read_frames(
         cap,
         frame_idx,
