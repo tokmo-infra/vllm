@@ -319,7 +319,7 @@ class SessionCheckpointCatalog:
                 for r in self.db.execute(
                     "SELECT key FROM garbage WHERE NOT EXISTS "
                     "(SELECT 1 FROM refs WHERE refs.key=garbage.key) "
-                    "ORDER BY failures,key LIMIT ?",
+                    "ORDER BY rowid LIMIT ?",
                     (limit,),
                 )
             ]
@@ -337,7 +337,10 @@ class SessionCheckpointCatalog:
                     removed += 1
                 else:
                     self.db.execute(
-                        "UPDATE garbage SET failures=failures+1 WHERE key=?", (key,)
+                        "UPDATE garbage SET failures=failures+1, "
+                        "rowid=(SELECT COALESCE(MAX(rowid),0)+1 FROM garbage) "
+                        "WHERE key=?",
+                        (key,),
                     )
                     self.counters["remove_failures"] += 1
             self.counters["removed_keys"] += removed

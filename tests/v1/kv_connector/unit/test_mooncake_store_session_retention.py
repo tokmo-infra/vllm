@@ -195,6 +195,23 @@ def test_non_forcing_lease_retry_and_readoption_cancel_pending_deletion(catalog)
     assert set(keys("shared")) <= store.objects
 
 
+def test_new_garbage_does_not_starve_retry_after_a_read_lease_expires(catalog):
+    owner, store, _ = catalog
+    old = prepare(owner, store, "old-session", "old-request", "old")
+    owner.abandon(old)
+    store.leased.update(keys("old"))
+    assert owner.collect(limit=24) == 0
+
+    fresh = prepare(owner, store, "fresh-session", "fresh-request", "fresh")
+    owner.abandon(fresh)
+    store.leased.update(keys("fresh"))
+    store.leased.difference_update(keys("old"))
+
+    assert owner.collect(limit=24) == 24
+    assert not set(keys("old")) & store.objects
+    assert set(keys("fresh")) <= store.objects
+
+
 def test_session_expiry_waits_for_pending_puts_and_live_readers(catalog):
     owner, store, clock = catalog
     candidate = prepare(owner, store, "s", "r", "pending")

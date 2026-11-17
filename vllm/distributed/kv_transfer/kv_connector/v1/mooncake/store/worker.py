@@ -1655,8 +1655,6 @@ class MooncakeStoreWorker:
                         for _ in range(4):
                             count = self.session_catalog.collect()
                             removed += count
-                            if count == 0:
-                                break
                         self._record_kv_connector_operation(
                             "session_checkpoint_gc",
                             time.perf_counter() - start,
