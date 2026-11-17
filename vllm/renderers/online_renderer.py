@@ -154,6 +154,26 @@ def _reused_prompt_token_ids(
         )
     # The engine checks this too, but only after a streamed response starts.
     renderer.validate_token_ids(ids, parameter="kv_transfer_params.prompt_token_ids")
+    from vllm.tokenizers.qwen38_native_cache import (
+        ENABLED,
+        LIMIT,
+        REQUESTS,
+        SIZE,
+        TOKENS,
+    )
+
+    rank = str(renderer.api_process_rank)
+    from contextlib import suppress
+
+    from prometheus_client import REGISTRY
+
+    if not getattr(renderer, "_qwen38_pd_metrics_registered", False):
+        for metric in (REQUESTS, TOKENS, SIZE, LIMIT, ENABLED):
+            with suppress(ValueError):
+                REGISTRY.register(metric)
+        renderer._qwen38_pd_metrics_registered = True
+    REQUESTS.labels(rank, "pd_reuse_prompt_ids").inc()
+    TOKENS.labels(rank, "pd_forwarded_tokens").inc(len(ids))
     return ids
 
 
