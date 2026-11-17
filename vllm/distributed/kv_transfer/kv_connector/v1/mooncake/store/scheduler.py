@@ -561,6 +561,19 @@ class MooncakeStoreScheduler:
                     token_len=num_tokens_to_compute,
                     allocated_block_ids=block_ids,
                     num_saved_tokens=0,
+                    prefill_end_tokens=(
+                        len(unfinished_req.all_token_ids)
+                        if self.retention_config
+                        else 0
+                    ),
+                    session_id=(
+                        unfinished_req.session_id if self.retention_config else None
+                    ),
+                    session_generation=(
+                        self._session_generations.get(request_id)
+                        if self.retention_config
+                        else None
+                    ),
                 )
                 self._request_trackers[request_id] = request_tracker
                 req_meta = ReqMeta.from_request_tracker(
@@ -804,6 +817,8 @@ class MooncakeStoreScheduler:
                     prefill_end_tokens=tracker.prefill_end_tokens,
                     boundary_puts=accepted,
                     completed_token_len=tracker.token_len,
+                    session_id=tracker.session_id,
+                    session_generation=tracker.session_generation,
                 )
             )
 

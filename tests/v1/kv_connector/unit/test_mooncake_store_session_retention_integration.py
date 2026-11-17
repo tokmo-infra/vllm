@@ -264,6 +264,41 @@ def test_finish_time_handoff_survives_request_cleanup(scheduler_fixture):
     assert rpc.catalog.current("s")["checkpoint"] == job.checkpoint_id
 
 
+def test_offload_only_boundary_keeps_the_conversation_owner(scheduler_fixture):
+    scheduler, rpc, pool = scheduler_fixture
+    request, tables, first = schedule(scheduler, pool, handoff=False)
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=MooncakeStoreWorkerMetadata(
+                completed_saves={
+                    m.store_job_id: 2 for m in first.requests if m.can_save
+                }
+            )
+        )
+    )
+    output = SchedulerOutput.make_empty()
+    output.kv_connector_block_state = KVConnectorBlockState(
+        {request.request_id},
+        lambda _: tables,
+        {request.request_id: [(g, tables[g][0], 36) for g in range(1, 4)]},
+    )
+    metadata = scheduler.build_connector_meta(output)
+    job = next(m for m in metadata.requests if m.can_save and m.token_len_chunk == 0)
+    assert job.session_id == "s"
+    assert job.session_generation == 1
+    assert job.checkpoint_id is not None
+    rpc.store.objects.update(rpc.prepared[job.checkpoint_id])
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=MooncakeStoreWorkerMetadata(
+                completed_saves={job.store_job_id: 2},
+                checkpoint_results={job.checkpoint_id: {0: True, 1: True}},
+            )
+        )
+    )
+    assert rpc.catalog.current("s")["checkpoint"] == job.checkpoint_id
+
+
 def test_reader_is_released_after_all_ranks_even_after_request_cancellation(
     scheduler_fixture,
 ):
