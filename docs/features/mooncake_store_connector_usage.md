@@ -193,6 +193,11 @@ that request, including Attention data needed to prove a complete hybrid hit.
 If a later request step can still supply the proof tail, the unpublished KDA
 candidate remains owned until the request finishes and those writes drain.
 An incomplete final proof preserves the previously committed checkpoint.
+Publication and ownership cleanup run on the lookup executor; the scheduler
+polls their completion instead of waiting for these RPCs inside an engine step.
+Pending candidates keep their references until publication or abandonment is
+acknowledged. Session admission and pre-write ownership claims remain ordered
+before the corresponding Store writes.
 
 Only Mamba Store payload keys receive the isolated
 `@mamba_session_latest_v1` namespace. Attention, indexer and draft payloads keep

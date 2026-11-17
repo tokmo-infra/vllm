@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 from threading import Event
 
@@ -100,6 +101,14 @@ class RetentionRPC:
 
     def discard(self, request):
         pass
+
+    def submit_session_command(self, command, block_hashes=()):
+        result: Future[dict[str, object]] = Future()
+        try:
+            result.set_result(self.session_command(command, block_hashes))
+        except Exception as error:
+            result.set_exception(error)
+        return result
 
 
 @pytest.fixture
@@ -245,6 +254,73 @@ def test_unidentified_request_does_not_persist_unowned_kda(scheduler_fixture):
         p.group_id == 0 for r in metadata.requests for p in r.boundary_puts or []
     )
     assert rpc.catalog.snapshot()["sessions"] == 0
+
+
+@pytest.mark.parametrize("hybrid_ready", [True, False])
+def test_slow_checkpoint_commit_does_not_stop_scheduler_or_request_finish(
+    scheduler_fixture, monkeypatch, hybrid_ready
+):
+    """A slow Store proof must retain ownership without blocking engine steps."""
+    scheduler, rpc, pool = scheduler_fixture
+    old_generation = rpc.catalog.begin("s", "old")
+    old_keys = [prefix + "@old" for prefix in rpc.prefixes]
+    old = rpc.catalog.prepare("old", old_generation, 16, old_keys)
+    rpc.store.objects.update(old_keys)
+    assert rpc.catalog.commit(old, lambda _: True)
+    rpc.catalog.finish("old")
+    request, _, metadata = schedule(scheduler, pool)
+    job = next(r for r in metadata.requests if r.checkpoint_id)
+    rpc.store.objects.update(rpc.prepared[job.checkpoint_id])
+    rpc.hybrid_ready = hybrid_ready
+    started, release = Event(), Event()
+    command = rpc.session_command
+
+    def gated_command(message, hashes=()):
+        if message["action"] == "commit":
+            started.set()
+            assert release.wait(10), "test did not release the external Store proof"
+        return command(message, hashes)
+
+    with ThreadPoolExecutor(max_workers=1) as transport:
+        monkeypatch.setattr(rpc, "session_command", gated_command)
+        monkeypatch.setattr(
+            rpc,
+            "submit_session_command",
+            lambda *args: transport.submit(gated_command, *args),
+        )
+        with ThreadPoolExecutor(max_workers=1) as engine:
+            step = engine.submit(
+                scheduler.update_connector_output,
+                KVConnectorOutput(
+                    kv_connector_worker_meta=MooncakeStoreWorkerMetadata(
+                        completed_saves={job.store_job_id: 2},
+                        checkpoint_results={job.checkpoint_id: {0: True, 1: True}},
+                    )
+                ),
+            )
+            try:
+                assert started.wait(5), "checkpoint verification never started"
+                step.result(timeout=1)
+                assert rpc.catalog.current("s")["checkpoint"] == old
+                assert rpc.catalog.collect() == 0
+                output = SchedulerOutput.make_empty()
+                output.finished_req_ids = {request.request_id}
+                engine.submit(scheduler.build_connector_meta, output).result(timeout=1)
+                assert scheduler.has_pending_push_work()
+            finally:
+                release.set()
+        # Fence the external service, then poll through the real engine hook.
+        transport.submit(lambda: None).result(timeout=5)
+        scheduler.build_connector_meta(SchedulerOutput.make_empty())
+        transport.submit(lambda: None).result(timeout=5)
+        scheduler.build_connector_meta(SchedulerOutput.make_empty())
+        assert rpc.catalog.current("s")["checkpoint"] == (
+            job.checkpoint_id if hybrid_ready else old
+        )
+        rpc.catalog.collect()
+        assert rpc.store.objects == set(
+            rpc.prepared[job.checkpoint_id] if hybrid_ready else old_keys
+        )
 
 
 def test_checkpoint_waits_for_earlier_attention_save_on_every_rank(scheduler_fixture):

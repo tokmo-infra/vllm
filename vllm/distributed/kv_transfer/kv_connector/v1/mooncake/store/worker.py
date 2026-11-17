@@ -2732,9 +2732,15 @@ class LookupKeyClient:
         self, command: dict[str, Any], block_hashes: Sequence[BlockHash] = ()
     ) -> dict[str, Any]:
         """Use the lookup executor so ownership RPCs cannot interleave frames."""
+        return self.submit_session_command(command, block_hashes).result()
+
+    def submit_session_command(
+        self, command: dict[str, Any], block_hashes: Sequence[BlockHash] = ()
+    ) -> Future[dict[str, Any]]:
+        """Queue ownership work without blocking the engine's scheduling loop."""
         return self.executor.submit(
             self._retention_request, command, list(block_hashes)
-        ).result()
+        )
 
     def _session_lookup(
         self, req_id: str, num_tokens: int, block_hashes: Sequence[BlockHash]

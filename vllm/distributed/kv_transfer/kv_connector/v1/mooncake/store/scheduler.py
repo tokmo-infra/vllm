@@ -7,7 +7,9 @@
 
 import time
 from collections.abc import Sequence
+from concurrent.futures import Future
 from dataclasses import dataclass, field
+from typing import Any
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -59,6 +61,15 @@ class _PendingSessionCheckpoint:
     ranks: dict[int, bool] = field(default_factory=dict)
     retry_at: float = 0
     wait_for_request_end: bool = False
+    action: str | None = None
+    future: Future[dict[str, Any]] | None = None
+
+
+@dataclass
+class _PendingSessionCommand:
+    command: dict[str, Any]
+    future: Future[dict[str, Any]]
+    retry_at: float = 0
 
 
 def _new_req_prefill_tokens(request: NewRequestData) -> list[int]:
@@ -170,6 +181,7 @@ class MooncakeStoreScheduler:
         self._session_save_owners: dict[int, str] = {}
         self._session_save_jobs: dict[str, set[int]] = {}
         self._session_read_ranks: dict[str, set[int]] = {}
+        self._session_commands: list[_PendingSessionCommand] = []
         self._warned_missing_session = False
         self.load_async = kvc_extra_config.get("load_async", True)
         self.lookup_async = kvc_extra_config.get("lookup_async", False)
@@ -284,7 +296,7 @@ class MooncakeStoreScheduler:
 
         if need_to_allocate <= 0:
             if lookup_result.read_handle:
-                self.client.session_command(
+                self._submit_session_command(
                     {"action": "release_reader", "reader": lookup_result.read_handle}
                 )
             return 0, False
@@ -354,6 +366,8 @@ class MooncakeStoreScheduler:
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         """Build connector metadata for this scheduler step."""
+        if self.retention_config is not None:
+            self._poll_session_commands()
         is_consumer = self.kv_role == "kv_consumer"
         can_process_cached = not is_consumer or self.save_decode_cache
 
@@ -365,7 +379,7 @@ class MooncakeStoreScheduler:
             self._unfinished_request_ids.discard(finished_req_id)
             if self.retention_config is not None:
                 if self._session_generations.pop(finished_req_id, None) is not None:
-                    self.client.session_command(
+                    self._submit_session_command(
                         {"action": "finish", "request": finished_req_id}
                     )
                 self._session_candidate_jobs = {
@@ -845,7 +859,7 @@ class MooncakeStoreScheduler:
                 done = self._session_read_ranks.setdefault(reader, set())
                 done.update(ranks)
                 if done == set(range(self._num_workers)):
-                    self.client.session_command(
+                    self._submit_session_command(
                         {"action": "release_reader", "reader": reader}
                     )
                     del self._session_read_ranks[reader]
@@ -888,12 +902,13 @@ class MooncakeStoreScheduler:
         request no longer defers its own free.
         """
         return bool(self._pinned_saves) or (
-            self.retention_config is not None and bool(self._session_candidates)
+            self.retention_config is not None
+            and bool(self._session_candidates or self._session_commands)
         )
 
     def _release_proposed_read(self, spec: LoadSpec | None) -> None:
         if spec is not None and spec.read_handle:
-            self.client.session_command(
+            self._submit_session_command(
                 {"action": "release_reader", "reader": spec.read_handle}
             )
             spec.read_handle = None
@@ -956,31 +971,58 @@ class MooncakeStoreScheduler:
             ):
                 continue
             try:
-                committed = False
-                if all(pending.ranks.values()):
-                    result = self.client.session_command(
+                if pending.future is None:
+                    pending.action = pending.action or (
+                        "commit" if all(pending.ranks.values()) else "abandon"
+                    )
+                    pending.future = self.client.submit_session_command(
                         {
-                            "action": "commit",
+                            "action": pending.action,
                             "checkpoint": checkpoint,
                             "num_tokens": pending.num_tokens,
                         },
                         pending.hashes,
                     )
-                    committed = result["committed"]
-                    if not committed and pending.request in self._session_generations:
-                        # A later step can still publish the Attention proof
-                        # tail. Keep its KDA candidate owned until that step
-                        # and all of the request's rank-local PUTs have drained.
-                        pending.wait_for_request_end = True
-                        continue
-                if not committed:
-                    self.client.session_command(
+                if not pending.future.done():
+                    continue
+                result = pending.future.result()
+                pending.future = None
+                if pending.action == "abandon" or result["committed"]:
+                    del self._session_candidates[checkpoint]
+                elif pending.request in self._session_generations:
+                    # A later step can still publish the Attention proof tail.
+                    pending.action = None
+                    pending.wait_for_request_end = True
+                else:
+                    pending.action = "abandon"
+                    pending.future = self.client.submit_session_command(
                         {"action": "abandon", "checkpoint": checkpoint}
                     )
-                del self._session_candidates[checkpoint]
+                    if pending.future.done():
+                        pending.future.result()
+                        del self._session_candidates[checkpoint]
             except Exception:
+                pending.future = None
                 pending.retry_at = time.monotonic() + 1
                 logger.exception("Session checkpoint commit deferred")
+
+    def _submit_session_command(self, command: dict[str, Any]) -> None:
+        self._session_commands.append(
+            _PendingSessionCommand(command, self.client.submit_session_command(command))
+        )
+        self._poll_session_commands()
+
+    def _poll_session_commands(self) -> None:
+        for pending in list(self._session_commands):
+            if not pending.future.done() or time.monotonic() < pending.retry_at:
+                continue
+            try:
+                pending.future.result()
+                self._session_commands.remove(pending)
+            except Exception:
+                pending.future = self.client.submit_session_command(pending.command)
+                pending.retry_at = time.monotonic() + 1
+                logger.exception("Session ownership cleanup deferred")
 
     def reset_store(self) -> bool:
         """Trigger a global ``remove_all(force=True)`` on the Mooncake master.
@@ -1008,6 +1050,7 @@ class MooncakeStoreScheduler:
                     self._session_save_owners.clear()
                     self._session_save_jobs.clear()
                     self._session_read_ranks.clear()
+                    self._session_commands.clear()
                 logger.info("Mooncake store reset via remove_all succeeded.")
             else:
                 logger.warning("Mooncake store reset returned NACK from worker.")
