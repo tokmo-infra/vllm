@@ -196,8 +196,11 @@ An incomplete final proof preserves the previously committed checkpoint.
 Publication and ownership cleanup run on the lookup executor; the scheduler
 polls their completion instead of waiting for these RPCs inside an engine step.
 Pending candidates keep their references until publication or abandonment is
-acknowledged. Session admission and pre-write ownership claims remain ordered
-before the corresponding Store writes.
+acknowledged. With asynchronous lookup, session admission pre-claims the prompt
+checkpoint before GPU allocation; a pending claim defers that request instead
+of blocking the engine. Cancellation retires an unused claim after its RPC
+acknowledgement. Ownership claims remain ordered before corresponding Store
+writes, including the synchronous lookup and resumed-checkpoint paths.
 
 Only Mamba Store payload keys receive the isolated
 `@mamba_session_latest_v1` namespace. Attention, indexer and draft payloads keep

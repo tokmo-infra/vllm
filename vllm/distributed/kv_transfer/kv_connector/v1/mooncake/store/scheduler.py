@@ -72,6 +72,13 @@ class _PendingSessionCommand:
     retry_at: float = 0
 
 
+@dataclass
+class _PendingSessionAdmission:
+    boundary: int
+    digest: str
+    future: Future[dict[str, Any]]
+
+
 def _new_req_prefill_tokens(request: NewRequestData) -> list[int]:
     """Tokens this prefill will compute KV for.
 
@@ -182,6 +189,9 @@ class MooncakeStoreScheduler:
         self._session_save_jobs: dict[str, set[int]] = {}
         self._session_read_ranks: dict[str, set[int]] = {}
         self._session_commands: list[_PendingSessionCommand] = []
+        self._session_admissions: dict[str, _PendingSessionAdmission] = {}
+        self._cancelled_session_admissions: set[str] = set()
+        self._prepared_session_checkpoints: dict[str, tuple[str, int, str]] = {}
         self._warned_missing_session = False
         self.load_async = kvc_extra_config.get("load_async", True)
         self.lookup_async = kvc_extra_config.get("lookup_async", False)
@@ -257,6 +267,13 @@ class MooncakeStoreScheduler:
         Returns ``(None, False)`` when an async lookup is still in flight,
         signaling the scheduler to retry this request on a later step.
         """
+        if (
+            self.retention_config is not None
+            and self.lookup_async
+            and request.session_id
+            and not self._admit_session(request)
+        ):
+            return None, False
         if not self.enable_lookup:
             return 0, False
         if self.retention_config is not None:
@@ -367,6 +384,10 @@ class MooncakeStoreScheduler:
     ) -> KVConnectorMetadata:
         """Build connector metadata for this scheduler step."""
         if self.retention_config is not None:
+            self._cancelled_session_admissions.update(
+                scheduler_output.finished_req_ids & self._session_admissions.keys()
+            )
+            self._poll_session_admissions()
             self._poll_session_commands()
         is_consumer = self.kv_role == "kv_consumer"
         can_process_cached = not is_consumer or self.save_decode_cache
@@ -623,6 +644,11 @@ class MooncakeStoreScheduler:
         if not self._capacity_only:
             self._reference_save_blocks(meta)
         if self.retention_config is not None:
+            for req_id in scheduler_output.finished_req_ids:
+                if unused := self._prepared_session_checkpoints.pop(req_id, None):
+                    self._submit_session_command(
+                        {"action": "abandon", "checkpoint": unused[0]}
+                    )
             self._settle_session_checkpoints()
         return meta
 
@@ -903,7 +929,12 @@ class MooncakeStoreScheduler:
         """
         return bool(self._pinned_saves) or (
             self.retention_config is not None
-            and bool(self._session_candidates or self._session_commands)
+            and bool(
+                self._session_candidates
+                or self._session_commands
+                or self._session_admissions
+                or self._prepared_session_checkpoints
+            )
         )
 
     def _release_proposed_read(self, spec: LoadSpec | None) -> None:
@@ -942,21 +973,81 @@ class MooncakeStoreScheduler:
         job = (meta.req_id, meta.session_generation, digest)
         if job in self._session_candidate_jobs:
             return
-        result = self.client.session_command(
-            {
-                "action": "prepare",
-                "request": meta.req_id,
-                "generation": meta.session_generation,
-                "boundary": boundary,
-                "hash": digest.hex(),
-            }
-        )
-        meta.checkpoint_id = result["checkpoint"]
+        prepared = self._prepared_session_checkpoints.pop(meta.req_id, None)
+        if prepared is not None and prepared[1:] == (boundary, digest.hex()):
+            meta.checkpoint_id = prepared[0]
+        else:
+            if prepared is not None:
+                self._submit_session_command(
+                    {"action": "abandon", "checkpoint": prepared[0]}
+                )
+            result = self.client.session_command(
+                {
+                    "action": "prepare",
+                    "request": meta.req_id,
+                    "generation": meta.session_generation,
+                    "boundary": boundary,
+                    "hash": digest.hex(),
+                }
+            )
+            meta.checkpoint_id = result["checkpoint"]
         meta.boundary_puts = [*keep, *states]
         self._session_candidate_jobs.add(job)
         self._session_candidates[meta.checkpoint_id] = _PendingSessionCheckpoint(
             meta.req_id, meta.prefill_end_tokens or 0, list(meta.block_hashes)
         )
+
+    def _admit_session(self, request: Request) -> bool:
+        if request.request_id in self._session_generations:
+            return True
+        if request.request_id not in self._session_admissions:
+            coord = self._store_coord
+            assert coord is not None
+            boundary = get_mamba_prefill_checkpoint_position(
+                request.num_tokens, self._hash_block_size, coord.use_eagle
+            )
+            digest = (
+                bytes(request.block_hashes[boundary // self._hash_block_size - 1]).hex()
+                if boundary > 0
+                else ""
+            )
+            self._session_admissions[request.request_id] = _PendingSessionAdmission(
+                boundary,
+                digest,
+                self.client.submit_session_command(
+                    {
+                        "action": "begin_prepare",
+                        "session": request.session_id,
+                        "request": request.request_id,
+                        "boundary": boundary,
+                        "hash": digest,
+                    }
+                ),
+            )
+        self._poll_session_admissions()
+        return request.request_id in self._session_generations
+
+    def _poll_session_admissions(self) -> None:
+        for req_id, pending in list(self._session_admissions.items()):
+            if not pending.future.done():
+                continue
+            result = pending.future.result()
+            del self._session_admissions[req_id]
+            if req_id in self._cancelled_session_admissions:
+                self._cancelled_session_admissions.remove(req_id)
+                if checkpoint := result.get("checkpoint"):
+                    self._submit_session_command(
+                        {"action": "abandon", "checkpoint": checkpoint}
+                    )
+                self._submit_session_command({"action": "finish", "request": req_id})
+            else:
+                self._session_generations[req_id] = result["generation"]
+                if checkpoint := result.get("checkpoint"):
+                    self._prepared_session_checkpoints[req_id] = (
+                        checkpoint,
+                        pending.boundary,
+                        pending.digest,
+                    )
 
     def _settle_session_checkpoints(self) -> None:
         for checkpoint, pending in list(self._session_candidates.items()):
@@ -1051,6 +1142,9 @@ class MooncakeStoreScheduler:
                     self._session_save_jobs.clear()
                     self._session_read_ranks.clear()
                     self._session_commands.clear()
+                    self._session_admissions.clear()
+                    self._cancelled_session_admissions.clear()
+                    self._prepared_session_checkpoints.clear()
                 logger.info("Mooncake store reset via remove_all succeeded.")
             else:
                 logger.warning("Mooncake store reset returned NACK from worker.")

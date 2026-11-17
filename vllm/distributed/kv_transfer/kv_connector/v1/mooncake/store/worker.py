@@ -2285,6 +2285,15 @@ class MooncakeStoreWorker:
         if catalog is None:
             raise ValueError("session_latest is not enabled on this writer")
         action = command["action"]
+        if action == "begin_prepare":
+            result = self.session_retention_command({**command, "action": "begin"}, ())
+            if command.get("boundary"):
+                result.update(
+                    self.session_retention_command(
+                        {**command, **result, "action": "prepare"}, ()
+                    )
+                )
+            return result
         if action == "begin":
             return {"generation": catalog.begin(command["session"], command["request"])}
         if action == "prepare":

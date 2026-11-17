@@ -18,6 +18,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     ChunkedTokenDatabase,
     KeyMetadata,
     LoadSpec,
+    MooncakeLookupResult,
     MooncakeStoreWorkerMetadata,
     ReqMeta,
 )
@@ -72,6 +73,15 @@ class RetentionRPC:
 
     def session_command(self, command, block_hashes=()):
         action = command["action"]
+        if action == "begin_prepare":
+            result = RetentionRPC.session_command(self, {**command, "action": "begin"})
+            if command.get("boundary"):
+                result.update(
+                    RetentionRPC.session_command(
+                        self, {**command, **result, "action": "prepare"}
+                    )
+                )
+            return result
         if action == "begin":
             return {
                 "generation": self.catalog.begin(command["session"], command["request"])
@@ -102,6 +112,9 @@ class RetentionRPC:
     def discard(self, request):
         pass
 
+    def lookup(self, *args, **kwargs):
+        return MooncakeLookupResult(0)
+
     def submit_session_command(self, command, block_hashes=()):
         result: Future[dict[str, object]] = Future()
         try:
@@ -125,6 +138,7 @@ def scheduler_fixture(tmp_path, monkeypatch):
         kv_connector_extra_config={
             "mamba_checkpoint_retention": "session_latest",
             "mamba_checkpoint_journal": str(tmp_path / "catalog.sqlite"),
+            "lookup_async": True,
         },
     )
     config = replace(
@@ -168,7 +182,7 @@ def scheduler_fixture(tmp_path, monkeypatch):
     rpc.catalog.close()
 
 
-def schedule(scheduler, pool, session="s", *, handoff=True):
+def schedule(scheduler, pool, session="s", *, handoff=True, admit=False):
     request = Request(
         "request",
         prompt_token_ids=list(range(40)),
@@ -182,6 +196,8 @@ def schedule(scheduler, pool, session="s", *, handoff=True):
         [b.block_id for b in allocated[:3]],
         *([b.block_id] for b in allocated[3:]),
     )
+    if admit:
+        assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
     scheduler.update_state_after_alloc(request, KVCacheBlocks(((),) * 4), 0)
     output = SchedulerOutput.make_empty()
     output.scheduled_new_reqs = [NewRequestData.from_request(request, tables)]
@@ -199,11 +215,12 @@ def schedule(scheduler, pool, session="s", *, handoff=True):
 @pytest.mark.parametrize(
     "success,hybrid_ready", [(True, True), (False, True), (True, False)]
 )
+@pytest.mark.parametrize("admit", [False, True])
 def test_scheduler_waits_for_all_rank_success_and_full_hybrid_prefix(
-    scheduler_fixture, success, hybrid_ready
+    scheduler_fixture, success, hybrid_ready, admit
 ):
     scheduler, rpc, pool = scheduler_fixture
-    _, _, metadata = schedule(scheduler, pool)
+    _, _, metadata = schedule(scheduler, pool, admit=admit)
     job = next(r for r in metadata.requests if r.checkpoint_id)
     assert {p.num_tokens for p in job.boundary_puts if p.group_id in (1, 2, 3)} == {36}
     checkpoint = job.checkpoint_id
@@ -282,7 +299,11 @@ def test_slow_checkpoint_commit_does_not_stop_scheduler_or_request_finish(
         return command(message, hashes)
 
     with ThreadPoolExecutor(max_workers=1) as transport:
-        monkeypatch.setattr(rpc, "session_command", gated_command)
+        monkeypatch.setattr(
+            rpc,
+            "session_command",
+            lambda *args: transport.submit(gated_command, *args).result(),
+        )
         monkeypatch.setattr(
             rpc,
             "submit_session_command",
@@ -303,8 +324,26 @@ def test_slow_checkpoint_commit_does_not_stop_scheduler_or_request_finish(
                 step.result(timeout=1)
                 assert rpc.catalog.current("s")["checkpoint"] == old
                 assert rpc.catalog.collect() == 0
+                next_request = Request(
+                    "next",
+                    prompt_token_ids=list(range(40)),
+                    sampling_params=SamplingParams(max_tokens=1),
+                    pooling_params=None,
+                    session_id="next",
+                    block_hasher=lambda _: [bytes([n + 1]) * 4 for n in range(10)],
+                )
+
+                def admit_next_request():
+                    matched, _ = scheduler.get_num_new_matched_tokens(next_request, 0)
+                    if matched is not None:
+                        scheduler.update_state_after_alloc(
+                            next_request, KVCacheBlocks(([], [], [], [])), 0
+                        )
+                    return matched
+
+                assert engine.submit(admit_next_request).result(timeout=1) is None
                 output = SchedulerOutput.make_empty()
-                output.finished_req_ids = {request.request_id}
+                output.finished_req_ids = {request.request_id, next_request.request_id}
                 engine.submit(scheduler.build_connector_meta, output).result(timeout=1)
                 assert scheduler.has_pending_push_work()
             finally:
@@ -513,6 +552,66 @@ class TransferStore(MemoryStore):
 
     def batch_get_into_multi_buffers(self, keys, addrs, sizes):
         return [-1 if self.fail else sum(s) for s in sizes]
+
+
+def test_worker_admission_claims_checkpoint_before_payload_writes(
+    tmp_path, monkeypatch
+):
+    from .test_mooncake_store_hma_e2e import _build_worker_with_dict_store
+
+    class SDKStore(TransferStore):
+        def setup(self, *args, **kwargs):
+            return 0
+
+    monkeypatch.setenv("VLLM_MOONCAKE_STORE_SELECTIVE_LEASE", "1")
+    config = create_vllm_config(
+        kv_connector="MooncakeStoreConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={
+            "mamba_checkpoint_retention": "session_latest",
+            "mamba_checkpoint_journal": str(tmp_path / "worker.sqlite"),
+        },
+    )
+    groups = [
+        KVCacheGroupSpec(
+            ["mamba"],
+            MambaSpec(
+                block_size=16,
+                shapes=((2, 2),),
+                dtypes=(torch.float32,),
+                mamba_cache_mode="align",
+            ),
+        )
+    ]
+    kv = KVCacheConfig(num_blocks=4, kv_cache_tensors=[], kv_cache_groups=groups)
+    store = SDKStore()
+    worker = _build_worker_with_dict_store(config, kv, store)
+    try:
+        result = worker.session_retention_command(
+            {
+                "action": "begin_prepare",
+                "session": "s",
+                "request": "r",
+                "boundary": 16,
+                "hash": "abcd",
+            },
+            (),
+        )
+        assert result["generation"] == 1
+        assert worker.session_catalog.snapshot()["checkpoints"] == 1
+        assert not store.objects
+        assert worker.session_catalog.current("s") is None
+        worker.session_retention_command(
+            {
+                "action": "abandon",
+                "checkpoint": result["checkpoint"],
+            },
+            (),
+        )
+        worker.session_retention_command({"action": "finish", "request": "r"}, ())
+        assert worker.session_catalog.snapshot()["checkpoints"] == 0
+    finally:
+        worker.close()
 
 
 def transfer_inputs():
