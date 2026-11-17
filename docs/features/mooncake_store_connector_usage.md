@@ -188,6 +188,12 @@ engine admission order to determine the latest version, not prompt length.
 Requests without an ID still generate normally, but skip Mamba persistence and
 emit a warning. They do not acquire session ownership or a retention guarantee.
 
+Checkpoint publication waits for every rank's outstanding Store writes for
+that request, including Attention data needed to prove a complete hybrid hit.
+If a later request step can still supply the proof tail, the unpublished KDA
+candidate remains owned until the request finishes and those writes drain.
+An incomplete final proof preserves the previously committed checkpoint.
+
 Only Mamba Store payload keys receive the isolated
 `@mamba_session_latest_v1` namespace. Attention, indexer and draft payloads keep
 their existing keys and retention. GPU cache allocation, speculative scratch

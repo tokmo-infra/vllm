@@ -58,6 +58,7 @@ class _PendingSessionCheckpoint:
     hashes: list[BlockHash]
     ranks: dict[int, bool] = field(default_factory=dict)
     retry_at: float = 0
+    wait_for_request_end: bool = False
 
 
 def _new_req_prefill_tokens(request: NewRequestData) -> list[int]:
@@ -166,6 +167,8 @@ class MooncakeStoreScheduler:
         self._session_generations: dict[str, int] = {}
         self._session_candidates: dict[str, _PendingSessionCheckpoint] = {}
         self._session_candidate_jobs: set[tuple[str, int, bytes]] = set()
+        self._session_save_owners: dict[int, str] = {}
+        self._session_save_jobs: dict[str, set[int]] = {}
         self._session_read_ranks: dict[str, set[int]] = {}
         self._warned_missing_session = False
         self.load_async = kvc_extra_config.get("load_async", True)
@@ -353,9 +356,6 @@ class MooncakeStoreScheduler:
         """Build connector metadata for this scheduler step."""
         is_consumer = self.kv_role == "kv_consumer"
         can_process_cached = not is_consumer or self.save_decode_cache
-
-        if self.retention_config is not None:
-            self._settle_session_checkpoints()
 
         for finished_req_id in scheduler_output.finished_req_ids:
             self.client.discard(finished_req_id)
@@ -608,6 +608,8 @@ class MooncakeStoreScheduler:
 
         if not self._capacity_only:
             self._reference_save_blocks(meta)
+        if self.retention_config is not None:
+            self._settle_session_checkpoints()
         return meta
 
     def _apply_current_save_block_ids(
@@ -682,7 +684,13 @@ class MooncakeStoreScheduler:
             if not block_ids:
                 continue
             self._pinned_saves[store_job_id] = (block_ids, self._num_workers)
+            self._reference_session_save(req_meta, store_job_id)
             pool.touch([pool.blocks[block_id] for block_id in block_ids])
+
+    def _reference_session_save(self, meta: ReqMeta, job: int) -> None:
+        if self.retention_config is not None and meta.session_id:
+            self._session_save_owners[job] = meta.req_id
+            self._session_save_jobs.setdefault(meta.req_id, set()).add(job)
 
     def register_finished_partial_tail(
         self,
@@ -755,6 +763,7 @@ class MooncakeStoreScheduler:
         store_job_id = self._next_store_job_id
         self._next_store_job_id += 1
         self._pinned_saves[store_job_id] = (pinned_block_ids, self._num_workers)
+        self._reference_session_save(req_meta, store_job_id)
         pool.touch([pool.blocks[block_id] for block_id in pinned_block_ids])
 
         req_meta.store_job_id = store_job_id
@@ -840,7 +849,6 @@ class MooncakeStoreScheduler:
                         {"action": "release_reader", "reader": reader}
                     )
                     del self._session_read_ranks[reader]
-            self._settle_session_checkpoints()
         pool = self._gpu_block_pool
         assert pool is not None
         for store_job_id, count in meta.completed_saves.items():
@@ -857,8 +865,19 @@ class MooncakeStoreScheduler:
                 f"store job {store_job_id} reported by too many ranks"
             )
             del self._pinned_saves[store_job_id]
+            if (
+                self.retention_config is not None
+                and (owner := self._session_save_owners.pop(store_job_id, None))
+                is not None
+            ):
+                jobs = self._session_save_jobs[owner]
+                jobs.remove(store_job_id)
+                if not jobs:
+                    del self._session_save_jobs[owner]
             # Tail-first, as elsewhere, so the shared prefix is evicted last.
             pool.free_blocks(pool.blocks[bid] for bid in reversed(block_ids))
+        if self.retention_config is not None:
+            self._settle_session_checkpoints()
 
     def has_pending_push_work(self) -> bool:
         """Keep the engine stepping while any store job still holds block refs.
@@ -929,6 +948,11 @@ class MooncakeStoreScheduler:
             if (
                 set(pending.ranks) != set(range(self._num_workers))
                 or time.monotonic() < pending.retry_at
+                or pending.request in self._session_save_jobs
+                or (
+                    pending.wait_for_request_end
+                    and pending.request in self._session_generations
+                )
             ):
                 continue
             try:
@@ -943,6 +967,12 @@ class MooncakeStoreScheduler:
                         pending.hashes,
                     )
                     committed = result["committed"]
+                    if not committed and pending.request in self._session_generations:
+                        # A later step can still publish the Attention proof
+                        # tail. Keep its KDA candidate owned until that step
+                        # and all of the request's rank-local PUTs have drained.
+                        pending.wait_for_request_end = True
+                        continue
                 if not committed:
                     self.client.session_command(
                         {"action": "abandon", "checkpoint": checkpoint}
@@ -975,6 +1005,8 @@ class MooncakeStoreScheduler:
                     self._session_generations.clear()
                     self._session_candidates.clear()
                     self._session_candidate_jobs.clear()
+                    self._session_save_owners.clear()
+                    self._session_save_jobs.clear()
                     self._session_read_ranks.clear()
                 logger.info("Mooncake store reset via remove_all succeeded.")
             else:

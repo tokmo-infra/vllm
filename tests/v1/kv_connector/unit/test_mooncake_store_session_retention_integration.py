@@ -227,6 +227,12 @@ def test_scheduler_waits_for_all_rank_success_and_full_hybrid_prefix(
     )
     latest = rpc.catalog.current("s")
     assert (latest is not None) == (success and hybrid_ready)
+    if success and not hybrid_ready:
+        # Missing proof is final only once no later request step can supply it.
+        assert rpc.catalog.collect() == 0
+        output = SchedulerOutput.make_empty()
+        output.finished_req_ids = {job.req_id}
+        scheduler.build_connector_meta(output)
     rpc.catalog.collect()
     assert bool(rpc.store.objects) == (success and hybrid_ready)
 
@@ -241,9 +247,77 @@ def test_unidentified_request_does_not_persist_unowned_kda(scheduler_fixture):
     assert rpc.catalog.snapshot()["sessions"] == 0
 
 
+def test_checkpoint_waits_for_earlier_attention_save_on_every_rank(scheduler_fixture):
+    scheduler, rpc, pool = scheduler_fixture
+    request, tables, first = schedule(scheduler, pool, handoff=False)
+    attention_job = next(m for m in first.requests if m.can_save)
+    output = SchedulerOutput.make_empty()
+    output.kv_connector_block_state = KVConnectorBlockState(
+        {request.request_id},
+        lambda _: tables,
+        {request.request_id: [(g, tables[g][0], 36) for g in range(1, 4)]},
+    )
+    metadata = scheduler.build_connector_meta(output)
+    state_job = next(m for m in metadata.requests if m.checkpoint_id)
+    rpc.store.objects.update(rpc.prepared[state_job.checkpoint_id])
+    rpc.hybrid_ready = False
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=MooncakeStoreWorkerMetadata(
+                completed_saves={state_job.store_job_id: 2},
+                checkpoint_results={state_job.checkpoint_id: {0: True, 1: True}},
+            )
+        )
+    )
+    assert rpc.catalog.current("s") is None
+    assert rpc.catalog.collect() == 0
+    assert rpc.store.objects == set(rpc.prepared[state_job.checkpoint_id])
+    # A completion from one rank cannot fence the other rank's Attention PUT.
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=MooncakeStoreWorkerMetadata(
+                completed_saves={attention_job.store_job_id: 1}
+            )
+        )
+    )
+    assert rpc.catalog.current("s") is None
+    rpc.hybrid_ready = True
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=MooncakeStoreWorkerMetadata(
+                completed_saves={attention_job.store_job_id: 1}
+            )
+        )
+    )
+    assert rpc.catalog.current("s")["checkpoint"] == state_job.checkpoint_id
+
+
+def test_late_attention_proof_is_checked_after_finish_metadata(scheduler_fixture):
+    scheduler, rpc, pool = scheduler_fixture
+    request, _, metadata = schedule(scheduler, pool)
+    job = next(m for m in metadata.requests if m.checkpoint_id)
+    rpc.store.objects.update(rpc.prepared[job.checkpoint_id])
+    rpc.hybrid_ready = False
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=MooncakeStoreWorkerMetadata(
+                completed_saves={job.store_job_id: 2},
+                checkpoint_results={job.checkpoint_id: {0: True, 1: True}},
+            )
+        )
+    )
+    assert rpc.catalog.collect() == 0
+    assert rpc.catalog.current("s") is None
+    rpc.hybrid_ready = True
+    output = SchedulerOutput.make_empty()
+    output.finished_req_ids = {request.request_id}
+    scheduler.build_connector_meta(output)
+    assert rpc.catalog.current("s")["checkpoint"] == job.checkpoint_id
+
+
 def test_finish_time_handoff_survives_request_cleanup(scheduler_fixture):
     scheduler, rpc, pool = scheduler_fixture
-    request, tables, _ = schedule(scheduler, pool, handoff=False)
+    request, tables, first = schedule(scheduler, pool, handoff=False)
     request.num_computed_tokens = 40
     scheduler.register_finished_partial_tail(
         request, tables, [(g, tables[g][0], 36) for g in range(1, 4)]
@@ -258,6 +332,16 @@ def test_finish_time_handoff_survives_request_cleanup(scheduler_fixture):
             kv_connector_worker_meta=MooncakeStoreWorkerMetadata(
                 completed_saves={job.store_job_id: 2},
                 checkpoint_results={job.checkpoint_id: {0: True, 1: True}},
+            )
+        )
+    )
+    assert rpc.catalog.current("s") is None
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=MooncakeStoreWorkerMetadata(
+                completed_saves={
+                    m.store_job_id: 2 for m in first.requests if m.can_save
+                }
             )
         )
     )
