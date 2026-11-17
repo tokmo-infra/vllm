@@ -618,6 +618,14 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def on_load_failure(self, request_ids: set[str]) -> None:
+        """Scheduler-only notification before failed requests are recomputed.
+
+        Connectors may suppress further external reads for these requests.
+        This does not signal transfer completion or release any KV blocks.
+        """
+        return
+
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """Update KVConnector state from worker-side connectors output.
 

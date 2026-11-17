@@ -510,6 +510,10 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             self._extra_async_saves = {}
         return metadata
 
+    def on_load_failure(self, request_ids: set[str]) -> None:
+        for connector in self._connectors:
+            connector.on_load_failure(request_ids)
+
     def update_connector_output(self, connector_output: KVConnectorOutput):
         multi_connector_worker_meta: MultiKVConnectorWorkerMetadata | None = None
         if connector_output.kv_connector_worker_meta is not None:

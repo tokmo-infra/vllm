@@ -3698,6 +3698,9 @@ class Scheduler(SchedulerInterface):
                 if self.recompute_kv_load_failures:
                     request.num_computed_tokens = 0
                     self.failed_recving_kv_req_ids.add(req_id)
+        if self.recompute_kv_load_failures and affected_req_ids:
+            assert self.connector is not None
+            self.connector.on_load_failure(affected_req_ids)
         return set() if self.recompute_kv_load_failures else affected_req_ids
 
     def _handle_invalid_blocks(

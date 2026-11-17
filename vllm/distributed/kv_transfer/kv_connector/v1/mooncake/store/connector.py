@@ -301,6 +301,10 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
             return self.connector_scheduler.reset_store()
         return None
 
+    def on_load_failure(self, request_ids: set[str]) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.on_load_failure(request_ids)
+
     def update_connector_output(self, connector_output: KVConnectorOutput):
         assert self.connector_scheduler is not None
         self.connector_scheduler.update_connector_output(connector_output)

@@ -199,6 +199,9 @@ class MooncakeStoreScheduler:
 
         # Per-request state
         self.load_specs: dict[str, LoadSpec] = {}  # to be loaded
+        # A failed HMA load must not retry the same Store hit. Keep the bypass
+        # across allocation, capacity deferrals and preemption until terminal.
+        self._load_failure_bypass_req_ids: set[str] = set()
         self._request_trackers: dict[str, RequestTracker] = {}  # scheduled new requests
         self._unfinished_requests: dict[str, tuple[Request, tuple[list[int], ...]]] = {}
         self._unfinished_request_ids: set[str] = set()
@@ -217,6 +220,8 @@ class MooncakeStoreScheduler:
         Returns ``(None, False)`` when an async lookup is still in flight,
         signaling the scheduler to retry this request on a later step.
         """
+        if request.request_id in self._load_failure_bypass_req_ids:
+            return 0, False
         if not self.enable_lookup:
             return 0, False
 
@@ -309,6 +314,7 @@ class MooncakeStoreScheduler:
         can_process_cached = not is_consumer or self.save_decode_cache
 
         for finished_req_id in scheduler_output.finished_req_ids:
+            self._load_failure_bypass_req_ids.discard(finished_req_id)
             self.client.discard(finished_req_id)
             self.load_specs.pop(finished_req_id, None)
             self._request_trackers.pop(finished_req_id, None)
@@ -725,6 +731,12 @@ class MooncakeStoreScheduler:
                     completed_token_len=tracker.token_len,
                 )
             )
+
+    def on_load_failure(self, request_ids: set[str]) -> None:
+        self._load_failure_bypass_req_ids.update(request_ids)
+        for req_id in request_ids:
+            self.load_specs.pop(req_id, None)
+            self.client.discard(req_id)
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         """Drop the block references of store jobs every rank has finished."""
