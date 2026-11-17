@@ -5,7 +5,9 @@
 # (vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/).
 """Scheduler-side logic for MooncakeStoreConnector."""
 
+import time
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -22,6 +24,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
     ReqMeta,
     RequestTracker,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.session_retention import (  # noqa: E501
+    SessionRetentionConfig,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (  # noqa: E501
     LookupKeyClient,
 )
@@ -31,6 +36,7 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
     resolve_kv_cache_block_sizes,
 )
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
@@ -43,6 +49,15 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _PendingSessionCheckpoint:
+    request: str
+    num_tokens: int
+    hashes: list[BlockHash]
+    ranks: dict[int, bool] = field(default_factory=dict)
+    retry_at: float = 0
 
 
 def _new_req_prefill_tokens(request: NewRequestData) -> list[int]:
@@ -135,6 +150,8 @@ def _partial_tail_non_mamba_puts(
 class MooncakeStoreScheduler:
     """Scheduler-side component for MooncakeStoreConnector."""
 
+    retention_config: SessionRetentionConfig | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -143,6 +160,14 @@ class MooncakeStoreScheduler:
         assert vllm_config.kv_transfer_config is not None
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         kvc_extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+        self.retention_config = SessionRetentionConfig.from_extra_config(
+            kvc_extra_config
+        )
+        self._session_generations: dict[str, int] = {}
+        self._session_candidates: dict[str, _PendingSessionCheckpoint] = {}
+        self._session_candidate_jobs: set[tuple[str, int, bytes]] = set()
+        self._session_read_ranks: dict[str, set[int]] = {}
+        self._warned_missing_session = False
         self.load_async = kvc_extra_config.get("load_async", True)
         self.lookup_async = kvc_extra_config.get("lookup_async", False)
         # Skips lookup CPU cost on instances that never load KV from the store.
@@ -219,6 +244,8 @@ class MooncakeStoreScheduler:
         """
         if not self.enable_lookup:
             return 0, False
+        if self.retention_config is not None:
+            self._release_proposed_read(self.load_specs.pop(request.request_id, None))
 
         # Fine-grained hits may land on a hash boundary inside a block; without
         # partial hits, prefixes shorter than one physical block are skipped.
@@ -253,6 +280,10 @@ class MooncakeStoreScheduler:
         )
 
         if need_to_allocate <= 0:
+            if lookup_result.read_handle:
+                self.client.session_command(
+                    {"action": "release_reader", "reader": lookup_result.read_handle}
+                )
             return 0, False
 
         self.load_specs[request.request_id] = LoadSpec(
@@ -260,6 +291,7 @@ class MooncakeStoreScheduler:
             kvpool_cached_tokens=num_external_hit_tokens,
             can_load=False,
             tail_key_boundaries=lookup_result.tail_key_boundaries,
+            read_handle=lookup_result.read_handle,
         )
 
         return need_to_allocate, self.load_async
@@ -271,6 +303,19 @@ class MooncakeStoreScheduler:
         num_external_tokens: int,
     ):
         """Update state after block allocation."""
+        if (
+            self.retention_config is not None
+            and request.session_id
+            and request.request_id not in self._session_generations
+        ):
+            result = self.client.session_command(
+                {
+                    "action": "begin",
+                    "session": request.session_id,
+                    "request": request.request_id,
+                }
+            )
+            self._session_generations[request.request_id] = result["generation"]
         local_block_ids: tuple[list[int], ...] = ()
         if num_external_tokens > 0:
             local_block_ids = blocks.get_block_ids(
@@ -285,6 +330,7 @@ class MooncakeStoreScheduler:
 
         if num_external_tokens == 0:
             self.load_specs[request.request_id].can_load = False
+            self._release_proposed_read(self.load_specs[request.request_id])
             return
 
         assert (
@@ -308,16 +354,29 @@ class MooncakeStoreScheduler:
         is_consumer = self.kv_role == "kv_consumer"
         can_process_cached = not is_consumer or self.save_decode_cache
 
+        if self.retention_config is not None:
+            self._settle_session_checkpoints()
+
         for finished_req_id in scheduler_output.finished_req_ids:
             self.client.discard(finished_req_id)
-            self.load_specs.pop(finished_req_id, None)
+            self._release_proposed_read(self.load_specs.pop(finished_req_id, None))
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
             self._unfinished_request_ids.discard(finished_req_id)
+            if self.retention_config is not None:
+                if self._session_generations.pop(finished_req_id, None) is not None:
+                    self.client.session_command(
+                        {"action": "finish", "request": finished_req_id}
+                    )
+                self._session_candidate_jobs = {
+                    job
+                    for job in self._session_candidate_jobs
+                    if job[0] != finished_req_id
+                }
 
         preempted_ids = scheduler_output.preempted_req_ids or set()
         for req_id in preempted_ids:
-            self.load_specs.pop(req_id, None)
+            self._release_proposed_read(self.load_specs.pop(req_id, None))
             if request_tracker := self._request_trackers.get(req_id):
                 request_tracker.reset()
             self._unfinished_requests.pop(req_id, None)
@@ -354,6 +413,12 @@ class MooncakeStoreScheduler:
                     else None
                 ),
                 prefill_end_tokens=len(prefill_tokens),
+                session_id=request_real.session_id if self.retention_config else None,
+                session_generation=(
+                    self._session_generations.get(request.req_id)
+                    if self.retention_config
+                    else None
+                ),
             )
             self._request_trackers[request.req_id] = request_tracker
 
@@ -408,6 +473,14 @@ class MooncakeStoreScheduler:
                             else None
                         ),
                         prefill_end_tokens=len(prefill_tokens),
+                        session_id=request_real.session_id
+                        if self.retention_config
+                        else None,
+                        session_generation=(
+                            self._session_generations.get(req_id)
+                            if self.retention_config
+                            else None
+                        ),
                     )
                     self._request_trackers[req_id] = request_tracker
 
@@ -561,6 +634,7 @@ class MooncakeStoreScheduler:
         for req_meta in meta.requests:
             if not req_meta.can_save:
                 continue
+            self._prepare_session_checkpoint(req_meta)
             assert pool is not None, (
                 "GPU block pool must be bound before any store job is emitted"
             )
@@ -638,6 +712,12 @@ class MooncakeStoreScheduler:
             prefill_end_tokens=tracker.prefill_end_tokens,
             boundary_puts=mamba_puts,
             completed_token_len=request.num_computed_tokens,
+            session_id=request.session_id if self.retention_config else None,
+            session_generation=(
+                self._session_generations.get(request.request_id)
+                if self.retention_config
+                else None
+            ),
         )
         coord = self._store_coord
         assert coord is not None
@@ -649,6 +729,7 @@ class MooncakeStoreScheduler:
             ),
             *mamba_puts,
         ]
+        self._prepare_session_checkpoint(req_meta)
         pinned_block_ids = list(
             dict.fromkeys(put.block_id for put in req_meta.boundary_puts)
         )
@@ -731,6 +812,20 @@ class MooncakeStoreScheduler:
         meta = connector_output.kv_connector_worker_meta
         if not isinstance(meta, MooncakeStoreWorkerMetadata):
             return
+        if self.retention_config is not None:
+            for checkpoint, ranks in meta.checkpoint_results.items():
+                if pending := self._session_candidates.get(checkpoint):
+                    for rank, success in ranks.items():
+                        pending.ranks[rank] = pending.ranks.get(rank, True) and success
+            for reader, ranks in meta.completed_reads.items():
+                done = self._session_read_ranks.setdefault(reader, set())
+                done.update(ranks)
+                if done == set(range(self._num_workers)):
+                    self.client.session_command(
+                        {"action": "release_reader", "reader": reader}
+                    )
+                    del self._session_read_ranks[reader]
+            self._settle_session_checkpoints()
         pool = self._gpu_block_pool
         assert pool is not None
         for store_job_id, count in meta.completed_saves.items():
@@ -758,7 +853,89 @@ class MooncakeStoreScheduler:
         held indefinitely. Nothing else keeps it alive now that a finishing
         request no longer defers its own free.
         """
-        return bool(self._pinned_saves)
+        return bool(self._pinned_saves) or (
+            self.retention_config is not None and bool(self._session_candidates)
+        )
+
+    def _release_proposed_read(self, spec: LoadSpec | None) -> None:
+        if spec is not None and spec.read_handle:
+            self.client.session_command(
+                {"action": "release_reader", "reader": spec.read_handle}
+            )
+            spec.read_handle = None
+
+    def _prepare_session_checkpoint(self, meta: ReqMeta) -> None:
+        if self.retention_config is None or meta.checkpoint_id is not None:
+            return
+        coord = self._store_coord
+        assert coord is not None
+        boundary = get_mamba_prefill_checkpoint_position(
+            meta.prefill_end_tokens or 0, self._hash_block_size, coord.use_eagle
+        )
+        puts = meta.boundary_puts or []
+        keep = [p for p in puts if p.group_id not in self._boundary_state_group_ids]
+        states = [
+            p
+            for p in puts
+            if p.group_id in self._boundary_state_group_ids and p.num_tokens == boundary
+        ]
+        meta.boundary_puts = keep
+        if not meta.session_id or meta.session_generation is None:
+            if not self._warned_missing_session:
+                logger.warning(
+                    "session_latest: requests without session_id skip Mamba persistence"
+                )
+                self._warned_missing_session = True
+            return
+        if {p.group_id for p in states} != self._boundary_state_group_ids:
+            return
+        digest = bytes(meta.block_hashes[boundary // self._hash_block_size - 1])
+        job = (meta.req_id, meta.session_generation, digest)
+        if job in self._session_candidate_jobs:
+            return
+        result = self.client.session_command(
+            {
+                "action": "prepare",
+                "request": meta.req_id,
+                "generation": meta.session_generation,
+                "boundary": boundary,
+                "hash": digest.hex(),
+            }
+        )
+        meta.checkpoint_id = result["checkpoint"]
+        meta.boundary_puts = [*keep, *states]
+        self._session_candidate_jobs.add(job)
+        self._session_candidates[meta.checkpoint_id] = _PendingSessionCheckpoint(
+            meta.req_id, meta.prefill_end_tokens or 0, list(meta.block_hashes)
+        )
+
+    def _settle_session_checkpoints(self) -> None:
+        for checkpoint, pending in list(self._session_candidates.items()):
+            if (
+                set(pending.ranks) != set(range(self._num_workers))
+                or time.monotonic() < pending.retry_at
+            ):
+                continue
+            try:
+                committed = False
+                if all(pending.ranks.values()):
+                    result = self.client.session_command(
+                        {
+                            "action": "commit",
+                            "checkpoint": checkpoint,
+                            "num_tokens": pending.num_tokens,
+                        },
+                        pending.hashes,
+                    )
+                    committed = result["committed"]
+                if not committed:
+                    self.client.session_command(
+                        {"action": "abandon", "checkpoint": checkpoint}
+                    )
+                del self._session_candidates[checkpoint]
+            except Exception:
+                pending.retry_at = time.monotonic() + 1
+                logger.exception("Session checkpoint commit deferred")
 
     def reset_store(self) -> bool:
         """Trigger a global ``remove_all(force=True)`` on the Mooncake master.
@@ -779,6 +956,11 @@ class MooncakeStoreScheduler:
         try:
             ok = self.client.reset()
             if ok:
+                if self.retention_config is not None:
+                    self._session_generations.clear()
+                    self._session_candidates.clear()
+                    self._session_candidate_jobs.clear()
+                    self._session_read_ranks.clear()
                 logger.info("Mooncake store reset via remove_all succeeded.")
             else:
                 logger.warning("Mooncake store reset returned NACK from worker.")

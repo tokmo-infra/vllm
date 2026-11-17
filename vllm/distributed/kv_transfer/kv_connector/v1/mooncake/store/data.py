@@ -742,6 +742,7 @@ class MooncakeLookupResult:
 
     hit_length: int
     tail_key_boundaries: tuple[TailKeyBoundary, ...] = ()
+    read_handle: str | None = None
 
 
 @dataclass
@@ -753,6 +754,7 @@ class LoadSpec:
     can_load: bool
     token_len: int = 0
     tail_key_boundaries: tuple[TailKeyBoundary, ...] = ()
+    read_handle: str | None = None
 
 
 @dataclass
@@ -770,6 +772,8 @@ class RequestTracker:
     # request it includes previously-generated tokens, which are re-prefilled.
     prefill_end_tokens: int = 0
     partial_tail_sent: bool = False
+    session_id: str | None = None
+    session_generation: int | None = None
 
     def reset(self) -> None:
         self.token_len = 0
@@ -841,6 +845,9 @@ class ReqMeta:
     # Set on the save that first covers the whole prompt, so the scheduler
     # publishes the prompt's partial tail once rather than on every save.
     publish_partial_tail: bool = False
+    session_id: str | None = None
+    checkpoint_id: str | None = None
+    session_generation: int | None = None
 
     @staticmethod
     def from_request_tracker(
@@ -919,6 +926,8 @@ class ReqMeta:
             prefill_end_tokens=tracker.prefill_end_tokens,
             completed_token_len=input_token_len,
             publish_partial_tail=publish_tail and not skip_save,
+            session_id=tracker.session_id,
+            session_generation=tracker.session_generation,
         )
 
 
@@ -927,6 +936,10 @@ class MooncakeStoreWorkerMetadata(KVConnectorWorkerMetadata):
     """Maps ``ReqMeta.store_job_id`` to the number of ranks done with that job."""
 
     completed_saves: dict[int, int] = field(default_factory=dict)
+    # Explicit rank identities prevent duplicate completions from masquerading
+    # as an all-rank successful checkpoint or an all-rank finished read.
+    checkpoint_results: dict[str, dict[int, bool]] = field(default_factory=dict)
+    completed_reads: dict[str, dict[int, bool]] = field(default_factory=dict)
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -936,6 +949,12 @@ class MooncakeStoreWorkerMetadata(KVConnectorWorkerMetadata):
             self.completed_saves[store_job_id] = (
                 self.completed_saves.get(store_job_id, 0) + count
             )
+        for name in ("checkpoint_results", "completed_reads"):
+            target = getattr(self, name)
+            for identity, ranks in getattr(other, name).items():
+                merged = target.setdefault(identity, {})
+                for rank, success in ranks.items():
+                    merged[rank] = merged.get(rank, True) and success
         return self
 
 

@@ -41,6 +41,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
 # Request message-type tags. Frame 0 of every request.
 LOOKUP_MSG: bytes = b"lookup"
 RESET_MSG: bytes = b"reset"
+# JSON command plus the same hash-length/blob frames as lookup. Only used by
+# opt-in session-latest writers; existing lookup/reset frames remain unchanged.
+RETENTION_MSG: bytes = b"session_retention"
 
 # Single-byte response status codes for admin commands.
 RESP_OK: bytes = b"\x01"
