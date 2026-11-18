@@ -6130,7 +6130,7 @@ async fn chat_decode_reuses_prefill_ids_without_forwarding_them_as_sampling_meta
         Arc::new(FakeChatBackend::new()),
         move |request| {
             sent.send((
-                request.prompt_token_ids.clone(),
+                decode_prompt_token_ids(request),
                 request.sampling_params.clone(),
             ))
             .unwrap();
