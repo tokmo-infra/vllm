@@ -42,6 +42,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.data import (
 # Request message-type tags. Frame 0 of every request.
 LOOKUP_MSG: bytes = b"lookup"
 RESET_MSG: bytes = b"reset"
+# JSON command plus the same hash-length/blob frames as lookup. Only used by
+# opt-in session-latest writers; existing lookup/reset frames remain unchanged.
+RETENTION_MSG: bytes = b"session_retention"
 
 # Single-byte response status codes for admin commands.
 RESP_OK: bytes = b"\x01"
@@ -77,8 +80,8 @@ def decode_lookup_response(payload: bytes) -> MooncakeLookupResult:
     if len(payload) == 4:
         return MooncakeLookupResult(hit_length)
 
-    boundaries = []
-    older = []
+    boundaries: list[TailKeyBoundary] = []
+    older: list[TailKeyBoundary] = []
     for offset in range(4, len(payload), TAIL_KEY_BOUNDARY_ENTRY_SIZE):
         group_id = int.from_bytes(payload[offset : offset + 4], "big")
         boundary = TailKeyBoundary(

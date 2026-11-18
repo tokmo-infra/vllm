@@ -1,8 +1,8 @@
 # Kimi K3 text-piece tokenization cache
 
 This branch starts from upstream commit
-`78e9a0c28093d71d2805f9acc74d3c08c88a4314`, recorded in the vLLM package in
-`vllm/vllm-openai:kimi-k31-mc@sha256:f81998764e8594d71b40788c5285ae112acf9230129d5d0d238b5df83da5acf6`.
+`dbbc9e310d9b1bf6f9499bc27136686245acc7c7`, used as the source baseline for
+`vllm/vllm-openai:kimi-k31-mc-dbbc9e3@sha256:0507dd0ba274bdb5bb8223f3248c0772db2a9517cfd1c06f132ec2989713635e`.
 The previous deployment and its build scripts remain in Git history.
 
 Set `KIMI31_TOKENIZER_CACHE_GIB=12` on each model API process to enable a

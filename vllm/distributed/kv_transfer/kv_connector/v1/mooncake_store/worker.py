@@ -12,6 +12,7 @@ and MooncakeDistributedStore integration.
 
 import dataclasses
 import functools
+import json
 import math
 import os
 import queue
@@ -77,11 +78,16 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.protocol import
     RESET_MSG,
     RESP_ERR,
     RESP_OK,
+    RETENTION_MSG,
     decode_lookup_response,
     encode_lookup_response,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.selective_lease import (  # noqa: E501
     SelectiveLookupLease,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.session_retention import (  # noqa: E501
+    SessionCheckpointCatalog,
+    SessionRetentionConfig,
 )
 from vllm.distributed.mooncake_store import MooncakeStoreConfig, setup_mooncake_store
 from vllm.logger import init_logger
@@ -582,7 +588,7 @@ class _ConsumedTailCollector:
                 logger.exception("Mooncake tail collector sweep failed")
 
     def remove_due(self, now: float) -> None:
-        """Remove every key due by ``now``; requeue failures for a retry."""
+        """Remove every key due by `now`; requeue failures for a retry."""
         with self._lock:
             due = [entry for entry in self._pending if entry[0] <= now]
             if not due:
@@ -675,6 +681,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # store_job_id -> times this rank finished with it, drained every step
         # so the scheduler can release the blocks it referenced for those jobs.
         self._completed_saves: dict[int, int] = {}
+        self._completed_checkpoints: dict[str, dict[int, bool]] = {}
         self.enable_kv_event = enable_kv_event
         # Caller always passes a non-None ReplicateConfig — see
         # MooncakeStoreWorker.__init__ where store_replicate_config is built.
@@ -718,7 +725,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self._saved_offset.pop(req_id, None)
             self._retry_token_ids.pop(req_id, None)
 
-    def finish_store_job(self, req_meta: ReqMeta) -> None:
+    def finish_store_job(
+        self, req_meta: ReqMeta, checkpoint_success: bool = False
+    ) -> None:
         """Retire a job from the ledger and report its blocks as no longer read.
 
         Every path out of a job must reach this, skips and failures included: a
@@ -736,6 +745,16 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self._completed_saves[store_job_id] = (
                 self._completed_saves.get(store_job_id, 0) + 1
             )
+            if req_meta.checkpoint_id is not None:
+                self._completed_checkpoints[req_meta.checkpoint_id] = {
+                    self.tp_rank: checkpoint_success
+                }
+
+    def take_checkpoint_results(self) -> dict[str, dict[int, bool]]:
+        with self.done_task_lock:
+            result = self._completed_checkpoints
+            self._completed_checkpoints = {}
+            return result
 
     def take_completed_saves(self) -> dict[int, int]:
         with self.done_task_lock:
@@ -808,8 +827,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
     def _boundary_chunks(
         self, group_id: int, num_tokens: int, block_hashes: Sequence[BlockHash]
     ) -> Iterator[tuple[int, int, int, BlockHash]]:
-        """Yield ``(block_start, start, end, key_hash)`` for each Store chunk
-        this rank writes for the group's block ending at ``num_tokens``."""
+        """Yield `(block_start, start, end, key_hash)` for each Store chunk
+        this rank writes for the group's block ending at `num_tokens`."""
         if not self.group_participates[group_id] or num_tokens == 0:
             return
         hash_block_size = self.coord.hash_block_size
@@ -901,9 +920,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
         return results
 
     def _superseded_tail_keys(self, req_meta: ReqMeta) -> list[str]:
-        """This rank's Store keys of the tails listed in ``remove_tail_keys``.
+        """This rank's Store keys of the tails listed in `remove_tail_keys`.
 
-        Keys are built as ``_boundary_puts`` built them. Only a tail's final
+        Keys are built as `_boundary_puts` built them. Only a tail's final
         chunk qualifies, and only when it ends off a chunk boundary: any other
         chunk key also names a full chunk of every longer prefix.
         """
@@ -1028,6 +1047,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         save_completed = False
         available_token_len = 0
         checkpoint_len = 0
+        checkpoint_success = False
         req_id = req_meta.req_id
         event_token_ids = req_meta.token_ids
         token_ids_start = req_meta.token_ids_start
@@ -1065,6 +1085,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 return
             if tail_keys := self._superseded_tail_keys(req_meta):
                 self._tail_collector.add(tail_keys)
+            checkpoint_success = True
 
             save_start = self._saved_offset.get(req_id, 0)
             if checkpoint_len <= save_start:
@@ -1362,7 +1383,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     token_ids_start,
                     event_token_ids,
                 )
-            self.finish_store_job(req_meta)
+            self.finish_store_job(req_meta, checkpoint_success)
             self.request_queue.task_done()
 
 
@@ -1414,6 +1435,13 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             )
         )
         self.coord = coord
+        self._completed_reads: set[str] = set()
+
+    def take_completed_reads(self) -> set[str]:
+        with self.done_task_lock:
+            completed = self._completed_reads
+            self._completed_reads = set()
+            return completed
 
     def _add_load_error_block_ids(self, block_ids: list[int]) -> None:
         with self._invalid_block_ids_lock:
@@ -1442,6 +1470,27 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         return invalid_block_ids
 
     def _handle_request(self, req_meta: ReqMeta):
+        try:
+            self._load_request(req_meta)
+        except Exception:
+            self._report_load_error(
+                req_meta.req_id,
+                [
+                    bid
+                    for group in req_meta.block_ids
+                    for bid in group
+                    if bid != NULL_BLOCK_ID
+                ],
+            )
+            raise
+        finally:
+            if req_meta.load_spec is not None and req_meta.load_spec.read_handle:
+                with self.done_task_lock:
+                    self._completed_reads.add(req_meta.load_spec.read_handle)
+            self.set_finished_request(req_meta.req_id)
+            self.request_queue.task_done()
+
+    def _load_request(self, req_meta: ReqMeta):
         token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
         req_id = req_meta.req_id
         mask_num = (
@@ -1548,8 +1597,6 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                         oversized_key_bytes,
                         self.disk_offload_buffer_budget_bytes,
                     )
-                    self.set_finished_request(req_id)
-                    self.request_queue.task_done()
                     return
                 load_batches = []
                 block_id_offset = 0
@@ -1635,9 +1682,6 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 current_batch_keys[:3],
                 e,
             )
-
-        self.set_finished_request(req_id)
-        self.request_queue.task_done()
 
 
 # ============================================================
@@ -1741,6 +1785,21 @@ class MooncakeStoreWorker:
         assert kv_role is not None
         self.kv_role = kv_role
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+        self.retention_config = SessionRetentionConfig.from_extra_config(extra_config)
+        self.session_catalog: SessionCheckpointCatalog | None = None
+        self._retention_stop = threading.Event()
+        self._retention_gc_thread: threading.Thread | None = None
+        if self.retention_config is not None and (
+            kv_role not in ("kv_producer", "kv_both")
+            or parallel_config.data_parallel_size != 1
+            or self.pp_size != 1
+            or self.pcp_size != 1
+            or not envs.VLLM_MOONCAKE_STORE_SELECTIVE_LEASE
+        ):
+            raise ValueError(
+                "session_latest requires a single DP1/PP1/PCP1 Store writer "
+                "with VLLM_MOONCAKE_STORE_SELECTIVE_LEASE=1"
+            )
         self.save_decode_cache = extra_config.get("save_decode_cache", False)
         self.can_put = (
             self.kv_role in ("kv_producer", "kv_both") or self.save_decode_cache
@@ -1923,6 +1982,41 @@ class MooncakeStoreWorker:
                 self._lookup_key_prefixes,
                 self._record_kv_connector_operation,
             )
+        if self.retention_config is not None and parallel_config.rank == 0:
+            prefixes = [
+                prefix
+                for group in self.coord.mamba_group_ids
+                for prefix in self._lookup_key_prefixes[group]
+            ]
+            self.session_catalog = SessionCheckpointCatalog(
+                self.retention_config, self.store, prefixes
+            )
+
+            def collect_retired_checkpoints() -> None:
+                while not self._retention_stop.wait(1):
+                    try:
+                        assert self.session_catalog is not None
+                        start = time.perf_counter()
+                        removed = 0
+                        # Bound each deletion critical section while keeping up
+                        # with TP8 writers publishing several checkpoints/s.
+                        for _ in range(4):
+                            count = self.session_catalog.collect()
+                            removed += count
+                        self._record_kv_connector_operation(
+                            "session_checkpoint_gc",
+                            time.perf_counter() - start,
+                            removed,
+                        )
+                    except Exception:
+                        logger.exception("Session checkpoint collection failed")
+
+            self._retention_gc_thread = threading.Thread(
+                target=collect_retired_checkpoints,
+                name="MooncakeSessionCheckpointGC",
+                daemon=True,
+            )
+            self._retention_gc_thread.start()
 
     def _select_store_layout(
         self, extra_config: dict[str, Any]
@@ -2051,11 +2145,18 @@ class MooncakeStoreWorker:
             )
             plan = plans[group_idx] if plans is not None else None
             if plan is None:
+                group_namespace = metadata.store_namespace
+                if (
+                    getattr(self, "retention_config", None) is not None
+                    and group_idx in self.coord.mamba_group_ids
+                ):
+                    group_namespace += "@mamba_session_latest_v1"
                 token_dbs.append(
                     ChunkedTokenDatabase(
                         dataclasses.replace(
                             metadata,
                             group_id=group_idx,
+                            store_namespace=group_namespace,
                             tp_rank=(
                                 self.tp_rank
                                 // self._group_tp_replication_factors[group_idx]
@@ -2078,6 +2179,11 @@ class MooncakeStoreWorker:
                 tp_rank=plan.tp_rank,
                 store_namespace=group_namespace,
             )
+            if (
+                getattr(self, "retention_config", None) is not None
+                and group_idx in self.coord.mamba_group_ids
+            ):
+                group_metadata.store_namespace += "@mamba_session_latest_v1"
             if issubclass(plan.layout_cls, AttentionStoreLayout):
                 attention_layout_cls = cast(type[AttentionStoreLayout], plan.layout_cls)
                 store_layout: StoreLayout = attention_layout_cls(
@@ -2657,9 +2763,99 @@ class MooncakeStoreWorker:
         if self.kv_send_thread is None:
             return None
         completed_saves = self.kv_send_thread.take_completed_saves()
-        if not completed_saves:
+        if getattr(self, "retention_config", None) is None:
+            return (
+                MooncakeStoreWorkerMetadata(completed_saves=completed_saves)
+                if completed_saves
+                else None
+            )
+        checkpoint_results = self.kv_send_thread.take_checkpoint_results()
+        completed_reads = {
+            reader: {self.tp_rank: True}
+            for thread in self.kv_recv_threads
+            for reader in thread.take_completed_reads()
+        }
+        if not (completed_saves or checkpoint_results or completed_reads):
             return None
-        return MooncakeStoreWorkerMetadata(completed_saves=completed_saves)
+        return MooncakeStoreWorkerMetadata(
+            completed_saves=completed_saves,
+            checkpoint_results=checkpoint_results,
+            completed_reads=completed_reads,
+        )
+
+    def session_retention_command(
+        self, command: dict[str, Any], block_hashes: Sequence[BlockHash]
+    ) -> dict[str, Any]:
+        """Rank-0 ownership RPCs, serialized with non-forcing collection."""
+        catalog = self.session_catalog
+        if catalog is None:
+            raise ValueError("session_latest is not enabled on this writer")
+        action = command["action"]
+        if action == "begin_prepare":
+            result = self.session_retention_command({**command, "action": "begin"}, ())
+            if command.get("boundary"):
+                result.update(
+                    self.session_retention_command(
+                        {**command, **result, "action": "prepare"}, ()
+                    )
+                )
+            return result
+        if action == "begin":
+            return {"generation": catalog.begin(command["session"], command["request"])}
+        if action == "prepare":
+            digest = command["hash"]
+            bytes.fromhex(digest)
+            keys = [
+                PoolKey.build_key_string(prefix, digest)
+                for group in self.coord.mamba_group_ids
+                for prefix in self._lookup_key_prefixes[group]
+            ]
+            return {
+                "checkpoint": catalog.prepare(
+                    command["request"], command["generation"], command["boundary"], keys
+                )
+            }
+        if action == "commit":
+            return {
+                "committed": catalog.commit(
+                    command["checkpoint"],
+                    lambda boundary: (
+                        self.lookup(command["num_tokens"], block_hashes).hit_length
+                        >= boundary
+                    ),
+                )
+            }
+        if action == "abandon":
+            catalog.abandon(command["checkpoint"])
+        elif action == "finish":
+            catalog.finish(command["request"])
+        elif action == "release_reader":
+            catalog.release_reader(command["reader"])
+        elif action == "lookup":
+            with catalog.lock:
+                hit = self.lookup(command["num_tokens"], block_hashes)
+                keys = [
+                    PoolKey.build_key_string(
+                        prefix,
+                        block_hashes[b.num_tokens // self.hash_block_size - 1].hex(),
+                    )
+                    for b in hit.tail_key_boundaries
+                    if b.group_id in self.coord.mamba_group_ids
+                    for prefix in self._lookup_key_prefixes[b.group_id]
+                ]
+                reader = catalog.hold_reader(command["request"], keys) if keys else None
+                return {
+                    "hit_length": hit.hit_length,
+                    "tails": [
+                        [b.group_id, b.num_tokens] for b in hit.tail_key_boundaries
+                    ],
+                    "reader": reader,
+                }
+        elif action == "stats":
+            return catalog.snapshot()
+        else:
+            raise ValueError(f"Unknown session retention command: {action}")
+        return {}
 
     def lookup(
         self, num_tokens: int, block_hashes: Sequence[BlockHash]
@@ -2903,6 +3099,15 @@ class MooncakeStoreWorker:
         store = getattr(self, "store", None)
         if store is None:
             return
+        gc_thread = getattr(self, "_retention_gc_thread", None)
+        if gc_thread is not None:
+            self._retention_stop.set()
+            gc_thread.join()
+            catalog = self.session_catalog
+            self.session_catalog = None
+            if catalog is not None:
+                with catalog.lock:
+                    catalog.close()
         self.store = None
         tail_collector = getattr(self.kv_send_thread, "_tail_collector", None)
         if tail_collector is not None:
@@ -2974,6 +3179,19 @@ class LookupKeyServer:
                     result = self.store_worker.lookup(num_tokens, block_hashes)
                     self.socket.send(encode_lookup_response(result))
 
+                elif msg_type == RETENTION_MSG:
+                    try:
+                        command = json.loads(bytes(all_frames[1]))
+                        hash_len = int.from_bytes(all_frames[2], byteorder="big")
+                        hashes = BlobBlockHashes(all_frames[3].buffer, hash_len)
+                        retention_result = self.store_worker.session_retention_command(
+                            command, hashes
+                        )
+                        self.socket.send_json({"ok": True, "result": retention_result})
+                    except Exception as e:
+                        logger.exception("Session retention command failed")
+                        self.socket.send_json({"ok": False, "error": str(e)})
+
                 elif msg_type == RESET_MSG:
                     try:
                         # Drain in-flight puts before wiping the master;
@@ -2982,7 +3200,13 @@ class LookupKeyServer:
                         # flat key space, clearing every (group_id, hash) entry.
                         if self.store_worker.kv_send_thread is not None:
                             self.store_worker.kv_send_thread.request_queue.join()
-                        self.store_worker.store.remove_all(force=True)
+                        catalog = getattr(self.store_worker, "session_catalog", None)
+                        if catalog is None:
+                            self.store_worker.store.remove_all(force=True)
+                        else:
+                            with catalog.lock:
+                                self.store_worker.store.remove_all(force=True)
+                                catalog.reset()
                         logger.info("Mooncake store reset via remove_all succeeded.")
                         self.socket.send(RESP_OK)
                     except Exception as e:
@@ -3046,15 +3270,12 @@ def _lookup_signature(
 
 
 class LookupKeyClient:
-    """ZMQ client for the LookupKey admin channel.
-
-    Routes both prefix-cache lookups and admin commands (currently:
-    `reset`) to `LookupKeyServer` on worker rank 0. The first frame
-    of every request is a named tag from `protocol.py`.
-    """
+    """ZMQ client for prefix lookups, session ownership and reset commands."""
 
     class _LookupExpired(TimeoutError):
         """The deadline passed while queued, before any RPC was sent."""
+
+    retention_enabled = False
 
     def __init__(self, vllm_config: VllmConfig):
         assert vllm_config.kv_transfer_config is not None
@@ -3092,6 +3313,15 @@ class LookupKeyClient:
         )
         self._lookup_ttl_s = extra_config.get("lookup_prefetch_ttl_s", 2.0)
 
+        self.futures: dict[str, Future[MooncakeLookupResult]] = {}
+        assert vllm_config.kv_transfer_config is not None
+        self.retention_enabled = (
+            SessionRetentionConfig.from_extra_config(
+                vllm_config.kv_transfer_config.kv_connector_extra_config
+            )
+            is not None
+        )
+
     def _wait_for_socket(self, event: int, deadline: float) -> None:
         remaining_ms = int((deadline - time.monotonic()) * 1000)
         if remaining_ms <= 0 or not self.socket.poll(remaining_ms, event):
@@ -3102,6 +3332,50 @@ class LookupKeyClient:
         self.socket.send_multipart(frames, copy=False, flags=zmq.NOBLOCK)
         self._wait_for_socket(zmq.POLLIN, deadline)
         return self.socket.recv(flags=zmq.NOBLOCK)
+
+    def _retention_request(
+        self, command: dict[str, Any], block_hashes: Sequence[BlockHash] = ()
+    ) -> dict[str, Any]:
+        hash_len = len(block_hashes[0]) if block_hashes else 0
+        self.socket.send_multipart(
+            (
+                RETENTION_MSG,
+                json.dumps(command).encode(),
+                hash_len.to_bytes(2, "big"),
+                b"".join(block_hashes),
+            )
+        )
+        response = self.socket.recv_json()
+        if not response["ok"]:
+            raise RuntimeError(response["error"])
+        return response["result"]
+
+    def session_command(
+        self, command: dict[str, Any], block_hashes: Sequence[BlockHash] = ()
+    ) -> dict[str, Any]:
+        """Use the lookup executor so ownership RPCs cannot interleave frames."""
+        return self.submit_session_command(command, block_hashes).result()
+
+    def submit_session_command(
+        self, command: dict[str, Any], block_hashes: Sequence[BlockHash] = ()
+    ) -> Future[dict[str, Any]]:
+        """Queue ownership work without blocking the engine's scheduling loop."""
+        return self.executor.submit(
+            self._retention_request, command, list(block_hashes)
+        )
+
+    def _session_lookup(
+        self, req_id: str, num_tokens: int, block_hashes: Sequence[BlockHash]
+    ) -> MooncakeLookupResult:
+        result = self._retention_request(
+            {"action": "lookup", "request": req_id, "num_tokens": num_tokens},
+            block_hashes,
+        )
+        return MooncakeLookupResult(
+            result["hit_length"],
+            tuple(TailKeyBoundary(*b) for b in result["tails"]),
+            read_handle=result["reader"],
+        )
 
     def _lookup(
         self, num_tokens: int, block_hashes: list[BlockHash], deadline: float
@@ -3126,6 +3400,10 @@ class LookupKeyClient:
     ) -> MooncakeLookupResult | None:
         """If non_block is True, will return None until the result is ready,
         then cache it until expiry or discard()."""
+        if self.retention_enabled:
+            return self._lookup_session_result(
+                req_id, num_tokens, block_hashes, non_block
+            )
         now = time.monotonic()
         signature = _lookup_signature(num_tokens, block_hashes)
         state = self._lookups.get(req_id)
@@ -3172,12 +3450,39 @@ class LookupKeyClient:
             self.discard(req_id)
         return result
 
+    def _lookup_session_result(
+        self,
+        req_id: str,
+        num_tokens: int,
+        block_hashes: list[BlockHash],
+        non_block: bool = False,
+    ) -> MooncakeLookupResult | None:
+        """If non_block is True, will return None until the result is ready,
+        so the caller retries on a later step."""
+        future = self.futures.get(req_id)
+        if future is None:
+            future = self.executor.submit(
+                self._session_lookup, req_id, num_tokens, list(block_hashes)
+            )
+            self.futures[req_id] = future
+        if non_block and not future.done():
+            return None
+        try:
+            return future.result()
+        except Exception as e:
+            logger.error("Async Mooncake lookup failed for %s: %s", req_id, e)
+            return MooncakeLookupResult(0)
+        finally:
+            del self.futures[req_id]
+
     def prefetch(
         self, req_id: str, num_tokens: int, block_hashes: list[BlockHash]
     ) -> bool:
         """Start a lookup for a newly added request; a later lookup(req_id)
         reuses it. At most `lookup_prefetch_limit` prefetches are in flight;
         beyond that, returns False and the scheduler looks up as usual."""
+        if self.retention_enabled:
+            return False
         assert req_id not in self._lookups
         slots = self._prefetch_slots
         if slots is None or not slots.acquire(blocking=False):
@@ -3206,6 +3511,20 @@ class LookupKeyClient:
         state = self._lookups.pop(req_id, None)
         if state is not None:
             state.future.cancel()
+
+        future = self.futures.pop(req_id, None)
+        if future is not None:
+            cancelled = future.cancel()
+            if not cancelled and self.retention_enabled:
+
+                def release_unconsumed_lookup() -> None:
+                    result = future.result()
+                    if result.read_handle:
+                        self._retention_request(
+                            {"action": "release_reader", "reader": result.read_handle}
+                        )
+
+                self.executor.submit(release_unconsumed_lookup)
 
     def _reset(self) -> bool:
         """Trigger `store.remove_all(force=True)` on worker rank 0.

@@ -175,6 +175,86 @@ Store. It also covers prompt KV delivered directly by `MooncakeConnector`.
 }
 ```
 
+#### Retaining only the latest Mamba checkpoint per session
+
+`mamba_checkpoint_retention` defaults to `"all"`, preserving the existing
+hash-based retention behavior. A single hybrid-model Store writer may opt in
+to `"session_latest"` to retire superseded recurrent/convolution checkpoints:
+
+```json
+{
+    "kv_connector_extra_config": {
+        "mamba_checkpoint_retention": "session_latest",
+        "mamba_checkpoint_journal": "/data/cache/mamba-checkpoints.sqlite",
+        "mamba_session_ttl_seconds": 3600,
+        "cache_prefix": "my-model-deployment"
+    }
+}
+```
+
+Set `VLLM_MOONCAKE_STORE_SELECTIVE_LEASE=1`. This mode currently supports one
+DP1/PP1/PCP1 writer (TP and DCP may be greater than one). Do not share its
+`cache_prefix` and Mamba policy namespace with another writer. Keep the journal
+on persistent local storage; an exclusive file lock rejects a second owner of
+the same journal. The SDK must implement `batch_probe_key` and non-forcing
+`batch_remove`.
+
+Send a stable, deployment-unique `session_id` on every turn; use independent IDs
+for conversation branches. The Python and Rust OpenAI frontends accept
+`session_id`, while a router may expose it as `session_params.session_id`.
+Verify propagation to `Request.session_id` through the deployed router. This
+policy targets serial conversations; concurrent turns with the same ID use
+engine admission order to determine the latest version, not prompt length.
+Requests without an ID still generate normally, but skip Mamba persistence and
+emit a warning. They do not acquire session ownership or a retention guarantee.
+
+Checkpoint publication waits for every rank's outstanding Store writes for
+that request, including Attention data needed to prove a complete hybrid hit.
+If a later request step can still supply the proof tail, the unpublished KDA
+candidate remains owned until the request finishes and those writes drain.
+An incomplete final proof preserves the previously committed checkpoint.
+Publication and ownership cleanup run on the lookup executor; the scheduler
+polls their completion instead of waiting for these RPCs inside an engine step.
+Pending candidates keep their references until publication or abandonment is
+acknowledged. With asynchronous lookup, session admission pre-claims the prompt
+checkpoint before GPU allocation; a pending claim defers that request instead
+of blocking the engine. Cancellation retires an unused claim after its RPC
+acknowledgement. Ownership claims remain ordered before corresponding Store
+writes, including the synchronous lookup and resumed-checkpoint paths.
+
+Only Mamba Store payload keys receive the isolated
+`@mamba_session_latest_v1` namespace. Attention, indexer and draft payloads keep
+their existing keys and retention. GPU cache allocation, speculative scratch
+states, CUDA kernels, PD transfer and decoder HiSparse pools are unchanged.
+Changing from `all` does not scan, adopt or delete old anonymous keys. Use a new
+deployment prefix or an explicitly managed cold-start procedure for migration.
+
+The writer publishes the final reusable prefill checkpoint, using the existing
+alignment and EAGLE proof rules. Intermediate prefill states are not persisted
+as long-lived versions. Every rank must report successful boundary writes, and
+the complete hybrid prefix must be readable before the durable latest pointer
+changes. A failed or stale candidate leaves the previous latest intact.
+Completion of a Store job alone is not a successful-write acknowledgement.
+
+Pending candidates, other sessions sharing the same hash, and outstanding loads
+hold references. Superseded unreferenced keys enter a bounded background
+`batch_remove(force=False)` queue, which respects native read leases and
+replication tasks. Claims and deletion are serialized. Loads release their
+references only after every rank finishes, including failure/cancellation
+paths. Thus one committed checkpoint per session is the steady-state target;
+transitions and pending leases can temporarily retain several versions.
+
+The SQLite WAL stores IDs, hashes and ownership only. Restart restores committed
+ownership; interrupted candidates and reads receive a full session-TTL grace
+period before collection. Inactive sessions expire after
+`mamba_session_ttl_seconds`, provided no live PUT remains. Expired sessions may
+recompute on their next turn. The internal lookup client exposes retention
+`stats`, and GC operations use the existing Store per-operation telemetry.
+
+This is a retention policy, not permanent pinning: normal Store capacity
+eviction can still remove a latest checkpoint or required Attention data.
+Logical key removal also need not immediately shrink physical disk buckets.
+
 #### Sharing one Store across multiple Prefill TP sizes
 
 Heterogeneous-TP sharing normally uses a fixed `store_tp_size`. When several
