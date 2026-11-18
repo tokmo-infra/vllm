@@ -84,6 +84,7 @@ def _make_runner(
     kv_cache_groups: list[KVCacheGroupSpec],
     num_lookahead_tokens: int,
     num_spec_steps: int = NUM_SPEC_STEPS,
+    mtp_context_only: bool = False,
 ) -> SimpleNamespace:
     """Stub model runner exposing only what the warmup entry points read."""
     return SimpleNamespace(
@@ -104,7 +105,9 @@ def _make_runner(
             kv_cache_groups=kv_cache_groups, num_blocks=1024
         ),
         vllm_config=SimpleNamespace(
-            num_lookahead_tokens=num_lookahead_tokens, is_mm_encoder_only=False
+            num_lookahead_tokens=num_lookahead_tokens,
+            is_mm_encoder_only=False,
+            qwen38_p_mtp_context_only=mtp_context_only,
         ),
         kv_block_zeroer=None,
         kv_connector=SimpleNamespace(set_disabled=lambda disabled: None),
@@ -118,9 +121,11 @@ class _StepRecorder:
         # (blocks held per group, num_computed_tokens, num_scheduled_tokens)
         self.steps: list[tuple[list[int], int, int]] = []
         self.num_spec_tokens_to_schedule: list[int] = []
+        self.did_schedule_drafts = False
         self._held: dict[str, list[int]] = {}
 
     def execute_model(self, scheduler_output) -> None:
+        self.did_schedule_drafts |= bool(scheduler_output.scheduled_spec_decode_tokens)
         if scheduler_output.total_num_scheduled_tokens:
             self.num_spec_tokens_to_schedule.append(
                 scheduler_output.num_spec_tokens_to_schedule
@@ -149,6 +154,18 @@ class _StepRecorder:
 
     def sample_tokens(self, grammar_output=None) -> None:
         return None
+
+
+@pytest.mark.parametrize("steps", [1, 5])
+def test_context_only_warmup_does_not_verify_nonexistent_drafts(steps):
+    runner = _make_runner(
+        [], num_lookahead_tokens=steps, num_spec_steps=steps, mtp_context_only=True
+    )
+    recorder = _StepRecorder()
+    warmup_kernels(runner, recorder.execute_model, recorder.sample_tokens)
+    assert not recorder.did_schedule_drafts
+    assert set(recorder.num_spec_tokens_to_schedule) == {steps}
+    assert {scheduled for _, _, scheduled in recorder.steps} == {1, steps + 2}
 
 
 def _assert_covers_lookahead(

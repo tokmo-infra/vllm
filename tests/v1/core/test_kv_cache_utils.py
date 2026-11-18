@@ -29,6 +29,10 @@ from vllm.config import (
 from vllm.config.attention import HiSparseConfig
 from vllm.config.kv_events import KVEventsConfig
 from vllm.config.speculative import SpeculativeConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+    KeyMetadata,
+    PoolKey,
+)
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
@@ -37,6 +41,7 @@ from vllm.multimodal.inputs import (
 )
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor, xxhash, xxhash_cbor
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_planning import (
     get_kv_cache_groups,
@@ -57,6 +62,7 @@ from vllm.v1.core.kv_cache_utils import (
     tensor_data,
     to_event_extra_keys,
 )
+from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.hisparse.layout import (
     create_hisparse_layout,
     get_hisparse_kv_cache_groups,
@@ -1042,6 +1048,66 @@ def test_request_block_hasher(hash_fn):
     assert block_hashes[1] == hash_fn(
         (block_hashes[0], (3, 4, 5), (("mm", "hash2", 0),))
     )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("tail", [21, 22])
+def test_qwen_mtp_handoff_hashes_the_actual_prompt_tail(tail):
+    block_size = 16
+    prefix = list(range(block_size))
+    sample = 23
+
+    def request(token, lookahead=1):
+        return make_request(
+            "p",
+            prefix + [token],
+            block_size,
+            sha256,
+            num_hash_lookahead_tokens=lookahead,
+        )
+
+    p = request(tail)
+    assert p.truncate_prompt_for_remote_prefill(block_size, 1, retain_mtp_context=True)
+    metadata = NewRequestData.from_request(
+        p, ([1],), prefill_token_ids=list(p.all_token_ids)
+    )
+    assert metadata.prefill_token_ids == prefix
+    assert metadata.mtp_context_next_token_id == tail
+    assert p.num_prompt_tokens == block_size
+    p.append_output_token_ids(sample)
+
+    d = request(tail)
+    other = request(22 if tail == 21 else 21)
+    old_p = request(tail)
+    assert old_p.truncate_prompt_for_remote_prefill(block_size, 1)
+    old_p.append_output_token_ids(sample)
+    assert p.block_hashes == d.block_hashes
+    assert p.block_hashes != other.block_hashes
+    assert p.block_hashes != old_p.block_hashes
+    assert p.block_hashes != request(tail, 0).block_hashes
+    assert p.get_kv_cache_token_ids(0, block_size + 1) == prefix + [tail]
+    pool = BlockPool(8, True, block_size, num_hash_lookahead_tokens=1)
+    assert pool.get_lookahead_token_ids(p, block_size) == [tail]
+    assert pool.get_lookahead_token_ids(old_p, block_size) == [sample]
+
+    baseline_meta = KeyMetadata("Qwen3.8-Flash-Next-FP8", 0, 0, 0, 0)
+    isolated_meta = replace(baseline_meta, cache_prefix="qwen38-mtp-context-v1/test")
+    # Even identical block digests cannot address an object in the old FP8 Store.
+    hash_hex = p.block_hashes[0].hex()
+    assert (
+        PoolKey(isolated_meta, hash_hex).to_string()
+        != PoolKey(baseline_meta, hash_hex).to_string()
+    )
+
+
+@pytest.mark.cpu_test
+def test_qwen_mtp_handoff_rejects_zero_lookahead_before_truncation():
+    tokens = [2, 4, 6]
+    p = make_request("p", tokens.copy(), 2, sha256)
+    with pytest.raises(ValueError, match="one hash lookahead token"):
+        p.truncate_prompt_for_remote_prefill(2, 0, retain_mtp_context=True)
+    assert p.all_token_ids[:] == tokens
+    assert p.mtp_context_next_token_id is None
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])

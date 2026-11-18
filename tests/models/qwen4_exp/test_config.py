@@ -9,13 +9,21 @@ import pytest
 import torch
 from transformers import Qwen4ExpConfig, Qwen4ExpTextConfig
 
-from vllm.config import CacheConfig, ParallelConfig
+from vllm.config import (
+    CacheConfig,
+    DeviceConfig,
+    KVTransferConfig,
+    ModelConfig,
+    ParallelConfig,
+    VllmConfig,
+)
 from vllm.config.speculative import SpeculativeConfig
 from vllm.model_executor.models.config import (
     Qwen3_5ForConditionalGenerationConfig,
     Qwen4ExpForConditionalGenerationConfig,
 )
 from vllm.models.qwen4_exp.nvidia.model_state import Qwen4ExpModelState
+from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
 from ...utils import spawn_new_process_for_each_test
@@ -47,6 +55,173 @@ def _text_config(**kwargs) -> Qwen4ExpTextConfig:
     }
     values.update(kwargs)
     return Qwen4ExpTextConfig(**values)
+
+
+@pytest.fixture
+def qwen_mtp_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    _text_config(
+        architectures=["Qwen4ExpForCausalLM"],
+        ple_layer_ids=[],
+    ).save_pretrained(tmp_path)
+
+    def build(steps, opt_in=False, kv=None, **spec_options):
+        model = ModelConfig(
+            model=str(tmp_path),
+            dtype="bfloat16",
+            max_model_len=128,
+            skip_tokenizer_init=True,
+        )
+        parallel = ParallelConfig()
+        return VllmConfig(
+            model_config=model,
+            parallel_config=parallel,
+            device_config=DeviceConfig("cpu"),
+            cache_config=CacheConfig(cache_dtype="fp8_e4m3"),
+            kv_transfer_config=kv,
+            speculative_config=SpeculativeConfig(
+                method="mtp",
+                num_speculative_tokens=steps,
+                qwen38_p_mtp_context_only=opt_in,
+                target_model_config=model,
+                target_parallel_config=parallel,
+                **spec_options,
+            ),
+        )
+
+    return build
+
+
+@pytest.mark.parametrize("steps", [1, 2, 5])
+@pytest.mark.parametrize("role", [None, "kv_producer", "kv_consumer"])
+def test_qwen_mtp_native_depth_and_role(qwen_mtp_config, role, steps):
+    kv = (
+        KVTransferConfig(kv_connector="MooncakeConnector", kv_role=role)
+        if role
+        else None
+    )
+    native = qwen_mtp_config(steps, kv=kv)
+    assert not native.qwen38_p_mtp_context_only
+    assert native.num_speculative_tokens == steps
+    assert native.uniform_decode_query_len == steps + 1
+    assert native.num_prefill_lookahead_tokens == 1
+    if role != "kv_producer":
+        with pytest.raises(ValueError, match="dedicated Mooncake P2P producer"):
+            qwen_mtp_config(steps, opt_in=True, kv=kv)
+
+
+def test_qwen_mtp_context_store_namespace_is_not_available_to_baseline_p(
+    qwen_mtp_config,
+):
+    store = {
+        "kv_connector": "MooncakeStoreConnector",
+        "kv_role": "kv_both",
+        "kv_connector_extra_config": {"cache_prefix": "qwen38-mtp-context-v1/test"},
+    }
+
+    def kv(role):
+        return KVTransferConfig(
+            kv_connector="MultiConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "connectors": [
+                    {"kv_connector": "MooncakeConnector", "kv_role": role},
+                    store,
+                ]
+            },
+        )
+
+    with pytest.raises(ValueError, match="reserved Store cache_prefix"):
+        qwen_mtp_config(2, kv=kv("kv_producer"))
+    d = qwen_mtp_config(2, kv=kv("kv_consumer"))
+    assert not d.qwen38_p_mtp_context_only and d.num_hash_lookahead_tokens == 1
+    with pytest.raises(ValueError, match="requires one hash lookahead token"):
+        qwen_mtp_config(2, kv=kv("kv_consumer"), disable_lookahead_block_hashes=True)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA context prefill")
+@pytest.mark.parametrize("steps", [1, 2, 5])
+def test_qwen_mtp_context_prefill_keeps_every_row(qwen_mtp_config, steps):
+    from dataclasses import replace
+
+    from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+    from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
+    from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
+        prepare_prefill_inputs,
+    )
+
+    kv = KVTransferConfig(kv_connector="MooncakeConnector", kv_role="kv_producer")
+    config = qwen_mtp_config(steps, opt_in=True, kv=kv)
+    assert config.qwen38_p_mtp_context_only
+    with pytest.raises(ValueError, match="one hash lookahead token"):
+        qwen_mtp_config(steps, opt_in=True, kv=kv, disable_lookahead_block_hashes=True)
+    # Head quantization needs the real native head; don't apply context slimming.
+    full = qwen_mtp_config(steps, opt_in=True, kv=kv, draft_lm_head_quantization="fp8")
+    assert not full.qwen38_p_mtp_context_only
+    assert full.num_speculative_tokens == steps
+
+    dev = torch.device("cuda")
+    speculator = MTPSpeculator(config, dev)
+    assert speculator.draft_tokens.shape[1] == steps
+
+    target = InputBuffers(3, 7, dev)
+    batch = InputBatch.make_dummy(3, 7, target)
+    # One one-token final prefill (no truncation), a middle chunk, and the
+    # final chunk of a GDN P request. Each has a different next-token source.
+    batch = replace(
+        batch, mtp_context_next_token_ids=torch.tensor([-1, 41, 42], device=dev)
+    )
+    batch.input_ids.copy_(torch.tensor([5, 6, 7, 8, 9, 10, 11], device=dev))
+    batch.positions.copy_(torch.tensor([0, 5, 6, 13, 14, 15, 16], device=dev))
+    batch.query_start_loc.copy_(torch.tensor([0, 1, 3, 7], device=dev))
+    batch.seq_lens.copy_(torch.tensor([1, 7, 17], device=dev))
+    last_indices = prepare_prefill_inputs(
+        speculator.last_token_indices,
+        speculator.current_draft_step,
+        speculator.input_buffers,
+        batch,
+        torch.tensor([1, 0, 1], device=dev),
+        torch.zeros(3, dtype=torch.int32, device=dev),
+        torch.tensor([51, 52, 53], device=dev),
+        torch.tensor([[31, 32, 33]], device=dev),
+        speculator.max_num_reqs,
+    )
+    assert last_indices[:3].tolist() == [0, 2, 6]
+    assert speculator.input_buffers.input_ids[:7].tolist() == [51, 7, 32, 9, 10, 11, 42]
+    assert speculator.input_buffers.positions[:7].tolist() == batch.positions.tolist()
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA output fence")
+def test_qwen_mtp_context_output_waits_for_late_compute():
+    from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
+    from vllm.v1.worker.gpu.async_utils import AsyncOutput
+    from vllm.v1.worker.gpu.sample.output import SamplerOutput
+
+    main = torch.cuda.current_stream()
+    copy = torch.cuda.Stream()
+    ids = torch.tensor([[7]], device="cuda")
+    count = torch.ones(1, dtype=torch.int32, device="cuda")
+    ready = torch.cuda.Event()
+    output = ModelRunnerOutput(["p"], {"p": 0})
+    pending = AsyncOutput(
+        output,
+        SamplerOutput(ids, None, None, count, torch.zeros_like(count)),
+        count,
+        main,
+        copy,
+        check_ep_fault=False,
+        pending_aux_output=None,
+    )
+    # Enqueue the late context work separately from the early sampler copy.
+    context = torch.empty(128 * 1024, device="cuda")
+    context.fill_(9)
+    ready.record(main)
+    pending.wait_for_compute(main, copy)
+    output.kv_connector_output = KVConnectorOutput(finished_sending={"old"})
+    result = pending.get_output()
+    assert ready.query()
+    assert result.sampled_token_ids == [[7]]
+    assert result.kv_connector_output.finished_sending == {"old"}
 
 
 def test_moe_sp_rejects_pipeline_parallel() -> None:

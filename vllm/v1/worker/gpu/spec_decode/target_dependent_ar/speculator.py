@@ -30,6 +30,8 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
     hidden states (and, for Gemma4, its KV cache) at each draft step.
     """
 
+    context_only: bool = False
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
 
@@ -81,7 +83,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
 
     def _configure_decode_metadata_update(self) -> None:
         # With one speculative step there are no draft decode steps to update.
-        if self.num_speculative_steps == 1:
+        if self.num_speculative_steps == 1 or self.context_only:
             self.supports_decode_metadata_update = False
             return
         super()._configure_decode_metadata_update()
@@ -94,6 +96,9 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
             cudagraph_mode,
             self.num_speculative_steps + 1,
         )
+
+        if self.context_only:
+            return
 
         # PIECEWISE cudagraphs are not supported for draft decodes.
         if cudagraph_mode.decode_mode() == CUDAGraphMode.FULL:
@@ -137,7 +142,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
         )
         self.on_prefill_end(self.max_num_reqs)
 
-        if self.num_speculative_steps == 1:
+        if self.num_speculative_steps == 1 or self.context_only:
             return
 
         self.on_multi_step_decode_begin(self.max_num_reqs)
@@ -214,13 +219,14 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
             )
         else:
             hidden_states = last_hidden_states
-        self._copy_request_inputs(
-            num_reqs,
-            input_batch.idx_mapping,
-            temperature,
-            seeds,
-            dummy_run=dummy_run,
-        )
+        if not self.context_only:
+            self._copy_request_inputs(
+                num_reqs,
+                input_batch.idx_mapping,
+                temperature,
+                seeds,
+                dummy_run=dummy_run,
+            )
 
         # Get the input ids and last token indices for the speculator.
         prepare_prefill_inputs(
@@ -294,8 +300,8 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
             )
         self.on_prefill_end(num_reqs)
 
-        if num_speculative_tokens <= 1:
-            if num_speculative_tokens == 0:
+        if self.context_only or num_speculative_tokens <= 1:
+            if self.context_only or num_speculative_tokens == 0:
                 self.draft_tokens[:num_reqs].fill_(-1)
             return self.draft_tokens[:num_reqs]
 
@@ -448,6 +454,17 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         skip_sample: bool = False,
     ) -> None:
+        if self.context_only:
+            self._run_model(
+                num_tokens,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
+                mm_inputs=mm_inputs,
+            )
+            return
+
         last_token_indices = self.last_token_indices[:num_reqs]
         positions = self.input_buffers.positions[last_token_indices]
         # The output hidden state at position P (= positions) and the token id
@@ -699,8 +716,10 @@ def _prepare_prefill_inputs_kernel(
     num_rejected_ptr,
     query_start_loc_ptr,
     seq_lens_ptr,
+    mtp_context_next_token_ids_ptr,
     max_num_reqs,
     BLOCK_SIZE: tl.constexpr,
+    HAS_MTP_CONTEXT_TOKENS: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     num_reqs = tl.num_programs(0)
@@ -718,6 +737,9 @@ def _prepare_prefill_inputs_kernel(
     num_sampled = tl.load(num_sampled_ptr + req_idx)
     if num_sampled > 0:
         next_token = tl.load(last_sampled_ptr + req_state_idx).to(tl.int32)
+        if HAS_MTP_CONTEXT_TOKENS:
+            context_token = tl.load(mtp_context_next_token_ids_ptr + req_state_idx)
+            next_token = tl.where(context_token >= 0, context_token, next_token)
     else:
         # Chunked prefilling.
         # Get the next prefill token.
@@ -798,8 +820,10 @@ def prepare_prefill_inputs(
         num_rejected,
         input_batch.query_start_loc,
         input_batch.seq_lens,
+        input_batch.mtp_context_next_token_ids,
         max_num_reqs,
         BLOCK_SIZE=1024,
+        HAS_MTP_CONTEXT_TOKENS=input_batch.mtp_context_next_token_ids is not None,
     )
     return last_token_indices
 

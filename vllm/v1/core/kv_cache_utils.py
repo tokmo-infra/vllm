@@ -973,6 +973,9 @@ def get_request_block_hasher(
     def request_block_hasher(request: Request) -> list[BlockHash]:
         start_token_idx = len(request.block_hashes) * hash_block_size
         num_tokens = request.num_tokens - num_hash_lookahead_tokens
+        if request.mtp_context_next_token_id is not None:
+            # The producer never computes target KV past the truncated prompt.
+            num_tokens = min(num_tokens, request.num_prompt_tokens)
 
         if start_token_idx + hash_block_size > num_tokens:
             # Early stop when there no new full blocks created.
@@ -1009,13 +1012,10 @@ def get_request_block_hasher(
                     hash_end_token_idx,
                     curr_mm_idx,
                 )
-                if num_hash_lookahead_tokens == 1:
-                    extra_keys = (extra_keys, request.all_token_ids[end_token_idx])
-                else:
-                    extra_keys = (
-                        extra_keys,
-                        *request.all_token_ids[end_token_idx:hash_end_token_idx],
-                    )
+                extra_keys = (
+                    extra_keys,
+                    *request.get_kv_cache_token_ids(end_token_idx, hash_end_token_idx),
+                )
             else:
                 extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
                     request, start_token_idx, end_token_idx, curr_mm_idx

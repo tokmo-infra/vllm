@@ -277,6 +277,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.ec_connector = get_ec_connector(vllm_config, self.encoder_cache)
 
         self.num_speculative_steps = vllm_config.num_speculative_tokens
+        self.mtp_context_only = vllm_config.qwen38_p_mtp_context_only
         num_prefill_lookahead = max(1, vllm_config.num_prefill_lookahead_tokens)
         use_dense_all_token_ids = (
             self.speculative_config is not None and self.speculative_config.use_ngram()
@@ -292,6 +293,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
             num_prefill_lookahead=num_prefill_lookahead,
             use_dense_all_token_ids=use_dense_all_token_ids,
+            mtp_context_only=self.mtp_context_only,
         )
 
         # Speculative decoding.
@@ -1230,6 +1232,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 all_token_ids=new_req_data.prefill_token_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
+                mtp_context_next_token_id=new_req_data.mtp_context_next_token_id,
             )
             req_index = self.req_states.req_id_to_index[req_id]
             if self.adaptive_verification is not None:
@@ -1581,6 +1584,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cu_num_logits_np=cu_num_logits_np,
             has_structured_output_reqs=scheduler_output.has_structured_output_requests,
             prompt_lens=prompt_lens,
+            mtp_context_next_token_ids=(
+                self.req_states.mtp_context_next_token_ids.gpu
+                if self.req_states.mtp_context_next_token_ids is not None
+                else None
+            ),
             fast_prefill=fast_prefill,
             max_query_len=(
                 int(num_scheduled_tokens_upper_bound.max())
@@ -2120,6 +2128,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if dp_sync_state is not None
             else scheduler_output.skip_drafts
         )
+        if self.mtp_context_only:
+            skip_drafts = True
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
             attn_metadata=attn_metadata,
@@ -2321,15 +2331,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     dp_sync_state=dp_sync_state,
                     mm_inputs=mm_inputs,
                 )
-            if num_spec_tokens < self.num_speculative_steps:
-                draft_tokens[:, num_spec_tokens:] = -1
-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            if self.mtp_context_only:
+                # Copy was launched earlier; gate output publication, not D2H.
+                async_output.wait_for_compute(self.main_stream, self.output_copy_stream)
+            else:
+                if num_spec_tokens < self.num_speculative_steps:
+                    draft_tokens[:, num_spec_tokens:] = -1
+                self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
             if self.adaptive_verification is not None:
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch
                 )
 
-        if self.num_speculative_steps > 0:
+        if self.num_speculative_steps > 0 and not self.mtp_context_only:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
             draft_tokens = self.req_states.draft_tokens[input_batch.idx_mapping]

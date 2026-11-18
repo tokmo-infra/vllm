@@ -55,6 +55,7 @@ def make_hybrid_gdn_kv_cache_config(block_size: int) -> KVCacheConfig:
     return KVCacheConfig(
         num_blocks=16,
         kv_cache_tensors=[],
+        hash_block_size=block_size,
         kv_cache_groups=[
             KVCacheGroupSpec(
                 ["model.layers.0.self_attn"],

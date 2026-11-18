@@ -587,11 +587,9 @@ class MooncakeStoreScheduler:
             if self.enable_kv_events and coord.num_hash_lookahead_tokens:
                 request, _ = self._unfinished_requests[req_meta.req_id]
                 req_meta.num_hash_lookahead_tokens = coord.num_hash_lookahead_tokens
-                req_meta.token_ids = list(
-                    request.all_token_ids[
-                        req_meta.token_ids_start : req_meta.token_len_chunk
-                        + coord.num_hash_lookahead_tokens
-                    ]
+                req_meta.token_ids = request.get_kv_cache_token_ids(
+                    req_meta.token_ids_start,
+                    req_meta.token_len_chunk + coord.num_hash_lookahead_tokens,
                 )
             req_meta.store_job_id = store_job_id = self._next_store_job_id
             self._next_store_job_id += 1

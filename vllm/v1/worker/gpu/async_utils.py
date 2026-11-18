@@ -171,6 +171,13 @@ class AsyncOutput(AsyncModelRunnerOutput):
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
             self.copy_event.record(copy_stream)
 
+    def wait_for_compute(
+        self, main_stream: torch.cuda.Stream, copy_stream: torch.cuda.Stream
+    ) -> None:
+        """Include late GPU writes in output readiness without delaying D2H."""
+        copy_stream.wait_stream(main_stream)
+        self.copy_event.record(copy_stream)
+
     def get_output(self) -> ModelRunnerOutput:
         self.copy_event.synchronize()
 

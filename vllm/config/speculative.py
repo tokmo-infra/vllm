@@ -431,6 +431,10 @@ class SpeculativeConfig:
     """Users should pass "draft_tensor_parallel_size". This parameter's purpose is to
     warn users when they mistakenly provide the wrong argument."""
 
+    qwen38_p_mtp_context_only: bool = False
+    """Build MTP context without generating drafts on a dedicated Qwen3.8
+    Flash-Next Mooncake prefill producer. Leave disabled on D and coupled."""
+
     # Draft model configuration
     quantization: me_quant.QuantizationMethods | str | None = None
     """Quantization method that was used to quantize the draft model weights.
@@ -680,6 +684,8 @@ class SpeculativeConfig:
             "dspark",
         )
         factors.append(uses_aux_hidden_states)
+        if self.qwen38_p_mtp_context_only:
+            factors.append("qwen38_p_mtp_context_only")
         if self.method == "dspark":
             factors.append(self.enable_adaptive_verification)
 

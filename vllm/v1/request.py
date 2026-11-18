@@ -103,6 +103,8 @@ class Request:
 
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
+        # Mooncake hybrid P may keep the excluded prompt token for MTP KV only.
+        self.mtp_context_next_token_id: int | None = None
         # E/P/D: Connector-specific encoder-cache transfer parameters.
         self.ec_transfer_params: dict[str, Any] | None = None
 
@@ -296,6 +298,45 @@ class Request:
         )
         del self.block_hashes[num_valid_hashes:]
         self._prompt_embeds_per_block_hashes.clear()
+
+    def truncate_prompt_for_remote_prefill(
+        self,
+        hash_block_size: int,
+        num_hash_lookahead_tokens: int,
+        *,
+        retain_mtp_context: bool = False,
+    ) -> bool:
+        """Drop the target's tail row, optionally keeping its token for MTP."""
+        if retain_mtp_context and num_hash_lookahead_tokens != 1:
+            raise ValueError(
+                "MTP prompt-tail context requires one hash lookahead token"
+            )
+        if self.prompt_token_ids is not None:
+            tail_token = self.prompt_token_ids.pop()
+            if retain_mtp_context:
+                self.mtp_context_next_token_id = tail_token
+                # The retained token still contributes to the last page's hash.
+                num_hash_lookahead_tokens -= 1
+        elif self.prompt_embeds is not None:
+            self.prompt_embeds = self.prompt_embeds[:-1]
+        else:
+            return False
+        self._all_token_ids.pop()
+        self.num_prompt_tokens -= 1
+        self.max_tokens = 1
+        self.truncate_block_hashes(hash_block_size, num_hash_lookahead_tokens)
+        return True
+
+    def get_kv_cache_token_ids(self, start: int, end: int) -> list[int]:
+        """Return cache provenance, not the synthetic P output token."""
+        next_token = self.mtp_context_next_token_id
+        if next_token is None:
+            return self.all_token_ids[start:end]
+        boundary = self.num_prompt_tokens
+        tokens = self.all_token_ids[start : min(end, boundary)]
+        if start <= boundary < end:
+            tokens.append(next_token)
+        return tokens
 
     @property
     def use_structured_output(self) -> bool:

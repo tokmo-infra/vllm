@@ -517,7 +517,7 @@ class DefaultModelLoader(BaseModelLoader):
             if self.enable_weights_track is not None
             else default_enable_weights_track
         )
-        if enable_weights_track:
+        if enable_weights_track or getattr(model, "requires_weight_tracking", False):
             self.track_weights_loading(
                 model, loaded_weights, quantized=model_config.quantization is not None
             )

@@ -1030,22 +1030,14 @@ class MooncakeConnectorScheduler:
             # loads nothing on the decoder, which recomputes its whole prompt.
             and not request.get_skip_reading_prefix_cache()
         ):
-            if request.prompt_token_ids is not None:
-                request.prompt_token_ids.pop()
-            elif request.prompt_embeds is not None:
-                request.prompt_embeds = request.prompt_embeds[:-1]
-            else:
-                return
-
-            request._all_token_ids.pop()
-            request.num_prompt_tokens -= 1
-            request.max_tokens = 1
             hash_block_size = self.kv_cache_config.hash_block_size
             assert hash_block_size is not None
-            request.truncate_block_hashes(
-                hash_block_size, self.vllm_config.num_hash_lookahead_tokens
-            )
-            params["_p_side_truncated"] = True
+            if request.truncate_prompt_for_remote_prefill(
+                hash_block_size,
+                self.vllm_config.num_hash_lookahead_tokens,
+                retain_mtp_context=self.vllm_config.qwen38_p_mtp_context_only,
+            ):
+                params["_p_side_truncated"] = True
 
     def on_new_request(self, request: "Request") -> None:
         params = request.kv_transfer_params

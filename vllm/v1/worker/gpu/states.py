@@ -17,6 +17,7 @@ class RequestState:
         device: torch.device,
         num_prefill_lookahead: int = 1,
         use_dense_all_token_ids: bool = False,
+        mtp_context_only: bool = False,
     ):
         self.max_num_reqs = max_num_reqs
         self.max_model_len = max_model_len
@@ -83,6 +84,11 @@ class RequestState:
         self.next_prefill_tokens = torch.zeros(
             num_prefill_lookahead, self.max_num_reqs, dtype=torch.int32, device=device
         )
+        self.mtp_context_next_token_ids = (
+            StagedWriteTensor(max_num_reqs, dtype=torch.int32, device=device)
+            if mtp_context_only
+            else None
+        )
 
     @property
     def num_reqs(self) -> int:
@@ -95,6 +101,7 @@ class RequestState:
         all_token_ids: list[int],
         num_computed_tokens: int,
         max_tokens: int,
+        mtp_context_next_token_id: int | None = None,
     ) -> None:
         assert len(self.free_indices) > 0, "No free indices"
         req_idx = self.free_indices.pop()
@@ -116,6 +123,11 @@ class RequestState:
 
         if self.num_speculative_steps > 0:
             self.draft_tokens[req_idx].zero_()
+        if self.mtp_context_next_token_ids is not None:
+            self.mtp_context_next_token_ids.stage_write_elem(
+                req_idx,
+                -1 if mtp_context_next_token_id is None else mtp_context_next_token_id,
+            )
 
     def apply_staged_writes(self) -> None:
         self.prompt_len.copy_to_uva()
@@ -123,6 +135,8 @@ class RequestState:
         self.total_len.apply_write()
         self.all_token_ids.apply_write()
         self.num_computed_tokens.apply_write()
+        if self.mtp_context_next_token_ids is not None:
+            self.mtp_context_next_token_ids.apply_write()
 
     def remove_request(self, req_id: str) -> int | None:
         """Return the freed slot index, or None if the request was not found."""

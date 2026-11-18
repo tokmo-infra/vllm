@@ -67,6 +67,38 @@ vllm serve XiaomiMiMo/MiMo-7B-Base \
     --speculative-config '{"method":"mtp","num_speculative_tokens":1}'
 ```
 
+## Qwen3.8 Flash-Next: dedicated prefill producer
+
+On a dedicated NVIDIA Model Runner V2 Mooncake P2P producer, set
+`"qwen38_p_mtp_context_only": true` in the producer's `--speculative-config` JSON,
+alongside `"method": "mtp"` and your normal `num_speculative_tokens`. Leave the
+flag off on decode and coupled instances. P retains the full target and the
+draft input fusion, attention, and cache updates without the draft MoE, final
+mixer, head, or autoregressive proposals. The router must issue one-output-token
+requests with `do_remote_decode` and a KV transfer ID. Streaming input and prompt
+embeddings are not supported on a context-only producer.
+
+Keep lookahead block hashing and EAGLE-style block drop enabled. Mooncake's
+hybrid handoff still computes the target through the penultimate prompt token.
+P forwards the removed final token only to MTP, so the last draft KV row
+conditions on the original prompt, not P's throwaway sampled token.
+
+**Start cold in a separate Store namespace.** With Mooncake Store in a
+MultiConnector, set the Store child's `cache_prefix` to
+`qwen38-mtp-context-v1/<deployment>` with a fresh, unused deployment suffix. Do
+not use the previous Store prefix, migrate old entries, or route the paired
+decoder to legacy producers. A native decoder may read the new Store prefix
+with the same checkpoint, lookahead hashing, and cache-layout settings. Keep
+the optimization off on the decoder.
+
+The optimization is scoped to CUDA, single-module, PP=1 native MTP with BF16
+or FP8 checkpoints through the regular weight loader. Other quantization or
+prepacked loaders, non-CUDA backends, multi-module MTP and configurations that
+need a draft head or adaptive verification keep the full native path. Do not
+use the reserved Store prefix on fallback producers. This mode does not change
+configured MTP depth, FP8 KV settings, chunked prefill, asynchronous scheduling,
+or target/context graph selection.
+
 ## Notes
 
 - MTP only works for model families that support MTP in vLLM.

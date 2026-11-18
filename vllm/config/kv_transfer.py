@@ -146,3 +146,42 @@ class KVTransferConfig:
             child.get("kv_connector") == connector_name
             for child in self.kv_connector_extra_config.get("connectors", [])
         )
+
+    def is_dedicated_mooncake_producer(self) -> bool:
+        """Recognize a P2P-only producer, optionally backed by shared Store."""
+        if self.kv_connector == "MooncakeConnector":
+            return self.kv_role == "kv_producer" and not self.kv_connector_module_path
+        if self.kv_connector != "MultiConnector" or self.kv_connector_module_path:
+            return False
+        children = self.get_from_extra_config("connectors", [])
+        if any(child.get("kv_connector_module_path") for child in children):
+            return False
+        p2p = [c for c in children if c.get("kv_connector") == "MooncakeConnector"]
+        store = [
+            c for c in children if c.get("kv_connector") == "MooncakeStoreConnector"
+        ]
+        return (
+            len(p2p) == 1
+            and p2p[0].get("kv_role") == "kv_producer"
+            and len(store) <= 1
+            and len(children) == len(p2p) + len(store)
+            and self.kv_role in ("kv_producer", "kv_both")
+        )
+
+    def uses_qwen38_mtp_context_store_prefix(self) -> bool:
+        """Whether a Store uses the reserved prompt-tail provenance namespace."""
+        store_configs = [self.kv_connector_extra_config]
+        if self.kv_connector == "MultiConnector":
+            store_configs = [
+                child.get("kv_connector_extra_config", {})
+                for child in self.get_from_extra_config("connectors", [])
+                if child.get("kv_connector") == "MooncakeStoreConnector"
+            ]
+        elif self.kv_connector != "MooncakeStoreConnector":
+            return False
+        return any(
+            isinstance(prefix := config.get("cache_prefix"), str)
+            and prefix.startswith("qwen38-mtp-context-v1/")
+            and bool(prefix.removeprefix("qwen38-mtp-context-v1/"))
+            for config in store_configs
+        )

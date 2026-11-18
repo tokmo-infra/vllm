@@ -535,6 +535,29 @@ class InputProcessor:
                     )
                 )
 
+        if self.vllm_config.qwen38_p_mtp_context_only:
+            kv_params = (
+                (sampling_params.extra_args or {}).get("kv_transfer_params") or {}
+                if sampling_params is not None
+                else {}
+            )
+            if (
+                sampling_params is None
+                or sampling_params.max_tokens != 1
+                or not isinstance(kv_params, dict)
+                or not kv_params.get("do_remote_decode")
+                or kv_params.get("do_remote_prefill")
+                or not kv_params.get("transfer_id")
+                or "_p_side_truncated" in kv_params
+                or resumable
+                or prompt_embeds is not None
+            ):
+                raise VLLMValidationError(
+                    "Qwen3.8 MTP context-only P requires a one-output-token "
+                    "Mooncake remote-decode request with a transfer ID, no "
+                    "prompt embeddings, and no streaming input."
+                )
+
         return EngineCoreRequest(
             request_id=request_id,
             prompt_token_ids=prompt_token_ids,

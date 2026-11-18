@@ -123,6 +123,18 @@ def _remap_mtp_weight_name(name: str) -> str | None:
     return None
 
 
+def _is_generation_only_weight(name: str) -> bool:
+    if name.startswith(("lm_head.", "model.hyper_connection_mixer.")):
+        return True
+    parts = name.split(".", 4)
+    return (
+        len(parts) == 5
+        and parts[:2] == ["model", "layers"]
+        and parts[2].isdigit()
+        and parts[3] in ("mlp", "mlp_hyper_connection")
+    )
+
+
 def _make_draft_vllm_config(
     vllm_config: VllmConfig,
     mtp_start_layer_idx: int,
@@ -171,6 +183,7 @@ def _make_draft_vllm_config(
 
 class Qwen4ExpMultiTokenPredictor(nn.Module):
     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
+    mtp_context_only: bool = False
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -179,6 +192,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         config: Qwen4ExpTextConfig = model_config.hf_text_config
 
         self.config = config
+        self.mtp_context_only = vllm_config.qwen38_p_mtp_context_only
         # MoE SP also enables HC SP, while HC SP can be enabled independently.
         self.use_hc_sequence_parallel = is_hc_sequence_parallel_enabled(vllm_config)
         self.use_sequence_parallel = (
@@ -225,6 +239,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
                     draft_vllm_config,
                     layer_type="qwen_sparse_attention",
                     prefix=f"{prefix}.layers.{self.mtp_start_layer_idx + idx}",
+                    mtp_context_only=self.mtp_context_only,
                 )
                 for idx in range(self.num_mtp_layers)
             )
@@ -241,19 +256,20 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             self.hidden_size * self.hc_count, eps=config.rms_norm_eps
         )
         # HC final mixer collapses the multi stream into [T, H] for the LM head.
-        hc_config = HyperConnectionConfig(
-            hc_count=config.hc_count,
-            hidden_size=config.hidden_size,
-            params_dtype=torch.bfloat16,
-            hc_lowrank=config.hc_lowrank,
-            rms_norm_eps=config.rms_norm_eps,
-            hc_per_branch_norm=True,
-        )
-        self.hyper_connection_mixer = GatedResidual(
-            hc_config,
-            use_combine=False,
-            prefix=maybe_prefix(prefix, "hyper_connection_mixer"),
-        )
+        if not self.mtp_context_only:
+            hc_config = HyperConnectionConfig(
+                hc_count=config.hc_count,
+                hidden_size=config.hidden_size,
+                params_dtype=torch.bfloat16,
+                hc_lowrank=config.hc_lowrank,
+                rms_norm_eps=config.rms_norm_eps,
+                hc_per_branch_norm=True,
+            )
+            self.hyper_connection_mixer = GatedResidual(
+                hc_config,
+                use_combine=False,
+                prefix=maybe_prefix(prefix, "hyper_connection_mixer"),
+            )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states"], self.hidden_size * self.hc_count
         )
@@ -349,6 +365,8 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             query_start_loc=None,
             ngram_context=None,
         )
+        if self.mtp_context_only:
+            return block_output
         if not get_pp_group().is_last_rank:
             # As in the target model, PP carries a materialized tensor rather
             # than the delayed hidden/output/injection tuple.
@@ -380,6 +398,11 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         return sample_hidden_states, multi_hidden
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # AutoWeightsLoader tracks the packed destination, not each source shard.
+        # A partially loaded QKV/HC projection cannot produce valid context.
+        seen: set[str] = set()
+        if self.mtp_context_only:
+            weights = _track_weight_names(weights, seen)
         weights = maybe_fuse_shared_experts(
             weights,
             enabled=self.is_fused_shared_expert_enabled,
@@ -394,7 +417,43 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             self,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(weights, mapper=mapper)
+        loaded = loader.load_weights(weights, mapper=mapper)
+        if self.mtp_context_only:
+            for idx, layer in enumerate(self.layers):
+                prefix = f"layers.{idx}."
+                _require_packed_weight_sources(
+                    seen,
+                    prefix + "attn_hyper_connection.",
+                    "input_mix_weight_down_block_inject",
+                    ("input_mix_weight_down", "block_inject_weight"),
+                )
+                qkv_sources: tuple[str, ...] = ("q_proj", "k_proj", "v_proj")
+                if getattr(layer.self_attn, "fuse_indexer_projection", False):
+                    qkv_sources += ("indexer.index_qk_proj",)
+                _require_packed_weight_sources(
+                    seen, prefix + "self_attn.", "qkv_proj", qkv_sources
+                )
+        return loaded
+
+
+def _track_weight_names(
+    weights: Iterable[tuple[str, torch.Tensor]], seen: set[str]
+) -> Iterable[tuple[str, torch.Tensor]]:
+    for name, weight in weights:
+        seen.add(name)
+        yield name, weight
+
+
+def _require_packed_weight_sources(
+    seen: set[str], prefix: str, packed: str, sources: tuple[str, ...]
+) -> None:
+    if f"{prefix}{packed}.weight" in seen:
+        return
+    missing = {f"{prefix}{name}.weight" for name in sources} - seen
+    if missing:
+        raise ValueError(
+            f"Missing Qwen3.8 MTP context weight shards: {sorted(missing)}"
+        )
 
 
 class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts):
@@ -417,12 +476,19 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
 
         super().__init__()
         self.config = config
+        self.mtp_context_only = vllm_config.qwen38_p_mtp_context_only
+        self.requires_weight_tracking = self.mtp_context_only
+        if self.mtp_context_only:
+            self.is_unused_checkpoint_weight = self._is_unused_context_weight
         self.model = Qwen4ExpMultiTokenPredictor(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "mtp"),
         )
 
-        if get_pp_group().is_last_rank:
+        if self.mtp_context_only:
+            # Don't allocate a head or alias the target's head in load_eagle_model.
+            self.has_own_lm_head = True
+        elif get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
@@ -434,7 +500,8 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
         else:
             self.lm_head = PPMissingLayer()
 
-        self.logits_processor = LogitsProcessor(config.vocab_size)
+        if not self.mtp_context_only:
+            self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
@@ -465,13 +532,22 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
     def compute_logits(
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
     ) -> torch.Tensor | None:
+        if self.mtp_context_only:
+            raise RuntimeError("Qwen3.8 MTP context-only model cannot generate drafts")
         return self.logits_processor(self.lm_head, hidden_states)
+
+    @staticmethod
+    def _is_unused_context_weight(name: str) -> bool:
+        remapped = _remap_mtp_weight_name(name)
+        return remapped is None or _is_generation_only_weight(remapped)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names():
             for name, weight in weights:
                 remapped_name = _remap_mtp_weight_name(name)
-                if remapped_name is not None:
+                if remapped_name is not None and not (
+                    self.mtp_context_only and _is_generation_only_weight(remapped_name)
+                ):
                     yield remapped_name, weight
 
         mapper = WeightsMapper(

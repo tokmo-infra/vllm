@@ -131,6 +131,9 @@ class InputBatch:
     # adaptive verification with batch-sharded sampling, when the budget binds.
     num_admitted_draft_tokens: "AdmittedDraftCounts | None" = None
 
+    # Per request-state slot; -1 means use the ordinary next token.
+    mtp_context_next_token_ids: torch.Tensor | None = None
+
     @classmethod
     def make_dummy(
         cls,

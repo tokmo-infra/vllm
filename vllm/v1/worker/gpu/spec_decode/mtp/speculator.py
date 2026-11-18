@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import torch
 import torch.nn as nn
 
+from vllm.config import VllmConfig
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
     TargetDependentARSpeculator,
@@ -12,12 +14,18 @@ from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
 class MTPSpeculator(TargetDependentARSpeculator):
     share_mtp_topk_indices: bool = False
 
+    def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        super().__init__(vllm_config, device)
+        self.context_only = vllm_config.qwen38_p_mtp_context_only
+
     def load_draft_model(
         self,
         target_model: nn.Module,
         target_attn_layer_names: set[str],
     ) -> nn.Module:
         draft_model = load_eagle_model(target_model, self.vllm_config)
+        if self.context_only and not getattr(draft_model, "mtp_context_only", False):
+            raise RuntimeError("Expected the native Qwen3.8 MTP context-only model")
         spec_config = self.vllm_config.speculative_config
         draft_hf_config = (
             spec_config.draft_model_config.hf_config
@@ -29,6 +37,7 @@ class MTPSpeculator(TargetDependentARSpeculator):
         # steps 1+ reuse them.
         self.share_mtp_topk_indices = (
             self.vllm_config.parallel_config.prefill_context_parallel_size == 1
+            and not self.context_only
             and getattr(draft_hf_config, "index_share_for_mtp_iteration", False)
             and hasattr(draft_model.model, "set_skip_topk")
             and hasattr(draft_model.model, "compact_topk_indices")

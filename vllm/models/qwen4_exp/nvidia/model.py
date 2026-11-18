@@ -194,6 +194,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
         vllm_config: VllmConfig,
         layer_type: str,
         prefix: str = "",
+        *,
+        mtp_context_only: bool = False,
     ) -> None:
         super().__init__()
         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
@@ -255,10 +257,14 @@ class Qwen4ExpDecoderLayer(nn.Module):
         else:
             raise ValueError(f"Invalid layer_type {layer_type}")
 
-        self.mlp = Qwen4ExpSparseMoeBlock(
-            vllm_config=vllm_config,
-            prefix=f"{prefix}.mlp",
-            reduce_results=not self.use_hc_sequence_parallel,
+        self.mlp = (
+            None
+            if mtp_context_only
+            else Qwen4ExpSparseMoeBlock(
+                vllm_config=vllm_config,
+                prefix=f"{prefix}.mlp",
+                reduce_results=not self.use_hc_sequence_parallel,
+            )
         )
 
         hc_config = HyperConnectionConfig(
@@ -273,9 +279,13 @@ class Qwen4ExpDecoderLayer(nn.Module):
             hc_config,
             prefix=maybe_prefix(prefix, "attn_hyper_connection"),
         )
-        self.mlp_hyper_connection = GatedResidual(
-            hc_config,
-            prefix=maybe_prefix(prefix, "mlp_hyper_connection"),
+        self.mlp_hyper_connection = (
+            None
+            if mtp_context_only
+            else GatedResidual(
+                hc_config,
+                prefix=maybe_prefix(prefix, "mlp_hyper_connection"),
+            )
         )
 
     def forward(
@@ -332,6 +342,10 @@ class Qwen4ExpDecoderLayer(nn.Module):
             raise ValueError("Invalid layer_type")
 
         mlp_hc = self.mlp_hyper_connection
+        if mlp_hc is None:
+            # The native attention call above writes main KV and both QSA caches.
+            return hidden_states, attn_out, injection
+        assert self.mlp is not None
         if self.use_hc_sequence_parallel:
             attn_out = sp_reduce_scatter(attn_out)
         hidden_states, block_input, injection = mlp_hc.combine_and_mix(

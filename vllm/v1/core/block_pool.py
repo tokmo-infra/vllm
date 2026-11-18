@@ -366,9 +366,9 @@ class BlockPool:
         return generate_block_hash_extra_keys(request, start, end, start_mm_idx)
 
     def get_lookahead_token_ids(self, request: Request, block_end: int) -> list[int]:
-        return request.all_token_ids[
-            block_end : block_end + self.num_hash_lookahead_tokens
-        ]
+        return request.get_kv_cache_token_ids(
+            block_end, block_end + self.num_hash_lookahead_tokens
+        )
 
     def _build_block_stored_event(
         self,

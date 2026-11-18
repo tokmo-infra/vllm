@@ -625,6 +625,94 @@ class VllmConfig:
         return 0
 
     @property
+    def qwen38_p_mtp_context_only(self) -> bool:
+        spec = self.speculative_config
+        if spec is None or not spec.qwen38_p_mtp_context_only:
+            return False
+        draft = spec.draft_model_config
+        assert draft is not None
+        # A multi-module chain can need the preceding module's complete
+        # output to build context for the next module, even with no proposals.
+        return (
+            current_platform.is_cuda()
+            and getattr(draft.hf_text_config, "mtp_num_hidden_layers", 1) == 1
+            and not spec.use_multi_module_mtp()
+            and self.parallel_config.pipeline_parallel_size == 1
+            and not spec.enable_adaptive_verification
+            and spec.draft_lm_head_quantization is None
+            and not spec.use_local_argmax_reduction
+            and spec.draft_sample_method != "probabilistic"
+            and draft.quantization in (None, "fp8")
+            # Prepacked state requires the native model layout.
+            and (spec.draft_load_config or self.load_config).load_format
+            in ("auto", "hf", "safetensors", "pt")
+        )
+
+    def _validate_qwen38_p_mtp_context(self) -> None:
+        spec = self.speculative_config
+        kv = self.kv_transfer_config
+        isolated_store = kv is not None and kv.uses_qwen38_mtp_context_store_prefix()
+        if isolated_store and self.num_hash_lookahead_tokens != 1:
+            raise ValueError(
+                "Qwen3.8 MTP context Store requires one hash lookahead token"
+            )
+        if isolated_store and not self.qwen38_p_mtp_context_only:
+            assert kv is not None
+            # A native D may read the new namespace. A legacy P must never
+            # populate it with KV conditioned on its synthetic sampled output.
+            p2p_roles = [
+                c.get("kv_role")
+                for c in kv.get_from_extra_config("connectors", [])
+                if c.get("kv_connector") == "MooncakeConnector"
+            ]
+            if kv.kv_connector != "MultiConnector" or p2p_roles != ["kv_consumer"]:
+                raise ValueError(
+                    "Only Qwen3.8 MTP context-only P and its native Mooncake D "
+                    "may use the reserved Store cache_prefix"
+                )
+        if spec is None or not spec.qwen38_p_mtp_context_only:
+            return
+        model = self.model_config
+        draft = spec.draft_model_config
+        if (
+            spec.method != "mtp"
+            or draft is None
+            or "Qwen4ExpMTP" not in draft.architectures
+            or model is None
+            or not set(model.architectures).intersection(
+                {
+                    "Qwen4ExpForCausalLM",
+                    "Qwen4ExpForConditionalGeneration",
+                    "Qwen4ExpMTP",
+                }
+            )
+            or model.using_transformers_backend()
+        ):
+            raise ValueError("qwen38_p_mtp_context_only requires native Qwen3.8 MTP")
+        if kv is None or not kv.is_dedicated_mooncake_producer():
+            raise ValueError(
+                "qwen38_p_mtp_context_only requires a dedicated Mooncake P2P producer"
+            )
+        if not self.use_v2_model_runner:
+            raise ValueError("qwen38_p_mtp_context_only requires Model Runner V2")
+        if not self.qwen38_p_mtp_context_only:
+            logger.info_once(
+                "Qwen3.8 P-only MTP slimming is unavailable for this configuration; "
+                "keeping the full native drafter."
+            )
+            return
+        if self.num_hash_lookahead_tokens != 1:
+            raise ValueError(
+                "qwen38_p_mtp_context_only requires one hash lookahead token; "
+                "do not disable lookahead hashes or EAGLE-style block drop"
+            )
+        if kv.has_connector("MooncakeStoreConnector") and not isolated_store:
+            raise ValueError(
+                "qwen38_p_mtp_context_only requires a fresh Mooncake Store "
+                "cache_prefix of qwen38-mtp-context-v1/<deployment>"
+            )
+
+    @property
     def num_lookahead_tokens(self) -> int:
         """KV slots to reserve past the tokens the target model is scheduled for.
 
@@ -2347,6 +2435,7 @@ class VllmConfig:
         # Log the custom passes that are enabled
         self.compilation_config.pass_config.log_enabled_passes()
         self.num_hash_lookahead_tokens = self._resolve_num_hash_lookahead_tokens()
+        self._validate_qwen38_p_mtp_context()
 
     def _set_max_num_scheduled_tokens(self):
         """In most cases, the scheduler may schedule a batch with as many tokens as the

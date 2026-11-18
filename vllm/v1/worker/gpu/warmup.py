@@ -441,7 +441,12 @@ def _warmup_kernels(
                 req_computed[i] += decode_query_len if use_spec else 1
 
         all_indices = list(range(num_reqs))
-        use_spec_decode = num_spec_steps > 0
+        # Context-only P never produces drafts to verify. Still exercise the
+        # same context prefill path and leave the target graph sizing intact.
+        use_spec_decode = (
+            num_spec_steps > 0
+            and not model_runner.vllm_config.qwen38_p_mtp_context_only
+        )
 
         # Decode steps to warm, as (request indices, per-request spec flag).
         # Under spec decoding the scheduler drops requests the drafter proposed
