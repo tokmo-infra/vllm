@@ -510,3 +510,52 @@ def test_hot_view_preserves_row_stride_with_partial_lease_padding():
         ],
         payload,
     )
+
+
+@pytest.mark.parametrize("tokens", [1, 512, 513, 16384, 16385, 40971, 41926])
+@pytest.mark.parametrize("interleave", [1, 4, 128])
+def test_imported_draft_tail_is_finite_without_touching_owned_rows(tokens, interleave):
+    from vllm.v1.hisparse.dcp import clear_imported_draft_tail
+
+    rows = 2048
+    # Packed layout: layer 1 shares backing memory with layer 0, not content.
+    backing = torch.full((4, 2, rows, 2), 0xFF, dtype=torch.uint8)
+    cache = backing[:, 1:2]
+    block_id = 2  # Last newly imported block, unrelated to logical position.
+    for rank in range(8):
+        shard = HiSparseDCPShard(8, rank, interleave)
+        valid = sum(
+            p // interleave % 8 == rank
+            for p in range((tokens - 1) // (rows * 8) * (rows * 8), tokens)
+        )
+        cache[block_id].fill_(0xFF)  # Stale bytes in D's *following* kernel page.
+        cache[block_id, 0, :valid].fill_(0x38)
+        wire_end = min(rows, (valid + 63) // 64 * 64)
+        cache[block_id, 0, valid:wire_end].fill_(0x7F)  # NaN padding from P.
+        wrote = clear_imported_draft_tail(cache, block_id, rows, tokens, shard)
+        assert wrote == (valid < rows)
+        assert (cache[block_id, 0, :valid] == 0x38).all()
+        assert (cache[block_id, 0, valid:] == 0).all()
+        assert (backing[:, 0] == 0xFF).all()
+        assert (cache[[0, 1, 3]] == 0xFF).all()
+
+
+@pytest.mark.parametrize("bad_row", [5122, 5184])
+def test_imported_fp8_draft_attention_ignores_nan_in_either_half_tile(bad_row):
+    from vllm.v1.hisparse.dcp import clear_imported_draft_tail
+
+    rows = 2048
+    cache = torch.full((4, rows, 1), 0x38, dtype=torch.uint8)  # FP8 1.0
+    last_block = 3
+    shard = HiSparseDCPShard(8, 7, 1)
+    start = 5120 % rows
+    tile = cache[last_block, start : start + 128].view(torch.float8_e4m3fn)
+    prob = torch.zeros(4, 128)
+    prob[:, :2] = 0.5
+
+    cache[last_block, bad_row % rows] = 0x7F
+    assert (prob @ tile.float()).isnan().all()
+    clear_imported_draft_tail(cache, last_block, rows, 40971, shard)
+    # The draft query writes the newly computed positions before attention.
+    cache[last_block, start : start + 2] = 0x38
+    assert torch.equal(prob @ tile.float(), torch.ones(4, 1))

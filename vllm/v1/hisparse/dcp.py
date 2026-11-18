@@ -35,6 +35,26 @@ def coalesce_import_descriptors(
     return result
 
 
+def clear_imported_draft_tail(
+    cache: "torch.Tensor",
+    block_id: int,
+    block_size: int,
+    tokens: int,
+    shard: "HiSparseDCPShard",
+) -> bool:
+    """Clear uncomputed FP8 rows of the last received manager block only."""
+    if block_id <= 0 or tokens <= 0:
+        return False
+    used_in_block = (tokens - 1) % (block_size * shard.size) + 1
+    valid = shard.count_before(used_in_block)
+    if valid == block_size:
+        return False
+    # The FP8 PV tile can span multiple kernel pages. A partial import did
+    # not initialize the next page either; keep the entire unused suffix finite.
+    cache[block_id, ..., valid:, :].zero_()
+    return True
+
+
 def query_chunk_rows(
     num_tokens: int, max_query_len: int, queries_per_chunk: int
 ) -> list[list[int]]:

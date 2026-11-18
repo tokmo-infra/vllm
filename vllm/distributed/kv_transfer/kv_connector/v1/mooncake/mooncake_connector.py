@@ -10,11 +10,12 @@ import queue
 import secrets
 import threading
 import time
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, deque
 from collections.abc import Collection
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import IntEnum
+from functools import partial
 from typing import TYPE_CHECKING, Any, Final
 
 import msgspec
@@ -74,6 +75,8 @@ from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.hisparse.dcp import (
+    HiSparseDCPShard,
+    clear_imported_draft_tail,
     coalesce_import_descriptors,
     import_page_offset,
     pair_import_pages,
@@ -788,6 +791,7 @@ class SendBlockMeta:
     need_send: int = 0
     sent: int = 0
     sending: int = 0
+    write_done: torch.cuda.Event | None = None
 
 
 class MooncakeConnectorMetadata(KVConnectorMetadata):
@@ -835,6 +839,7 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         assert vllm_config.kv_transfer_config is not None
         assert vllm_config.kv_transfer_config.engine_id is not None
         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
+        self._write_done: torch.cuda.Event | None = None
 
         if role == KVConnectorRole.SCHEDULER:
             assert kv_cache_config is not None, (
@@ -941,6 +946,21 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
 
+    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
+        super().bind_connector_metadata(connector_metadata)
+        assert isinstance(connector_metadata, MooncakeConnectorMetadata)
+        worker = self.connector_worker
+        self._write_done = None
+        if (
+            worker is not None
+            and worker.fence_draft_writes
+            and any(blocks for _, blocks in connector_metadata.reqs_to_send.values())
+        ):
+            # Finished block IDs arrive in a later step. Record on the model
+            # stream before the new batch's forward, never on the sender thread.
+            self._write_done = torch.cuda.Event(blocking=True)
+            self._write_done.record(torch.cuda.current_stream(worker.device_id))
+
     def unregister_kv_caches(self) -> None:
         assert self.connector_worker is not None
         self.connector_worker.unregister_kv_caches()
@@ -971,7 +991,7 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, MooncakeConnectorMetadata)
-        self.connector_worker.start_load_kv(self._connector_metadata)
+        self.connector_worker.start_load_kv(self._connector_metadata, self._write_done)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """MooncakeConnector does not do layerwise saving."""
@@ -1352,6 +1372,12 @@ class MooncakeConnectorWorker:
         assert (kv_transfer_config := vllm_config.kv_transfer_config)
         self.is_kv_producer: bool = kv_transfer_config.kv_role == "kv_producer"
         self.is_kv_consumer: bool = kv_transfer_config.kv_role == "kv_consumer"
+        self.fence_draft_writes = (
+            not self.is_kv_consumer
+            and vllm_config.speculative_config is not None
+            and vllm_config.speculative_config.use_dspark()
+            and current_platform.is_cuda()
+        )
         self.num_sender_workers = kv_transfer_config.kv_connector_extra_config.get(
             "num_workers", 10
         )
@@ -1466,6 +1492,9 @@ class MooncakeConnectorWorker:
 
         self.finished_sending_reqs: set[ReqId] = set()
         self.finished_recving_reqs: set[ReqId] = set()
+        self._draft_tail_views: list[tuple[int, torch.Tensor]] = []
+        self._draft_tail_stream: torch.cuda.Stream | None = None
+        self._draft_tail_events: deque[tuple[ReqId, torch.cuda.Event]] = deque()
         # Written from the receiver loop, drained from the worker thread.
         self._invalid_block_ids: queue.Queue[set[int]] = queue.Queue()
         self._is_hma_required = len(kv_cache_config.kv_cache_groups) > 1
@@ -1862,9 +1891,20 @@ class MooncakeConnectorWorker:
 
             if src_ptrs:
                 remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
+                send = self._send_blocks
+                if self.fence_draft_writes:
+                    events = tuple(
+                        dict.fromkeys(
+                            state.write_done
+                            for _, state in ok_ready_reqs
+                            if state.write_done is not None
+                        )
+                    )
+                    if events:
+                        send = partial(self._send_blocks, write_events=events)
                 ret_value = await self.sender_loop.run_in_executor(
                     self._sender_executor,
-                    self._send_blocks,
+                    send,
                     remote_session,
                     src_ptrs,
                     dst_ptrs,
@@ -2438,7 +2478,25 @@ class MooncakeConnectorWorker:
         src_ptrs: list[int],
         dst_ptrs: list[int],
         lengths: list[int],
+        write_events: tuple[torch.cuda.Event, ...] = (),
     ) -> int:
+        if write_events:
+            start = time.perf_counter() if logger.isEnabledFor(logging.DEBUG) else None
+            try:
+                for event in write_events:
+                    event.synchronize()
+            except RuntimeError:
+                logger.exception(
+                    "Producer draft KV write did not complete; not sending"
+                )
+                self.xfer_stats.record_failed_transfer()
+                return -1
+            if start is not None:
+                logger.debug(
+                    "Draft KV fence: %d event(s), %.3f ms before RDMA",
+                    len(write_events),
+                    (time.perf_counter() - start) * 1000,
+                )
         start_time = time.perf_counter()
         ret_value = self.engine.batch_transfer_sync_write(
             remote_session, src_ptrs, dst_ptrs, lengths
@@ -2671,6 +2729,7 @@ class MooncakeConnectorWorker:
             raise RuntimeError("Mooncake batch memory registration failed.")
 
         self.device_kv_caches = kv_caches
+        self._bind_draft_import_tails(kv_caches)
         logger.debug(
             "registered block_lens=%s kv_block_lens=%s",
             self.block_len_per_layer,
@@ -2723,7 +2782,55 @@ class MooncakeConnectorWorker:
             raise RuntimeError("Mooncake batch memory registration failed.")
         self._kv_unregistered = False
 
+    def _bind_draft_import_tails(self, caches: dict[str, torch.Tensor]) -> None:
+        config = self.vllm_config
+        parallel = config.parallel_config
+        self._draft_tail_views = []
+        self._draft_tail_stream = None
+        if (
+            self.is_kv_producer
+            or config.attention_config.hisparse_config is None
+            or parallel.decode_context_parallel_size <= 1
+            or parallel.decode_context_parallel_size != self.tp_size
+            or config.speculative_config is None
+            or not config.speculative_config.use_dspark()
+            or not current_platform.is_cuda()
+        ):
+            return
+        self._draft_shard = HiSparseDCPShard(
+            self.tp_size, self.tp_rank, parallel.cp_kv_cache_interleave_size
+        )
+        layers = config.compilation_config.static_forward_context
+        for name, cache in caches.items():
+            spec = self._layer_specs.get(name)
+            if not (
+                isinstance(spec, MLAAttentionSpec)
+                and spec.dcp_sharded
+                and spec.cache_dtype_str in ("fp8", "fp8_e4m3")
+                and spec.tokens_per_state == 1
+                and spec.topk_buffer_width is None
+                and getattr(layers.get(name), "is_draft_layer", False)
+                and cache.is_cuda
+            ):
+                continue
+            # Registered dense MLA views are [B, 1, N, C]; compact kernel
+            # subpages can also be viewed in their scheduler block geometry.
+            view = cache.view(self.kv_cache_config.num_blocks, spec.block_size, -1)
+            group = self.kv_cache_config.transfer_group_index_by_layer[name]
+            self._draft_tail_views.append((group, view))
+        logger.info(
+            "Mooncake FP8 draft import tail: %d layers, DCP rank %d",
+            len(self._draft_tail_views),
+            self.tp_rank,
+        )
+        if self._draft_tail_views:
+            self._draft_tail_stream = torch.cuda.Stream(device=self.device_id)
+
     async def fetch_finished_recving_reqs(self) -> set[ReqId]:
+        # Same receiver loop, same stream: event order is submission order.
+        while self._draft_tail_events and self._draft_tail_events[0][1].query():
+            req_id, _ = self._draft_tail_events.popleft()
+            self.finished_recving_reqs.add(req_id)
         finished_recving_reqs = self.finished_recving_reqs
         self.finished_recving_reqs = set()
         return finished_recving_reqs
@@ -2945,6 +3052,33 @@ class MooncakeConnectorWorker:
         if pull_meta.pull_tasks_count > 0:
             pull_meta.pull_tasks_count -= 1
         if pull_meta.pull_tasks_count == 0 and any(pull_meta.local_block_ids):
+            if (
+                not pull_meta.failed
+                and pull_meta.import_tokens > 0
+                and self._draft_tail_stream is not None
+            ):
+                wrote = False
+                stream = self._draft_tail_stream
+                with torch.inference_mode(), torch.cuda.stream(stream):
+                    try:
+                        for group, cache in self._draft_tail_views:
+                            ids = pull_meta.local_block_ids[group]
+                            if ids:
+                                wrote |= clear_imported_draft_tail(
+                                    cache,
+                                    ids[-1],
+                                    cache.shape[-2],
+                                    pull_meta.import_tokens,
+                                    self._draft_shard,
+                                )
+                        if wrote:
+                            event = stream.record_event()
+                            self._draft_tail_events.append((pull_meta.d_req_id, event))
+                            return
+                    except Exception:
+                        # Failure releases these blocks too: finish prior writes first.
+                        stream.synchronize()
+                        raise
             self.finished_recving_reqs.add(pull_meta.d_req_id)
 
     def get_block_ids_with_load_errors(self) -> set[int]:
@@ -2969,9 +3103,10 @@ class MooncakeConnectorWorker:
         ok_reqs: list[ReqId] = response.ok_reqs or []
 
         for req_id in ok_reqs:
-            pull_meta = pull_metas.pop(req_id, None)
+            pull_meta = pull_metas.get(req_id)
             if pull_meta is not None:
                 self._complete_pull_task(pull_meta)
+                del pull_metas[req_id]
 
         if ok_reqs:
             logger.debug("pulling kv_caches for %s finished", ok_reqs)
@@ -3094,13 +3229,18 @@ class MooncakeConnectorWorker:
             else:
                 self.receive_kv(remote_engine_id, pull_metas)
 
-    async def record_send_reqs(self, metadata: MooncakeConnectorMetadata):
+    async def record_send_reqs(
+        self,
+        metadata: MooncakeConnectorMetadata,
+        write_done: torch.cuda.Event | None = None,
+    ):
         for p_req_id, (transfer_id, block_ids) in metadata.reqs_to_send.items():
             if block_ids:
                 # Already gone through request_finished()
                 send_meta = self.reqs_need_send[transfer_id]
                 send_meta.p_req_id = p_req_id
                 send_meta.local_block_ids = block_ids
+                send_meta.write_done = write_done
                 send_meta.expire_time = (
                     time.perf_counter() + envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
                 )
@@ -3122,7 +3262,11 @@ class MooncakeConnectorWorker:
             if send_meta:
                 assert not send_meta.ready.is_set()
 
-    def start_load_kv(self, metadata: MooncakeConnectorMetadata):
+    def start_load_kv(
+        self,
+        metadata: MooncakeConnectorMetadata,
+        write_done: torch.cuda.Event | None = None,
+    ):
         if not self.is_kv_producer and metadata.reqs_to_recv:
             asyncio.run_coroutine_threadsafe(
                 self._start_load_kv(metadata.reqs_to_recv), self.receiver_loop
@@ -3132,7 +3276,7 @@ class MooncakeConnectorWorker:
             metadata.reqs_to_send or metadata.reqs_not_processed
         ):
             asyncio.run_coroutine_threadsafe(
-                self.record_send_reqs(metadata), self.sender_loop
+                self.record_send_reqs(metadata, write_done), self.sender_loop
             )
 
     def _producer_cache_is_replicated(self) -> bool:

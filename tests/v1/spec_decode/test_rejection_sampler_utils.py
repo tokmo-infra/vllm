@@ -984,6 +984,38 @@ def test_placeholder_draft_token_rejected():
     assert (recovered >= 0).all() and (recovered < VOCAB_SIZE).all()
 
 
+def test_block_verification_truncates_at_first_nan_draft_distribution():
+    """An unusable draft row is a block boundary, not an accepted token 0."""
+    steps, vocab = 4, 32
+    target = torch.zeros(vocab, device="cuda")
+    target[0] = -torch.inf
+    inputs = _build_rejection_sample_inputs(target, target, steps, 1.0, 3)
+    proposals = inputs["draft_sampled"].view(3, steps + 1)
+    proposals[:, 1:] = 7
+    proposals[0, 1:] = 0
+    proposals[1, 3] = 0
+
+    # Reference: explicitly end the first two blocks at the bad row. Keep a
+    # healthy request in the same batch and a valid proposal after the NaN.
+    ref_ids = proposals.clone()
+    ref_ids[0, 1:] = -1
+    ref_ids[1, 3:] = -1
+    expected, ref_counts = _rejection_sample(
+        **(inputs | {"draft_sampled": ref_ids.flatten()}),
+        num_speculative_steps=steps,
+        use_block_verification=True,
+    )
+    inputs["draft_logits"][0].fill_(torch.nan)
+    inputs["draft_logits"][1, 2].fill_(torch.nan)
+    actual, counts = _rejection_sample(
+        **inputs, num_speculative_steps=steps, use_block_verification=True
+    )
+    assert counts.tolist() == ref_counts.tolist() == [1, 3, 5]
+    for row, count in enumerate([1, 3, 5]):
+        assert torch.equal(actual[row, :count], expected[row, :count])
+        assert actual[row, count - 1].item() != 0
+
+
 @pytest.mark.parametrize("has_draft_logits", [True, False])
 @pytest.mark.parametrize("num_placeholders", [1, 2])
 def test_block_verification_placeholder_truncates_block(

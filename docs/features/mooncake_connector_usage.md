@@ -71,6 +71,8 @@ cache), see [ECMooncakeConnector Usage Guide](mooncake_ec_connector_usage.md).
 
 ### KV Role Options
 
+With DSpark on CUDA, the producer records an event on the model stream before handing finished KV blocks to Mooncake. The sender waits for that event before starting RDMA; it does not synchronize the entire device. On the decoder, probabilistic block verification stops at the first proposed token with a non-finite draft log-probability and samples from the target at that boundary. For HiSparse DCP with a dense FP8 DSpark draft cache, the decoder also clears the uncomputed suffix of the last imported draft block after the transfers finish. The request becomes ready after that clear completes; valid draft rows and target KV are unchanged. No new flag is required.
+
 - **kv_producer**: For prefiller instances that generate KV caches
 - **kv_consumer**: For decoder instances that consume KV caches from prefiller
 - **kv_both**: Enables symmetric functionality where the connector can act as both producer and consumer. This provides flexibility for experimental setups and scenarios where the role distinction is not predetermined.

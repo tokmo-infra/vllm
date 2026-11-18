@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -250,6 +251,39 @@ def test_send_blocks_records_failure():
     assert ret == 1
     assert worker.xfer_stats.num_successful_transfers == 0
     assert worker.xfer_stats.data["num_failed_transfers"] == [1]
+
+
+@pytest.mark.parametrize("write_failed", [False, True])
+def test_draft_handoff_never_reads_an_unfinished_producer(write_failed):
+    worker = _bare_worker()
+    source, destination = bytearray(b"old"), bytearray(b"---")
+    entered, release = threading.Event(), threading.Event()
+
+    class ProducerEvent:
+        def synchronize(self):
+            entered.set()
+            assert release.wait(timeout=5)
+            if write_failed:
+                raise RuntimeError("producer write failed")
+
+    def transfer(*args):
+        destination[:] = source
+        return 0
+
+    worker.engine.batch_transfer_sync_write.side_effect = transfer
+    with ThreadPoolExecutor(1) as sender:
+        sent = sender.submit(
+            worker._send_blocks, "peer", [1], [2], [3], (ProducerEvent(),)
+        )
+        try:
+            assert entered.wait(timeout=2)
+            assert destination == b"---"
+            source[:] = b"new"
+        finally:
+            release.set()
+        assert (sent.result() == 0) == (not write_failed)
+    assert destination == (b"---" if write_failed else b"new")
+    assert worker.xfer_stats.num_successful_transfers == int(not write_failed)
 
 
 def test_get_kv_connector_stats_returns_none_when_empty():

@@ -377,6 +377,7 @@ def _compute_cumulative_log_p_kernel(
         return
 
     log_p = tl.zeros((), tl.float32)
+    usable = num_draft_tokens
     for step in range(num_draft_tokens):
         logit_idx = start_idx + step
         draft_token = tl.load(draft_sampled_ptr + logit_idx + 1).to(tl.int64)
@@ -410,8 +411,20 @@ def _compute_cumulative_log_p_kernel(
                     HAS_DRAFT_LOGITS,
                 )
             )
+            if HAS_DRAFT_LOGITS:
+                # A non-finite log q for the proposed token is not a usable
+                # proposal. Truncate before it influences block lookahead.
+                usable = tl.where(
+                    (step < usable) & ~(tl.abs(draft_logprob) < float("inf")),
+                    step,
+                    usable,
+                )
             log_p = tl.minimum(log_p + (target_logprob - draft_logprob), 0.0)
         tl.store(cumulative_log_p_ptr + logit_idx, log_p)
+    if HAS_DRAFT_LOGITS:
+        # No ratio is needed for the bonus row. Reuse its slot for the usable
+        # prefix instead of allocating a second tensor on every decode step.
+        tl.store(cumulative_log_p_ptr + end_idx - 1, usable, mask=end_idx > start_idx)
 
 
 @triton.jit(do_not_specialize=["num_logits"])
@@ -587,6 +600,12 @@ def _rejection_kernel(
     seed = tl.load(seed_ptr + req_state_idx)
     temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
     is_greedy = temp == 0.0
+    if USE_BLOCK_VERIFICATION and HAS_DRAFT_LOGITS:  # noqa: SIM102
+        # Keep the None pointer out of non-block specializations at compile time.
+        if not is_greedy:
+            num_draft_tokens = tl.load(
+                cumulative_log_p_ptr + end_idx - 1, mask=end_idx > start_idx, other=0
+            ).to(tl.int64)
 
     accepted_length = tl.zeros((), tl.int64)
     # Freeze the accepted prefix and recovery stats until the window is confirmed.
@@ -882,6 +901,13 @@ def _resample_kernel(
 
     temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
     is_bonus = resample_token_idx == end_idx - 1
+    if USE_BLOCK_VERIFICATION and HAS_DRAFT_LOGITS:  # noqa: SIM102
+        # The first unusable proposal is the bonus row of the shorter block:
+        # draw from the target, never from a residual involving the bad q.
+        if temp != 0.0 and not is_bonus:
+            is_bonus = resample_idx == tl.load(cumulative_log_p_ptr + end_idx - 1).to(
+                tl.int32
+            )
     if temp == 0.0 and not is_bonus:
         # Greedy + non-bonus token. No resampling needed because
         # the target argmax is already in the sampled tensor.
