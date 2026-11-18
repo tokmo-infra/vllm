@@ -77,6 +77,7 @@ class _PendingSessionAdmission:
     boundary: int
     digest: str
     future: Future[dict[str, Any]]
+    command: dict[str, Any]
 
 
 def _new_req_prefill_tokens(request: NewRequestData) -> list[int]:
@@ -1011,18 +1012,18 @@ class MooncakeStoreScheduler:
                 if boundary > 0
                 else ""
             )
+            command = {
+                "action": "begin_prepare",
+                "session": request.session_id,
+                "request": request.request_id,
+                "boundary": boundary,
+                "hash": digest,
+            }
             self._session_admissions[request.request_id] = _PendingSessionAdmission(
                 boundary,
                 digest,
-                self.client.submit_session_command(
-                    {
-                        "action": "begin_prepare",
-                        "session": request.session_id,
-                        "request": request.request_id,
-                        "boundary": boundary,
-                        "hash": digest,
-                    }
-                ),
+                self.client.submit_session_command(command),
+                command,
             )
         self._poll_session_admissions()
         return request.request_id in self._session_generations
@@ -1032,6 +1033,9 @@ class MooncakeStoreScheduler:
             if not pending.future.done():
                 continue
             result = pending.future.result()
+            if result.get("retry") and req_id not in self._cancelled_session_admissions:
+                pending.future = self.client.submit_session_command(pending.command)
+                continue
             del self._session_admissions[req_id]
             if req_id in self._cancelled_session_admissions:
                 self._cancelled_session_admissions.remove(req_id)

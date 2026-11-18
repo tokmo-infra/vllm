@@ -2280,7 +2280,7 @@ class MooncakeStoreWorker:
     def session_retention_command(
         self, command: dict[str, Any], block_hashes: Sequence[BlockHash]
     ) -> dict[str, Any]:
-        """Rank-0 ownership RPCs, serialized with non-forcing collection."""
+        """Rank-0 ownership RPCs with per-key non-forcing collection fences."""
         catalog = self.session_catalog
         if catalog is None:
             raise ValueError("session_latest is not enabled on this writer")
@@ -2290,7 +2290,13 @@ class MooncakeStoreWorker:
             if command.get("boundary"):
                 result.update(
                     self.session_retention_command(
-                        {**command, **result, "action": "prepare"}, ()
+                        {
+                            **command,
+                            **result,
+                            "action": "prepare",
+                            "wait_for_deletion": False,
+                        },
+                        (),
                     )
                 )
             return result
@@ -2304,11 +2310,18 @@ class MooncakeStoreWorker:
                 for group in self.coord.mamba_group_ids
                 for prefix in self._lookup_key_prefixes[group]
             ]
-            return {
-                "checkpoint": catalog.prepare(
-                    command["request"], command["generation"], command["boundary"], keys
-                )
-            }
+            checkpoint = catalog.prepare(
+                command["request"],
+                command["generation"],
+                command["boundary"],
+                keys,
+                wait_for_deletion=command.get("wait_for_deletion", True),
+            )
+            return (
+                {"checkpoint": checkpoint}
+                if checkpoint is not None
+                else {"retry": True}
+            )
         if action == "commit":
             return {
                 "committed": catalog.commit(
@@ -2326,25 +2339,44 @@ class MooncakeStoreWorker:
         elif action == "release_reader":
             catalog.release_reader(command["reader"])
         elif action == "lookup":
-            with catalog.lock:
-                hit = self.lookup(command["num_tokens"], block_hashes)
-                keys = [
-                    PoolKey.build_key_string(
-                        prefix,
-                        block_hashes[b.num_tokens // self.hash_block_size - 1].hex(),
+            # Store RPCs can be slow. Claim the resulting load plan under the
+            # catalog lock, then validate it outside the lock: GC may have
+            # finished deleting these keys between lookup and reader claim.
+            hit = self.lookup(command["num_tokens"], block_hashes)
+            keys = [
+                PoolKey.build_key_string(
+                    prefix,
+                    block_hashes[b.num_tokens // self.hash_block_size - 1].hex(),
+                )
+                for b in hit.tail_key_boundaries
+                if b.group_id in self.coord.mamba_group_ids
+                for prefix in self._lookup_key_prefixes[b.group_id]
+            ]
+            reader = catalog.hold_reader(command["request"], keys) if keys else None
+            if keys:
+                valid = False
+                if reader is not None:
+                    validation_start = time.perf_counter()
+                    try:
+                        valid = self.store.batch_probe_key(keys) == [1] * len(keys)
+                    except Exception:
+                        logger.exception("Session lookup validation failed")
+                    self._record_kv_connector_operation(
+                        "lookup_validate",
+                        time.perf_counter() - validation_start,
+                        len(keys),
+                        status="ok" if valid else "error",
+                        num_failed_keys=0 if valid else len(keys),
                     )
-                    for b in hit.tail_key_boundaries
-                    if b.group_id in self.coord.mamba_group_ids
-                    for prefix in self._lookup_key_prefixes[b.group_id]
-                ]
-                reader = catalog.hold_reader(command["request"], keys) if keys else None
-                return {
-                    "hit_length": hit.hit_length,
-                    "tails": [
-                        [b.group_id, b.num_tokens] for b in hit.tail_key_boundaries
-                    ],
-                    "reader": reader,
-                }
+                    if not valid:
+                        catalog.release_reader(reader)
+                if not valid:
+                    return {"hit_length": 0, "tails": [], "reader": None}
+            return {
+                "hit_length": hit.hit_length,
+                "tails": [[b.group_id, b.num_tokens] for b in hit.tail_key_boundaries],
+                "reader": reader,
+            }
         elif action == "stats":
             return catalog.snapshot()
         else:
@@ -2559,6 +2591,9 @@ class MooncakeStoreWorker:
         if gc_thread is not None:
             self._retention_stop.set()
             gc_thread.join()
+            if self.lookup_server is not None:
+                self.lookup_server.close()
+                self.lookup_server = None
             catalog = self.session_catalog
             self.session_catalog = None
             if catalog is not None:
@@ -2588,12 +2623,19 @@ class MooncakeStoreWorker:
 # Lookup Key Server
 # ============================================================
 
+# Bound backend pressure while keeping one slow query off the admission path.
+# Every channel has one REQ/REP pair and one owning client/server thread.
+_SESSION_LOOKUP_CONCURRENCY = 4
+
 
 class LookupKeyServer:
-    """ZMQ server on worker rank 0 for the LookupKey admin channel.
+    """Rank-0 control service with separate publication and lookup channels.
 
-    Handles two request types, tagged at frame 0:
+    Handles request types tagged at frame 0:
     - ``LOOKUP_MSG``: prefix-cache hit query, returns its load plan.
+    - ``RETENTION_MSG``: session ownership command; publication proofs use
+      their own REP socket so they cannot block new admissions. Session
+      lookups use a bounded set of independent REP sockets.
     - ``RESET_MSG``: drains the send thread queue, then runs
       ``store.remove_all(force=True)``. Caller must have paused the
       scheduler first.
@@ -2618,10 +2660,36 @@ class LookupKeyServer:
 
         self.store_worker = store_worker
         self.running = True
+        self.commit_socket = None
+        self.commit_thread = None
+        self.lookup_sockets = []
+        self.lookup_threads = []
+        assert vllm_config.kv_transfer_config is not None
+        if (
+            SessionRetentionConfig.from_extra_config(
+                vllm_config.kv_transfer_config.kv_connector_extra_config
+            )
+            is not None
+        ):
+            if os.path.exists(self._ipc_path + "_commit"):
+                os.unlink(self._ipc_path + "_commit")
+            self.commit_socket = make_zmq_socket(
+                self.ctx, socket_path + "_commit", zmq.REP, bind=True
+            )
+            for index in range(_SESSION_LOOKUP_CONCURRENCY):
+                path = socket_path + f"_lookup_{index}"
+                ipc_path = path.removeprefix("ipc://")
+                if os.path.exists(ipc_path):
+                    os.unlink(ipc_path)
+                self.lookup_sockets.append(
+                    make_zmq_socket(self.ctx, path, zmq.REP, bind=True)
+                )
 
-        def process_request():
+        def process_request(rpc_socket):
             while self.running:
-                all_frames = self.socket.recv_multipart(copy=False)
+                if not rpc_socket.poll(timeout=100):
+                    continue
+                all_frames = rpc_socket.recv_multipart(copy=False)
                 msg_type = bytes(all_frames[0])
 
                 if msg_type == LOOKUP_MSG:
@@ -2630,7 +2698,7 @@ class LookupKeyServer:
                     blob = all_frames[3].buffer
                     block_hashes = BlobBlockHashes(blob, hash_len)
                     result = self.store_worker.lookup(num_tokens, block_hashes)
-                    self.socket.send(encode_lookup_response(result))
+                    rpc_socket.send(encode_lookup_response(result))
 
                 elif msg_type == RETENTION_MSG:
                     try:
@@ -2640,10 +2708,10 @@ class LookupKeyServer:
                         retention_result = self.store_worker.session_retention_command(
                             command, hashes
                         )
-                        self.socket.send_json({"ok": True, "result": retention_result})
+                        rpc_socket.send_json({"ok": True, "result": retention_result})
                     except Exception as e:
                         logger.exception("Session retention command failed")
-                        self.socket.send_json({"ok": False, "error": str(e)})
+                        rpc_socket.send_json({"ok": False, "error": str(e)})
 
                 elif msg_type == RESET_MSG:
                     try:
@@ -2661,25 +2729,53 @@ class LookupKeyServer:
                                 self.store_worker.store.remove_all(force=True)
                                 catalog.reset()
                         logger.info("Mooncake store reset via remove_all succeeded.")
-                        self.socket.send(RESP_OK)
+                        rpc_socket.send(RESP_OK)
                     except Exception as e:
                         logger.error("Mooncake remove_all failed: %s", e)
-                        self.socket.send(RESP_ERR)
+                        rpc_socket.send(RESP_ERR)
 
                 else:
                     logger.warning(
                         "LookupKeyServer received unknown msg_type: %r",
                         msg_type,
                     )
-                    self.socket.send(RESP_ERR)
+                    rpc_socket.send(RESP_ERR)
 
-        self.thread = threading.Thread(target=process_request, daemon=True)
+        self.thread = threading.Thread(
+            target=process_request, args=(self.socket,), daemon=True
+        )
         self.thread.start()
+        if self.commit_socket is not None:
+            self.commit_thread = threading.Thread(
+                target=process_request, args=(self.commit_socket,), daemon=True
+            )
+            self.commit_thread.start()
+        for rpc_socket in self.lookup_sockets:
+            thread = threading.Thread(
+                target=process_request, args=(rpc_socket,), daemon=True
+            )
+            self.lookup_threads.append(thread)
+            thread.start()
 
     def close(self):
+        self.running = False
+        self.thread.join()
+        for thread, rpc_socket in zip(self.lookup_threads, self.lookup_sockets):
+            thread.join()
+            rpc_socket.close(linger=0)
+        if self.commit_thread is not None:
+            self.commit_thread.join()
+            assert self.commit_socket is not None
+            self.commit_socket.close(linger=0)
         self.socket.close(linger=0)
         if os.path.exists(self._ipc_path):
             os.unlink(self._ipc_path)
+        if os.path.exists(self._ipc_path + "_commit"):
+            os.unlink(self._ipc_path + "_commit")
+        for index in range(len(self.lookup_sockets)):
+            path = self._ipc_path + f"_lookup_{index}"
+            if os.path.exists(path):
+                os.unlink(path)
 
 
 # ============================================================
@@ -2690,15 +2786,17 @@ class LookupKeyServer:
 class LookupKeyClient:
     """ZMQ client for the LookupKey admin channel.
 
-    Routes both prefix-cache lookups and admin commands (currently:
-    ``reset``) to ``LookupKeyServer`` on worker rank 0. The first frame
-    of every request is a named tag from ``protocol.py``.
+    Routes prefix-cache lookups, ownership and reset commands to worker rank 0.
+    Session publication and lookups have separate single-owner REQ sockets
+    and executors. Four lookup workers share one queue, each owning a socket.
+    The first frame of every request is a named tag from ``protocol.py``.
     """
 
     retention_enabled = False
 
     def __init__(self, vllm_config: VllmConfig):
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
+        self._closed = threading.Event()
         socket_path = get_zmq_rpc_path_lookup(vllm_config)
         self.socket = make_zmq_socket(
             self.ctx,
@@ -2719,12 +2817,60 @@ class LookupKeyClient:
             )
             is not None
         )
+        self.commit_executor = None
+        self.commit_socket = None
+        self.lookup_sockets = []
+        self.lookup_executor = None
+        self._lookup_local = threading.local()
+        if self.retention_enabled:
+            # Each REQ socket has one owning executor. Slow publication proofs
+            # must not sit in front of admissions, lookups or reader releases.
+            self.commit_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="MooncakeCommitClient"
+            )
+            self.commit_socket = make_zmq_socket(
+                self.ctx, socket_path + "_commit", zmq.REQ, bind=False
+            )
+            for index in range(_SESSION_LOOKUP_CONCURRENCY):
+                self.lookup_sockets.append(
+                    make_zmq_socket(
+                        self.ctx, socket_path + f"_lookup_{index}", zmq.REQ, bind=False
+                    )
+                )
+            available_sockets: queue.SimpleQueue = queue.SimpleQueue()
+            for rpc_socket in self.lookup_sockets:
+                available_sockets.put(rpc_socket)
+
+            def own_lookup_socket() -> None:
+                self._lookup_local.socket = available_sockets.get_nowait()
+
+            self.lookup_executor = ThreadPoolExecutor(
+                max_workers=_SESSION_LOOKUP_CONCURRENCY,
+                thread_name_prefix="MooncakeLookupClient",
+                initializer=own_lookup_socket,
+            )
+
+    def _submit_lookup(self, fn: Callable[..., _T], *args: Any) -> Future[_T]:
+        def run() -> _T:
+            return fn(*args, rpc_socket=self._lookup_local.socket)
+
+        assert self.lookup_executor is not None
+        return self.lookup_executor.submit(run)
 
     def _retention_request(
-        self, command: dict[str, Any], block_hashes: Sequence[BlockHash] = ()
+        self,
+        command: dict[str, Any],
+        block_hashes: Sequence[BlockHash] = (),
+        *,
+        rpc_socket=None,
     ) -> dict[str, Any]:
         hash_len = len(block_hashes[0]) if block_hashes else 0
-        self.socket.send_multipart(
+        if rpc_socket is None:
+            rpc_socket = (
+                self.commit_socket if command["action"] == "commit" else self.socket
+            )
+        assert rpc_socket is not None
+        rpc_socket.send_multipart(
             (
                 RETENTION_MSG,
                 json.dumps(command).encode(),
@@ -2732,31 +2878,49 @@ class LookupKeyClient:
                 b"".join(block_hashes),
             )
         )
-        response = self.socket.recv_json()
+        response = self._recv_response(rpc_socket, as_json=True)
         if not response["ok"]:
             raise RuntimeError(response["error"])
         return response["result"]
 
+    def _recv_response(self, rpc_socket, *, as_json: bool = False):
+        while not self._closed.is_set():
+            if rpc_socket.poll(timeout=100):
+                return rpc_socket.recv_json() if as_json else rpc_socket.recv()
+        raise RuntimeError("Mooncake lookup client closed")
+
     def session_command(
         self, command: dict[str, Any], block_hashes: Sequence[BlockHash] = ()
     ) -> dict[str, Any]:
-        """Use the lookup executor so ownership RPCs cannot interleave frames."""
+        """Use each channel's owning executor to avoid interleaving frames."""
         return self.submit_session_command(command, block_hashes).result()
 
     def submit_session_command(
         self, command: dict[str, Any], block_hashes: Sequence[BlockHash] = ()
     ) -> Future[dict[str, Any]]:
         """Queue ownership work without blocking the engine's scheduling loop."""
-        return self.executor.submit(
-            self._retention_request, command, list(block_hashes)
+        if command["action"] == "lookup" and self.retention_enabled:
+            return self._submit_lookup(
+                self._retention_request, command, list(block_hashes)
+            )
+        executor = (
+            self.commit_executor if command["action"] == "commit" else self.executor
         )
+        assert executor is not None
+        return executor.submit(self._retention_request, command, list(block_hashes))
 
     def _session_lookup(
-        self, req_id: str, num_tokens: int, block_hashes: Sequence[BlockHash]
+        self,
+        req_id: str,
+        num_tokens: int,
+        block_hashes: Sequence[BlockHash],
+        *,
+        rpc_socket=None,
     ) -> MooncakeLookupResult:
         result = self._retention_request(
             {"action": "lookup", "request": req_id, "num_tokens": num_tokens},
             block_hashes,
+            rpc_socket=rpc_socket,
         )
         return MooncakeLookupResult(
             result["hit_length"],
@@ -2775,7 +2939,7 @@ class LookupKeyClient:
             b"".join(block_hashes),
         )
         self.socket.send_multipart(all_frames, copy=False)
-        resp = self.socket.recv()
+        resp = self._recv_response(self.socket)
         return decode_lookup_response(resp)
 
     def lookup(
@@ -2790,7 +2954,7 @@ class LookupKeyClient:
         future = self.futures.get(req_id)
         if future is None:
             if self.retention_enabled:
-                future = self.executor.submit(
+                future = self._submit_lookup(
                     self._session_lookup, req_id, num_tokens, list(block_hashes)
                 )
             else:
@@ -2815,14 +2979,19 @@ class LookupKeyClient:
             cancelled = future.cancel()
             if not cancelled and self.retention_enabled:
 
-                def release_unconsumed_lookup() -> None:
-                    result = future.result()
+                def release_unconsumed_lookup(completed) -> None:
+                    if self._closed.is_set() or completed.cancelled():
+                        return
+                    try:
+                        result = completed.result()
+                    except Exception:
+                        return
                     if result.read_handle:
-                        self._retention_request(
+                        self.submit_session_command(
                             {"action": "release_reader", "reader": result.read_handle}
                         )
 
-                self.executor.submit(release_unconsumed_lookup)
+                future.add_done_callback(release_unconsumed_lookup)
 
     def _reset(self) -> bool:
         """Trigger ``store.remove_all(force=True)`` on worker rank 0.
@@ -2833,14 +3002,37 @@ class LookupKeyClient:
         rollout drain. Returns True on ACK, False on NACK.
         """
         self.socket.send(RESET_MSG)
-        resp = self.socket.recv()
+        resp = self._recv_response(self.socket)
         return bytes(resp) == RESP_OK
 
     def reset(self) -> bool:
+        # Occupy all workers at once, after earlier tasks and their callbacks.
+        # Plain no-ops could all run on one free worker while another is busy.
+        # The caller must still quiesce the scheduler before reset.
+        if self.lookup_executor is not None:
+            barrier = threading.Barrier(_SESSION_LOOKUP_CONCURRENCY + 1)
+            drained = [
+                self.lookup_executor.submit(barrier.wait)
+                for _ in range(_SESSION_LOOKUP_CONCURRENCY)
+            ]
+            barrier.wait()
+            for future in drained:
+                future.result()
+        if self.commit_executor is not None:
+            self.commit_executor.submit(lambda: None).result()
         return self.executor.submit(self._reset).result()
 
     def close(self):
-        self.executor.shutdown(wait=False, cancel_futures=True)
+        self._closed.set()
+        if self.lookup_executor is not None:
+            self.lookup_executor.shutdown(wait=True, cancel_futures=True)
+        for rpc_socket in self.lookup_sockets:
+            rpc_socket.close(linger=0)
+        if self.commit_executor is not None:
+            self.commit_executor.shutdown(wait=True, cancel_futures=True)
+            assert self.commit_socket is not None
+            self.commit_socket.close(linger=0)
+        self.executor.shutdown(wait=True, cancel_futures=True)
         self.socket.close(linger=0)
 
 

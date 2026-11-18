@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from threading import Event
+
 import pytest
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.session_retention import (  # noqa: E501
@@ -121,6 +124,148 @@ def test_new_checkpoint_requires_every_shard_and_hybrid_proof(catalog):
     assert owner.commit(new, lambda boundary: boundary == 256)
     assert owner.collect() == 24
     assert store.objects == set(keys("new"))
+
+
+def test_slow_proof_allows_unrelated_admission_and_pins_abandoned_payload(catalog):
+    """Store verification must not stall admissions or lose its payload fence."""
+    owner, store, _ = catalog
+    candidate = prepare(owner, store, "slow", "slow-request", "slow")
+    started, release = Event(), Event()
+
+    def verify(_):
+        started.set()
+        assert release.wait(5)
+        return True
+
+    with ThreadPoolExecutor(max_workers=2) as threads:
+        commit = threads.submit(owner.commit, candidate, verify)
+        try:
+            assert started.wait(5)
+            admitted = threads.submit(
+                prepare, owner, store, "new", "new-request", "new"
+            )
+            admitted.result(timeout=1)
+            owner.abandon(candidate)
+            assert owner.collect() == 0
+            assert set(keys("slow")) <= store.objects
+        finally:
+            release.set()
+        assert not commit.result(timeout=5)
+    assert owner.collect() == len(keys("slow"))
+    assert store.objects == set(keys("new"))
+
+
+def test_slow_proof_cannot_replace_a_newer_committed_generation(catalog):
+    """Publishing after a slow proof must recheck the latest generation."""
+    owner, store, _ = catalog
+    older = prepare(owner, store, "s", "older", "older")
+    newer = prepare(owner, store, "s", "newer", "newer")
+    started, release = Event(), Event()
+
+    def verify(_):
+        started.set()
+        assert release.wait(5)
+        return True
+
+    with ThreadPoolExecutor(max_workers=2) as threads:
+        commit = threads.submit(owner.commit, older, verify)
+        try:
+            assert started.wait(5)
+            assert threads.submit(owner.commit, newer, lambda _: True).result(timeout=1)
+        finally:
+            release.set()
+        assert not commit.result(timeout=5)
+    assert owner.current("s")["checkpoint"] == newer
+
+
+def test_slow_gc_allows_unrelated_admission_but_fences_readoption(catalog, monkeypatch):
+    """Only claims of keys being deleted may wait for the Store deletion RPC."""
+    owner, store, _ = catalog
+    candidate = prepare(owner, store, "old", "old-request", "shared")
+    owner.abandon(candidate)
+    started, release = Event(), Event()
+    remove = store.batch_remove
+
+    def slow_remove(batch, force=False):
+        started.set()
+        assert release.wait(5)
+        return remove(batch, force=force)
+
+    monkeypatch.setattr(store, "batch_remove", slow_remove)
+    with ThreadPoolExecutor(max_workers=3) as threads:
+        gc = threads.submit(owner.collect)
+        try:
+            assert started.wait(5)
+            threads.submit(prepare, owner, store, "new", "new-request", "new").result(
+                timeout=1
+            )
+            # A lookup racing an already-started deletion must return a miss.
+            assert owner.hold_reader("late-reader", keys("shared")) is None
+            generation = owner.begin("adopt", "adopt-request")
+            assert (
+                owner.prepare(
+                    "adopt-request",
+                    generation,
+                    128,
+                    keys("shared"),
+                    wait_for_deletion=False,
+                )
+                is None
+            )
+            adopting = threads.submit(
+                owner.prepare, "adopt-request", generation, 128, keys("shared")
+            )
+            with pytest.raises(TimeoutError):
+                adopting.result(timeout=0.05)
+        finally:
+            release.set()
+        assert gc.result(timeout=5) == len(keys("shared"))
+        adopted = adopting.result(timeout=5)
+    store.objects.update(keys("shared"))
+    assert owner.commit(adopted, lambda _: True)
+    assert set(keys("shared")) <= store.objects
+
+
+@pytest.mark.parametrize("failure", ["raise", "truncated", "probe"])
+def test_failed_collection_releases_deletion_fence(catalog, monkeypatch, failure):
+    """A failed Store RPC leaves garbage retryable without stranding claims."""
+    owner, store, _ = catalog
+    candidate = prepare(owner, store, "old", "old-request", "shared")
+    owner.abandon(candidate)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("Store unavailable")
+
+    if failure == "raise":
+        monkeypatch.setattr(store, "batch_remove", fail)
+    elif failure == "truncated":
+        monkeypatch.setattr(store, "batch_remove", lambda *a, **kw: [])
+    else:
+        store.leased.update(keys("shared"))
+        monkeypatch.setattr(store, "batch_probe_key", fail)
+    with pytest.raises(RuntimeError):
+        owner.collect()
+    generation = owner.begin("adopt", "adopt-request")
+    assert (
+        owner.prepare(
+            "adopt-request", generation, 128, keys("shared"), wait_for_deletion=False
+        )
+        is not None
+    )
+
+
+def test_failed_proof_releases_its_temporary_reader(catalog):
+    owner, store, _ = catalog
+    candidate = prepare(owner, store, "s", "r", "candidate")
+
+    def fail(_):
+        raise RuntimeError("Store unavailable")
+
+    with pytest.raises(RuntimeError, match="Store unavailable"):
+        owner.commit(candidate, fail)
+    assert owner.snapshot()["readers"] == 0
+    owner.abandon(candidate)
+    assert owner.collect() == len(keys("candidate"))
 
 
 def test_abandoned_partial_write_does_not_replace_latest(catalog):

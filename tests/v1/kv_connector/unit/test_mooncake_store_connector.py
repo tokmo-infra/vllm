@@ -3,12 +3,14 @@
 
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
-from vllm.config import set_current_vllm_config
+from vllm.config import KVTransferConfig, VllmConfig, set_current_vllm_config
 from vllm.distributed.kv_events import BlockStored
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
@@ -30,6 +32,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import (
     MooncakeStoreConnectorStats,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.session_retention import (  # noqa: E501
+    SessionCheckpointCatalog,
+    SessionRetentionConfig,
+)
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
@@ -42,6 +48,12 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput
 
+from .test_mooncake_store_session_retention import (
+    PREFIXES,
+    MemoryStore,
+    keys,
+    prepare,
+)
 from .utils import create_vllm_config
 
 
@@ -760,6 +772,293 @@ def test_lookup_key_client_lookup_prepends_typed_tag():
     sent_frames = fake_socket.send_multipart.call_args[0][0]
     assert sent_frames[0] == protocol.LOOKUP_MSG
     assert int.from_bytes(sent_frames[1], "big") == 128
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("close_pending", [False, True])
+def test_slow_commit_rpc_does_not_queue_new_session_admission(
+    tmp_path, monkeypatch, close_pending
+):
+    """Exercise real IPC: a gated Store proof must not head-of-line block reads."""
+    store = MemoryStore()
+    catalog = SessionCheckpointCatalog(
+        SessionRetentionConfig(tmp_path / "catalog.sqlite"), store, PREFIXES
+    )
+    candidate = prepare(catalog, store, "old", "old-request", "old")
+    started, release = threading.Event(), threading.Event()
+
+    def verify(_):
+        started.set()
+        assert release.wait(5)
+        return True
+
+    class StoreService:
+        """External rank-0 service behind the transport under test."""
+
+        def session_retention_command(self, command, hashes):
+            if command["action"] == "commit":
+                return {"committed": catalog.commit(command["checkpoint"], verify)}
+            if command["action"] == "begin_prepare":
+                generation = catalog.begin(command["session"], command["request"])
+                checkpoint = catalog.prepare(
+                    command["request"], generation, 128, keys("new")
+                )
+                return {"generation": generation, "checkpoint": checkpoint}
+            assert command["action"] == "lookup"
+            return {"hit_length": 0, "tails": [], "reader": None}
+
+    config = VllmConfig(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="MooncakeStoreConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "mamba_checkpoint_retention": "session_latest",
+                "mamba_checkpoint_journal": str(tmp_path / "catalog.sqlite"),
+            },
+        )
+    )
+    # Keep IPC filenames below macOS's Unix-domain socket path limit.
+    with TemporaryDirectory(dir="/tmp", prefix="mk-rpc-") as rpc_dir:
+        monkeypatch.setattr(worker.envs, "VLLM_RPC_BASE_PATH", rpc_dir)
+        server = worker.LookupKeyServer(StoreService(), config)
+        client = worker.LookupKeyClient(config)
+        commit = client.submit_session_command(
+            {"action": "commit", "checkpoint": candidate}
+        )
+        closed = False
+        try:
+            assert started.wait(5)
+            admitted = client.submit_session_command(
+                {"action": "begin_prepare", "session": "new", "request": "new-request"}
+            ).result(timeout=1)
+            assert admitted["generation"] == 1
+            assert admitted["checkpoint"] is not None
+            with ThreadPoolExecutor(max_workers=1) as threads:
+                lookup = threads.submit(client.lookup, "new-request", 128, [])
+                assert lookup.result(timeout=1).hit_length == 0
+            assert not commit.done()
+            if close_pending:
+                with ThreadPoolExecutor(max_workers=1) as threads:
+                    threads.submit(client.close).result(timeout=1)
+                closed = True
+                with pytest.raises(RuntimeError, match="client closed"):
+                    commit.result(timeout=1)
+        finally:
+            release.set()
+            if not closed:
+                commit.result(timeout=5)
+                client.close()
+            server.close()
+            catalog.close()
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("mode", ["normal", "cancel", "close"])
+def test_slow_lookup_rpc_does_not_block_admission_or_other_lookup(
+    tmp_path, monkeypatch, mode
+):
+    """One slow query or aborted read must not serialize unrelated requests."""
+    store = MemoryStore()
+    catalog = SessionCheckpointCatalog(
+        SessionRetentionConfig(tmp_path / "catalog.sqlite"), store, PREFIXES
+    )
+    started, release, released = (threading.Event() for _ in range(3))
+
+    class StoreService:
+        def session_retention_command(self, command, hashes):
+            action = command["action"]
+            if action == "lookup":
+                if command["request"] == "slow":
+                    reader = catalog.hold_reader("slow", [])
+                    started.set()
+                    assert release.wait(5)
+                    return {"hit_length": 16, "tails": [], "reader": reader}
+                return {"hit_length": 32, "tails": [], "reader": None}
+            if action == "begin_prepare":
+                return {"generation": catalog.begin("new", "new-request")}
+            assert action == "release_reader"
+            catalog.release_reader(command["reader"])
+            released.set()
+            return {}
+
+    config = VllmConfig(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="MooncakeStoreConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "mamba_checkpoint_retention": "session_latest",
+                "mamba_checkpoint_journal": str(tmp_path / "catalog.sqlite"),
+            },
+        )
+    )
+    with TemporaryDirectory(dir="/tmp", prefix="mk-query-") as rpc_dir:
+        monkeypatch.setattr(worker.envs, "VLLM_RPC_BASE_PATH", rpc_dir)
+        server = worker.LookupKeyServer(StoreService(), config)
+        client = worker.LookupKeyClient(config)
+        closed = False
+        try:
+            assert client.lookup("slow", 128, [], non_block=True) is None
+            assert started.wait(5)
+            if mode == "cancel":
+                client.discard("slow")
+            admitted = client.submit_session_command(
+                {"action": "begin_prepare", "session": "new", "request": "new-request"}
+            ).result(timeout=1)
+            assert admitted["generation"] == 1
+            fast = client.submit_session_command(
+                {"action": "lookup", "request": "fast", "num_tokens": 128}
+            ).result(timeout=1)
+            assert fast == {"hit_length": 32, "tails": [], "reader": None}
+            assert not release.is_set()
+            if mode == "close":
+                pending = client.futures["slow"]
+                with ThreadPoolExecutor(max_workers=1) as threads:
+                    threads.submit(client.close).result(timeout=1)
+                closed = True
+                with pytest.raises(RuntimeError, match="client closed"):
+                    pending.result(timeout=1)
+        finally:
+            release.set()
+            if mode == "normal":
+                hit = client.lookup("slow", 128, [])
+                assert hit.hit_length == 16
+                client.session_command(
+                    {"action": "release_reader", "reader": hit.read_handle}
+                )
+            if not closed:
+                assert released.wait(5)
+                client.close()
+            server.close()
+            catalog.close()
+
+
+@pytest.mark.cpu_test
+def test_session_lookup_burst_uses_idle_channels_behind_a_slow_query(
+    tmp_path, monkeypatch
+):
+    """Queued queries must use free workers instead of sticking to one lane."""
+    started = [threading.Event() for _ in range(4)]
+    release_slow, release_others = threading.Event(), threading.Event()
+
+    class StoreService:
+        def session_retention_command(self, command, hashes):
+            request = command["request"]
+            if request < 4:
+                started[request].set()
+                gate = release_slow if request == 0 else release_others
+                assert gate.wait(5)
+            return {"hit_length": request, "tails": [], "reader": None}
+
+    config = VllmConfig(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="MooncakeStoreConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "mamba_checkpoint_retention": "session_latest",
+                "mamba_checkpoint_journal": str(tmp_path / "catalog.sqlite"),
+            },
+        )
+    )
+    with TemporaryDirectory(dir="/tmp", prefix="mk-burst-") as rpc_dir:
+        monkeypatch.setattr(worker.envs, "VLLM_RPC_BASE_PATH", rpc_dir)
+        server = worker.LookupKeyServer(StoreService(), config)
+        client = worker.LookupKeyClient(config)
+        queries = []
+        try:
+            for i in range(4):
+                queries.append(
+                    client.submit_session_command({"action": "lookup", "request": i})
+                )
+                assert started[i].wait(5)
+            burst = [
+                client.submit_session_command({"action": "lookup", "request": i})
+                for i in range(4, 20)
+            ]
+            release_others.set()
+            assert [q.result(timeout=1)["hit_length"] for q in burst] == list(
+                range(4, 20)
+            )
+            assert not queries[0].done()
+        finally:
+            release_slow.set()
+            release_others.set()
+            client.close()
+            server.close()
+
+
+@pytest.mark.cpu_test
+def test_session_lookup_channels_are_bounded_and_reset_drains_them(
+    tmp_path, monkeypatch
+):
+    started, release = threading.Event(), threading.Event()
+    lock = threading.Lock()
+    active, completed, peak = 0, 0, 0
+
+    class StoreService:
+        kv_send_thread = None
+
+        def __init__(self):
+            self.store = self
+
+        def session_retention_command(self, command, hashes):
+            nonlocal active, completed, peak
+            if command["action"] == "stats":
+                return {"ready": True}
+            with lock:
+                active += 1
+                peak = max(peak, active)
+                if active == 4:
+                    started.set()
+            try:
+                assert release.wait(5)
+                return {
+                    "hit_length": int(command["request"]),
+                    "tails": [],
+                    "reader": None,
+                }
+            finally:
+                with lock:
+                    active -= 1
+                    completed += 1
+
+        def remove_all(self, force):
+            assert force
+            assert completed == 32
+            assert active == 0
+
+    config = VllmConfig(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="MooncakeStoreConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "mamba_checkpoint_retention": "session_latest",
+                "mamba_checkpoint_journal": str(tmp_path / "catalog.sqlite"),
+            },
+        )
+    )
+    with TemporaryDirectory(dir="/tmp", prefix="mk-query-") as rpc_dir:
+        monkeypatch.setattr(worker.envs, "VLLM_RPC_BASE_PATH", rpc_dir)
+        server = worker.LookupKeyServer(StoreService(), config)
+        client = worker.LookupKeyClient(config)
+        try:
+            queries = [
+                client.submit_session_command({"action": "lookup", "request": str(i)})
+                for i in range(32)
+            ]
+            assert started.wait(5)
+            assert client.session_command({"action": "stats"}) == {"ready": True}
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                reset = pool.submit(client.reset)
+                release.set()
+                assert reset.result(timeout=5)
+            assert [q.result(timeout=1)["hit_length"] for q in queries] == list(
+                range(32)
+            )
+            assert peak == 4
+        finally:
+            release.set()
+            client.close()
+            server.close()
 
 
 def test_lookup_key_client_reset_uses_typed_protocol():

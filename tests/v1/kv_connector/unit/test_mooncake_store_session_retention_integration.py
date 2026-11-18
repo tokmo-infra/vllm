@@ -212,6 +212,54 @@ def schedule(scheduler, pool, session="s", *, handoff=True, admit=False):
     return request, tables, scheduler.build_connector_meta(output)
 
 
+@pytest.mark.parametrize("cancel", [False, True])
+def test_async_admission_retries_deleting_keys_before_dispatch(
+    scheduler_fixture, monkeypatch, cancel
+):
+    """Retry a deletion conflict without admitting writes or leaking on abort."""
+    scheduler, rpc, pool = scheduler_fixture
+    submit = rpc.submit_session_command
+    retry: Future[dict[str, object]] = Future()
+    waiting: Future[dict[str, object]] = Future()
+    retry.set_result({"generation": 1, "retry": True})
+    responses = iter((retry, waiting))
+    command = None
+
+    def submit_admission(message, hashes=()):
+        nonlocal command
+        if message["action"] == "begin_prepare":
+            command = message
+            return next(responses)
+        return submit(message, hashes)
+
+    monkeypatch.setattr(rpc, "submit_session_command", submit_admission)
+    request = Request(
+        "request",
+        prompt_token_ids=list(range(40)),
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        session_id="s",
+        block_hasher=lambda _: [bytes([n + 1]) * 4 for n in range(10)],
+    )
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+    assert rpc.catalog.current("s") is None
+    if cancel:
+        output = SchedulerOutput.make_empty()
+        output.finished_req_ids = {request.request_id}
+        scheduler.build_connector_meta(output)
+        waiting.set_result({"generation": 1, "retry": True})
+        scheduler.build_connector_meta(SchedulerOutput.make_empty())
+        assert not scheduler.has_pending_push_work()
+        assert rpc.catalog.snapshot()["checkpoints"] == 0
+    else:
+        admitted = rpc.session_command(command)
+        waiting.set_result(admitted)
+        assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+        _, _, metadata = schedule(scheduler, pool, admit=True)
+        job = next(r for r in metadata.requests if r.checkpoint_id)
+        assert job.checkpoint_id == admitted["checkpoint"]
+
+
 @pytest.mark.parametrize(
     "success,hybrid_ready", [(True, True), (False, True), (True, False)]
 )
@@ -552,6 +600,168 @@ class TransferStore(MemoryStore):
 
     def batch_get_into_multi_buffers(self, keys, addrs, sizes):
         return [-1 if self.fail else sum(s) for s in sizes]
+
+
+@pytest.fixture
+def lookup_worker(tmp_path, monkeypatch):
+    from .test_mooncake_store_hma_e2e import _build_worker_with_dict_store
+
+    class SDKStore(TransferStore):
+        gate = None
+        after_claim = None
+        catalog = None
+
+        def __init__(self):
+            super().__init__()
+            self.started = Event()
+            self.release = Event()
+
+        def setup(self, *args, **kwargs):
+            return 0
+
+        def close(self):
+            pass
+
+        def pause(self, operation, result):
+            if self.gate == operation:
+                self.gate = None
+                self.started.set()
+                assert self.release.wait(5)
+            return result
+
+        def batch_probe_key(self, keys):
+            if self.after_claim and self.catalog.snapshot()["readers"]:
+                if self.after_claim == "error":
+                    raise RuntimeError("Store probe failed")
+                return [] if self.after_claim == "short" else [0] * len(keys)
+            return self.pause("probe", super().batch_probe_key(keys))
+
+        def batch_is_exist(self, keys):
+            return self.pause("lease", super().batch_probe_key(keys))
+
+    monkeypatch.setenv("VLLM_MOONCAKE_STORE_SELECTIVE_LEASE", "1")
+    config = create_vllm_config(
+        kv_connector="MooncakeStoreConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={
+            "mamba_checkpoint_retention": "session_latest",
+            "mamba_checkpoint_journal": str(tmp_path / "worker.sqlite"),
+        },
+    )
+    groups = [
+        KVCacheGroupSpec(
+            ["mamba"],
+            MambaSpec(
+                block_size=16,
+                shapes=((2, 2),),
+                dtypes=(torch.float32,),
+                mamba_cache_mode="align",
+            ),
+        )
+    ]
+    kv = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+        hash_block_size=4,
+        cache_hit_alignment_tokens=4,
+    )
+    store = SDKStore()
+    instance = _build_worker_with_dict_store(config, kv, store)
+    store.catalog = instance.session_catalog
+    hashes = [i.to_bytes(4, "big") for i in range(5)]
+    prepared = instance.session_retention_command(
+        {
+            "action": "begin_prepare",
+            "session": "s",
+            "request": "seed",
+            "boundary": 16,
+            "hash": hashes[3].hex(),
+        },
+        (),
+    )
+    store.objects.add(instance.token_dbs[0].key_for(hashes[3]))
+    assert instance.session_catalog.commit(prepared["checkpoint"], lambda _: True)
+    instance.session_catalog.finish("seed")
+    try:
+        yield instance, store, hashes
+    finally:
+        store.release.set()
+        instance.close()
+
+
+def test_worker_slow_lookup_does_not_hold_catalog_lock(lookup_worker):
+    instance, store, hashes = lookup_worker
+    store.gate = "probe"
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        lookup = pool.submit(
+            instance.session_retention_command,
+            {"action": "lookup", "request": "reader", "num_tokens": 20},
+            hashes,
+        )
+        try:
+            assert store.started.wait(5)
+            admitted = pool.submit(
+                instance.session_retention_command,
+                {"action": "begin_prepare", "session": "other", "request": "other"},
+                (),
+            ).result(timeout=1)
+            assert admitted["generation"] == 1
+        finally:
+            store.release.set()
+        result = lookup.result(timeout=5)
+    assert result["hit_length"] == 16
+    assert result["reader"] is not None
+    instance.session_catalog.release_reader(result["reader"])
+
+
+def test_worker_lookup_rejects_payload_deleted_before_reader_claim(lookup_worker):
+    instance, store, hashes = lookup_worker
+    store.gate = "lease"
+
+    def replace_checkpoint():
+        newer = b"next"
+        prepared = instance.session_retention_command(
+            {
+                "action": "begin_prepare",
+                "session": "s",
+                "request": "newer",
+                "boundary": 16,
+                "hash": newer.hex(),
+            },
+            (),
+        )
+        store.objects.add(instance.token_dbs[0].key_for(newer))
+        assert instance.session_catalog.commit(prepared["checkpoint"], lambda _: True)
+        instance.session_catalog.collect()
+        assert instance.token_dbs[0].key_for(hashes[3]) not in store.objects
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        lookup = pool.submit(
+            instance.session_retention_command,
+            {"action": "lookup", "request": "reader", "num_tokens": 20},
+            hashes,
+        )
+        try:
+            assert store.started.wait(5)
+            pool.submit(replace_checkpoint).result(timeout=1)
+        finally:
+            store.release.set()
+        result = lookup.result(timeout=5)
+    assert result == {"hit_length": 0, "tails": [], "reader": None}
+    assert instance.session_catalog.snapshot()["readers"] == 0
+
+
+@pytest.mark.parametrize("failure", ["missing", "short", "error"])
+def test_worker_lookup_releases_reader_when_validation_fails(lookup_worker, failure):
+    instance, store, hashes = lookup_worker
+    store.after_claim = failure
+    result = instance.session_retention_command(
+        {"action": "lookup", "request": "reader", "num_tokens": 20},
+        hashes,
+    )
+    assert result == {"hit_length": 0, "tails": [], "reader": None}
+    assert instance.session_catalog.snapshot()["readers"] == 0
 
 
 def test_worker_admission_claims_checkpoint_before_payload_writes(
