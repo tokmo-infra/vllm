@@ -213,8 +213,22 @@ that request, including Attention data needed to prove a complete hybrid hit.
 If a later request step can still supply the proof tail, the unpublished KDA
 candidate remains owned until the request finishes and those writes drain.
 An incomplete final proof preserves the previously committed checkpoint.
-Publication and ownership cleanup run on the lookup executor; the scheduler
-polls their completion instead of waiting for these RPCs inside an engine step.
+Publication uses a separate single-owner RPC channel from admission, lookup
+and ownership cleanup; the scheduler polls completion instead of waiting for
+these RPCs inside an engine step. Slow publication proofs pin their payloads
+while running outside the catalog lock and recheck the latest generation before
+publishing. Garbage collection also releases the catalog lock during Store
+deletion RPCs: only claims of keys being deleted must wait. An asynchronous
+admission conflicting with deletion retries on a later scheduler step, leaving
+the RPC channel available to other requests. A lookup racing an in-flight
+deletion returns a miss rather than an unsafe hit. Session lookups use four
+independent RPC channels with one shared work queue, so queued lookups can
+use any free worker and a slow lookup does not occupy the admission or
+publication channel. Each lookup worker exclusively owns one socket. Store queries
+run outside the catalog lock; after claiming a reader, the worker rechecks
+every required Mamba shard before returning a hit. Cancellation queues reader
+cleanup only after its lookup finishes, without holding up other commands.
+This bounds lookup concurrency but does not remove the Store's own query cost.
 Pending candidates keep their references until publication or abandonment is
 acknowledged. With asynchronous lookup, session admission pre-claims the prompt
 checkpoint before GPU allocation; a pending claim defers that request instead

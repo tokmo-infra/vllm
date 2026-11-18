@@ -53,12 +53,13 @@ class RetentionStore(Protocol):
 class SessionCheckpointCatalog:
     """One rank-0 owner per journal and isolated Store namespace.
 
-    All ownership changes and deletions share a lock. A candidate claims its
-    keys *before* any worker PUT is dispatched, fencing deletion against reuse.
+    Ownership changes share a lock; slow Store RPCs run outside it. A candidate
+    claims its keys *before* any worker PUT is dispatched, fencing deletion
+    against reuse. Claims wait only for deletions of their own keys.
     Workers must finish their PUTs before a candidate is committed or abandoned.
-    A read claims its keys while the caller still holds `lock` around
-    lookup/lease acquisition. Read references are retired after all ranks finish
-    the load, independently of the HTTP request's cancellation.
+    A read claims its keys after lookup/lease acquisition and revalidates their
+    existence after the claim, outside the lock. Read references are retired
+    after all ranks finish the load, independently of HTTP cancellation.
     """
 
     def __init__(
@@ -74,6 +75,8 @@ class SessionCheckpointCatalog:
         self.config, self.store, self.clock = config, store, clock
         self.prefixes = tuple(sorted(key_prefixes))
         self.lock = threading.RLock()
+        self._deletion_finished = threading.Condition(self.lock)
+        self._deleting: set[str] = set()
         config.journal.parent.mkdir(parents=True, exist_ok=True)
         self._owner = config.journal.with_suffix(config.journal.suffix + ".lock").open(
             "a+b"
@@ -188,11 +191,26 @@ class SessionCheckpointCatalog:
             return generation
 
     def prepare(
-        self, request: str, generation: int, boundary: int, keys: Sequence[str]
-    ) -> str:
+        self,
+        request: str,
+        generation: int,
+        boundary: int,
+        keys: Sequence[str],
+        *,
+        wait_for_deletion: bool = True,
+    ) -> str | None:
         if boundary <= 0 or not keys:
             raise ValueError("checkpoint must have a positive boundary and keys")
-        with self.lock, self.db:
+        with self.lock:
+            if not wait_for_deletion and not self._deleting.isdisjoint(keys):
+                return None
+            self._deletion_finished.wait_for(lambda: self._deleting.isdisjoint(keys))
+            return self._prepare(request, generation, boundary, keys)
+
+    def _prepare(
+        self, request: str, generation: int, boundary: int, keys: Sequence[str]
+    ) -> str:
+        with self.db:
             row = self.db.execute(
                 "SELECT session,generation FROM requests WHERE request=?", (request,)
             ).fetchone()
@@ -227,30 +245,53 @@ class SessionCheckpointCatalog:
                 (session,),
             ).fetchone()
             keys = self._keys(checkpoint)
-            if (
-                (
+            if latest is not None and latest[0] is not None and latest[1] > generation:
+                self.counters["rejected_commits"] += 1
+                return False
+            # Abandon/expiry may retire the candidate while its proof is in
+            # flight. A durable reader keeps its payload fenced until we return.
+            reader = self.hold_reader("commit:" + checkpoint, keys)
+            assert reader is not None
+        try:
+            complete = self.store.batch_probe_key(keys) == [1] * len(keys) and verify(
+                row[3]
+            )
+            with self.lock:
+                current = self.db.execute(
+                    "SELECT committed,orphaned FROM checkpoints WHERE id=?",
+                    (checkpoint,),
+                ).fetchone()
+                if current is None or current[1]:
+                    return False
+                if current[0]:
+                    return True
+                latest = self.db.execute(
+                    "SELECT c.id,c.generation FROM sessions s LEFT JOIN checkpoints c "
+                    "ON c.id=s.latest WHERE s.session=?",
+                    (session,),
+                ).fetchone()
+                if not complete or (
                     latest is not None
                     and latest[0] is not None
                     and latest[1] > generation
-                )
-                or self.store.batch_probe_key(keys) != [1] * len(keys)
-                or not verify(row[3])
-            ):
-                self.counters["rejected_commits"] += 1
-                return False
-            with self.db:
-                self.db.execute(
-                    "UPDATE checkpoints SET committed=1 WHERE id=?", (checkpoint,)
-                )
-                self.db.execute(
-                    "UPDATE sessions SET latest=?,touched=? WHERE session=?",
-                    (checkpoint, self.clock(), session),
-                )
-                if latest is not None and latest[0] is not None:
-                    self._drop_checkpoint(latest[0])
-                self._prune_requests()
-            self.counters["commits"] += 1
-            return True
+                ):
+                    self.counters["rejected_commits"] += 1
+                    return False
+                with self.db:
+                    self.db.execute(
+                        "UPDATE checkpoints SET committed=1 WHERE id=?", (checkpoint,)
+                    )
+                    self.db.execute(
+                        "UPDATE sessions SET latest=?,touched=? WHERE session=?",
+                        (checkpoint, self.clock(), session),
+                    )
+                    if latest is not None and latest[0] is not None:
+                        self._drop_checkpoint(latest[0])
+                    self._prune_requests()
+                self.counters["commits"] += 1
+                return True
+        finally:
+            self.release_reader(reader)
 
     def _drop_checkpoint(self, checkpoint: str) -> None:
         self._release(checkpoint)
@@ -278,8 +319,11 @@ class SessionCheckpointCatalog:
             "AND committed=0)"
         )
 
-    def hold_reader(self, request: str, keys: Sequence[str]) -> str:
+    def hold_reader(self, request: str, keys: Sequence[str]) -> str | None:
+        """Claim a lookup hit, or reject it if deletion has already started."""
         with self.lock, self.db:
+            if not self._deleting.isdisjoint(keys):
+                return None
             reader = "read:" + uuid.uuid4().hex
             self.db.execute("INSERT INTO readers VALUES (?,?,NULL)", (reader, request))
             self._claim(reader, keys)
@@ -322,29 +366,40 @@ class SessionCheckpointCatalog:
                     "ORDER BY rowid LIMIT ?",
                     (limit,),
                 )
+                if r[0] not in self._deleting
             ]
             if not keys:
                 return 0
-            # Holding the ownership lock until the RPC completes serializes
-            # claims against deletion, including re-adoption of a queued key.
+            # A journal commit failure must not strand an in-memory fence.
+            self.db.commit()
+            self._deleting.update(keys)
+        try:
             results = self.store.batch_remove(keys, force=False)
             if len(results) != len(keys):
                 raise RuntimeError("batch_remove returned a truncated result")
-            removed = 0
-            for key, result in zip(keys, results):
-                if result >= 0 or self.store.batch_probe_key([key]) == [0]:
-                    self.db.execute("DELETE FROM garbage WHERE key=?", (key,))
-                    removed += 1
-                else:
-                    self.db.execute(
-                        "UPDATE garbage SET failures=failures+1, "
-                        "rowid=(SELECT COALESCE(MAX(rowid),0)+1 FROM garbage) "
-                        "WHERE key=?",
-                        (key,),
-                    )
-                    self.counters["remove_failures"] += 1
-            self.counters["removed_keys"] += removed
-            return removed
+            deleted = [
+                result >= 0 or self.store.batch_probe_key([key]) == [0]
+                for key, result in zip(keys, results)
+            ]
+            with self.lock, self.db:
+                for key, success in zip(keys, deleted):
+                    if success:
+                        self.db.execute("DELETE FROM garbage WHERE key=?", (key,))
+                    else:
+                        self.db.execute(
+                            "UPDATE garbage SET failures=failures+1, "
+                            "rowid=(SELECT COALESCE(MAX(rowid),0)+1 FROM garbage) "
+                            "WHERE key=?",
+                            (key,),
+                        )
+                        self.counters["remove_failures"] += 1
+                removed = sum(deleted)
+                self.counters["removed_keys"] += removed
+                return removed
+        finally:
+            with self._deletion_finished:
+                self._deleting.difference_update(keys)
+                self._deletion_finished.notify_all()
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -383,7 +438,12 @@ class SessionCheckpointCatalog:
 
     def reset(self) -> None:
         """Reset metadata only after the caller has quiesced and reset Store."""
-        with self.lock, self.db:
+        with self._deletion_finished:
+            self._deletion_finished.wait_for(lambda: not self._deleting)
+            self._reset()
+
+    def _reset(self) -> None:
+        with self.db:
             for table in (
                 "refs",
                 "readers",
