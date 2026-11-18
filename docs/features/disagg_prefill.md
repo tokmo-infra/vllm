@@ -17,6 +17,14 @@ Two main reasons:
 
 ## Usage example
 
+For text-only chat requests, a router can forward the prefill response's
+`prompt_token_ids` in the decode request's `kv_transfer_params.prompt_token_ids`.
+The decode frontend uses these IDs as its prompt and removes the array from
+engine sampling metadata. The Rust Kimi K3/K3.1 renderer also skips its native
+prompt encoding while retaining reasoning and tool output processing. Echo
+and multimodal requests render their messages normally. Forwarded IDs must be
+a non-empty array of non-negative token IDs from the same tokenizer and template.
+
 Now supports 9 types of connectors:
 
 - **ExampleConnector**: refer to [examples/disaggregated/example_connector/run.sh](../../examples/disaggregated/example_connector/run.sh) for the example usage of ExampleConnector disaggregated prefilling.
