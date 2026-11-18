@@ -221,6 +221,7 @@ pub(crate) fn prepare_responses_request(
 
     let chat_request = ChatRequest {
         request_id: request_id.clone(),
+        prompt_token_ids: None,
         messages,
         sampling_params: SamplingParams {
             temperature,
