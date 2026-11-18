@@ -14,6 +14,7 @@ from vllm.renderers.chat_utils import (
     parse_chat_messages_async,
 )
 from vllm.tokenizers.hf import HfTokenizer, ThreadSafeHFTokenizerMixin
+from vllm.tokenizers.kimi_k3_cache import attach_cache
 from vllm.utils.async_utils import make_async
 
 from .base import BaseRenderer
@@ -155,6 +156,7 @@ class KimiK3Renderer(BaseRenderer[HfTokenizer]):
 
     def __init__(self, config: VllmConfig, tokenizer: HfTokenizer | None) -> None:
         super().__init__(config, tokenizer)
+        attach_cache(config, tokenizer)
 
         self._thinking_efforts = (
             _K31_THINKING_EFFORTS
