@@ -1266,6 +1266,79 @@ def test_boundary_state_offloads_block_aligned_prompt():
     assert manager.take_boundary_state_offloads() == {}
 
 
+def test_connector_reconciles_short_sliding_window_draft_hit():
+    """A remote Mamba state cannot make missing local draft attention KV valid."""
+    hash_block_size = 2
+    kv_cache_config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=2, num_kv_heads=1, head_size=1, dtype=torch.float32
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=4,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["swa_draft"],
+                SlidingWindowSpec(
+                    block_size=4,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=4,
+                ),
+                is_eagle_group=True,
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        use_eagle=True,
+    )
+    producer = make_request("producer", list(range(13)), hash_block_size, sha256)
+    for end in (4, 8, 12):
+        assert manager.allocate_slots(producer, 4) is not None
+        producer.num_computed_tokens = end
+        manager.new_step_starts()
+    manager.free(producer)
+    manager.new_step_starts()
+
+    consumer = make_request("consumer", list(range(14)), hash_block_size, sha256)
+    blocks, num_computed, _, diverged = manager.get_computed_blocks_for_connector(
+        consumer
+    )
+    # This is the view consumed when a longer remote hit replaces a partial
+    # local hit. Every attention group must cover its local endpoint.
+    truncated = manager.truncate_computed_blocks(blocks, num_computed)
+    assert num_computed == 8
+    assert not diverged
+    assert len(truncated.blocks[2]) == 2
+    assert (
+        manager.allocate_slots(
+            consumer,
+            1,
+            num_computed,
+            truncated,
+            num_external_computed_tokens=4,
+            delay_cache_blocks=True,
+        )
+        is not None
+    )
+
+
 def test_truncate_computed_blocks_preserves_sparse_prefix_positions():
     """truncate_computed_blocks slices each group by its own block size,
     keeps null placeholders in the retained prefix, and leaves the original

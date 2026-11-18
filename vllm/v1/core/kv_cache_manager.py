@@ -394,6 +394,21 @@ class KVCacheManager:
             return *self.get_computed_blocks(request, max_cache_hit_length), False
 
         num_local = per_group_hits[fa_group_id]
+        if any(
+            group.kv_cache_spec.prefix_cacheable
+            and not isinstance(group.kv_cache_spec, MambaSpec)
+            and hit < num_local
+            for group, hit in zip(
+                self.kv_cache_config.kv_cache_groups, per_group_hits, strict=True
+            )
+        ):
+            # Only recurrent state may lag the advertised attention prefix.
+            # A draft/SWA group must also cover that prefix: suffix-only remote
+            # loads cannot replace its missing local attention blocks.
+            logger.info_once(
+                "Reconciling a shorter local attention hit before hybrid KV transfer."
+            )
+            return *self.get_computed_blocks(request, max_cache_hit_length), False
         blocks = self.create_kv_cache_blocks(computed)
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
         return blocks, num_local, 0, min(per_group_hits) < num_local
