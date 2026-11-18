@@ -743,6 +743,30 @@ def test_store_sending_thread_skips_request_during_cpu_pressure():
     assert store.batch_put_from_multi_buffers.call_count == 3
 
 
+def test_store_sending_thread_probes_after_all_active_requests_are_skipped():
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = [
+        [-200, -200],
+        [-200, -200],
+        [256, 256],
+    ]
+    thread = _make_store_sending_thread(store)
+    with patch.object(worker.time, "monotonic", return_value=20.0) as clock:
+        _run_store_req(thread, _make_store_req("req-a", [b"a0", b"a1"]))
+        _run_store_req(thread, _make_store_req("req-b", [b"b0", b"b1"]))
+        _run_store_req(thread, _make_store_req("req-a", [b"a0", b"a1"]))
+        assert store.batch_put_from_multi_buffers.call_count == 2
+        assert thread._skip_store_requests == {"req-a", "req-b"}
+        assert thread._saved_offset.get("req-a", 0) == 0
+
+        clock.return_value = 21.0
+        _run_store_req(thread, _make_store_req("req-a", [b"a0", b"a1"]))
+        assert store.batch_put_from_multi_buffers.call_count == 3
+        assert not thread._store_pressure_active
+        assert not thread._skip_store_requests
+
+
 def test_store_sending_thread_records_mooncake_metrics():
     store = MagicMock()
     store.batch_is_exist.return_value = [0, 0]
@@ -907,6 +931,7 @@ def test_store_sending_thread_retries_skipped_range_after_pressure():
     # saved offset stays at 0.
     thread._store_pressure_active = True
     thread._skip_store_requests.add("req-a")
+    thread._store_pressure_probe_at = float("inf")
 
     _run_store_req(
         thread,
@@ -1253,6 +1278,7 @@ def test_partial_tail_offload_honors_active_pressure_gate():
     thread = _make_partial_tail_send_thread(store)
     thread._store_pressure_active = True
     thread._skip_store_requests.add("req-a")
+    thread._store_pressure_probe_at = float("inf")
 
     _run_store_req(thread, _make_partial_tail_req([1, 2, 3]))
 

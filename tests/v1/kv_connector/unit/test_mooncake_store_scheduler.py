@@ -61,6 +61,7 @@ def _make_bare_scheduler(
     scheduler._unfinished_requests = {}
     scheduler._request_trackers = {}
     scheduler._finished_partial_tail_metas = {}
+    scheduler._finished_lookahead_metas = {}
     scheduler._gpu_block_pool = BlockPool(
         num_gpu_blocks=64, enable_caching=True, hash_block_size=hash_block_size
     )
@@ -511,7 +512,7 @@ def test_consumer_saves_only_full_decode_blocks(token_len, saved_tokens):
         assert req_meta.token_ids == list(range(32, 48))
 
 
-def test_preemption_resets_tracker():
+def test_preemption_discards_tracker():
     scheduler = _make_bare_scheduler()
     _add_unfinished_request(
         scheduler,
@@ -523,13 +524,7 @@ def test_preemption_resets_tracker():
 
     scheduler.build_connector_meta(_make_preemption_scheduler_output())
 
-    tracker = scheduler._request_trackers["req-0"]
-    assert tracker.token_len == 0
-    assert tracker.allocated_block_ids == ()
-    assert tracker.num_saved_tokens == 0
-    assert tracker.token_ids is None
-    assert tracker.has_pending_offload is False
-    assert tracker.prefill_end_tokens == 0
+    assert "req-0" not in scheduler._request_trackers
 
 
 def test_preemption_clears_stale_load_state():
@@ -795,6 +790,7 @@ def test_from_request_tracker_load_overrides_caller_skip_save():
     req_meta = ReqMeta.from_request_tracker(
         tracker,
         block_size=16,
+        hash_block_size=16,
         load_spec=load_spec,
         skip_save=False,
         block_hashes=[b"h0", b"h1", b"h2"],
@@ -820,6 +816,7 @@ def test_from_request_tracker_load_with_can_load_false_still_saves():
     req_meta = ReqMeta.from_request_tracker(
         tracker,
         block_size=16,
+        hash_block_size=16,
         load_spec=load_spec,
         skip_save=False,
         block_hashes=[b"h0", b"h1", b"h2"],
@@ -845,7 +842,7 @@ def test_from_request_tracker_no_load_saves_normally(token_len, save_partial_tai
         tracker.token_len = 8
         assert (
             ReqMeta.from_request_tracker(
-                tracker, 16, save_partial_tail=True, num_prompt_tokens=token_len
+                tracker, 16, 16, save_partial_tail=True, num_prompt_tokens=token_len
             )
             is None
         )
@@ -854,6 +851,7 @@ def test_from_request_tracker_no_load_saves_normally(token_len, save_partial_tai
     req_meta = ReqMeta.from_request_tracker(
         tracker,
         block_size=16,
+        hash_block_size=16,
         load_spec=None,
         skip_save=False,
         block_hashes=[b"h0", b"h1", b"h2"],
@@ -872,11 +870,23 @@ def test_from_request_tracker_no_load_saves_normally(token_len, save_partial_tai
         ReqMeta.from_request_tracker(
             tracker,
             16,
+            16,
             save_partial_tail=save_partial_tail,
             num_prompt_tokens=token_len,
         )
         is None
     )
+
+
+def test_from_request_tracker_waits_for_final_lookahead_hash():
+    tracker = RequestTracker("req-0", 32, ([1, 2],))
+    meta = ReqMeta.from_request_tracker(tracker, 16, 16, block_hashes=[b"h0"])
+    assert meta is not None and meta.token_len_chunk == 16
+    assert tracker.num_saved_tokens == 16
+    assert ReqMeta.from_request_tracker(tracker, 16, 16, block_hashes=[b"h0"]) is None
+
+    meta = ReqMeta.from_request_tracker(tracker, 16, 16, block_hashes=[b"h0", b"h1"])
+    assert meta is not None and meta.token_len_chunk == 32
 
 
 def test_partial_tail_is_resolved_once_on_the_prompt_completing_save():

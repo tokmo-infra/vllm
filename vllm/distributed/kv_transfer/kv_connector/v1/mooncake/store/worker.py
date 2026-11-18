@@ -93,6 +93,7 @@ from .metrics import MooncakeStoreConnectorStats
 logger = init_logger(__name__)
 
 MOONCAKE_NO_AVAILABLE_HANDLE = -200
+_STORE_PRESSURE_PROBE_INTERVAL_S = 1.0
 _T = TypeVar("_T")
 
 
@@ -452,6 +453,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # Pause store requests when CPU/disk offloading is under pressure.
         self._store_pressure_active = False
         self._skip_store_requests: set[str] = set()
+        self._store_pressure_probe_at = 0.0
 
         # Per-request high-water mark of tokens actually persisted; the next
         # batch resumes here, so pressure-skipped or failed ranges are retried.
@@ -547,12 +549,31 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
     def _should_skip_request(self, req_id: str) -> bool:
         with self.done_task_lock:
-            return self._store_pressure_active and req_id in self._skip_store_requests
+            if (
+                not self._store_pressure_active
+                or req_id not in self._skip_store_requests
+            ):
+                return False
+            now = time.monotonic()
+            if now < self._store_pressure_probe_at:
+                return True
+            # All active requests may have failed allocation. Requiring another
+            # request's successful PUT to reopen the gate can then suppress every
+            # later checkpoint even after the Store has evicted enough data.
+            # Reserve one probe per sending thread; the caller uses only this
+            # job's pinned blocks and still retires it through the normal finally.
+            self._store_pressure_probe_at = now + _STORE_PRESSURE_PROBE_INTERVAL_S
+        logger.info("Mooncake store pressure recovery probe for request %s", req_id)
+        return False
 
     def _mark_request_skipped_for_pressure(self, req_meta: ReqMeta) -> bool:
         req_id = req_meta.req_id
         with self.done_task_lock:
             already_skipped = req_id in self._skip_store_requests
+            if not self._store_pressure_active:
+                self._store_pressure_probe_at = (
+                    time.monotonic() + _STORE_PRESSURE_PROBE_INTERVAL_S
+                )
             self._store_pressure_active = True
             # The pressure itself is global, but only a live job may sentence its
             # own request to being skipped.
@@ -566,6 +587,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 return False
             self._store_pressure_active = False
             self._skip_store_requests.clear()
+            self._store_pressure_probe_at = 0.0
         return True
 
     def _boundary_puts(
@@ -747,8 +769,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 retry_token_ids = self._get_retry_token_ids(req_meta)
                 if retry_token_ids is not None and event_token_ids is not None:
                     retry_start, retry_ids = retry_token_ids
-                    if retry_start + len(retry_ids) == token_ids_start:
-                        event_token_ids = retry_ids + event_token_ids
+                    if retry_start <= token_ids_start <= retry_start + len(retry_ids):
+                        event_token_ids = (
+                            retry_ids[: token_ids_start - retry_start] + event_token_ids
+                        )
                         token_ids_start = retry_start
 
             if self._should_skip_request(req_id):
@@ -1007,9 +1031,21 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         event_token_ids[s - token_ids_start : end - token_ids_start]
                         if event_token_ids is not None
                         and token_ids_start <= s
-                        and end <= token_ids_end
+                        and end + req_meta.num_hash_lookahead_tokens <= token_ids_end
                         else []
                     )
+                    lookahead_token_ids = None
+                    if (
+                        token_ids
+                        and req_meta.num_hash_lookahead_tokens
+                        and event_token_ids is not None
+                    ):
+                        offset = end - token_ids_start
+                        lookahead_token_ids = [
+                            event_token_ids[
+                                offset : offset + req_meta.num_hash_lookahead_tokens
+                            ]
+                        ]
                     stored_events.append(
                         BlockStored(
                             block_hashes=[maybe_convert_block_hash(block_hash)],
@@ -1023,6 +1059,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                                 else None
                             ),
                             token_ids=token_ids,
+                            lookahead_token_ids=lookahead_token_ids,
                             block_size=db.block_size,
                             lora_id=None,
                             medium="cpu",
@@ -2076,9 +2113,15 @@ class MooncakeStoreWorker:
         for req_id in meta.preempted_req_ids:
             self.kv_send_thread.delete_finished_stored_request(req_id)
 
+        pending_save_req_ids = {
+            request.req_id for request in meta.requests if request.can_save
+        }
         for req_id in finished_req_ids | self.finished_store_req:
-            if self.kv_send_thread.stored_requests.get(req_id):
-                # Queued jobs still need the resume offset; retire on a later step.
+            if (
+                req_id in pending_save_req_ids
+                or self.kv_send_thread.stored_requests.get(req_id)
+            ):
+                # Current or queued saves still need the request's bookkeeping.
                 self.finished_store_req.add(req_id)
             else:
                 self.finished_store_req.discard(req_id)
