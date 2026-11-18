@@ -99,6 +99,26 @@ use the reserved Store prefix on fallback producers. This mode does not change
 configured MTP depth, FP8 KV settings, chunked prefill, asynchronous scheduling,
 or target/context graph selection.
 
+### With packed NVFP4 target QSA KV
+
+For native Qwen3.8 MTP on a dedicated Mooncake P/D pair, selecting
+`--kv-cache-dtype nvfp4` on both endpoints automatically requires context-only
+MTP on P. Keep the existing speculative configuration, including its proposal
+depth. D still runs full native MTP; the draft main QSA cache defaults to
+FP8 E4M3 on both endpoints. This does not change GDN or the raw/compressed QSA
+index caches. Context-only P accepts the native ModelOpt mixed checkpoint
+configuration through the regular loader, with weight coverage checks on the
+retained modules. It fails on incompatible configurations rather than silently
+generating drafts.
+
+If the pair also uses Mooncake Store, the runtime derives a separate reserved
+namespace from the existing prefix and draft KV dtype. Both endpoints must
+start cold in that namespace; do not populate it with old FP8 Store entries
+or mix endpoints from before and after changing the dtype. This namespace
+does not replace packed transfer ABI validation. Lookahead hashing is still
+required, and the physical page size and graph behavior are not overridden by
+MTP activation.
+
 ## Notes
 
 - MTP only works for model families that support MTP in vLLM.

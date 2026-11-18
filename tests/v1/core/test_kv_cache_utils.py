@@ -1052,8 +1052,8 @@ def test_request_block_hasher(hash_fn):
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("tail", [21, 22])
-def test_qwen_mtp_handoff_hashes_the_actual_prompt_tail(tail):
-    block_size = 16
+@pytest.mark.parametrize("block_size", [16, 3200])
+def test_qwen_mtp_handoff_hashes_the_actual_prompt_tail(tail, block_size):
     prefix = list(range(block_size))
     sample = 23
 

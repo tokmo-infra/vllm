@@ -271,6 +271,7 @@ steps:
   source_file_dependencies:
   - vllm/models/qwen4_exp/
   - vllm/config/compilation.py
+  - vllm/config/kv_transfer.py
   - vllm/config/speculative.py
   - vllm/config/vllm.py
   - vllm/v1/worker/gpu/spec_decode/
@@ -280,7 +281,7 @@ steps:
   commands:
     - pytest -v -s models/qwen4_exp/test_hc_ops.py models/qwen4_exp/test_qsa_prepare.py models/qwen4_exp/test_qsa_reference.py
     - pytest -v -s models/qwen4_exp/test_ple.py
-    - pytest -v -s models/qwen4_exp/test_config.py -k 'qwen_mtp_context_prefill or qwen_mtp_context_output'
+    - pytest -v -s models/qwen4_exp/test_config.py -k qwen_mtp
     - pytest -v -s v1/worker/test_gpu_warmup_blocks.py -k context_only
   mirror:
     amd:

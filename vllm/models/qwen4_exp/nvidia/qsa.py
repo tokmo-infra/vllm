@@ -12,7 +12,7 @@ from torch import nn
 from transformers import Qwen4ExpTextConfig
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, replace
 from vllm.config.cache import CacheConfig, CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
@@ -54,8 +54,10 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadataBuilder,
 )
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     FullAttentionSpec,
     KVCacheSpec,
+    KVQuantMode,
     get_kv_quant_mode,
 )
 
@@ -141,6 +143,23 @@ class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
     """Flash metadata supporting uniform decode and target-verify graphs."""
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+
+    def __init__(
+        self,
+        kv_cache_spec: AttentionSpec,
+        layer_names: list[str],
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        # MRV2 also builds metadata for draft groups using the target config.
+        # In a mixed layout the local spec, not the target flag, identifies
+        # the native QSA groups passed to the inherited FA scheduler.
+        if self.cache_config.cache_dtype == "nvfp4":
+            if kv_cache_spec.kv_quant_mode == KVQuantMode.FP8_PER_TENSOR:
+                self.cache_config = replace(self.cache_config, cache_dtype="fp8_e4m3")
+            elif kv_cache_spec.kv_quant_mode == KVQuantMode.NONE:
+                self.cache_config = replace(self.cache_config, cache_dtype="auto")
 
 
 class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):

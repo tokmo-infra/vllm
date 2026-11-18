@@ -4,6 +4,7 @@
 import copy
 import functools
 from collections.abc import Callable, Mapping
+from dataclasses import field
 from typing import TYPE_CHECKING, Any, Literal, Self, get_args
 
 from pydantic import Field, SkipValidation, field_validator, model_validator
@@ -435,6 +436,9 @@ class SpeculativeConfig:
     """Build MTP context without generating drafts on a dedicated Qwen3.8
     Flash-Next Mooncake prefill producer. Leave disabled on D and coupled."""
 
+    qwen38_main_nvfp4: bool = field(default=False, init=False, repr=False)
+    """Internal marker preserved when deriving the native draft KV config."""
+
     # Draft model configuration
     quantization: me_quant.QuantizationMethods | str | None = None
     """Quantization method that was used to quantize the draft model weights.
@@ -686,6 +690,8 @@ class SpeculativeConfig:
         factors.append(uses_aux_hidden_states)
         if self.qwen38_p_mtp_context_only:
             factors.append("qwen38_p_mtp_context_only")
+        if self.qwen38_main_nvfp4:
+            factors.append(("qwen38_main_nvfp4", self.qwen38_draft_kv_dtype()))
         if self.method == "dspark":
             factors.append(self.enable_adaptive_verification)
 
@@ -1920,6 +1926,15 @@ class SpeculativeConfig:
 
         return draft_parallel_config
 
+    def qwen38_draft_kv_dtype(self) -> CacheDType | str:
+        """Keep the Qwen draft QSA main cache independent of packed target KV."""
+        dtype = self.kv_cache_dtype
+        if dtype in (None, "fp8", "fp8_e4m3"):
+            return "fp8_e4m3"
+        if dtype not in ("auto", "bfloat16"):
+            raise ValueError("Qwen3.8 NVFP4 target KV requires native draft QSA KV")
+        return dtype
+
     def apply_draft_overrides(self, vllm_config: VllmConfig) -> VllmConfig:
         """Overlay this config's kernel overrides onto a target VllmConfig.
 
@@ -1927,7 +1942,12 @@ class SpeculativeConfig:
         target resolved.
         """
         for src, config_name, dst in _DRAFT_VLLM_CONFIG_OVERRIDES:
-            if (value := getattr(self, src)) is not None:
+            value = (
+                self.qwen38_draft_kv_dtype()
+                if src == "kv_cache_dtype" and self.qwen38_main_nvfp4
+                else getattr(self, src)
+            )
+            if value is not None:
                 sub_config = replace(getattr(vllm_config, config_name), **{dst: value})
                 vllm_config = replace(vllm_config, **{config_name: sub_config})
         return vllm_config

@@ -5,12 +5,15 @@ import uuid
 from dataclasses import field
 from typing import Any, Literal, get_args
 
-from vllm.config.utils import config
+from vllm.config.utils import config, replace
 from vllm.utils.hashing import safe_hash
 
 KVProducer = Literal["kv_producer", "kv_both"]
 KVConsumer = Literal["kv_consumer", "kv_both"]
 KVRole = Literal[KVProducer, KVConsumer]
+
+QWEN38_MTP_CONTEXT_STORE_NAMESPACE = "qwen38-mtp-context-v1/"
+QWEN38_NVFP4_MTP_STORE_NAMESPACE = QWEN38_MTP_CONTEXT_STORE_NAMESPACE + "nvfp4-main-v1/"
 
 
 def hisparse_host_pool_gib(
@@ -168,7 +171,9 @@ class KVTransferConfig:
             and self.kv_role in ("kv_producer", "kv_both")
         )
 
-    def uses_qwen38_mtp_context_store_prefix(self) -> bool:
+    def uses_qwen38_mtp_context_store_prefix(
+        self, namespace: str = QWEN38_MTP_CONTEXT_STORE_NAMESPACE
+    ) -> bool:
         """Whether a Store uses the reserved prompt-tail provenance namespace."""
         store_configs = [self.kv_connector_extra_config]
         if self.kv_connector == "MultiConnector":
@@ -181,7 +186,47 @@ class KVTransferConfig:
             return False
         return any(
             isinstance(prefix := config.get("cache_prefix"), str)
-            and prefix.startswith("qwen38-mtp-context-v1/")
-            and bool(prefix.removeprefix("qwen38-mtp-context-v1/"))
+            and prefix.startswith(namespace)
             for config in store_configs
+        )
+
+    def with_qwen38_nvfp4_mtp_store_prefix(
+        self, draft_dtype: str
+    ) -> "KVTransferConfig":
+        """Isolate mixed-KV MTP provenance without changing the supplied prefix."""
+        namespace = f"{QWEN38_NVFP4_MTP_STORE_NAMESPACE}{draft_dtype}/"
+        if not self.has_connector("MooncakeStoreConnector"):
+            return self
+        if self.kv_connector != "MultiConnector":
+            raise ValueError("Qwen3.8 NVFP4 MTP Store requires a Mooncake P/D pair")
+        children = self.get_from_extra_config("connectors", [])
+        updated = []
+        for child in children:
+            if child.get("kv_connector") == "MooncakeStoreConnector":
+                extra = child.get("kv_connector_extra_config", {})
+                prefix = extra.get("cache_prefix", "")
+                if not isinstance(prefix, str):
+                    raise ValueError("Mooncake Store cache_prefix must be a string")
+                if prefix.startswith(QWEN38_NVFP4_MTP_STORE_NAMESPACE) and (
+                    not prefix.startswith(namespace) or prefix == namespace
+                ):
+                    raise ValueError("Incompatible Qwen3.8 NVFP4 MTP Store namespace")
+                if not prefix.startswith(namespace):
+                    suffix = f"named/{prefix}" if prefix else "default"
+                    child = {
+                        **child,
+                        "kv_connector_extra_config": {
+                            **extra,
+                            "cache_prefix": namespace + suffix,
+                        },
+                    }
+            updated.append(child)
+        if children == updated:
+            return self
+        return replace(
+            self,
+            kv_connector_extra_config={
+                **self.kv_connector_extra_config,
+                "connectors": updated,
+            },
         )

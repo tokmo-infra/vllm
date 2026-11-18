@@ -39,7 +39,7 @@ from .ec_transfer import ECTransferConfig
 from .engram import EngramConfig, model_has_engram_layers
 from .kernel import KernelConfig
 from .kv_events import KVEventsConfig
-from .kv_transfer import KVTransferConfig
+from .kv_transfer import QWEN38_NVFP4_MTP_STORE_NAMESPACE, KVTransferConfig
 from .load import LoadConfig
 from .logging import LoggingConfig
 from .lora import LoRAConfig
@@ -533,6 +533,8 @@ class VllmConfig:
             vllm_factors.append(self.speculative_config.compute_hash())
         else:
             vllm_factors.append("None")
+        if self.qwen38_nvfp4_p_mtp_required:
+            vllm_factors.append("qwen38_nvfp4_p_mtp_context_only")
         if self.structured_outputs_config:
             vllm_factors.append(self.structured_outputs_config.compute_hash())
         if self.profiler_config:
@@ -625,9 +627,21 @@ class VllmConfig:
         return 0
 
     @property
+    def qwen38_nvfp4_p_mtp_required(self) -> bool:
+        spec = self.speculative_config
+        kv = self.kv_transfer_config
+        return (
+            spec is not None
+            and spec.qwen38_main_nvfp4
+            and kv is not None
+            and kv.is_dedicated_mooncake_producer()
+        )
+
+    @property
     def qwen38_p_mtp_context_only(self) -> bool:
         spec = self.speculative_config
-        if spec is None or not spec.qwen38_p_mtp_context_only:
+        required = self.qwen38_nvfp4_p_mtp_required
+        if spec is None or not (spec.qwen38_p_mtp_context_only or required):
             return False
         draft = spec.draft_model_config
         assert draft is not None
@@ -642,35 +656,92 @@ class VllmConfig:
             and spec.draft_lm_head_quantization is None
             and not spec.use_local_argmax_reduction
             and spec.draft_sample_method != "probabilistic"
-            and draft.quantization in (None, "fp8")
+            and (
+                draft.quantization in (None, "fp8")
+                or (required and draft.quantization == "modelopt_mixed")
+            )
             # Prepacked state requires the native model layout.
             and (spec.draft_load_config or self.load_config).load_format
             in ("auto", "hf", "safetensors", "pt")
         )
 
+    def _resolve_qwen38_mixed_mtp_kv(self) -> None:
+        spec = self.speculative_config
+        model = self.model_config
+        if (
+            self.cache_config.cache_dtype != "nvfp4"
+            or model is None
+            or model.architecture
+            not in ("Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration")
+            or spec is None
+            or spec.method != "mtp"
+            or spec.draft_model_config is None
+            or "Qwen4ExpMTP" not in spec.draft_model_config.architectures
+        ):
+            return
+        draft_dtype = spec.qwen38_draft_kv_dtype()
+        spec = copy.copy(spec)
+        spec.qwen38_main_nvfp4 = True
+        self.speculative_config = spec
+        if self.kv_transfer_config is not None:
+            self.kv_transfer_config = (
+                self.kv_transfer_config.with_qwen38_nvfp4_mtp_store_prefix(draft_dtype)
+            )
+
     def _validate_qwen38_p_mtp_context(self) -> None:
         spec = self.speculative_config
         kv = self.kv_transfer_config
+        required = self.qwen38_nvfp4_p_mtp_required
         isolated_store = kv is not None and kv.uses_qwen38_mtp_context_store_prefix()
+        if (
+            kv is not None
+            and kv.uses_qwen38_mtp_context_store_prefix(
+                QWEN38_NVFP4_MTP_STORE_NAMESPACE
+            )
+            and not (spec is not None and spec.qwen38_main_nvfp4)
+        ):
+            raise ValueError("Qwen3.8 NVFP4 MTP Store requires mixed target/draft KV")
         if isolated_store and self.num_hash_lookahead_tokens != 1:
             raise ValueError(
                 "Qwen3.8 MTP context Store requires one hash lookahead token"
+            )
+        if required and not self.qwen38_p_mtp_context_only:
+            raise ValueError(
+                "Qwen3.8 NVFP4 Mooncake P requires active MTP context-only mode "
+                "(CUDA, one actual MTP module, PP=1, supported weights and loader, "
+                "no draft-head/verification overrides). Native fallback is disabled."
+            )
+        if (
+            spec is not None
+            and spec.qwen38_main_nvfp4
+            and kv is not None
+            and kv.has_connector("MooncakeConnector")
+            and self.num_hash_lookahead_tokens != 1
+        ):
+            raise ValueError(
+                "Qwen3.8 NVFP4 Mooncake P/D requires one hash lookahead token"
             )
         if isolated_store and not self.qwen38_p_mtp_context_only:
             assert kv is not None
             # A native D may read the new namespace. A legacy P must never
             # populate it with KV conditioned on its synthetic sampled output.
-            p2p_roles = [
-                c.get("kv_role")
-                for c in kv.get_from_extra_config("connectors", [])
-                if c.get("kv_connector") == "MooncakeConnector"
-            ]
-            if kv.kv_connector != "MultiConnector" or p2p_roles != ["kv_consumer"]:
+            children = kv.get_from_extra_config("connectors", [])
+            if (
+                kv.kv_connector != "MultiConnector"
+                or kv.kv_connector_module_path
+                or any(c.get("kv_connector_module_path") for c in children)
+                or [
+                    c.get("kv_role")
+                    for c in children
+                    if c.get("kv_connector") == "MooncakeConnector"
+                ]
+                != ["kv_consumer"]
+            ):
                 raise ValueError(
                     "Only Qwen3.8 MTP context-only P and its native Mooncake D "
                     "may use the reserved Store cache_prefix"
                 )
-        if spec is None or not spec.qwen38_p_mtp_context_only:
+        if spec is None or not (spec.qwen38_p_mtp_context_only or required):
             return
         model = self.model_config
         draft = spec.draft_model_config
@@ -710,6 +781,13 @@ class VllmConfig:
             raise ValueError(
                 "qwen38_p_mtp_context_only requires a fresh Mooncake Store "
                 "cache_prefix of qwen38-mtp-context-v1/<deployment>"
+            )
+        if required:
+            logger.info_once(
+                "Qwen3.8 NVFP4 Mooncake P: MTP context-only enabled "
+                "(configured proposal depth=%d; draft KV=%s).",
+                self.num_speculative_tokens,
+                spec.qwen38_draft_kv_dtype(),
             )
 
     @property
@@ -2315,6 +2393,7 @@ class VllmConfig:
         # Resolve kv_offloading-derived connector name into kv_transfer_config
         # before the HMA check below, which inspects the connector class.
         self._post_init_kv_transfer_config()
+        self._resolve_qwen38_mixed_mtp_kv()
         self._verify_aux_output_compatibility()
 
         # Hybrid KV cache manager (HMA) runtime rules:

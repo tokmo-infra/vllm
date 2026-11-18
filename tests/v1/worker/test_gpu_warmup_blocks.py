@@ -156,7 +156,7 @@ class _StepRecorder:
         return None
 
 
-@pytest.mark.parametrize("steps", [1, 5])
+@pytest.mark.parametrize("steps", [1, 2, 3, 5])
 def test_context_only_warmup_does_not_verify_nonexistent_drafts(steps):
     runner = _make_runner(
         [], num_lookahead_tokens=steps, num_spec_steps=steps, mtp_context_only=True

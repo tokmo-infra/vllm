@@ -16,8 +16,13 @@ from vllm.config import (
     ModelConfig,
     ParallelConfig,
     VllmConfig,
+    replace,
 )
 from vllm.config.speculative import SpeculativeConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+    KeyMetadata,
+    PoolKey,
+)
 from vllm.model_executor.models.config import (
     Qwen3_5ForConditionalGenerationConfig,
     Qwen4ExpForConditionalGenerationConfig,
@@ -60,12 +65,26 @@ def _text_config(**kwargs) -> Qwen4ExpTextConfig:
 @pytest.fixture
 def qwen_mtp_config(tmp_path, monkeypatch):
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
-    _text_config(
-        architectures=["Qwen4ExpForCausalLM"],
-        ple_layer_ids=[],
-    ).save_pretrained(tmp_path)
 
-    def build(steps, opt_in=False, kv=None, **spec_options):
+    def build(
+        steps,
+        opt_in=False,
+        kv=None,
+        cache_dtype="fp8_e4m3",
+        modules=1,
+        quantization_config=None,
+        **spec_options,
+    ):
+        _text_config(
+            architectures=["Qwen4ExpForCausalLM"],
+            ple_layer_ids=[],
+            mtp_num_hidden_layers=modules,
+            **(
+                {"quantization_config": quantization_config}
+                if quantization_config
+                else {}
+            ),
+        ).save_pretrained(tmp_path)
         model = ModelConfig(
             model=str(tmp_path),
             dtype="bfloat16",
@@ -77,7 +96,7 @@ def qwen_mtp_config(tmp_path, monkeypatch):
             model_config=model,
             parallel_config=parallel,
             device_config=DeviceConfig("cpu"),
-            cache_config=CacheConfig(cache_dtype="fp8_e4m3"),
+            cache_config=CacheConfig(cache_dtype=cache_dtype),
             kv_transfer_config=kv,
             speculative_config=SpeculativeConfig(
                 method="mtp",
@@ -92,7 +111,7 @@ def qwen_mtp_config(tmp_path, monkeypatch):
     return build
 
 
-@pytest.mark.parametrize("steps", [1, 2, 5])
+@pytest.mark.parametrize("steps", [1, 2, 3, 5])
 @pytest.mark.parametrize("role", [None, "kv_producer", "kv_consumer"])
 def test_qwen_mtp_native_depth_and_role(qwen_mtp_config, role, steps):
     kv = (
@@ -110,38 +129,188 @@ def test_qwen_mtp_native_depth_and_role(qwen_mtp_config, role, steps):
             qwen_mtp_config(steps, opt_in=True, kv=kv)
 
 
+def _mooncake_pair(role, prefix):
+    store = {
+        "kv_connector": "MooncakeStoreConnector",
+        "kv_role": "kv_both" if role == "kv_producer" else "kv_consumer",
+        "kv_connector_extra_config": {"cache_prefix": prefix},
+    }
+    return KVTransferConfig(
+        kv_connector="MultiConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={
+            "connectors": [
+                {"kv_connector": "MooncakeConnector", "kv_role": role},
+                store,
+            ]
+        },
+    )
+
+
+def _store_prefix(kv):
+    return kv.kv_connector_extra_config["connectors"][1]["kv_connector_extra_config"][
+        "cache_prefix"
+    ]
+
+
 def test_qwen_mtp_context_store_namespace_is_not_available_to_baseline_p(
     qwen_mtp_config,
 ):
-    store = {
-        "kv_connector": "MooncakeStoreConnector",
-        "kv_role": "kv_both",
-        "kv_connector_extra_config": {"cache_prefix": "qwen38-mtp-context-v1/test"},
-    }
-
-    def kv(role):
-        return KVTransferConfig(
-            kv_connector="MultiConnector",
-            kv_role="kv_both",
-            kv_connector_extra_config={
-                "connectors": [
-                    {"kv_connector": "MooncakeConnector", "kv_role": role},
-                    store,
-                ]
-            },
-        )
+    p = _mooncake_pair("kv_producer", "qwen38-mtp-context-v1/test")
+    d = _mooncake_pair("kv_consumer", "qwen38-mtp-context-v1/test")
 
     with pytest.raises(ValueError, match="reserved Store cache_prefix"):
-        qwen_mtp_config(2, kv=kv("kv_producer"))
-    d = qwen_mtp_config(2, kv=kv("kv_consumer"))
-    assert not d.qwen38_p_mtp_context_only and d.num_hash_lookahead_tokens == 1
+        qwen_mtp_config(2, kv=p)
+    config = qwen_mtp_config(2, kv=d)
+    assert not config.qwen38_p_mtp_context_only
+    assert config.num_hash_lookahead_tokens == 1
     with pytest.raises(ValueError, match="requires one hash lookahead token"):
-        qwen_mtp_config(2, kv=kv("kv_consumer"), disable_lookahead_block_hashes=True)
+        qwen_mtp_config(2, kv=d, disable_lookahead_block_hashes=True)
+
+
+@pytest.mark.parametrize("steps", [1, 2, 3, 5])
+def test_qwen_mtp_nvfp4_only_flag_delta(qwen_mtp_config, steps):
+    p_kv = _mooncake_pair("kv_producer", "prior-benchmark")
+    d_kv = _mooncake_pair("kv_consumer", "prior-benchmark")
+    baseline = qwen_mtp_config(steps, kv=p_kv)
+    d = qwen_mtp_config(steps, kv=d_kv, cache_dtype="nvfp4")
+    coupled = qwen_mtp_config(steps, cache_dtype="nvfp4")
+    assert not baseline.qwen38_p_mtp_context_only
+    assert not d.qwen38_p_mtp_context_only
+    assert not coupled.qwen38_p_mtp_context_only
+    if current_platform.is_cuda():
+        p = qwen_mtp_config(steps, kv=p_kv, cache_dtype="nvfp4")
+        assert p.qwen38_p_mtp_context_only
+        assert _store_prefix(p.kv_transfer_config) == _store_prefix(
+            d.kv_transfer_config
+        )
+        assert p.compute_hash() != d.compute_hash()
+        configs = (p, d, coupled)
+    else:
+        # Positive activation needs the actual NVIDIA platform, not a mock.
+        with pytest.raises(ValueError, match="Native fallback is disabled"):
+            qwen_mtp_config(steps, kv=p_kv, cache_dtype="nvfp4")
+        configs = (d, coupled)
+    for config in configs:
+        spec = config.speculative_config
+        assert not spec.qwen38_p_mtp_context_only  # No additional user setting.
+        assert config.num_speculative_tokens == steps
+        assert config.uniform_decode_query_len == steps + 1
+        assert config.num_prefill_lookahead_tokens == 1
+        assert config.cache_config.cache_dtype == "nvfp4"
+        draft = spec.apply_draft_overrides(config)
+        assert draft.cache_config.cache_dtype == "fp8_e4m3"
+        draft = replace(draft, model_config=spec.draft_model_config)
+        assert draft.cache_config.cache_dtype == "fp8_e4m3"
+        assert draft.qwen38_p_mtp_context_only == config.qwen38_p_mtp_context_only
+        assert draft.kv_transfer_config == config.kv_transfer_config
+
+    prefix = _store_prefix(d.kv_transfer_config)
+    assert _store_prefix(p_kv) == _store_prefix(d_kv) == "prior-benchmark"
+    assert d.num_hash_lookahead_tokens == 1
+    old_key = KeyMetadata("same-model", 0, 0, 0, 0, cache_prefix=_store_prefix(p_kv))
+    new_key = replace(old_key, cache_prefix=prefix)
+    assert (
+        PoolKey(old_key, "same-digest").to_string()
+        != PoolKey(new_key, "same-digest").to_string()
+    )
+
+
+@pytest.mark.parametrize(
+    ("opts", "message"),
+    [
+        ({"disable_lookahead_block_hashes": True}, "one hash lookahead token"),
+        ({"disable_eagle_block_drop": True}, "one hash lookahead token"),
+        ({"kv_cache_dtype": "nvfp4"}, "requires native draft QSA KV"),
+        ({"draft_lm_head_quantization": "fp8"}, "Native fallback is disabled"),
+    ],
+)
+def test_qwen_mtp_nvfp4_p_rejects_unsupported_contract(qwen_mtp_config, opts, message):
+    kv = _mooncake_pair("kv_producer", "prior-benchmark")
+    with pytest.raises(ValueError, match=message):
+        qwen_mtp_config(3, kv=kv, cache_dtype="nvfp4", **opts)
+
+
+def test_qwen_mtp_nvfp4_store_rejects_native_fp8_reader(qwen_mtp_config):
+    kv = _mooncake_pair("kv_consumer", "prior-benchmark")
+    d = qwen_mtp_config(2, kv=kv, cache_dtype="nvfp4")
+    with pytest.raises(ValueError, match="requires mixed target/draft KV"):
+        qwen_mtp_config(2, kv=d.kv_transfer_config)
+
+
+def test_qwen_mtp_nvfp4_p2p_reader_requires_lookahead_without_store(qwen_mtp_config):
+    kv = KVTransferConfig(kv_connector="MooncakeConnector", kv_role="kv_consumer")
+    with pytest.raises(ValueError, match="one hash lookahead token"):
+        qwen_mtp_config(
+            2, kv=kv, cache_dtype="nvfp4", disable_lookahead_block_hashes=True
+        )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA ModelOpt config")
+def test_qwen_mtp_nvfp4_modelopt_mixed_auto_producer(qwen_mtp_config):
+    from vllm.models.qwen4_exp.nvidia.mtp import _make_draft_vllm_config
+
+    p = qwen_mtp_config(
+        2,
+        kv=_mooncake_pair("kv_producer", "prior-benchmark"),
+        cache_dtype="nvfp4",
+        quantization_config={
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {
+                "mtp.layers.0.mlp.experts": {"quant_algo": "FP8_PB_WO"}
+            },
+        },
+    )
+    spec = p.speculative_config
+    assert spec.draft_model_config.quantization == "modelopt_mixed"
+    draft = _make_draft_vllm_config(spec.apply_draft_overrides(p), 2)
+    assert draft.qwen38_p_mtp_context_only
+    assert draft.cache_config.cache_dtype == "fp8_e4m3"
+    assert draft.quant_config.get_name() == "modelopt_mixed"
+    assert set(draft.quant_config.quantized_layers) == {"mtp.layers.2.mlp.experts"}
+
+
+@pytest.mark.parametrize("omit", [None, "indexer.index_qk_proj", "v_proj"])
+def test_qwen_mtp_context_checks_retained_checkpoint_sources(omit):
+    from vllm.models.qwen4_exp.nvidia.mtp import (
+        _remap_mtp_weight_name,
+        _require_packed_weight_sources,
+    )
+
+    prefix = "layers.0.self_attn."
+    # The benchmark checkpoint stores four separate sources for the fused QSA
+    # projection. Destination-only tracking misses an absent source shard.
+    sources = ("q_proj", "k_proj", "v_proj", "indexer.index_qk_proj")
+    seen = {
+        _remap_mtp_weight_name(f"mtp.{prefix}{name}.weight").removeprefix("model.")
+        for name in sources
+        if name != omit
+    }
+    if omit is None:
+        _require_packed_weight_sources(seen, prefix, "qkv_proj", sources)
+    else:
+        with pytest.raises(ValueError, match=rf"{omit}.weight"):
+            _require_packed_weight_sources(seen, prefix, "qkv_proj", sources)
+
+
+def test_qwen_mtp_context_only_rejects_multiple_actual_modules(qwen_mtp_config):
+    p_kv = KVTransferConfig(kv_connector="MooncakeConnector", kv_role="kv_producer")
+    # Even one proposal is distinct from one actual checkpoint module.
+    native = qwen_mtp_config(1, kv=p_kv, opt_in=True, modules=2)
+    assert (
+        native.speculative_config.draft_model_config.hf_text_config.mtp_num_hidden_layers
+        == 2
+    )
+    assert not native.qwen38_p_mtp_context_only
+    with pytest.raises(ValueError, match="one actual MTP module"):
+        qwen_mtp_config(1, kv=p_kv, modules=2, cache_dtype="nvfp4")
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA context prefill")
-@pytest.mark.parametrize("steps", [1, 2, 5])
-def test_qwen_mtp_context_prefill_keeps_every_row(qwen_mtp_config, steps):
+@pytest.mark.parametrize("steps", [1, 2, 3, 5])
+@pytest.mark.parametrize("cache_dtype", ["fp8_e4m3", "nvfp4"])
+def test_qwen_mtp_context_prefill_keeps_every_row(qwen_mtp_config, steps, cache_dtype):
     from dataclasses import replace
 
     from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
@@ -151,7 +320,9 @@ def test_qwen_mtp_context_prefill_keeps_every_row(qwen_mtp_config, steps):
     )
 
     kv = KVTransferConfig(kv_connector="MooncakeConnector", kv_role="kv_producer")
-    config = qwen_mtp_config(steps, opt_in=True, kv=kv)
+    config = qwen_mtp_config(
+        steps, opt_in=cache_dtype == "fp8_e4m3", kv=kv, cache_dtype=cache_dtype
+    )
     assert config.qwen38_p_mtp_context_only
     with pytest.raises(ValueError, match="one hash lookahead token"):
         qwen_mtp_config(steps, opt_in=True, kv=kv, disable_lookahead_block_hashes=True)
