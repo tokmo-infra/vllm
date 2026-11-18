@@ -1,0 +1,92 @@
+{
+  "name": "qwen38-NVFP4-P3200-restore-budget-flight-a002-C200U300N300-swe130k-YaRN4-1m",
+  "case": "82四个DEP2 P / 83和84各DEP8 D / SWE自然多轮",
+  "seed": 42,
+  "logging": {
+    "level": "INFO",
+    "progress_interval_seconds": 30
+  },
+  "pipeline": {
+    "loader": {
+      "plugin": "hf-datasets",
+      "settings": {
+        "dataset": "json",
+        "data_files": "swe-first300-130k.jsonl",
+        "split": "train"
+      }
+    },
+    "normalization": {
+      "plugin": "open-swe-traces",
+      "settings": {}
+    },
+    "selector": {
+      "plugin": "all",
+      "settings": {}
+    },
+    "executor": {
+      "plugin": "openai-chat",
+      "settings": {
+        "base_url": "http://P_IP:18300",
+        "model": "qwen3.8-flash-nvfp4",
+        "stream": true,
+        "max_tokens": 4096,
+        "timeout_seconds": null,
+        "extra_body": {
+          "temperature": 0.1,
+          "reasoning_effort": "xhigh",
+          "chat_template_kwargs": {
+            "enable_thinking": true
+          }
+        }
+      }
+    },
+    "scheduler": {
+      "plugin": "multi-turn-closed-loop",
+      "settings": {
+        "max_active_sessions": 300,
+        "max_concurrency": 200,
+        "stop": {
+          "session_count": 300
+        },
+        "on_exhausted": "error"
+      }
+    },
+    "metrics": {
+      "plugin": "standard",
+      "settings": {
+        "maxtpm": true,
+        "maxtpm_start_percent": 55,
+        "pricing": {
+          "input_price": 0.8,
+          "cached_input_price": 0.1,
+          "output_price": 2.7,
+          "currency": "CNY",
+          "per_tokens": 1000000,
+          "source": "user historical configured price; not realized revenue"
+        }
+      }
+    },
+    "saver": {
+      "plugin": "sqlite",
+      "settings": {
+        "path": "benchmark.db"
+      }
+    },
+    "exporter": {
+      "plugins": [
+        {
+          "plugin": "tabular",
+          "settings": {
+            "excel_path": "native-results.xlsx"
+          }
+        }
+      ]
+    }
+  },
+  "observation": {
+    "enabled": true,
+    "trace_mode": "observe",
+    "sample_rate": 0.1,
+    "trace_export": false
+  }
+}

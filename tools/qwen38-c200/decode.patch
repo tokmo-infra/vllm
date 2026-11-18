@@ -1,0 +1,539 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/base.py b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+index 8997571407d5c327fb9e35d709c2e43a1942f537..13a00e83a5cd5c3158b409d895ce2c0f2dc0e227 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/base.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+@@ -194,6 +194,13 @@ class KVConnectorBase_V1(ABC):
+         """
+         return False
+
++    @classmethod
++    def supports_lookahead_block_hashes(
++        cls, kv_transfer_config: "KVTransferConfig"
++    ) -> bool:
++        """Whether the connector supports core lookahead hashing."""
++        return False
++
+     @property
+     def requires_kv_delivery(self) -> bool:
+         """Whether this connector hands off KV that must be reliably delivered.
+@@ -636,7 +643,7 @@ class KVConnectorBase_V1(ABC):
+         """Called exactly once when a request has finished, before its blocks are
+         freed.
+
+-        The connector may assumes responsibility for freeing the blocks
++        The connector may assume responsibility for freeing the blocks
+         asynchronously by returning True.
+
+         Returns:
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
+index a91167234da41797399432b242e48a8c5df3d99d..4ddb54146db418fb3a1e05e1209ba4e6412b03cc 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py
+@@ -129,6 +129,12 @@ class MooncakeStoreKVEvents(KVConnectorKVEvents):
+ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
+     """KV connector using MooncakeDistributedStore as shared KV pool."""
+
++    @classmethod
++    def supports_lookahead_block_hashes(
++        cls, kv_transfer_config: KVTransferConfig
++    ) -> bool:
++        return True
++
+     @classmethod
+     def supports_sleep_mode(cls, kv_transfer_config: KVTransferConfig) -> bool:
+         config = MooncakeStoreConfig.load_from_config()
+@@ -286,6 +292,8 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
+     ) -> tuple[bool, dict[str, Any] | None]:
+         # An in-flight store job holds its own reference on the blocks it reads,
+         # so a finishing request never has to defer freeing them.
++        assert self.connector_scheduler is not None
++        self.connector_scheduler.register_finished_lookahead_save(request, block_ids)
+         return False, None
+
+     def register_finished_partial_tail(
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
+index 6830baf46122ce0e872839dcbf62ab3ae79c9a21..91222601fd97603f592bde7068ff4c537993a4c0 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/scheduler.py
+@@ -102,7 +102,10 @@ def _partial_tail_non_mamba_puts(
+     # Core drops the Mamba checkpoint whenever EAGLE block drop is on, whichever
+     # groups carry the eagle flag.
+     boundary = get_mamba_prefill_checkpoint_position(
+-        prompt_tokens, hash_block_size, coord.use_eagle
++        prompt_tokens,
++        hash_block_size,
++        coord.use_eagle,
++        coord.num_hash_lookahead_tokens,
+     )
+     # Any other sub-block Mamba hand-off is a shared-prefix junction. Its
+     # attention KV, EAGLE proof included, ends on an attention block end no later
+@@ -206,10 +209,12 @@ class MooncakeStoreScheduler:
+
+         # Per-request state
+         self.load_specs: dict[str, LoadSpec] = {}  # to be loaded
+-        self._request_trackers: dict[str, RequestTracker] = {}  # scheduled new requests
++        # Save progress starts when a request is scheduled for compute.
++        self._request_trackers: dict[str, RequestTracker] = {}
+         self._unfinished_requests: dict[str, tuple[Request, tuple[list[int], ...]]] = {}
+         self._unfinished_request_ids: set[str] = set()
+         self._finished_partial_tail_metas: dict[str, ReqMeta] = {}
++        self._finished_lookahead_metas: dict[str, ReqMeta] = {}
+
+     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
+         self._gpu_block_pool = gpu_block_pool
+@@ -325,8 +330,7 @@ class MooncakeStoreScheduler:
+         preempted_ids = scheduler_output.preempted_req_ids or set()
+         for req_id in preempted_ids:
+             self.load_specs.pop(req_id, None)
+-            if request_tracker := self._request_trackers.get(req_id):
+-                request_tracker.reset()
++            self._request_trackers.pop(req_id, None)
+             self._unfinished_requests.pop(req_id, None)
+
+         meta = MooncakeStoreConnectorMetadata(
+@@ -367,6 +371,7 @@ class MooncakeStoreScheduler:
+             req_meta = ReqMeta.from_request_tracker(
+                 request_tracker,
+                 self._block_size,
++                self._hash_block_size,
+                 load_spec=load_spec,
+                 # A consumer may write decode KV without becoming a prefill
+                 # producer. Loads are still carried by the same metadata.
+@@ -421,6 +426,7 @@ class MooncakeStoreScheduler:
+                     req_meta = ReqMeta.from_request_tracker(
+                         request_tracker,
+                         self._block_size,
++                        self._hash_block_size,
+                         load_spec=load_spec,
+                         skip_save=is_consumer,
+                         block_hashes=request_real.block_hashes,
+@@ -464,6 +470,7 @@ class MooncakeStoreScheduler:
+                     req_meta = ReqMeta.from_request_tracker(
+                         request_tracker,
+                         self._block_size,
++                        self._hash_block_size,
+                         load_spec=None,
+                         skip_save=False,
+                         block_hashes=unfinished_req.block_hashes,
+@@ -496,10 +503,10 @@ class MooncakeStoreScheduler:
+                     allocated_block_ids=block_ids,
+                     num_saved_tokens=0,
+                 )
+-                self._request_trackers[request_id] = request_tracker
+                 req_meta = ReqMeta.from_request_tracker(
+                     request_tracker,
+                     self._block_size,
++                    self._hash_block_size,
+                     load_spec=load_spec,
+                     skip_save=None,
+                     block_hashes=unfinished_req.block_hashes,
+@@ -526,9 +533,12 @@ class MooncakeStoreScheduler:
+         for req_meta in self._finished_partial_tail_metas.values():
+             meta.add_request(req_meta)
+         self._finished_partial_tail_metas.clear()
++        for req_meta in self._finished_lookahead_metas.values():
++            meta.add_request(req_meta)
++        self._finished_lookahead_metas.clear()
+
+         if not self._capacity_only:
+-            self._reference_save_blocks(meta)
++            self._reference_save_blocks(meta.requests)
+         return meta
+
+     def _apply_current_save_block_ids(
+@@ -554,7 +564,7 @@ class MooncakeStoreScheduler:
+                 block_ids[group_id] for group_id in self._store_group_ids
+             )
+
+-    def _reference_save_blocks(self, meta: MooncakeStoreConnectorMetadata) -> None:
++    def _reference_save_blocks(self, requests: list[ReqMeta]) -> None:
+         """Take a GPU block reference for every store job this step emits.
+
+         The worker DMAs out of these blocks after the step that scheduled them,
+@@ -565,7 +575,7 @@ class MooncakeStoreScheduler:
+         coord = self._store_coord
+         assert coord is not None
+         block_sizes = [g.kv_cache_spec.block_size for g in coord.kv_cache_groups]
+-        for req_meta in meta.requests:
++        for req_meta in requests:
+             if not req_meta.can_save:
+                 continue
+             assert pool is not None, (
+@@ -576,6 +586,13 @@ class MooncakeStoreScheduler:
+                 continue
+             if tail := _partial_tail_non_mamba_puts(coord, req_meta, block_sizes):
+                 req_meta.boundary_puts = [*tail, *(req_meta.boundary_puts or [])]
++            if self.enable_kv_events and coord.num_hash_lookahead_tokens:
++                request, _ = self._unfinished_requests[req_meta.req_id]
++                req_meta.num_hash_lookahead_tokens = coord.num_hash_lookahead_tokens
++                req_meta.token_ids = request.get_kv_cache_token_ids(
++                    req_meta.token_ids_start,
++                    req_meta.token_len_chunk + coord.num_hash_lookahead_tokens,
++                )
+             req_meta.store_job_id = store_job_id = self._next_store_job_id
+             self._next_store_job_id += 1
+             block_ids = [put.block_id for put in req_meta.boundary_puts or []]
+@@ -600,6 +617,48 @@ class MooncakeStoreScheduler:
+             self._pinned_saves[store_job_id] = (block_ids, self._num_workers)
+             pool.touch([pool.blocks[block_id] for block_id in block_ids])
+
++    def register_finished_lookahead_save(
++        self,
++        request: Request,
++        block_ids: tuple[list[int], ...],
++    ) -> None:
++        """Pin and queue KV newly eligible for saving after the final hash update."""
++        if self.kv_role == "kv_consumer" and not self.save_decode_cache:
++            return
++        coord = self._store_coord
++        assert coord is not None
++        if not coord.num_hash_lookahead_tokens:
++            return
++        tracker = self._request_trackers.get(request.request_id)
++        if tracker is None or not any(block_ids):
++            return
++        save_limit = (
++            request.num_tokens if self.save_decode_cache else tracker.prefill_end_tokens
++        )
++        in_flight_tokens = (
++            request.num_in_flight_tokens - request.num_stale_output_tokens
++        )
++        completed_tokens = request.num_computed_tokens - in_flight_tokens
++        tracker.token_len = min(completed_tokens, save_limit)
++        if tracker.token_ids is not None:
++            tracker.token_ids = request.all_token_ids[: tracker.token_len]
++        req_meta = ReqMeta.from_request_tracker(
++            tracker,
++            self._block_size,
++            self._hash_block_size,
++            block_hashes=request.block_hashes,
++            num_prompt_tokens=request.num_prompt_tokens,
++        )
++        if req_meta is None:
++            return
++        assert request.request_id not in self._finished_lookahead_metas
++        req_meta.block_ids = tuple(
++            block_ids[group_id].copy() for group_id in self._store_group_ids
++        )
++        self._reference_save_blocks([req_meta])
++        if req_meta.store_job_id in self._pinned_saves:
++            self._finished_lookahead_metas[request.request_id] = req_meta
++
+     def register_finished_partial_tail(
+         self,
+         request: Request,
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+index 3561b66e66b5b3c2e29aaabc8cda6cd16a8159ca..7b9ec53e72e66698ac0637da4d457d513b30c3f6 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
+@@ -11,6 +11,7 @@ and MooncakeDistributedStore integration.
+ """
+
+ import dataclasses
++import hashlib
+ import math
+ import os
+ import queue
+@@ -59,6 +60,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.layout import (
+     KeyMetadata,
+     MambaStoreLayout,
+     PoolKey,
++    RankLocalStoreLayout,
+     StoreLayout,
+     StoreShardId,
+     TokenMajorStoreLayout,
+@@ -77,6 +79,7 @@ from vllm.utils.math_utils import cdiv
+ from vllm.utils.network_utils import get_ip, make_zmq_socket
+ from vllm.utils.torch_utils import is_non_overlapping_and_dense
+ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
++from vllm.v1.attention.ops.qsa_nvfp4 import qsa_nvfp4_page_region
+ from vllm.v1.core.kv_cache_utils import (
+     BlockHash,
+     maybe_convert_block_hash,
+@@ -840,8 +843,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
+                 retry_token_ids = self._get_retry_token_ids(req_meta)
+                 if retry_token_ids is not None and event_token_ids is not None:
+                     retry_start, retry_ids = retry_token_ids
+-                    if retry_start + len(retry_ids) == token_ids_start:
+-                        event_token_ids = retry_ids + event_token_ids
++                    if retry_start <= token_ids_start <= retry_start + len(retry_ids):
++                        event_token_ids = (
++                            retry_ids[: token_ids_start - retry_start] + event_token_ids
++                        )
+                         token_ids_start = retry_start
+
+             if self._should_skip_request(req_id):
+@@ -1118,9 +1123,21 @@ class KVCacheStoreSendingThread(KVTransferThread):
+                         event_token_ids[s - token_ids_start : end - token_ids_start]
+                         if event_token_ids is not None
+                         and token_ids_start <= s
+-                        and end <= token_ids_end
++                        and end + req_meta.num_hash_lookahead_tokens <= token_ids_end
+                         else []
+                     )
++                    lookahead_token_ids = None
++                    if (
++                        token_ids
++                        and req_meta.num_hash_lookahead_tokens
++                        and event_token_ids is not None
++                    ):
++                        offset = end - token_ids_start
++                        lookahead_token_ids = [
++                            event_token_ids[
++                                offset : offset + req_meta.num_hash_lookahead_tokens
++                            ]
++                        ]
+                     stored_events.append(
+                         BlockStored(
+                             block_hashes=[maybe_convert_block_hash(block_hash)],
+@@ -1134,6 +1151,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
+                                 else None
+                             ),
+                             token_ids=token_ids,
++                            lookahead_token_ids=lookahead_token_ids,
+                             block_size=db.chunk_size,
+                             lora_id=None,
+                             medium="cpu",
+@@ -1523,6 +1541,7 @@ class MooncakeStoreWorker:
+             and not self.can_put
+         )
+         self.cache_config = vllm_config.cache_config
++        self._cache_owners = vllm_config.compilation_config.static_forward_context
+         self._is_hma_required = len(kv_cache_config.kv_cache_groups) > 1
+         self.block_size, self.hash_block_size = resolve_kv_cache_block_sizes(
+             kv_cache_config, vllm_config
+@@ -1980,6 +1999,69 @@ class MooncakeStoreWorker:
+                 for g_idx in range(len(self.token_dbs))
+             )
+
++    def _register_qsa_nvfp4_regions(self, caches: dict[str, torch.Tensor]) -> None:
++        if (self.tp_size, self.pp_size, self.pcp_size, self.dcp_size) != (1, 1, 1, 1):
++            raise ValueError("QSA NVFP4 Store requires TP1, PP1, PCP1 and DCP1")
++        if (
++            self._kv_cache_config.hisparse_host_num_blocks is not None
++            or self.coord.enable_partial_hash_hits
++            or self.store_tp_size is not None
++        ):
++            raise ValueError("QSA NVFP4 Store requires rank-local full device pages")
++
++        buffers: dict[int, int] = {}
++        group_regions: list[list[tuple[int, int, int]]] = []
++        schema = []
++        for group in self._kv_cache_groups:
++            group_spec = group.kv_cache_spec
++            per_layer = getattr(group_spec, "kv_cache_specs", {})
++            regions = []
++            group_schema = []
++            for name in sorted(group.layer_names):
++                spec = per_layer.get(name, group_spec)
++                layer_cache = caches[name]
++                views = layer_cache if isinstance(layer_cache, list) else [layer_cache]
++                packed = isinstance(spec, AttentionSpec) and spec.kv_quant_mode.is_nvfp4
++                if packed and len(views) != 1:
++                    raise ValueError(f"Packed QSA requires one view: {name}")
++                for view in views:
++                    cache = group_kernel_blocks(view, self.num_blocks)
++                    if not is_non_overlapping_and_dense(cache[0]):
++                        raise ValueError(f"QSA NVFP4 Store needs a dense view: {name}")
++                    stride, size = cache.stride(0) * cache.element_size(), cache[0].nbytes
++                    abi = None
++                    if packed:
++                        owner = self._cache_owners[name]
++                        region = qsa_nvfp4_page_region(
++                            cache, spec, (owner._k_scale_float, owner._v_scale_float)
++                        )
++                        abi = region.abi
++                    if not 0 < size <= stride:
++                        raise ValueError(f"QSA NVFP4 Store payload/stride mismatch: {name}")
++                    storage = cache.untyped_storage()
++                    buffers[storage.data_ptr()] = storage.nbytes()
++                    regions.append((cache.data_ptr(), stride, size))
++                    group_schema.append(
++                        (name, str(cache.dtype), tuple(cache.shape[1:]), cache.stride()[1:], abi)
++                    )
++            group_regions.append(regions)
++            schema.append(group_schema)
++
++        digest = hashlib.sha256(repr(schema).encode()).hexdigest()
++        for base, size in buffers.items():
++            if self.store.register_buffer(base, size) != 0:
++                raise RuntimeError("Mooncake QSA NVFP4 buffer registration failed")
++            self._device_regions[base] = size
++        for db, regions in zip(self.token_dbs, group_regions, strict=True):
++            namespace = f"{db.metadata.store_namespace}@store_format:qsa-nvfp4-v1:{digest}"
++            db.metadata = dataclasses.replace(db.metadata, store_namespace=namespace)
++            layout = RankLocalStoreLayout(
++                db.metadata, db.store_layout.block_size, db.hash_block_size
++            )
++            layout.register_page_regions(regions)
++            db.store_layout = layout
++        self._init_lookup_key_prefixes()
++
+     def register_kv_caches(
+         self,
+         kv_caches: dict[str, torch.Tensor],
+@@ -2001,7 +2083,15 @@ class MooncakeStoreWorker:
+         self.num_blocks = self.cache_config.num_gpu_blocks
+         use_group_regions = self._kv_cache_config.hisparse_host_num_blocks is not None
+
+-        if not use_group_regions:
++        qsa_nvfp4 = self.cache_config.cache_dtype == "nvfp4" and any(
++            getattr(self._cache_owners.get(name), "nvfp4_page_size", None) is not None
++            for group in self._kv_cache_groups
++            for name in group.layer_names
++        )
++        if qsa_nvfp4:
++            self._register_qsa_nvfp4_regions(kv_caches)
++            use_group_regions = False
++        elif not use_group_regions:
+             store_layer_names = {
+                 layer_name
+                 for group in self._kv_cache_groups
+@@ -2370,9 +2460,15 @@ class MooncakeStoreWorker:
+         for req_id in meta.preempted_req_ids:
+             self.kv_send_thread.delete_finished_stored_request(req_id)
+
++        pending_save_req_ids = {
++            request.req_id for request in meta.requests if request.can_save
++        }
+         for req_id in finished_req_ids | self.finished_store_req:
+-            if self.kv_send_thread.stored_requests.get(req_id):
+-                # Queued jobs still need the resume offset; retire on a later step.
++            if (
++                req_id in pending_save_req_ids
++                or self.kv_send_thread.stored_requests.get(req_id)
++            ):
++                # Current or queued saves still need the request's bookkeeping.
+                 self.finished_store_req.add(req_id)
+             else:
+                 self.finished_store_req.discard(req_id)
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
+index 70f9454a62b35b73451966fe51a6f1a8c8681c8f..e56bfbef3b862dbddd250922d21c8125f8f16aa0 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py
+@@ -216,6 +216,24 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
+             c.supports_divergent_local_hybrid_hits for c in self._connectors
+         )
+
++    @classmethod
++    def supports_lookahead_block_hashes(
++        cls, kv_transfer_config: "KVTransferConfig"
++    ) -> bool:
++        connectors_config = kv_transfer_config.kv_connector_extra_config.get(
++            "connectors", []
++        )
++        if not connectors_config:
++            return False
++        for conn_config in connectors_config:
++            child_config = KVTransferConfig(
++                **{"engine_id": kv_transfer_config.engine_id, **conn_config}
++            )
++            connector_cls = KVConnectorFactory.get_connector_class(child_config)
++            if not connector_cls.supports_lookahead_block_hashes(child_config):
++                return False
++        return True
++
+     @property
+     def requires_kv_delivery(self) -> bool:
+         return any(c.requires_kv_delivery for c in self._connectors)
+diff --git a/vllm/v1/worker/gpu/async_utils.py b/vllm/v1/worker/gpu/async_utils.py
+index 46182b7854edd96ca1a9f849c1a2a1462580c91b..7e8591983e229b71e1afddfe4206df60cce57842 100644
+--- a/vllm/v1/worker/gpu/async_utils.py
++++ b/vllm/v1/worker/gpu/async_utils.py
+@@ -171,6 +171,13 @@ class AsyncOutput(AsyncModelRunnerOutput):
+                 self._has_fault = has_fault.to("cpu", non_blocking=True)
+             self.copy_event.record(copy_stream)
+
++    def wait_for_compute(
++        self, main_stream: torch.cuda.Stream, copy_stream: torch.cuda.Stream
++    ) -> None:
++        """Include late GPU writes in output readiness without delaying D2H."""
++        copy_stream.wait_stream(main_stream)
++        self.copy_event.record(copy_stream)
++
+     def get_output(self) -> ModelRunnerOutput:
+         self.copy_event.synchronize()
+
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 95f4c9d8a0d81b160f0bd60daa571fae7179a354..5d07938cea0d039851025abc2c28e4959e5c445a 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -276,6 +276,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         self.ec_connector = get_ec_connector(vllm_config, self.encoder_cache)
+
+         self.num_speculative_steps = vllm_config.num_speculative_tokens
++        self.mtp_context_only = vllm_config.qwen38_p_mtp_context_only
+         num_prefill_lookahead = max(1, vllm_config.num_prefill_lookahead_tokens)
+         use_dense_all_token_ids = (
+             self.speculative_config is not None
+@@ -292,6 +293,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             device=self.device,
+             num_prefill_lookahead=num_prefill_lookahead,
+             use_dense_all_token_ids=use_dense_all_token_ids,
++            mtp_context_only=self.mtp_context_only,
+         )
+
+         # Speculative decoding.
+@@ -1259,6 +1261,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 all_token_ids=new_req_data.prefill_token_ids,
+                 num_computed_tokens=new_req_data.num_computed_tokens,
+                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
++                mtp_context_next_token_id=new_req_data.mtp_context_next_token_id,
+             )
+             req_index = self.req_states.req_id_to_index[req_id]
+             if self.adaptive_verification is not None:
+@@ -1610,6 +1613,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             cu_num_logits_np=cu_num_logits_np,
+             has_structured_output_reqs=scheduler_output.has_structured_output_requests,
+             prompt_lens=prompt_lens,
++            mtp_context_next_token_ids=(
++                self.req_states.mtp_context_next_token_ids.gpu
++                if self.req_states.mtp_context_next_token_ids is not None
++                else None
++            ),
+             fast_prefill=fast_prefill,
+             max_query_len=(
+                 int(num_scheduled_tokens_upper_bound.max())
+@@ -2149,6 +2157,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             if dp_sync_state is not None
+             else scheduler_output.skip_drafts
+         )
++        if self.mtp_context_only:
++            skip_drafts = True
+         self.execute_model_state = ExecuteModelState(
+             input_batch=input_batch,
+             attn_metadata=attn_metadata,
+@@ -2346,19 +2356,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     dp_sync_state=dp_sync_state,
+                     mm_inputs=mm_inputs,
+                 )
+-            if self.pcp_manager is not None:
+-                self.pcp_manager.sync_drafts(
+-                    draft_tokens, input_batch.idx_mapping, self.speculator.draft_logits
+-                )
+-            if num_spec_tokens < self.num_speculative_steps:
+-                draft_tokens[:, num_spec_tokens:] = -1
+-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
++            if self.mtp_context_only:
++                # Keep the early D2H copy; publish only after context writes finish.
++                async_output.wait_for_compute(self.main_stream, self.output_copy_stream)
++            else:
++                if self.pcp_manager is not None:
++                    self.pcp_manager.sync_drafts(
++                        draft_tokens,
++                        input_batch.idx_mapping,
++                        self.speculator.draft_logits,
++                    )
++                if num_spec_tokens < self.num_speculative_steps:
++                    draft_tokens[:, num_spec_tokens:] = -1
++                self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+             if self.adaptive_verification is not None:
+                 self.adaptive_verification.record_confidences(
+                     self.speculator.draft_token_confidence_probs, input_batch
+                 )
+
+-        if self.num_speculative_steps > 0:
++        if self.num_speculative_steps > 0 and not self.mtp_context_only:
+             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
+             # not have a speculator (i.e. self.speculator is None)
+             draft_tokens = self.req_states.draft_tokens[input_batch.idx_mapping]

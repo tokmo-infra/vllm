@@ -1,0 +1,15 @@
+
+FROM vllm-openai AS qwen38-openai
+
+# D uses the built wheel. P shares its binary extensions and unchanged files.
+COPY qwen38-build/prefill/vllm/ /opt/qwen38-patch/vllm/
+COPY qwen38-build/prefill.sha256 qwen38-build/decode.sha256 /opt/qwen38-patch/
+RUN mkdir -p /opt/qwen38-prefill \
+    && cp -al /usr/local/lib/python3.12/dist-packages/vllm /opt/qwen38-prefill/vllm \
+    && cp -r --remove-destination /opt/qwen38-patch/vllm/. /opt/qwen38-prefill/vllm/ \
+    && find /opt/qwen38-prefill/vllm -name '*.pyc' -delete \
+    && (cd /usr/local/lib/python3.12/dist-packages && sha256sum --quiet -c /opt/qwen38-patch/decode.sha256) \
+    && (cd /opt/qwen38-prefill && sha256sum --quiet -c /opt/qwen38-patch/prefill.sha256)
+COPY qwen38-build/entrypoint.sh /usr/local/bin/qwen38-serve
+RUN chmod 755 /usr/local/bin/qwen38-serve
+ENTRYPOINT ["/usr/local/bin/qwen38-serve"]

@@ -1,0 +1,2955 @@
+diff --git a/vllm/config/kv_transfer.py b/vllm/config/kv_transfer.py
+index 59eb4c80be2da41d792b59ac4df34e67c3e33c89..354c91815ffb41acb2a40d0f15c6256ef2ee94a9 100644
+--- a/vllm/config/kv_transfer.py
++++ b/vllm/config/kv_transfer.py
+@@ -5,13 +5,16 @@ import uuid
+ from dataclasses import field
+ from typing import Any, Literal, get_args
+
+-from vllm.config.utils import config
++from vllm.config.utils import config, replace
+ from vllm.utils.hashing import safe_hash
+
+ KVProducer = Literal["kv_producer", "kv_both"]
+ KVConsumer = Literal["kv_consumer", "kv_both"]
+ KVRole = Literal[KVProducer, KVConsumer]
+
++QWEN38_MTP_CONTEXT_STORE_NAMESPACE = "qwen38-mtp-context-v1/"
++QWEN38_NVFP4_MTP_STORE_NAMESPACE = QWEN38_MTP_CONTEXT_STORE_NAMESPACE + "nvfp4-main-v1/"
++
+
+ def hisparse_host_pool_gib(
+     kv_transfer_config: "KVTransferConfig | None",
+@@ -146,3 +149,84 @@ class KVTransferConfig:
+             child.get("kv_connector") == connector_name
+             for child in self.kv_connector_extra_config.get("connectors", [])
+         )
++
++    def is_dedicated_mooncake_producer(self) -> bool:
++        """Recognize a P2P-only producer, optionally backed by shared Store."""
++        if self.kv_connector == "MooncakeConnector":
++            return self.kv_role == "kv_producer" and not self.kv_connector_module_path
++        if self.kv_connector != "MultiConnector" or self.kv_connector_module_path:
++            return False
++        children = self.get_from_extra_config("connectors", [])
++        if any(child.get("kv_connector_module_path") for child in children):
++            return False
++        p2p = [c for c in children if c.get("kv_connector") == "MooncakeConnector"]
++        store = [
++            c for c in children if c.get("kv_connector") == "MooncakeStoreConnector"
++        ]
++        return (
++            len(p2p) == 1
++            and p2p[0].get("kv_role") == "kv_producer"
++            and len(store) <= 1
++            and len(children) == len(p2p) + len(store)
++            and self.kv_role in ("kv_producer", "kv_both")
++        )
++
++    def uses_qwen38_mtp_context_store_prefix(
++        self, namespace: str = QWEN38_MTP_CONTEXT_STORE_NAMESPACE
++    ) -> bool:
++        """Whether a Store uses the reserved prompt-tail provenance namespace."""
++        store_configs = [self.kv_connector_extra_config]
++        if self.kv_connector == "MultiConnector":
++            store_configs = [
++                child.get("kv_connector_extra_config", {})
++                for child in self.get_from_extra_config("connectors", [])
++                if child.get("kv_connector") == "MooncakeStoreConnector"
++            ]
++        elif self.kv_connector != "MooncakeStoreConnector":
++            return False
++        return any(
++            isinstance(prefix := config.get("cache_prefix"), str)
++            and prefix.startswith(namespace)
++            for config in store_configs
++        )
++
++    def with_qwen38_nvfp4_mtp_store_prefix(
++        self, draft_dtype: str
++    ) -> "KVTransferConfig":
++        """Isolate mixed-KV MTP provenance without changing the supplied prefix."""
++        namespace = f"{QWEN38_NVFP4_MTP_STORE_NAMESPACE}{draft_dtype}/"
++        if not self.has_connector("MooncakeStoreConnector"):
++            return self
++        if self.kv_connector != "MultiConnector":
++            raise ValueError("Qwen3.8 NVFP4 MTP Store requires a Mooncake P/D pair")
++        children = self.get_from_extra_config("connectors", [])
++        updated = []
++        for child in children:
++            if child.get("kv_connector") == "MooncakeStoreConnector":
++                extra = child.get("kv_connector_extra_config", {})
++                prefix = extra.get("cache_prefix", "")
++                if not isinstance(prefix, str):
++                    raise ValueError("Mooncake Store cache_prefix must be a string")
++                if prefix.startswith(QWEN38_NVFP4_MTP_STORE_NAMESPACE) and (
++                    not prefix.startswith(namespace) or prefix == namespace
++                ):
++                    raise ValueError("Incompatible Qwen3.8 NVFP4 MTP Store namespace")
++                if not prefix.startswith(namespace):
++                    suffix = f"named/{prefix}" if prefix else "default"
++                    child = {
++                        **child,
++                        "kv_connector_extra_config": {
++                            **extra,
++                            "cache_prefix": namespace + suffix,
++                        },
++                    }
++            updated.append(child)
++        if children == updated:
++            return self
++        return replace(
++            self,
++            kv_connector_extra_config={
++                **self.kv_connector_extra_config,
++                "connectors": updated,
++            },
++        )
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index 70ecfd1ccf9b720b87f30b503c02dfc48ddb5bd4..8bf451f0ee4bfb3c29c72ca7c1b0e90fa191ad3a 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -481,6 +481,13 @@ class SpeculativeConfig:
+     """Users should pass "draft_tensor_parallel_size". This parameter's purpose is to
+     warn users when they mistakenly provide the wrong argument."""
+
++    qwen38_p_mtp_context_only: bool = False
++    """Build MTP context without generating drafts on a dedicated Qwen3.8
++    Flash-Next Mooncake prefill producer. Leave disabled on D and coupled."""
++
++    qwen38_main_nvfp4: bool = field(default=False, init=False, repr=False)
++    """Internal marker preserved when deriving the native draft KV config."""
++
+     # Draft model configuration
+     quantization: me_quant.QuantizationMethods | str | None = None
+     """Quantization method that was used to quantize the draft model weights.
+@@ -733,6 +740,10 @@ class SpeculativeConfig:
+         # they return intermediate hidden states in addition to the final hidden state.
+         uses_aux_hidden_states = self.uses_aux_hidden_states
+         factors.append(uses_aux_hidden_states)
++        if self.qwen38_p_mtp_context_only:
++            factors.append("qwen38_p_mtp_context_only")
++        if self.qwen38_main_nvfp4:
++            factors.append(("qwen38_main_nvfp4", self.qwen38_draft_kv_dtype()))
+
+         if self.draft_model_config is not None:
+             factors.append(self.draft_model_config.compute_hash())
+@@ -1614,6 +1625,15 @@ class SpeculativeConfig:
+
+         return draft_parallel_config
+
++    def qwen38_draft_kv_dtype(self) -> CacheDType | str:
++        """Keep the Qwen draft QSA main cache independent of packed target KV."""
++        dtype = self.kv_cache_dtype
++        if dtype in (None, "fp8", "fp8_e4m3"):
++            return "fp8_e4m3"
++        if dtype not in ("auto", "bfloat16"):
++            raise ValueError("Qwen3.8 NVFP4 target KV requires native draft QSA KV")
++        return dtype
++
+     def apply_draft_overrides(self, vllm_config: VllmConfig) -> VllmConfig:
+         """Overlay this config's kernel overrides onto a target VllmConfig.
+
+@@ -1621,7 +1641,12 @@ class SpeculativeConfig:
+         target resolved.
+         """
+         for src, config_name, dst in _DRAFT_VLLM_CONFIG_OVERRIDES:
+-            if (value := getattr(self, src)) is not None:
++            value = (
++                self.qwen38_draft_kv_dtype()
++                if src == "kv_cache_dtype" and self.qwen38_main_nvfp4
++                else getattr(self, src)
++            )
++            if value is not None:
+                 sub_config = replace(getattr(vllm_config, config_name), **{dst: value})
+                 vllm_config = replace(vllm_config, **{config_name: sub_config})
+         return vllm_config
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index c871b225b6215276c3efb1fcc93ac320d08011f0..019b03a48d295465aff84104d81d407f7bdc85e4 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -39,7 +39,7 @@ from .ec_transfer import ECTransferConfig
+ from .engram import EngramConfig, model_has_engram_layers
+ from .kernel import KernelConfig
+ from .kv_events import KVEventsConfig
+-from .kv_transfer import KVTransferConfig
++from .kv_transfer import QWEN38_NVFP4_MTP_STORE_NAMESPACE, KVTransferConfig
+ from .load import LoadConfig
+ from .logging import LoggingConfig
+ from .lora import LoRAConfig
+@@ -398,6 +398,8 @@ class VllmConfig:
+     """LoRA configuration."""
+     speculative_config: SpeculativeConfig | None = None
+     """Speculative decoding configuration."""
++    num_hash_lookahead_tokens: int = Field(default=0, init=False)
++    """Tokens after each block covered by its hash; zero keeps legacy hashes."""
+     watermark_config: WatermarkConfig | None = None
+     """Text watermarking configuration."""
+     diffusion_config: DiffusionConfig | None = None
+@@ -546,6 +548,8 @@ class VllmConfig:
+             vllm_factors.append(self.speculative_config.compute_hash())
+         else:
+             vllm_factors.append("None")
++        if self.qwen38_nvfp4_p_mtp_required:
++            vllm_factors.append("qwen38_nvfp4_p_mtp_context_only")
+         if self.structured_outputs_config:
+             vllm_factors.append(self.structured_outputs_config.compute_hash())
+         if self.profiler_config:
+@@ -637,6 +641,170 @@ class VllmConfig:
+             return self.diffusion_config.canvas_length
+         return 0
+
++    @property
++    def qwen38_nvfp4_p_mtp_required(self) -> bool:
++        spec = self.speculative_config
++        kv = self.kv_transfer_config
++        return (
++            spec is not None
++            and spec.qwen38_main_nvfp4
++            and kv is not None
++            and kv.is_dedicated_mooncake_producer()
++        )
++
++    @property
++    def qwen38_p_mtp_context_only(self) -> bool:
++        spec = self.speculative_config
++        required = self.qwen38_nvfp4_p_mtp_required
++        if spec is None or not (spec.qwen38_p_mtp_context_only or required):
++            return False
++        draft = spec.draft_model_config
++        assert draft is not None
++        # A multi-module chain can need the preceding module's complete
++        # output to build context for the next module, even with no proposals.
++        return (
++            current_platform.is_cuda()
++            and getattr(draft.hf_text_config, "mtp_num_hidden_layers", 1) == 1
++            and not spec.use_multi_module_mtp()
++            and self.parallel_config.pipeline_parallel_size == 1
++            and not spec.enable_adaptive_verification
++            and spec.draft_lm_head_quantization is None
++            and not spec.use_local_argmax_reduction
++            and spec.draft_sample_method != "probabilistic"
++            and (
++                draft.quantization in (None, "fp8")
++                or (required and draft.quantization == "modelopt_mixed")
++            )
++            # Prepacked state requires the native model layout.
++            and (spec.draft_load_config or self.load_config).load_format
++            in ("auto", "hf", "safetensors", "pt")
++        )
++
++    def _resolve_qwen38_mixed_mtp_kv(self) -> None:
++        spec = self.speculative_config
++        model = self.model_config
++        if (
++            self.cache_config.cache_dtype != "nvfp4"
++            or model is None
++            or model.architecture
++            not in ("Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration")
++            or spec is None
++            or spec.method != "mtp"
++            or spec.draft_model_config is None
++            or "Qwen4ExpMTP" not in spec.draft_model_config.architectures
++        ):
++            return
++        draft_dtype = spec.qwen38_draft_kv_dtype()
++        spec = copy.copy(spec)
++        spec.qwen38_main_nvfp4 = True
++        self.speculative_config = spec
++        if self.kv_transfer_config is not None:
++            self.kv_transfer_config = (
++                self.kv_transfer_config.with_qwen38_nvfp4_mtp_store_prefix(draft_dtype)
++            )
++
++    def _validate_qwen38_p_mtp_context(self) -> None:
++        spec = self.speculative_config
++        kv = self.kv_transfer_config
++        required = self.qwen38_nvfp4_p_mtp_required
++        isolated_store = kv is not None and kv.uses_qwen38_mtp_context_store_prefix()
++        if (
++            kv is not None
++            and kv.uses_qwen38_mtp_context_store_prefix(
++                QWEN38_NVFP4_MTP_STORE_NAMESPACE
++            )
++            and not (spec is not None and spec.qwen38_main_nvfp4)
++        ):
++            raise ValueError("Qwen3.8 NVFP4 MTP Store requires mixed target/draft KV")
++        if isolated_store and self.num_hash_lookahead_tokens != 1:
++            raise ValueError(
++                "Qwen3.8 MTP context Store requires one hash lookahead token"
++            )
++        if required and not self.qwen38_p_mtp_context_only:
++            raise ValueError(
++                "Qwen3.8 NVFP4 Mooncake P requires active MTP context-only mode "
++                "(CUDA, one actual MTP module, PP=1, supported weights and loader, "
++                "no draft-head/verification overrides). Native fallback is disabled."
++            )
++        if (
++            spec is not None
++            and spec.qwen38_main_nvfp4
++            and kv is not None
++            and kv.has_connector("MooncakeConnector")
++            and self.num_hash_lookahead_tokens != 1
++        ):
++            raise ValueError(
++                "Qwen3.8 NVFP4 Mooncake P/D requires one hash lookahead token"
++            )
++        if isolated_store and not self.qwen38_p_mtp_context_only:
++            assert kv is not None
++            # A native D may read the new namespace. A legacy P must never
++            # populate it with KV conditioned on its synthetic sampled output.
++            children = kv.get_from_extra_config("connectors", [])
++            if (
++                kv.kv_connector != "MultiConnector"
++                or kv.kv_connector_module_path
++                or any(c.get("kv_connector_module_path") for c in children)
++                or [
++                    c.get("kv_role")
++                    for c in children
++                    if c.get("kv_connector") == "MooncakeConnector"
++                ]
++                != ["kv_consumer"]
++            ):
++                raise ValueError(
++                    "Only Qwen3.8 MTP context-only P and its native Mooncake D "
++                    "may use the reserved Store cache_prefix"
++                )
++        if spec is None or not (spec.qwen38_p_mtp_context_only or required):
++            return
++        model = self.model_config
++        draft = spec.draft_model_config
++        if (
++            spec.method != "mtp"
++            or draft is None
++            or "Qwen4ExpMTP" not in draft.architectures
++            or model is None
++            or not set(model.architectures).intersection(
++                {
++                    "Qwen4ExpForCausalLM",
++                    "Qwen4ExpForConditionalGeneration",
++                    "Qwen4ExpMTP",
++                }
++            )
++            or model.using_transformers_backend()
++        ):
++            raise ValueError("qwen38_p_mtp_context_only requires native Qwen3.8 MTP")
++        if kv is None or not kv.is_dedicated_mooncake_producer():
++            raise ValueError(
++                "qwen38_p_mtp_context_only requires a dedicated Mooncake P2P producer"
++            )
++        if not self.use_v2_model_runner:
++            raise ValueError("qwen38_p_mtp_context_only requires Model Runner V2")
++        if not self.qwen38_p_mtp_context_only:
++            logger.info_once(
++                "Qwen3.8 P-only MTP slimming is unavailable for this configuration; "
++                "keeping the full native drafter."
++            )
++            return
++        if self.num_hash_lookahead_tokens != 1:
++            raise ValueError(
++                "qwen38_p_mtp_context_only requires one hash lookahead token; "
++                "do not disable lookahead hashes or EAGLE-style block drop"
++            )
++        if kv.has_connector("MooncakeStoreConnector") and not isolated_store:
++            raise ValueError(
++                "qwen38_p_mtp_context_only requires a fresh Mooncake Store "
++                "cache_prefix of qwen38-mtp-context-v1/<deployment>"
++            )
++        if required:
++            logger.info_once(
++                "Qwen3.8 NVFP4 Mooncake P: MTP context-only enabled "
++                "(configured proposal depth=%d; draft KV=%s).",
++                self.num_speculative_tokens,
++                spec.qwen38_draft_kv_dtype(),
++            )
++
+     @property
+     def num_lookahead_tokens(self) -> int:
+         """KV slots to reserve past the tokens the target model is scheduled for.
+@@ -670,19 +838,25 @@ class VllmConfig:
+             return 0
+         return speculative_config.speculator_config.num_prefill_lookahead_tokens
+
+-    @property
+-    def num_hash_lookahead_tokens(self) -> int:
+-        """Tokens after each block that its hash covers; 0 keeps the legacy hashes."""
++    def _resolve_num_hash_lookahead_tokens(self) -> int:
++        """Resolve the hash lookahead after the relevant configs are finalized."""
+         speculative_config = self.speculative_config
+         if (
+             speculative_config is None
+             or not speculative_config.use_eagle_block_drop()
+             or speculative_config.disable_lookahead_block_hashes
+-            or not self.cache_config.enable_prefix_caching
+         ):
+             return 0
+-        # KV connectors, including HiSparse's, keep the legacy hashes.
+-        if self.kv_transfer_config is not None:
++        kv_transfer_config = self.kv_transfer_config
++        if kv_transfer_config is not None:
++            from vllm.distributed.kv_transfer.kv_connector.factory import (
++                KVConnectorFactory,
++            )
++
++            connector_cls = KVConnectorFactory.get_connector_class(kv_transfer_config)
++            if not connector_cls.supports_lookahead_block_hashes(kv_transfer_config):
++                return 0
++        elif not self.cache_config.enable_prefix_caching:
+             return 0
+         # The drafter's KV at a block's last position reads this far ahead.
+         return self.num_prefill_lookahead_tokens
+@@ -1540,6 +1714,7 @@ class VllmConfig:
+             # with_hf_config() view: the parent config was already validated,
+             # and this view's empty architecture list makes the model-dependent checks
+             # below unsafe (e.g. use_mla resolves the architecture registry).
++            self.num_hash_lookahead_tokens = self._resolve_num_hash_lookahead_tokens()
+             return
+
+         self._resolve_mm_encoder_only()
+@@ -2264,6 +2439,7 @@ class VllmConfig:
+         # Resolve kv_offloading-derived connector name into kv_transfer_config
+         # before the HMA check below, which inspects the connector class.
+         self._post_init_kv_transfer_config()
++        self._resolve_qwen38_mixed_mtp_kv()
+         self._verify_aux_output_compatibility()
+
+         # Hybrid KV cache manager (HMA) runtime rules:
+@@ -2383,6 +2559,8 @@ class VllmConfig:
+                 )
+         # Log the custom passes that are enabled
+         self.compilation_config.pass_config.log_enabled_passes()
++        self.num_hash_lookahead_tokens = self._resolve_num_hash_lookahead_tokens()
++        self._validate_qwen38_p_mtp_context()
+
+     def _set_max_num_scheduled_tokens(self):
+         """In most cases, the scheduler may schedule a batch with as many tokens as the
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
+index 769a4a0322db0e12627854138260d665fc917e74..261b123aa0880c0078da47939159a31d5c7c39a5 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
+@@ -66,6 +66,7 @@ from vllm.utils.network_utils import get_ip, make_zmq_path, make_zmq_socket
+ from vllm.utils.torch_utils import is_non_overlapping_and_dense
+ from vllm.v1.attention.backend import AttentionMetadata
+ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
++from vllm.v1.attention.ops.qsa_nvfp4 import qsa_nvfp4_page_region
+ from vllm.v1.core.sched.output import SchedulerOutput
+ from vllm.v1.kv_cache_interface import (
+     AttentionSpec,
+@@ -651,6 +652,7 @@ class MooncakeXferMetadata(
+     # Random per register_kv_caches, so ids never repeat across restarts.
+     # 0 means the peer sends the layout on every pull.
+     layout_id: int = 0
++    nvfp4_page_abis: dict[str, str] = msgspec.field(default_factory=dict)
+
+
+ class MooncakeXferResponseStatus(IntEnum):
+@@ -772,6 +774,12 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
+ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
+     _cache_hit_source = CacheHitSource.P2P
+
++    @classmethod
++    def supports_lookahead_block_hashes(
++        cls, kv_transfer_config: "KVTransferConfig"
++    ) -> bool:
++        return True
++
+     def __init__(
+         self,
+         vllm_config: VllmConfig,
+@@ -1084,17 +1092,14 @@ class MooncakeConnectorScheduler:
+             # loads nothing on the decoder, which recomputes past its local hit.
+             and not request.skip_reading_external_kv
+         ):
+-            if request.prompt_token_ids is not None:
+-                request.prompt_token_ids.pop()
+-            elif request.prompt_embeds is not None:
+-                request.prompt_embeds = request.prompt_embeds[:-1]
+-            else:
+-                return
+-
+-            request._all_token_ids.pop()
+-            request.num_prompt_tokens -= 1
+-            request.max_tokens = 1
+-            params["_p_side_truncated"] = True
++            hash_block_size = self.kv_cache_config.hash_block_size
++            assert hash_block_size is not None
++            if request.truncate_prompt_for_remote_prefill(
++                hash_block_size,
++                self.vllm_config.num_hash_lookahead_tokens,
++                retain_mtp_context=self.vllm_config.qwen38_p_mtp_context_only,
++            ):
++                params["_p_side_truncated"] = True
+
+     def on_new_request(self, request: "Request") -> None:
+         params = request.kv_transfer_params
+@@ -1411,6 +1416,7 @@ class MooncakeConnectorWorker:
+             tuple, tuple[list[TransferRegion], list[TransferRegion]]
+         ] = OrderedDict()
+         self._kv_layout_id = 0
++        self.nvfp4_page_abis: dict[str, str] = {}
+         # Decode side: worker addresses that echoed the current layout_id.
+         self._acked_layout_peers: set[str] = set()
+
+@@ -1711,6 +1717,13 @@ class MooncakeConnectorWorker:
+         self, identity: bytes, sock: zmq.asyncio.Socket, meta: MooncakeXferMetadata
+     ):
+         pending_reqs: dict[ReqId, SendBlockMeta] = {}
++        if self.nvfp4_page_abis != meta.nvfp4_page_abis:
++            response = MooncakeXferResponse(
++                status=MooncakeXferResponseStatus.ERROR,
++                err_msg="Mooncake QSA NVFP4 page layout or global scale mismatch.",
++            )
++            await sock.send_multipart((identity, self._encoder.encode(response)))
++            return
+         remote_tp_ranks = self.transfer_topo.handshake_target_ranks(meta.remote_tp_size)
+         if meta.remote_tp_rank not in remote_tp_ranks:
+             # This D worker does not pair with the P worker.
+@@ -2255,6 +2268,7 @@ class MooncakeConnectorWorker:
+         self._acked_layout_peers.clear()
+         # Odd, so never 0 (the "layout on every pull" marker).
+         self._kv_layout_id = secrets.randbits(63) | 1
++        self.nvfp4_page_abis.clear()
+
+         packed_storage_to_region: dict[int, int] = {}
+         packed_view_to_region: dict[tuple[int, int, int], int] = {}
+@@ -2283,6 +2297,39 @@ class MooncakeConnectorWorker:
+                 kv_data_ptrs.append(storage_addr)
+                 kv_data_lens.append(storage.nbytes())
+
++            if (
++                self.cache_config.cache_dtype == "nvfp4"
++                and isinstance(layer_spec, AttentionSpec)
++                and layer_spec.kv_quant_mode.is_nvfp4
++                and layer_spec.head_size == 256
++            ):
++                owner = self.vllm_config.compilation_config.static_forward_context[
++                    layer_name
++                ]
++                if getattr(owner, "nvfp4_page_size", None) is not None:
++                    if (
++                        self.tp_size != 1
++                        or self.pp_size != 1
++                        or self._physical_blocks_per_logical_kv_block != 1
++                    ):
++                        raise ValueError(
++                            "Mooncake QSA NVFP4 requires TP1, PP1 and full pages"
++                        )
++                    page = qsa_nvfp4_page_region(
++                        cache, layer_spec, (owner._k_scale_float, owner._v_scale_float)
++                    )
++                    self.nvfp4_page_abis[layer_name] = page.abi
++                    region_base_addresses.append(page.base)
++                    self.block_len_per_layer.append(page.stride)
++                    self.kv_block_len_per_layer.append(page.size)
++                    self.registered_layer_names.append(layer_name)
++                    self.registered_layer_indices.append(layer_index)
++                    self.registered_group_indices.append(group_index)
++                    self.region_shared_groups.append((group_index,))
++                    # Keep this named payload out of opaque whole-row copies.
++                    self.region_row_offsets.append(-1)
++                    continue
++
+             is_mla_region = isinstance(
+                 layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)
+             )
+@@ -3115,7 +3162,9 @@ class MooncakeConnectorWorker:
+         # gating on use_mla alone would promote and then fail the length check
+         # for a non-replicated MLA rank with tp_ratio != 1.
+         tp_ratio = _get_tp_ratio(self.tp_size, meta.remote_tp_size)
+-        if tp_ratio == 1 or self._producer_cache_is_replicated():
++        if not self.nvfp4_page_abis and (
++            tp_ratio == 1 or self._producer_cache_is_replicated()
++        ):
+             covered_both_sides = len(local_regions) == len(pre_align_local) and len(
+                 remote_regions
+             ) == len(pre_align_remote)
+@@ -3190,6 +3239,7 @@ class MooncakeConnectorWorker:
+                 kv_caches_base_addr=[],
+                 block_lens=[],
+                 kv_block_lens=[],
++                nvfp4_page_abis=self.nvfp4_page_abis,
+             )
+         return MooncakeXferMetadata(
+             remote_hostname=self.hostname,
+@@ -3209,6 +3259,7 @@ class MooncakeConnectorWorker:
+                 list(groups) for groups in self.region_shared_groups
+             ],
+             registered_row_offsets=self.region_row_offsets,
++            nvfp4_page_abis=self.nvfp4_page_abis,
+         )
+
+     def _validate_head_resharding_layout(
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+index a53aaf2f644279f63cf811d28da2f5287dc5603a..80c1cf3fa41bf5dd4a40a3042542c5300f4d11d0 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/coordinator.py
+@@ -89,6 +89,7 @@ class MooncakeStoreCoordinator:
+         use_eagle: bool = False,
+         retention_interval: int | None = None,
+         enable_partial_hash_hits: bool = False,
++        num_hash_lookahead_tokens: int = 0,
+     ) -> None:
+         # Match core's alignment requirements for prefix-cacheable groups.
+         assert all(
+@@ -115,7 +116,10 @@ class MooncakeStoreCoordinator:
+         self.lcm_block_size = scheduler_block_size
+         # Core's decision: whether hits land on the hash unit, below the block.
+         self.enable_partial_hash_hits = enable_partial_hash_hits
+-        self.use_eagle = use_eagle
++        # Lookahead hashes key the drafter's KV past each block, so no group
++        # drops its trailing block.
++        self.use_eagle = use_eagle and not num_hash_lookahead_tokens
++        self.num_hash_lookahead_tokens = num_hash_lookahead_tokens
+         # Mirror vLLM core's KVCacheCoordinator.retention_interval.
+         self.retention_interval = retention_interval
+         self._verify_and_split_kv_cache_groups()
+@@ -152,6 +156,7 @@ class MooncakeStoreCoordinator:
+             scheduler_block_size,
+             hash_block_size,
+             use_eagle=spec_config is not None and spec_config.use_eagle_block_drop(),
++            num_hash_lookahead_tokens=vllm_config.num_hash_lookahead_tokens,
+             retention_interval=kv_cache_config.prefix_cache_retention_interval,
+             enable_partial_hash_hits=(
+                 alignment is not None and alignment < scheduler_block_size
+@@ -177,16 +182,17 @@ class MooncakeStoreCoordinator:
+             assert manager_cls is not None, (
+                 f"No manager registered for KVCacheSpec {spec}"
+             )
++            drops_eagle_block = g.is_eagle_group and not self.num_hash_lookahead_tokens
+             for idx, group in enumerate(attention_groups):
+                 if group.spec == spec:
+                     assert manager_cls is group.manager_cls
+                     group.group_ids.append(i)
+-                    if g.is_eagle_group and not group.use_eagle:
++                    if drops_eagle_block and not group.use_eagle:
+                         attention_groups[idx] = group._replace(use_eagle=True)
+                     break
+             else:
+                 attention_groups.append(
+-                    StoreSpecGroup(spec, [i], manager_cls, g.is_eagle_group)
++                    StoreSpecGroup(spec, [i], manager_cls, drops_eagle_block)
+                 )
+         # Full attention first (matches upstream convergence ordering).
+         attention_groups.sort(key=lambda g: not isinstance(g.spec, FullAttentionSpec))
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
+index 47a0e2e1c0bbce69194754bbf829c3d1c7790978..e2d5d68ee9865162fd8c6508b466406659497d92 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/data.py
+@@ -237,15 +237,6 @@ class RequestTracker:
+     prefill_end_tokens: int = 0
+     partial_tail_sent: bool = False
+
+-    def reset(self) -> None:
+-        self.token_len = 0
+-        self.allocated_block_ids = ()
+-        self.num_saved_tokens = 0
+-        self.token_ids = None
+-        self.has_pending_offload = False
+-        self.prefill_end_tokens = 0
+-        self.partial_tail_sent = False
+-
+     def update(
+         self,
+         new_block_ids: tuple[list[int], ...] | list[int],
+@@ -288,6 +279,7 @@ class ReqMeta:
+     token_ids: list[int] | None = None
+     # Absolute request offset represented by token_ids[0].
+     token_ids_start: int = 0
++    num_hash_lookahead_tokens: int = 0
+     num_prompt_tokens: int | None = None
+     # Total prefill tokens, including generated tokens replayed after preemption.
+     prefill_end_tokens: int | None = None
+@@ -312,6 +304,7 @@ class ReqMeta:
+     def from_request_tracker(
+         tracker: RequestTracker,
+         block_size: int,
++        hash_block_size: int,
+         load_spec: LoadSpec | None = None,
+         skip_save: bool | None = False,
+         block_hashes: list[BlockHash] | None = None,
+@@ -328,6 +321,10 @@ class ReqMeta:
+         token_ids_start = tracker.num_saved_tokens
+         chunk_boundary = cdiv(token_ids_start + 1, block_size) * block_size
+         num_tokens_to_save = input_token_len // block_size * block_size
++        num_tokens_to_save = min(
++            num_tokens_to_save,
++            len(block_hashes) * hash_block_size // block_size * block_size,
++        )
+
+         publish_tail = (
+             save_partial_tail
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/layout.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/layout.py
+index 081ab27d4109ac34f4b7a963ee8378c2dc5e12fa..0a67bae580a7d6ade32331f5b44ae5e6835d477f 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/layout.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/layout.py
+@@ -172,6 +172,15 @@ class RankLocalStoreLayout(StoreLayout):
+         # byte of the group's data, skipping e.g. the padding of a Mamba state
+         # up to the attention page size.
+         self.block_len: list[int] = []
++        self._exact_page_regions = False
++
++    def register_page_regions(self, regions: Sequence[tuple[int, int, int]]) -> None:
++        if any(base <= 0 or not 0 < size <= stride for base, stride, size in regions):
++            raise ValueError("Invalid Mooncake Store page region")
++        self.kv_caches_base_addr = [base for base, _, _ in regions]
++        self.block_stride = [stride for _, stride, _ in regions]
++        self.block_len = [size for _, _, size in regions]
++        self._exact_page_regions = True
+
+     @property
+     def local_shard_ids(self) -> tuple[StoreShardId, ...]:
+@@ -288,6 +297,10 @@ class RankLocalStoreLayout(StoreLayout):
+         n = len(chunks)
+         starts = np.fromiter((c[0] for c in chunks), dtype=np.int64, count=n)
+         spans = np.fromiter((c[1] for c in chunks), dtype=np.int64, count=n) - starts
++        if self._exact_page_regions and (
++            np.any(starts % self.block_size != 0) or np.any(spans != self.block_size)
++        ):
++            raise ValueError("Exact Mooncake Store regions require full aligned pages")
+         assert np.all(spans % self.hash_block_size == 0)
+         bids = np.fromiter(
+             (block_ids[i] for i in (starts // self.block_size).tolist()),
+diff --git a/vllm/model_executor/model_loader/default_loader.py b/vllm/model_executor/model_loader/default_loader.py
+index f02cfd4476e6a7f9a9f51114ff423c7459570149..04faa9d379e533d06e1467db006821371fdf2761 100644
+--- a/vllm/model_executor/model_loader/default_loader.py
++++ b/vllm/model_executor/model_loader/default_loader.py
+@@ -517,7 +517,7 @@ class DefaultModelLoader(BaseModelLoader):
+             if self.enable_weights_track is not None
+             else default_enable_weights_track
+         )
+-        if enable_weights_track:
++        if enable_weights_track or getattr(model, "requires_weight_tracking", False):
+             self.track_weights_loading(
+                 model, loaded_weights, quantized=model_config.quantization is not None
+             )
+diff --git a/vllm/model_executor/warmup/qwen4_exp_qsa_warmup.py b/vllm/model_executor/warmup/qwen4_exp_qsa_warmup.py
+index e5126a766635ac5aacb475a44737beb6e27b3b9d..36538f8fb22f4d66c756d5c308abd00c7d6493ed 100644
+--- a/vllm/model_executor/warmup/qwen4_exp_qsa_warmup.py
++++ b/vllm/model_executor/warmup/qwen4_exp_qsa_warmup.py
+@@ -70,6 +70,9 @@ def qwen4_exp_qsa_triton_warmup(worker: "Worker") -> None:
+     )
+     logger.info("Warmed up Qwen4Exp QSA decode kernels: %s.", profiles)
+
++    if owner.kv_cache_dtype == "nvfp4":
++        return  # The indexer still uses Triton; the main reader is FlashInfer.
++
+     from vllm.models.qwen4_exp.nvidia.ops.qsa import (
+         warmup_qsa_sparse_paged_attention,
+     )
+diff --git a/vllm/models/qwen4_exp/nvidia/model.py b/vllm/models/qwen4_exp/nvidia/model.py
+index 08ad38361e149046dd1e5174589c4bc82a84b613..fec832d05b54a8213f2c0508a8526f062393ad92 100644
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -193,6 +193,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
+         vllm_config: VllmConfig,
+         layer_type: str,
+         prefix: str = "",
++        *,
++        mtp_context_only: bool = False,
+     ) -> None:
+         super().__init__()
+         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
+@@ -254,10 +256,14 @@ class Qwen4ExpDecoderLayer(nn.Module):
+         else:
+             raise ValueError(f"Invalid layer_type {layer_type}")
+
+-        self.mlp = Qwen4ExpSparseMoeBlock(
+-            vllm_config=vllm_config,
+-            prefix=f"{prefix}.mlp",
+-            reduce_results=not self.use_hc_sequence_parallel,
++        self.mlp = (
++            None
++            if mtp_context_only
++            else Qwen4ExpSparseMoeBlock(
++                vllm_config=vllm_config,
++                prefix=f"{prefix}.mlp",
++                reduce_results=not self.use_hc_sequence_parallel,
++            )
+         )
+
+         hc_config = HyperConnectionConfig(
+@@ -272,9 +278,13 @@ class Qwen4ExpDecoderLayer(nn.Module):
+             hc_config,
+             prefix=maybe_prefix(prefix, "attn_hyper_connection"),
+         )
+-        self.mlp_hyper_connection = GatedResidual(
+-            hc_config,
+-            prefix=maybe_prefix(prefix, "mlp_hyper_connection"),
++        self.mlp_hyper_connection = (
++            None
++            if mtp_context_only
++            else GatedResidual(
++                hc_config,
++                prefix=maybe_prefix(prefix, "mlp_hyper_connection"),
++            )
+         )
+
+     def forward(
+@@ -331,6 +341,10 @@ class Qwen4ExpDecoderLayer(nn.Module):
+             raise ValueError("Invalid layer_type")
+
+         mlp_hc = self.mlp_hyper_connection
++        if mlp_hc is None:
++            # The native attention call above writes main KV and both QSA caches.
++            return hidden_states, attn_out, injection
++        assert self.mlp is not None
+         if self.use_hc_sequence_parallel:
+             attn_out = sp_reduce_scatter(attn_out)
+         hidden_states, block_input, injection = mlp_hc.combine_and_mix(
+diff --git a/vllm/models/qwen4_exp/nvidia/mtp.py b/vllm/models/qwen4_exp/nvidia/mtp.py
+index 30401ca56dcb91171e9e22258b5153a4acd28469..e8b41449a33369334a62063ffbc6b4b37a955d0b 100644
+--- a/vllm/models/qwen4_exp/nvidia/mtp.py
++++ b/vllm/models/qwen4_exp/nvidia/mtp.py
+@@ -121,6 +121,18 @@ def _remap_mtp_weight_name(name: str) -> str | None:
+     return None
+
+
++def _is_generation_only_weight(name: str) -> bool:
++    if name.startswith(("lm_head.", "model.hyper_connection_mixer.")):
++        return True
++    parts = name.split(".", 4)
++    return (
++        len(parts) == 5
++        and parts[:2] == ["model", "layers"]
++        and parts[2].isdigit()
++        and parts[3] in ("mlp", "mlp_hyper_connection")
++    )
++
++
+ def _make_draft_vllm_config(
+     vllm_config: VllmConfig,
+     mtp_start_layer_idx: int,
+@@ -169,6 +181,7 @@ def _make_draft_vllm_config(
+
+ class Qwen4ExpMultiTokenPredictor(nn.Module):
+     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
++    mtp_context_only: bool = False
+
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+         super().__init__()
+@@ -177,6 +190,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
+         config: Qwen4ExpTextConfig = model_config.hf_text_config
+
+         self.config = config
++        self.mtp_context_only = vllm_config.qwen38_p_mtp_context_only
+         # MoE SP also enables HC SP, while HC SP can be enabled independently.
+         self.use_hc_sequence_parallel = is_hc_sequence_parallel_enabled(vllm_config)
+         self.use_sequence_parallel = (
+@@ -223,6 +237,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
+                     draft_vllm_config,
+                     layer_type="qwen_sparse_attention",
+                     prefix=f"{prefix}.layers.{self.mtp_start_layer_idx + idx}",
++                    mtp_context_only=self.mtp_context_only,
+                 )
+                 for idx in range(self.num_mtp_layers)
+             )
+@@ -239,19 +254,20 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
+             self.hidden_size * self.hc_count, eps=config.rms_norm_eps
+         )
+         # HC final mixer collapses the multi stream into [T, H] for the LM head.
+-        hc_config = HyperConnectionConfig(
+-            hc_count=config.hc_count,
+-            hidden_size=config.hidden_size,
+-            params_dtype=torch.bfloat16,
+-            hc_lowrank=config.hc_lowrank,
+-            rms_norm_eps=config.rms_norm_eps,
+-            hc_per_branch_norm=True,
+-        )
+-        self.hyper_connection_mixer = GatedResidual(
+-            hc_config,
+-            use_combine=False,
+-            prefix=maybe_prefix(prefix, "hyper_connection_mixer"),
+-        )
++        if not self.mtp_context_only:
++            hc_config = HyperConnectionConfig(
++                hc_count=config.hc_count,
++                hidden_size=config.hidden_size,
++                params_dtype=torch.bfloat16,
++                hc_lowrank=config.hc_lowrank,
++                rms_norm_eps=config.rms_norm_eps,
++                hc_per_branch_norm=True,
++            )
++            self.hyper_connection_mixer = GatedResidual(
++                hc_config,
++                use_combine=False,
++                prefix=maybe_prefix(prefix, "hyper_connection_mixer"),
++            )
+         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+             ["hidden_states"], self.hidden_size * self.hc_count
+         )
+@@ -349,6 +365,8 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
+             query_start_loc=None,
+             ngram_context=None,
+         )
++        if self.mtp_context_only:
++            return block_output
+         if not get_pp_group().is_last_rank:
+             # As in the target model, PP carries a materialized tensor rather
+             # than the delayed hidden/output/injection tuple.
+@@ -380,6 +398,10 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
+         return sample_hidden_states, multi_hidden
+
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        # Destination tracking alone cannot detect a missing packed source shard.
++        seen: set[str] = set()
++        if self.mtp_context_only:
++            weights = _track_weight_names(weights, seen)
+         weights = maybe_fuse_shared_experts(
+             weights,
+             fused_shared_expert_layers=self.fused_shared_expert_layers,
+@@ -394,7 +416,43 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
+             self,
+             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
+         )
+-        return loader.load_weights(weights, mapper=mapper)
++        loaded = loader.load_weights(weights, mapper=mapper)
++        if self.mtp_context_only:
++            for idx, layer in enumerate(self.layers):
++                prefix = f"layers.{idx}."
++                _require_packed_weight_sources(
++                    seen,
++                    prefix + "attn_hyper_connection.",
++                    "input_mix_weight_down_block_inject",
++                    ("input_mix_weight_down", "block_inject_weight"),
++                )
++                qkv_sources: tuple[str, ...] = ("q_proj", "k_proj", "v_proj")
++                if getattr(layer.self_attn, "fuse_indexer_projection", False):
++                    qkv_sources += ("indexer.index_qk_proj",)
++                _require_packed_weight_sources(
++                    seen, prefix + "self_attn.", "qkv_proj", qkv_sources
++                )
++        return loaded
++
++
++def _track_weight_names(
++    weights: Iterable[tuple[str, torch.Tensor]], seen: set[str]
++) -> Iterable[tuple[str, torch.Tensor]]:
++    for name, weight in weights:
++        seen.add(name)
++        yield name, weight
++
++
++def _require_packed_weight_sources(
++    seen: set[str], prefix: str, packed: str, sources: tuple[str, ...]
++) -> None:
++    if f"{prefix}{packed}.weight" in seen:
++        return
++    missing = {f"{prefix}{name}.weight" for name in sources} - seen
++    if missing:
++        raise ValueError(
++            f"Missing Qwen3.8 MTP context weight shards: {sorted(missing)}"
++        )
+
+
+ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts):
+@@ -417,12 +475,19 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
+
+         super().__init__()
+         self.config = config
++        self.mtp_context_only = vllm_config.qwen38_p_mtp_context_only
++        self.requires_weight_tracking = self.mtp_context_only
++        if self.mtp_context_only:
++            self.is_unused_checkpoint_weight = self._is_unused_context_weight
+         self.model = Qwen4ExpMultiTokenPredictor(
+             vllm_config=vllm_config,
+             prefix=maybe_prefix(prefix, "mtp"),
+         )
+
+-        if get_pp_group().is_last_rank:
++        if self.mtp_context_only:
++            # Don't allocate a head or alias the target's head in load_eagle_model.
++            self.has_own_lm_head = True
++        elif get_pp_group().is_last_rank:
+             if config.tie_word_embeddings:
+                 self.lm_head = self.model.embed_tokens
+             else:
+@@ -434,7 +499,8 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
+         else:
+             self.lm_head = PPMissingLayer()
+
+-        self.logits_processor = LogitsProcessor(config.vocab_size)
++        if not self.mtp_context_only:
++            self.logits_processor = LogitsProcessor(config.vocab_size)
+         self.make_empty_intermediate_tensors = (
+             self.model.make_empty_intermediate_tensors
+         )
+@@ -465,13 +531,22 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
+     def compute_logits(
+         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
+     ) -> torch.Tensor | None:
++        if self.mtp_context_only:
++            raise RuntimeError("Qwen3.8 MTP context-only model cannot generate drafts")
+         return self.logits_processor(self.lm_head, hidden_states)
+
++    @staticmethod
++    def _is_unused_context_weight(name: str) -> bool:
++        remapped = _remap_mtp_weight_name(name)
++        return remapped is None or _is_generation_only_weight(remapped)
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         def remap_weight_names():
+             for name, weight in weights:
+                 remapped_name = _remap_mtp_weight_name(name)
+-                if remapped_name is not None:
++                if remapped_name is not None and not (
++                    self.mtp_context_only and _is_generation_only_weight(remapped_name)
++                ):
+                     yield remapped_name, weight
+
+         mapper = WeightsMapper(
+diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+index 6ca0a05cdf698384bbcf9a6e18241ca2ca402745..83cf33d29fec0e32b72b6121e5a26a232dd1cb70 100644
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py
+@@ -47,12 +47,22 @@ from vllm.v1.attention.backend import (
+     AttentionType,
+     MultipleOf,
+ )
++from vllm.v1.attention.ops.nvfp4_kv import nvfp4_kv_spec
++from vllm.v1.attention.ops.qsa_nvfp4 import (
++    QsaNvfp4,
++    qsa_nvfp4_scales,
++    validate_qsa_nvfp4_binding,
++    validate_qsa_nvfp4_page,
++)
+ from vllm.v1.kv_cache_interface import (
++    AttentionSpec,
+     FullAttentionSpec,
+     KVCacheSpec,
+     get_kv_quant_mode,
+ )
+
++from vllm.v1.worker.workspace import current_workspace_manager
++
+ from ..common.qsa import Qwen4ExpQSAMetadata, Qwen4ExpQSAMetadataBuilder
+ from ..common.qsa_indexer import QSAIndexerMetadata, qsa_kv_cache_dtype
+ from . import model
+@@ -138,8 +148,17 @@ class Qwen4ExpQSABackend(AttentionBackend):
+         "bfloat16",
+         "fp8",
+         "fp8_e4m3",
++        "nvfp4",
+     ]
+
++    @classmethod
++    def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
++        return nvfp4_kv_spec(spec)
++
++    @classmethod
++    def uses_independent_mamba_pages(cls, kv_cache_dtype: str) -> bool:
++        return kv_cache_dtype == "nvfp4"
++
+     # The owner writes K/V before calling the sparse attention implementation.
+     forward_includes_kv_cache_update: bool = False
+
+@@ -184,7 +203,7 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
+             raise NotImplementedError(
+                 "Qwen4Exp QSA does not support decode context parallelism"
+             )
+-        if kv_cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3"):
++        if kv_cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3", "nvfp4"):
+             raise NotImplementedError(
+                 "Qwen4Exp QSA requires a BF16 or FP8-e4m3 main KV cache"
+             )
+@@ -193,6 +212,16 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
+         self.scale = float(scale)
+         self.num_kv_heads = num_kv_heads
+         self.kv_cache_dtype = kv_cache_dtype
++        if kv_cache_dtype == "nvfp4":
++            if not current_platform.is_device_capability(120):
++                raise NotImplementedError("QSA NVFP4 requires SM120")
++            if (
++                head_size != 256
++                or num_heads % num_kv_heads
++                or num_heads // num_kv_heads > 16
++            ):
++                raise ValueError("QSA NVFP4 requires D=256 and a GQA group of 1..16")
++            self.nvfp4 = QsaNvfp4(num_kv_heads)
+
+     def do_kv_cache_update(
+         self,
+@@ -203,6 +232,11 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
+         slot_mapping: torch.Tensor,
+     ) -> None:
+         """Scatter K/V using the same layout and scales as the fused writer."""
++        if self.kv_cache_dtype == "nvfp4":
++            self.nvfp4.write(
++                kv_cache, key, value, slot_mapping, layer._k_scale, layer._v_scale
++            )
++            return
+         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+         ops.reshape_and_cache_flash(
+             key,
+@@ -238,6 +272,20 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
+             raise RuntimeError("QSA owner did not provide its top-k buffer")
+         logical_indices = topk_buffer[:num_tokens]
+         token_to_req = token_to_req[:num_tokens]
++        if self.kv_cache_dtype == "nvfp4":
++            self.nvfp4.read(
++                kv_cache,
++                query[:num_tokens],
++                logical_indices,
++                attn_metadata.block_table,
++                token_to_req,
++                use_prefill_config,
++                output[:num_tokens],
++                layer._k_scale_float,
++                layer._v_scale_float,
++                output_gate[:num_tokens],
++            )
++            return output
+         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+         k_scale = v_scale = None
+         if self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
+@@ -305,6 +353,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+             "bfloat16",
+             "fp8",
+             "fp8_e4m3",
++            "nvfp4",
+         ):
+             raise NotImplementedError(
+                 "Qwen4Exp QSA requires a BF16 or FP8-e4m3 main KV cache"
+@@ -405,6 +454,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+         self.layer_name = f"{prefix}.attn"
+         self.attn_type = AttentionType.DECODER
+         self.kv_cache_dtype = qsa_kv_cache_dtype(cache_config, prefix)
++        if self.kv_cache_dtype == "nvfp4":
++            self.requested_nvfp4_page = (
++                cache_config.block_size if cache_config.user_specified_block_size else None
++            )
++            if cache_config.kv_offloading_size is not None:
++                raise NotImplementedError("QSA NVFP4 requires native Mooncake offload")
+         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
+             self.kv_cache_dtype, model_config
+         )
+@@ -424,6 +479,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+             self.num_kv_heads,
+             self.kv_cache_dtype,
+         )
++        static_context = vllm_config.compilation_config.static_forward_context
++        if self.layer_name in static_context:
++            raise ValueError(f"Duplicate layer name: {self.layer_name}")
++        if self.kv_cache_dtype == "nvfp4":
++            static_context[self.layer_name] = self
+         self.indexer = QSAIndexer(
+             vllm_config=vllm_config,
+             config=config,
+@@ -468,6 +528,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+         # index; the sparse attention kernel reads it as its loop bound.
+         # MTP skip_topk steps reuse rows frozen from step 0; the count is
+         # a row column, so compaction/reuse keep it paired with the content.
++        if self.kv_cache_dtype == "nvfp4" and self.use_fused_qsa_prepare:
++            self.register_buffer(
++                "staging_slots",
++                torch.arange(vllm_config.scheduler_config.max_num_batched_tokens),
++                persistent=False,
++            )
+         self.register_buffer(
+             "topk_indices_buffer",
+             torch.empty(
+@@ -478,10 +544,20 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+             persistent=False,
+         )
+
+-        static_context = vllm_config.compilation_config.static_forward_context
+-        if self.layer_name in static_context:
+-            raise ValueError(f"Duplicate layer name: {self.layer_name}")
+-        static_context[self.layer_name] = self
++        if self.kv_cache_dtype != "nvfp4":
++            static_context[self.layer_name] = self
++
++    def nvfp4_staging(self, num_tokens: int) -> torch.Tensor:
++        shape = (num_tokens, 1, self.num_kv_heads, 2 * self.head_dim)
++        return current_workspace_manager().get_simultaneous((shape, torch.bfloat16))[0]
++
++    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
++        if self.kv_cache_dtype == "nvfp4":
++            validate_qsa_nvfp4_binding(kv_cache, self.num_kv_heads, self.nvfp4_page_size)
++            self._k_scale_float, self._v_scale_float = qsa_nvfp4_scales(
++                self._k_scale, self._v_scale
++            )
++        super().bind_kv_cache(kv_cache)
+
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         mapper = None
+@@ -497,7 +573,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+         return self.attn_backend
+
+     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+-        return FullAttentionSpec(
++        spec = FullAttentionSpec(
+             block_size=vllm_config.cache_config.block_size,
+             num_kv_heads=self.num_kv_heads,
+             head_size=self.head_dim,
+@@ -505,6 +581,17 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+             dtype=self.kv_cache_torch_dtype,
+             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+         )
++        if self.kv_cache_dtype != "nvfp4":
++            return spec
++        packed = nvfp4_kv_spec(spec)
++        validate_qsa_nvfp4_page(
++            packed,
++            self.requested_nvfp4_page,
++            vllm_config.cache_config.prefix_match_unit,
++            prefix_caching=vllm_config.cache_config.enable_prefix_caching,
++        )
++        self.nvfp4_page_size = packed.block_size
++        return packed
+
+     @eager_break_during_capture
+     def _run_qsa(
+@@ -524,6 +611,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+         if isinstance(metadata, list):
+             metadata = metadata[0]
+         if not isinstance(metadata, dict):
++            if self.kv_cache_dtype == "nvfp4" and self.use_fused_qsa_prepare:
++                self.nvfp4_staging(self.staging_slots.numel())
+             # Profiling/dummy run: the indexer allocates its selection scratch
+             # on demand, so touch its peak here for the memory profiler (as
+             # sparse_attn_indexer does): the prefill logits budget or the
+diff --git a/vllm/models/qwen4_exp/nvidia/qsa_indexer.py b/vllm/models/qwen4_exp/nvidia/qsa_indexer.py
+index 2c7cebbb119aa4a45b60184c736869862052c9d3..2236d052543ed1abee938ba99a9faed40d77efc7 100644
+--- a/vllm/models/qwen4_exp/nvidia/qsa_indexer.py
++++ b/vllm/models/qwen4_exp/nvidia/qsa_indexer.py
+@@ -283,7 +283,11 @@ class QSAIndexer(nn.Module):
+                 dtype=self.indexer_dtype,
+             )
+             main_kv_cache = attn.kv_cache.transpose(1, 2)
+-            if attn.kv_cache_dtype in ("fp8", "fp8_e4m3"):
++            main_slots = slot_mapping[:num_tokens]
++            if attn.kv_cache_dtype == "nvfp4":
++                main_kv_cache = attn.nvfp4_staging(num_tokens)
++                main_slots = attn.staging_slots[:num_tokens]
++            elif attn.kv_cache_dtype in ("fp8", "fp8_e4m3"):
+                 main_kv_cache = main_kv_cache.view(torch.float8_e4m3fn)
+             main_outputs = qsa_prepare(
+                 projected_q,
+@@ -314,10 +318,15 @@ class QSAIndexer(nn.Module):
+                 main_k_norm_weight=attn.k_norm.weight,
+                 main_eps=attn.q_norm.variance_epsilon,
+                 main_kv_cache=main_kv_cache,
+-                main_slot_mapping=slot_mapping[:num_tokens],
++                main_slot_mapping=main_slots,
+                 main_k_scale=attn._k_scale_float,
+                 main_v_scale=attn._v_scale_float,
+             )
++            if attn.kv_cache_dtype == "nvfp4":
++                key, value = main_kv_cache[:, 0].split(attn.head_dim, dim=-1)
++                attn.impl.do_kv_cache_update(
++                    attn, key, value, attn.kv_cache, slot_mapping[:num_tokens]
++                )
+         else:
+             # Unfused reference path
+             from flashinfer.norm import gemma_rmsnorm
+diff --git a/vllm/platforms/interface.py b/vllm/platforms/interface.py
+index 533f23d13eb03cd417d57d0e075b3e115e6f9f9d..691978eb83a3045feb4396918b2b6dd3e2d991ec 100644
+--- a/vllm/platforms/interface.py
++++ b/vllm/platforms/interface.py
+@@ -1091,12 +1091,39 @@ class Platform:
+                 # For hybrid MLA/Mamba models, make the manager block size a
+                 # multiple of 128 so split kernel blocks keep that invariant.
+                 kernel_block_alignment_size = max(kernel_block_alignment_size, 128)
++        checkpoint_alignment = 1
+         if cache_config.mamba_cache_mode == "align":
+             # Internal prefill checkpoints land on block boundaries.
++            checkpoint_alignment = (
++                get_mamba_prefill_checkpoint_alignment(vllm_config) or 1
++            )
+             kernel_block_alignment_size = lcm(
+                 kernel_block_alignment_size,
+-                get_mamba_prefill_checkpoint_alignment(vllm_config) or 1,
++                checkpoint_alignment,
++            )
++
++        if backend_cls.uses_independent_mamba_pages(cache_config.cache_dtype):
++            # Retain the token cadence. The block-outermost planner packs
++            # native state and attention separately, without page equalization.
++            alignment = lcm(backend_block_alignment, checkpoint_alignment)
++            block_size = cache_config.block_size
++            if block_size % alignment:
++                if cache_config.user_specified_block_size:
++                    raise ValueError(
++                        f"Block size {block_size} must be divisible by the "
++                        f"cache/checkpoint alignment {alignment}"
++                    )
++                cache_config.block_size = cdiv(block_size, alignment) * alignment
++            if cache_config.mamba_cache_mode == "align":
++                cache_config.mamba_block_size = cache_config.block_size
++            logger.info(
++                "Independent hybrid pages: %d tokens, %d B attention payload, "
++                "up to %d B per native recurrent state page",
++                cache_config.block_size,
++                cache_config.block_size * attn_page_size_1_token,
++                mamba_page_size,
+             )
++            return
+
+         # Use minimum block size that satisfies both backend alignment and
+         # mamba page size compatibility
+diff --git a/vllm/renderers/base.py b/vllm/renderers/base.py
+index 395b1ead7acfcf9967a5c52fce8491329c29db88..599e758aa6dab1bcb858f985d18414c02e735526 100644
+--- a/vllm/renderers/base.py
++++ b/vllm/renderers/base.py
+@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
+ from concurrent.futures import Executor, Future, ThreadPoolExecutor
+ from contextlib import ExitStack
+ from dataclasses import replace
++from vllm.tokenizers.qwen38_native_cache import make_cache, timed_tokenize_async, track_render
+ from functools import cached_property
+ from threading import Lock
+ from typing import TYPE_CHECKING, Any, Generic, overload
+@@ -104,6 +105,7 @@ class _SwappableExecutor(Executor):
+
+
+ class BaseRenderer(ABC, Generic[_T]):
++    _qwen38_native_cache = None
+     def __init__(self, config: "VllmConfig", tokenizer: _T | None) -> None:
+         super().__init__()
+
+@@ -116,6 +118,7 @@ class BaseRenderer(ABC, Generic[_T]):
+         self._finalizer = weakref.finalize(self, self._resources.close)
+
+         self.tokenizer = tokenizer
++        self._qwen38_native_cache = make_cache(config, tokenizer)
+
+         # Background multimodal warmup task (a future returned by
+         # _mm_executor) so it overlaps engine-core initialization while
+@@ -156,6 +159,8 @@ class BaseRenderer(ABC, Generic[_T]):
+         self._tokenize_prompt_async = make_async(
+             self._tokenize_prompt, executor=self._executor
+         )
++        if self._qwen38_native_cache is not None:
++            self._tokenize_prompt_async = timed_tokenize_async(self, self._executor)
+         self._async_tokenizer_decode = make_async(self._decode, executor=self._executor)
+
+         self.mm_processor: BaseMultiModalProcessor | None = None
+@@ -668,12 +673,18 @@ class BaseRenderer(ABC, Generic[_T]):
+         self,
+         prompt: TextPrompt,
+         params: TokenizeParams,
++        *,
++        _queued_at: float | None = None,
+     ) -> TokensPrompt:
+         tokenizer = self.get_tokenizer()
+         want_offsets = self._wants_offsets(prompt, params)
+         kwargs = params.get_encode_kwargs()
+         if want_offsets:
+             kwargs = {**kwargs, "return_offsets_mapping": True}
++        if self._qwen38_native_cache is not None:
++            ids = self._qwen38_native_cache.try_encode(prompt, kwargs, want_offsets, _queued_at)
++            if ids is not None:
++                return self._build_tokens_prompt(ids, prompt)
+         encoding = tokenizer(prompt["prompt"], **kwargs)
+         return self._build_tokens_prompt(
+             encoding["input_ids"],
+@@ -1379,6 +1390,7 @@ class BaseRenderer(ABC, Generic[_T]):
+
+         return out_conversations, eng_prompts
+
++    @track_render
+     async def render_chat_async(
+         self,
+         conversations: Sequence[list["ChatCompletionMessageParam"]],
+diff --git a/vllm/renderers/online_renderer.py b/vllm/renderers/online_renderer.py
+index 941d173bd1d5cb2ad2c6e3f07f8d052c54770739..43e57a59107171216a910cd7d78770931a4750fd 100644
+--- a/vllm/renderers/online_renderer.py
++++ b/vllm/renderers/online_renderer.py
+@@ -154,6 +154,17 @@ def _reused_prompt_token_ids(
+         )
+     # The engine checks this too, but only after a streamed response starts.
+     renderer.validate_token_ids(ids, parameter="kv_transfer_params.prompt_token_ids")
++    from vllm.tokenizers.qwen38_native_cache import REQUESTS, TOKENS, SIZE, LIMIT, ENABLED
++    rank = str(renderer.api_process_rank)
++    from prometheus_client import REGISTRY
++    from contextlib import suppress
++    if not getattr(renderer, "_qwen38_pd_metrics_registered", False):
++        for metric in (REQUESTS, TOKENS, SIZE, LIMIT, ENABLED):
++            with suppress(ValueError):
++                REGISTRY.register(metric)
++        renderer._qwen38_pd_metrics_registered = True
++    REQUESTS.labels(rank, "pd_reuse_prompt_ids").inc()
++    TOKENS.labels(rank, "pd_forwarded_tokens").inc(len(ids))
+     return ids
+
+
+diff --git a/vllm/tokenizers/qwen38_native_cache.py b/vllm/tokenizers/qwen38_native_cache.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..247bd82d92982a9814af26230af6c8c451b27000
+--- /dev/null
++++ b/vllm/tokenizers/qwen38_native_cache.py
+@@ -0,0 +1,268 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Exact Qwen3.8 native CPU tokenization with optional shared segment storage."""
++
++import asyncio
++import functools
++import hashlib
++import json
++import logging
++import math
++import os
++import threading
++import time
++from contextlib import suppress
++from pathlib import Path
++from types import SimpleNamespace
++
++from prometheus_client import REGISTRY, Counter, Gauge, Histogram
++from tokenizers import Tokenizer
++
++from vllm.tokenizers.qwen38_segment_cache_core import SegmentCache
++from vllm.tokenizers.qwen38_shared_segment_store import SharedSegmentStore
++
++LOGGER = logging.getLogger(__name__)
++EXPECTED_TOKENIZER_SHA256 = (
++    "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
++)
++LABELS = ["api_process"]
++TOKENS = Counter(
++    "vllm:tokenizer_cache_tokens", "Exact segment tokens by source", LABELS + ["source"]
++)
++REQUESTS = Counter(
++    "vllm:tokenizer_cache_requests",
++    "Native tokenizer cache requests",
++    LABELS + ["path"],
++)
++SIZE = Gauge(
++    "vllm:tokenizer_cache_bytes",
++    "Retained CPU segment cache bytes",
++    LABELS,
++    multiprocess_mode="livesum",
++)
++LIMIT = Gauge(
++    "vllm:tokenizer_cache_max_bytes",
++    "CPU segment cache limit",
++    LABELS,
++    multiprocess_mode="livesum",
++)
++EVICTIONS = Counter(
++    "vllm:tokenizer_cache_evictions", "Native segment cache evictions", LABELS
++)
++SHARED = Counter(
++    "vllm:tokenizer_shared_cache_operations",
++    "Shared exact segment backend operations; errors fall back to native encoding",
++    LABELS + ["outcome"],
++)
++TIMING = Histogram(
++    "vllm:frontend_stage_seconds",
++    "Native frontend stage wall time; stages overlap",
++    LABELS + ["stage"],
++    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 60),
++)
++ENABLED = Gauge(
++    "vllm:tokenizer_cache_enabled",
++    "Native exact segment cache enabled",
++    LABELS,
++    multiprocess_mode="livesum",
++)
++ACTIVE = Gauge(
++    "vllm:frontend_active_renders",
++    "Active native render_chat_async calls",
++    LABELS,
++    multiprocess_mode="livesum",
++)
++
++
++EPOCH_UNAVAILABLE = object()
++
++
++class NativeCache:
++    def __init__(self, tokenizer, gib, rank):
++        # The original tokenizer pool can mutate padding/truncation. Keep a private
++        # immutable backend for exact segment encoding rather than sharing it.
++        backend = Tokenizer.from_str(tokenizer.backend_tokenizer.to_str())
++        if json.loads(backend.to_str())["model"].get("dropout") not in (None, 0):
++            raise ValueError("Tokenizer cache requires deterministic BPE encoding")
++        self.rank = str(rank)
++        self.epoch_path = os.environ.get("VLLM_QWEN38_TOKENIZER_CACHE_EPOCH_FILE", "")
++        self.epoch = self._epoch()
++        if self.epoch is EPOCH_UNAVAILABLE:
++            self.epoch = None
++        shared_path = os.environ.get("VLLM_QWEN38_TOKENIZER_SHARED_PATH", "")
++        shared_store = None
++        local_bytes = int(gib * 1024**3)
++        if shared_path:
++            shared_gib = float(os.environ.get("VLLM_QWEN38_TOKENIZER_SHARED_GIB", "8"))
++            local_mib = float(os.environ.get("VLLM_QWEN38_TOKENIZER_LOCAL_L1_MIB", "64"))
++            if not math.isfinite(shared_gib) or shared_gib <= 0:
++                raise ValueError("Shared tokenizer budget must be finite and positive")
++            if not math.isfinite(local_mib) or local_mib < 0:
++                raise ValueError(
++                    "Local tokenizer budget must be finite and nonnegative"
++                )
++            local_bytes = min(local_bytes, int(local_mib * 1024**2))
++        self.cache = SegmentCache(
++            SimpleNamespace(backend_tokenizer=backend),
++            None,
++            local_bytes,
++            shared_store=shared_store,
++            generation=self.epoch or "",
++        )
++        if shared_path:
++            # Match the private backend that really performs segment encoding,
++            # not just the tokenizer.json selected at startup.
++            self.cache.shared_store = SharedSegmentStore(
++                shared_path, int(shared_gib * 1024**3), self.cache.fingerprint
++            )
++        self.last_shared_counts = {}
++        self.metrics_lock = threading.Lock()
++        self.last_evictions = 0
++        self.metrics_registered = False
++        LIMIT.labels(self.rank).set(self.cache.max_bytes)
++        SIZE.labels(self.rank).set(0)
++        ENABLED.labels(self.rank).set(1)
++        LOGGER.info(
++            "QWEN38 native tokenizer cache enabled: api_process=%s "
++            "limit_bytes=%d; native backend unchanged",
++            self.rank,
++            self.cache.max_bytes,
++        )
++
++    def _epoch(self):
++        if not self.epoch_path:
++            return None
++        try:
++            return Path(self.epoch_path).read_text().strip()
++        except (OSError, UnicodeError):
++            # Missing/inaccessible epoch never serves stale cached IDs or fails
++            # an inference request. The renderer takes its native encode path.
++            return EPOCH_UNAVAILABLE
++
++    def try_encode(self, prompt, kwargs, want_offsets=False, queued_at=None):
++        # Single-API engine startup unregisters vllm collectors after rendering
++        # initialization. Reattach these same collectors on the first request.
++        if not self.metrics_registered:
++            for metric in (
++                TOKENS,
++                REQUESTS,
++                SIZE,
++                LIMIT,
++                EVICTIONS,
++                SHARED,
++                TIMING,
++                ENABLED,
++                ACTIVE,
++            ):
++                with suppress(ValueError):  # Multi-API servers retain the registration.
++                    REGISTRY.register(metric)
++            self.metrics_registered = True
++        started = time.monotonic()
++        if queued_at is not None:
++            TIMING.labels(self.rank, "tokenize_queue").observe(started - queued_at)
++        with self.metrics_lock:
++            epoch = self._epoch()
++            if epoch is EPOCH_UNAVAILABLE:
++                REQUESTS.labels(self.rank, "fallback").inc()
++                return None
++            if epoch != self.epoch:
++                self.cache.reset(generation=epoch or "")
++                self.last_evictions = 0
++                self.last_shared_counts.clear()
++                self.epoch = epoch
++                SIZE.labels(self.rank).set(0)
++        # Keep offsets, multimodal, BOS/EOS and unsupported encoding options on
++        # the original tokenizer path. Post-tokenization remains fully native.
++        safe = (
++            not want_offsets
++            and not prompt.get("multi_modal_data")
++            and not prompt.get("multi_modal_uuids")
++            and kwargs.get("add_special_tokens") is False
++            and set(kwargs) <= {"add_special_tokens", "truncation", "max_length"}
++        )
++        if kwargs.get("truncation") and (
++            type(kwargs.get("max_length")) is not int or kwargs["max_length"] < 0
++        ):
++            safe = False
++        if not safe:
++            REQUESTS.labels(self.rank, "fallback").inc()
++            return None
++        ids, counts = self.cache.encode(
++            prompt["prompt"], prompt.get("cache_salt") or ""
++        )
++        TIMING.labels(self.rank, "cache_encode").observe(time.monotonic() - started)
++        for source in ("reused_tokens", "encoded_tokens", "special_tokens"):
++            TOKENS.labels(self.rank, source).inc(counts[source])
++        # Several tokenizer executor threads may complete out of order. Read
++        # cumulative counters inside the same lock as the published baseline.
++        with self.metrics_lock:
++            state = self.cache.snapshot()
++            SIZE.labels(self.rank).set(state["cache_bytes"])
++            evicted = state.get("evictions", 0)
++            EVICTIONS.labels(self.rank).inc(evicted - self.last_evictions)
++            self.last_evictions = evicted
++            for name in ("shared_hits", "shared_misses", "shared_errors"):
++                value = state.get(name, 0)
++                SHARED.labels(self.rank, name).inc(
++                    value - self.last_shared_counts.get(name, 0)
++                )
++                self.last_shared_counts[name] = value
++        # If truncation could change the result, use the original implementation
++        # (including its truncation_side semantics), not a hand-written slice.
++        if kwargs.get("truncation") and len(ids) > kwargs["max_length"]:
++            REQUESTS.labels(self.rank, "fallback").inc()
++            return None
++        REQUESTS.labels(self.rank, "cached").inc()
++        return ids
++
++
++def make_cache(config, tokenizer):
++    gib = float(os.environ.get("VLLM_QWEN38_TOKENIZER_CACHE_GIB", "0"))
++    if not math.isfinite(gib) or gib < 0:
++        raise ValueError(
++            "VLLM_QWEN38_TOKENIZER_CACHE_GIB must be finite and nonnegative"
++        )
++    if gib == 0 or tokenizer is None:
++        return None
++    if getattr(config.model_config.hf_config, "model_type", None) != "qwen4_exp":
++        raise ValueError(
++            "This tokenizer cache is validated only for the pinned Qwen3.8 model"
++        )
++    tokenizer_file = Path(config.model_config.tokenizer) / "tokenizer.json"
++    actual_sha256 = hashlib.sha256(tokenizer_file.read_bytes()).hexdigest()
++    if actual_sha256 != EXPECTED_TOKENIZER_SHA256:
++        raise ValueError(
++            "Qwen tokenizer changed; rerun full token-ID validation "
++            "before enabling cache"
++        )
++    return NativeCache(tokenizer, gib, config.parallel_config._api_process_rank)
++
++
++def timed_tokenize_async(renderer, executor):
++    def tokenize(prompt, params):
++        queued_at = time.monotonic()
++        call = functools.partial(
++            renderer._tokenize_prompt, prompt, params, _queued_at=queued_at
++        )
++        return asyncio.get_running_loop().run_in_executor(executor, call)
++
++    return tokenize
++
++
++def track_render(fn):
++    @functools.wraps(fn)
++    async def wrapped(self, *args, **kwargs):
++        cache = self._qwen38_native_cache
++        if cache is None:
++            return await fn(self, *args, **kwargs)
++        started = time.monotonic()
++        ACTIVE.labels(cache.rank).inc()
++        try:
++            return await fn(self, *args, **kwargs)
++        finally:
++            TIMING.labels(cache.rank, "render_chat_total").observe(
++                time.monotonic() - started
++            )
++            ACTIVE.labels(cache.rank).dec()
++
++    return wrapped
+diff --git a/vllm/tokenizers/qwen38_segment_cache_core.py b/vllm/tokenizers/qwen38_segment_cache_core.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..96634965b3aa8876292c7921dea190a558d8aa1e
+--- /dev/null
++++ b/vllm/tokenizers/qwen38_segment_cache_core.py
+@@ -0,0 +1,213 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Exact native added-token-delimited BPE reuse for the pinned Qwen3.8 tokenizer."""
++
++import hashlib
++import json
++import sqlite3
++import sys
++import threading
++import time
++from array import array
++from collections import OrderedDict
++from pathlib import Path
++from typing import Any
++
++import regex as re
++
++
++class UnsupportedRequest(ValueError):
++    pass
++
++
++def literal_pattern(literals):
++    """Factor literal prefixes; preserve leftmost-longest added-token matches."""
++    trie: dict[str | None, Any] = {}
++    for literal in literals:
++        node = trie
++        for char in literal:
++            node = node.setdefault(char, {})
++        node[None] = {}
++
++    def emit(node):
++        choices = [
++            re.escape(char) + emit(child)
++            for char, child in sorted((c, n) for c, n in node.items() if c is not None)
++        ]
++        body = "|".join(choices)
++        if len(choices) > 1:
++            body = "(?:" + body + ")"
++        return "(?:" + body + ")?" if None in node and body else body
++
++    return re.compile(emit(trie))
++
++
++class SegmentCache:
++    def __init__(
++        self,
++        tokenizer,
++        tokenizer_path,
++        max_bytes=32 * 1024**3,
++        shared_store=None,
++        generation="",
++    ):
++        self.tokenizer = tokenizer
++        self.backend = tokenizer.backend_tokenizer
++        raw = (
++            Path(tokenizer_path).read_bytes()
++            if tokenizer_path
++            else self.backend.to_str().encode()
++        )
++        config = json.loads(raw)
++        normalizer = config.get("normalizer")
++        if normalizer != {"type": "NFC"}:
++            raise ValueError(
++                "Only the pinned Qwen NFC tokenizer is supported"
++            )
++        if config["model"]["type"] != "BPE":
++            raise ValueError("Unsupported BPE configuration")
++        # Every admitted request has add_special_tokens=False, so the native
++        # tokenizer post-processor is disabled for both full and segment encode.
++        added = config["added_tokens"]
++        if any(t.get("normalized", False) for t in added):
++            raise ValueError("Qwen segmentation requires pre-normalization added tokens")
++        if any(
++            any(t.get(k, False) for k in ("lstrip", "rstrip", "single_word"))
++            for t in added
++        ):
++            raise ValueError(
++                "Added-token whitespace/word-boundary behavior is unsupported"
++            )
++        self.specials = {
++            t["content"]: t["id"]
++            for t in added
++            if t.get("special") and not t.get("normalized", False)
++        }
++        if not self.specials:
++            raise ValueError("No proven added-token boundaries")
++        # Match ALL added tokens first: a longer ordinary added token must shield
++        # special-token substrings inside it, just as in the native tokenizer.
++        literals = sorted({t["content"] for t in added}, key=lambda x: (-len(x), x))
++        self.pattern = literal_pattern(literals)
++        self.backend.no_padding()
++        self.backend.no_truncation()
++        self.backend.encode_special_tokens = False
++        # Share entries only between the actual normalized native backends.
++        # A common tokenizer.json alone does not prove runtime added tokens or
++        # other backend settings are identical across API processes.
++        self.fingerprint = hashlib.sha256(self.backend.to_str().encode()).hexdigest()
++        for literal, token_id in self.specials.items():
++            if self.backend.encode(literal, add_special_tokens=False).ids != [token_id]:
++                raise ValueError("Added-token boundary is not token-exact")
++        self.max_bytes = max_bytes
++        self.lock = threading.Lock()
++        self.entries = OrderedDict()
++        self.bytes = 0
++        self.stats = {}
++        self.shared_store = shared_store
++        self.generation = generation
++        self.reset_version = 0
++
++    def _segment(self, namespace, text):
++        key = (namespace, text)
++        hash(key)  # Hash the fresh long string before entering the shared lock.
++        with self.lock:
++            generation = self.generation
++            reset_version = self.reset_version
++            entry = self.entries.get(key)
++            if entry is not None:
++                self.entries.move_to_end(key)
++                return entry[0], True
++        ids = None
++        shared_hit = False
++        if self.shared_store is not None:
++            try:
++                packed = self.shared_store.get(generation, namespace, text)
++                if packed is not None:
++                    ids = array("I")
++                    ids.frombytes(packed)
++                    shared_hit = True
++                self._record_shared("shared_hits" if shared_hit else "shared_misses")
++            except (OSError, ValueError, sqlite3.Error):
++                self._record_shared("shared_errors")
++        if ids is None:
++            ids = array("I", self.backend.encode(text, add_special_tokens=False).ids)
++            if self.shared_store is not None:
++                try:
++                    self.shared_store.put(generation, namespace, text, ids.tobytes())
++                except (OSError, ValueError, sqlite3.Error):
++                    self._record_shared("shared_errors")
++        size = (
++            sys.getsizeof(text)
++            + sys.getsizeof(ids)
++            + sys.getsizeof(key)
++            + sys.getsizeof(namespace)
++            + 256
++        )
++        if size <= self.max_bytes:
++            with self.lock:
++                if reset_version == self.reset_version and key not in self.entries:
++                    while self.entries and self.bytes + size > self.max_bytes:
++                        _, (_, old_size) = self.entries.popitem(last=False)
++                        self.bytes -= old_size
++                        self.stats["evictions"] = self.stats.get("evictions", 0) + 1
++                    self.entries[key] = (ids, size)
++                    self.bytes += size
++        return ids, shared_hit
++
++    def _record_shared(self, name):
++        with self.lock:
++            self.stats[name] = self.stats.get(name, 0) + 1
++
++    def encode(self, text, namespace=""):
++        start = time.monotonic()
++        result = []
++        counts: dict[str, int | float] = {
++            "reused_tokens": 0,
++            "encoded_tokens": 0,
++            "special_tokens": 0,
++            "hit_segments": 0,
++            "miss_segments": 0,
++        }
++        cursor = 0
++        for match in self.pattern.finditer(text):
++            literal = match.group()
++            if literal not in self.specials:
++                continue
++            if match.start() > cursor:
++                ids, hit = self._segment(namespace, text[cursor : match.start()])
++                result.extend(ids)
++                counts["reused_tokens" if hit else "encoded_tokens"] += len(ids)
++                counts["hit_segments" if hit else "miss_segments"] += 1
++            result.append(self.specials[literal])
++            counts["special_tokens"] += 1
++            cursor = match.end()
++        if cursor < len(text):
++            ids, hit = self._segment(namespace, text[cursor:])
++            result.extend(ids)
++            counts["reused_tokens" if hit else "encoded_tokens"] += len(ids)
++            counts["hit_segments" if hit else "miss_segments"] += 1
++        counts["encode_seconds"] = time.monotonic() - start
++        with self.lock:
++            for k, v in counts.items():
++                self.stats[k] = self.stats.get(k, 0) + v
++            self.stats["encoded_requests"] = self.stats.get("encoded_requests", 0) + 1
++        return result, counts
++
++    def snapshot(self):
++        with self.lock:
++            return {
++                **self.stats,
++                "cache_bytes": self.bytes,
++                "cache_max_bytes": self.max_bytes,
++                "cache_entries": len(self.entries),
++            }
++
++    def reset(self, generation=None):
++        with self.lock:
++            self.entries.clear()
++            self.bytes = 0
++            self.stats.clear()
++            self.reset_version += 1
++            if generation is not None:
++                self.generation = generation
+diff --git a/vllm/tokenizers/qwen38_shared_segment_store.py b/vllm/tokenizers/qwen38_shared_segment_store.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e894edd4a638dc676365d72b34d7b1a23a34b84c
+--- /dev/null
++++ b/vllm/tokenizers/qwen38_shared_segment_store.py
+@@ -0,0 +1,238 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Bounded, process-shared storage for exact tokenizer segment results.
++
++The database belongs on a project-private tmpfs. Tokenization and fallback stay
++in the caller; this module never interprets prompts or invokes a tokenizer.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import os
++import sqlite3
++import threading
++import time
++from contextlib import suppress
++from pathlib import Path
++
++
++class SharedSegmentStore:
++    """Share immutable token-ID blobs across independent API processes.
++
++    Entries include their original text to detect digest collisions. Generation,
++    tokenizer fingerprint and caller namespace are independent key components.
++    Readers never retain a transaction across a native encode or an RPC.
++    """
++
++    def __init__(
++        self,
++        path: str,
++        max_bytes: int,
++        fingerprint: str,
++        *,
++        busy_timeout_ms: int = 10,
++        touch_interval_seconds: float = 5.0,
++    ) -> None:
++        if max_bytes <= 0 or not fingerprint:
++            raise ValueError(
++                "A positive byte budget and tokenizer fingerprint are required"
++            )
++        if busy_timeout_ms < 0 or touch_interval_seconds < 0:
++            raise ValueError("Timeouts must be nonnegative")
++        self.path = str(Path(path).resolve())
++        self.max_bytes = int(max_bytes)
++        self.fingerprint = "qwen-v2-truncate-checksum16:" + fingerprint
++        self.busy_timeout_ms = busy_timeout_ms
++        self.touch_interval_ns = int(touch_interval_seconds * 1e9)
++        self._local = threading.local()
++
++    def _connection(self) -> sqlite3.Connection:
++        current = getattr(self._local, "connection", None)
++        if current is not None and self._local.pid == os.getpid():
++            return current
++        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
++        connection = sqlite3.connect(
++            self.path,
++            timeout=self.busy_timeout_ms / 1000,
++            isolation_level=None,
++            cached_statements=32,
++        )
++        try:
++            connection.execute("PRAGMA journal_mode=TRUNCATE")
++            connection.execute("PRAGMA synchronous=NORMAL")
++            connection.execute("PRAGMA cache_size=-2048")
++            connection.execute("PRAGMA mmap_size=268435456")
++            # Hard database-page ceiling leaves eight GiB of the32GiB pool for
++            # rollback journal, temporary pages, metadata and fragmentation.
++            page_size = connection.execute("PRAGMA page_size").fetchone()[0]
++            connection.execute(f"PRAGMA max_page_count={24 * 1024**3 // page_size}")
++            connection.execute("PRAGMA journal_size_limit=16777216")
++            connection.execute(
++                "CREATE TABLE IF NOT EXISTS metadata "
++                "(singleton INTEGER PRIMARY KEY CHECK(singleton=1), "
++                "bytes INTEGER NOT NULL, evictions INTEGER NOT NULL, "
++                "budget INTEGER NOT NULL, fingerprint TEXT NOT NULL)"
++            )
++            connection.execute(
++                "CREATE TABLE IF NOT EXISTS entries "
++                "(generation TEXT NOT NULL, namespace TEXT NOT NULL, "
++                "digest BLOB NOT NULL, text BLOB NOT NULL, ids BLOB NOT NULL, "
++                "bytes INTEGER NOT NULL, touched INTEGER NOT NULL, "
++                "PRIMARY KEY(generation, namespace, digest)) WITHOUT ROWID"
++            )
++            connection.execute(
++                "CREATE INDEX IF NOT EXISTS entries_age ON entries(touched)"
++            )
++            connection.execute(
++                "INSERT OR IGNORE INTO metadata VALUES(1,0,0,?,?)",
++                (self.max_bytes, self.fingerprint),
++            )
++            config = connection.execute(
++                "SELECT budget,fingerprint FROM metadata WHERE singleton=1"
++            ).fetchone()
++            if config != (self.max_bytes, self.fingerprint):
++                raise ValueError("Shared tokenizer cache configuration mismatch")
++        except BaseException:
++            connection.close()
++            raise
++        self._local.connection = connection
++        self._local.pid = os.getpid()
++        return connection
++
++    @staticmethod
++    def _key(generation: str, namespace: str, text: str):
++        raw = text.encode("utf-8")
++        return (generation, namespace, hashlib.sha256(raw).digest()), raw
++
++    def get(self, generation: str, namespace: str, text: str) -> bytes | None:
++        key, raw = self._key(generation, namespace, text)
++        connection = self._connection()
++        row = connection.execute(
++            "SELECT text,ids,touched FROM entries "
++            "WHERE generation=? AND namespace=? AND digest=?",
++            key,
++        ).fetchone()
++        if row is None:
++            return None
++        stored_text, packed_ids, touched = row
++        ids = packed_ids[16:]
++        if (stored_text != raw or len(packed_ids) < 16 or len(ids) % 4
++                or hashlib.blake2b(ids, digest_size=16).digest() != packed_ids[:16]):
++            raise ValueError("Shared tokenizer cache entry failed integrity validation")
++        now = time.monotonic_ns()
++        if now - touched >= self.touch_interval_ns:
++            # Touches are advisory. Contended writers must not turn a valid hit
++            # into an encode or a request error.
++            with suppress(sqlite3.OperationalError):
++                connection.execute(
++                    "UPDATE entries SET touched=? "
++                    "WHERE generation=? AND namespace=? AND digest=?",
++                    (now, *key),
++                )
++        return ids
++
++    def put(self, generation: str, namespace: str, text: str, ids: bytes) -> bool:
++        if len(ids) % 4:
++            raise ValueError("Token IDs must be packed uint32 values")
++        ids = hashlib.blake2b(ids, digest_size=16).digest() + ids
++        key, raw = self._key(generation, namespace, text)
++        size = (
++            len(raw)
++            + len(ids)
++            + len(namespace.encode())
++            + len(generation.encode())
++            + 256
++        )
++        if size > self.max_bytes:
++            return False
++        connection = self._connection()
++        connection.execute("BEGIN IMMEDIATE")
++        try:
++            existing = connection.execute(
++                "SELECT text,ids FROM entries "
++                "WHERE generation=? AND namespace=? AND digest=?",
++                key,
++            ).fetchone()
++            if existing is not None:
++                if existing != (raw, ids):
++                    raise ValueError("Conflicting exact tokenizer cache results")
++                connection.execute("COMMIT")
++                return False
++            used, evicted = connection.execute(
++                "SELECT bytes,evictions FROM metadata WHERE singleton=1"
++            ).fetchone()
++            if used + size > self.max_bytes:
++                target = min(int(self.max_bytes * 0.8), self.max_bytes - size)
++                while used > target:
++                    victims = connection.execute(
++                        "SELECT generation,namespace,digest,bytes FROM entries "
++                        "ORDER BY touched LIMIT 64"
++                    ).fetchall()
++                    if not victims:
++                        raise ValueError(
++                            "Shared tokenizer cache accounting is inconsistent"
++                        )
++                    for gen, salt, digest, amount in victims:
++                        connection.execute(
++                            "DELETE FROM entries WHERE generation=? "
++                            "AND namespace=? AND digest=?",
++                            (gen, salt, digest),
++                        )
++                        used -= amount
++                        evicted += 1
++                        if used <= target:
++                            break
++            connection.execute(
++                "INSERT INTO entries VALUES(?,?,?,?,?,?,?)",
++                (*key, raw, ids, size, time.monotonic_ns()),
++            )
++            connection.execute(
++                "UPDATE metadata SET bytes=?,evictions=? WHERE singleton=1",
++                (used + size, evicted),
++            )
++            connection.execute("COMMIT")
++            return True
++        except BaseException:
++            with suppress(sqlite3.Error):
++                connection.execute("ROLLBACK")
++            raise
++
++    def snapshot(self, generation: str | None = None) -> dict[str, int]:
++        connection = self._connection()
++        used, evicted = connection.execute(
++            "SELECT bytes,evictions FROM metadata WHERE singleton=1"
++        ).fetchone()
++        if generation is None:
++            count = connection.execute("SELECT count(*) FROM entries").fetchone()[0]
++        else:
++            count = connection.execute(
++                "SELECT count(*) FROM entries WHERE generation=?", (generation,)
++            ).fetchone()[0]
++        return {
++            "cache_bytes": used,
++            "cache_max_bytes": self.max_bytes,
++            "cache_entries": count,
++            "evictions": evicted,
++        }
++
++    def clear(self) -> None:
++        """Clear the pool once, with API ingress quiesced, before a cold run."""
++        connection = self._connection()
++        connection.execute("BEGIN IMMEDIATE")
++        try:
++            connection.execute("DELETE FROM entries")
++            connection.execute(
++                "UPDATE metadata SET bytes=0,evictions=0 WHERE singleton=1"
++            )
++            connection.execute("COMMIT")
++        except BaseException:
++            with suppress(sqlite3.Error):
++                connection.execute("ROLLBACK")
++            raise
++        connection.execute("PRAGMA shrink_memory")
++
++    def close(self) -> None:
++        connection = getattr(self._local, "connection", None)
++        if connection is not None:
++            connection.close()
++            del self._local.connection
+diff --git a/vllm/v1/attention/backend.py b/vllm/v1/attention/backend.py
+index 5f53f769929856e5fd227185184b713dd4135010..30eecefa6884a93e69fbca80bc28df789e4bb63b 100644
+--- a/vllm/v1/attention/backend.py
++++ b/vllm/v1/attention/backend.py
+@@ -72,6 +72,11 @@ class AttentionBackend(ABC):
+     # Can forward() run with key/value omitted after a fused op wrote the cache?
+     supports_kv_cache_update_bypass: bool = False
+
++    @classmethod
++    def uses_independent_mamba_pages(cls, cache_dtype: str) -> bool:
++        """Whether the hybrid allocator may keep native recurrent page sizes."""
++        return False
++
+     @staticmethod
+     def get_supported_kernel_block_sizes(
+         kv_cache_spec: "KVCacheSpec | None" = None,
+diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
+old mode 100755
+new mode 100644
+index 1a8c6c377ab9a994bba5622ea248bc348d021574..140577baac72878282a2ae610f4b79919ddc3112
+--- a/vllm/v1/attention/backends/flashinfer.py
++++ b/vllm/v1/attention/backends/flashinfer.py
+@@ -2,7 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Attention layer with FlashInfer."""
+
+-from dataclasses import dataclass, replace
++from dataclasses import dataclass
+ from enum import Enum
+ from functools import partial
+ from typing import ClassVar
+@@ -60,10 +60,7 @@ from vllm.utils.math_utils import cdiv, round_up
+ from vllm.utils.torch_utils import (
+     PIN_MEMORY,
+     canonicalize_singleton_dim_strides,
+-    get_dtype_size,
+     is_strictly_contiguous,
+-    nvfp4_kv_cache_full_dim,
+-    nvfp4_split_data_scale,
+ )
+ from vllm.v1.attention.backend import (
+     AttentionBackend,
+@@ -90,6 +87,8 @@ from vllm.v1.attention.ops.dcp import (
+     mask_dcp_empty_shards_,
+ )
+ from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
++from vllm.v1.attention.ops.nvfp4_kv import nvfp4_kv_spec
++from vllm.v1.attention.ops.nvfp4_kv import nvfp4_kv_views as _nvfp4_kv_views
+ from vllm.v1.kv_cache_interface import (
+     AttentionSpec,
+     KVCacheLayout,
+@@ -120,32 +119,6 @@ def _use_fa2_native_decode() -> bool:
+     return not current_platform.has_device_capability(90)
+
+
+-_KVPair = tuple[torch.Tensor, torch.Tensor]
+-
+-
+-def _nvfp4_kv_views(
+-    kv_cache: torch.Tensor, num_kv_heads: int
+-) -> tuple[_KVPair, _KVPair, str]:
+-    """Views of NVFP4 pages laid out as [K data | K scale | V data | V scale]."""
+-    num_blocks, num_slots, block_size, full_dim = kv_cache.shape
+-    hnd = kv_cache.stride()[1:] == (block_size * full_dim, full_dim, 1)
+-    if not hnd and kv_cache.stride()[1:] != (full_dim, num_slots * full_dim, 1):
+-        raise ValueError(f"NVFP4 KV pages must be dense, got {kv_cache.stride()}")
+-    dims = (num_kv_heads, block_size) if hnd else (block_size, num_kv_heads)
+-    side_size = num_kv_heads * block_size * full_dim
+-    (k_data, k_scale), (v_data, v_scale) = (
+-        nvfp4_split_data_scale(
+-            kv_cache.as_strided(
+-                (num_blocks, *dims, full_dim),
+-                (kv_cache.stride(0), dims[1] * full_dim, full_dim, 1),
+-                kv_cache.storage_offset() + side * side_size,
+-            )
+-        )
+-        for side in range(2)
+-    )
+-    return (k_data, v_data), (k_scale, v_scale), "HND" if hnd else "NHD"
+-
+-
+ def _get_trtllm_workspace_buffer():
+     global trtllm_workspace_buffer
+     if trtllm_workspace_buffer is None:
+@@ -558,16 +531,7 @@ class FlashInferBackend(AttentionBackend):
+     def customize_spec(cls, spec: "AttentionSpec") -> "AttentionSpec":
+         """NVFP4 stores K and V as separate per-head slots of packed fp4 data
+         plus fp8 block scales."""
+-        if spec.state_content_bytes is not None or not spec.kv_quant_mode.is_nvfp4:
+-            return spec
+-        hs_k = nvfp4_kv_cache_full_dim(spec.head_size)
+-        hs_v = nvfp4_kv_cache_full_dim(spec.head_size_v)
+-        assert hs_k == hs_v, "nvfp4 with asymmetric K/V head sizes not yet supported"
+-        return replace(
+-            spec,
+-            num_head_slots=2 * spec.num_kv_heads,
+-            state_content_bytes=hs_k * get_dtype_size(spec.dtype),
+-        )
++        return nvfp4_kv_spec(spec)
+
+     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
+     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+diff --git a/vllm/v1/attention/ops/nvfp4_kv.py b/vllm/v1/attention/ops/nvfp4_kv.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..04990b2c1186e3cccd86955738bed5eb302dee3a
+--- /dev/null
++++ b/vllm/v1/attention/ops/nvfp4_kv.py
+@@ -0,0 +1,53 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Page ABI shared by the FlashInfer and QSA slot-mapping writers/readers."""
++
++from dataclasses import replace
++
++import torch
++
++from vllm.utils.torch_utils import (
++    get_dtype_size,
++    nvfp4_kv_cache_full_dim,
++    nvfp4_split_data_scale,
++)
++from vllm.v1.kv_cache_interface import AttentionSpec
++
++
++def nvfp4_kv_spec(spec: AttentionSpec) -> AttentionSpec:
++    if spec.state_content_bytes is not None or not spec.kv_quant_mode.is_nvfp4:
++        return spec
++    hs_k = nvfp4_kv_cache_full_dim(spec.head_size)
++    hs_v = nvfp4_kv_cache_full_dim(spec.head_size_v)
++    assert hs_k == hs_v, "nvfp4 with asymmetric K/V head sizes not yet supported"
++    return replace(
++        spec,
++        num_head_slots=2 * spec.num_kv_heads,
++        state_content_bytes=hs_k * get_dtype_size(spec.dtype),
++    )
++
++
++_KVPair = tuple[torch.Tensor, torch.Tensor]
++
++
++def nvfp4_kv_views(
++    kv_cache: torch.Tensor, num_kv_heads: int
++) -> tuple[_KVPair, _KVPair, str]:
++    """Views of NVFP4 pages laid out as [K data | K scale | V data | V scale]."""
++    num_blocks, num_slots, block_size, full_dim = kv_cache.shape
++    hnd = kv_cache.stride()[1:] == (block_size * full_dim, full_dim, 1)
++    if not hnd and kv_cache.stride()[1:] != (full_dim, num_slots * full_dim, 1):
++        raise ValueError(f"NVFP4 KV pages must be dense, got {kv_cache.stride()}")
++    dims = (num_kv_heads, block_size) if hnd else (block_size, num_kv_heads)
++    side_size = num_kv_heads * block_size * full_dim
++    (k_data, k_scale), (v_data, v_scale) = (
++        nvfp4_split_data_scale(
++            kv_cache.as_strided(
++                (num_blocks, *dims, full_dim),
++                (kv_cache.stride(0), dims[1] * full_dim, full_dim, 1),
++                kv_cache.storage_offset() + side * side_size,
++            )
++        )
++        for side in range(2)
++    )
++    return (k_data, v_data), (k_scale, v_scale), "HND" if hnd else "NHD"
+diff --git a/vllm/v1/attention/ops/qsa_nvfp4.py b/vllm/v1/attention/ops/qsa_nvfp4.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2c499d4ae2b2338054724b0d80e20d932e975120
+--- /dev/null
++++ b/vllm/v1/attention/ops/qsa_nvfp4.py
+@@ -0,0 +1,190 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Bounds for the experimental local QSA main KV format."""
++
++import math
++import struct
++from dataclasses import dataclass
++
++import torch
++
++from vllm.v1.attention.ops.nvfp4_kv import nvfp4_kv_views
++from vllm.v1.kv_cache_interface import AttentionSpec
++
++QSA_NVFP4_FLASHINFER_SHA = "1658f0bf02b65fe9a71862286f6da546d0fce890"
++
++
++@dataclass(frozen=True)
++class QsaNvfp4PageRegion:
++    base: int
++    stride: int
++    size: int
++    abi: str
++
++
++def qsa_nvfp4_token_segments(
++    cache: torch.Tensor,
++    spec: AttentionSpec,
++    block_id: int,
++    start: int,
++    stop: int,
++) -> tuple[tuple[int, int], ...]:
++    """Exact data/scale spans of the selected token interval, in wire order."""
++    validate_qsa_nvfp4_binding(cache, spec.num_kv_heads, spec.block_size)
++    if not 0 <= block_id < cache.shape[0] or not 0 <= start < stop <= spec.block_size:
++        raise ValueError("QSA NVFP4 block or token slice is out of bounds")
++    data, scales, order = nvfp4_kv_views(cache, spec.num_kv_heads)
++    regions = []
++    for tensor in (data[0], scales[0], data[1], scales[1]):
++        page = tensor[block_id]
++        if order == "NHD":
++            rows = (page[start:stop],)
++        else:
++            rows = (head[start:stop] for head in page.unbind(0))
++        regions.extend((row.data_ptr(), row.nbytes) for row in rows)
++    return tuple(regions)
++
++
++def qsa_nvfp4_page_region(
++    cache: torch.Tensor,
++    spec: AttentionSpec,
++    scales: tuple[float, float],
++) -> QsaNvfp4PageRegion:
++    """Describe transferable bytes without including inter-layer padding."""
++    if not spec.kv_quant_mode.is_nvfp4 or spec.head_size != 256:
++        raise ValueError("Expected a packed D=256 QSA NVFP4 spec")
++    validate_qsa_nvfp4_binding(cache, spec.num_kv_heads, spec.block_size)
++    _, _, order = nvfp4_kv_views(cache, spec.num_kv_heads)
++    size = cache[0].nbytes
++    if size != spec.real_page_size_bytes:
++        raise ValueError("QSA NVFP4 tensor payload does not match its cache spec")
++    if not all(math.isfinite(scale) and scale > 0 for scale in scales):
++        raise ValueError("QSA NVFP4 global scales must be finite and positive")
++    scale_id = struct.pack("!ff", *scales).hex()
++    abi = f"qsa-nvfp4-v1:{order}:{spec.num_kv_heads}:{spec.block_size}:{scale_id}"
++    return QsaNvfp4PageRegion(cache.data_ptr(), cache.stride(0), size, abi)
++
++
++class QsaNvfp4:
++    """Paired slot writer and gated QSA reader; both consume the same page ABI."""
++
++    def __init__(self, num_kv_heads: int):
++        import flashinfer
++
++        if getattr(flashinfer, "__git_commit__", None) != QSA_NVFP4_FLASHINFER_SHA:
++            raise RuntimeError(
++                f"QSA NVFP4 requires FlashInfer {QSA_NVFP4_FLASHINFER_SHA} "
++                "built with the SM120 Cake sources"
++            )
++        from flashinfer import nvfp4_quantize_append_paged_kv_cache_with_slot_mapping
++        from flashinfer.sparse import qsa_sparse_paged_attention
++
++        self.num_kv_heads = num_kv_heads
++        self._append = nvfp4_quantize_append_paged_kv_cache_with_slot_mapping
++        self._attention = qsa_sparse_paged_attention
++
++    def write(
++        self,
++        cache: torch.Tensor,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        slots: torch.Tensor,
++        k_scale: torch.Tensor,
++        v_scale: torch.Tensor,
++    ) -> None:
++        data, scales, layout = nvfp4_kv_views(cache, self.num_kv_heads)
++        self._append(
++            key, value, slots, data, scales, k_scale, v_scale, kv_layout=layout
++        )
++
++    def read(
++        self,
++        cache: torch.Tensor,
++        q: torch.Tensor,
++        indices: torch.Tensor,
++        table: torch.Tensor,
++        reqs: torch.Tensor,
++        prefill: bool,
++        out: torch.Tensor,
++        k_scale: float,
++        v_scale: float,
++        gate: torch.Tensor,
++    ) -> None:
++        (k, v), (ks, vs), layout = nvfp4_kv_views(cache, self.num_kv_heads)
++        if layout == "HND":
++            k, v, ks, vs = (x.transpose(1, 2) for x in (k, v, ks, vs))
++        # Pinned Cake SM120 clips the number of 64-token tiles, but does not
++        # mask entries past the count within the final tile. Preserve the
++        # packed count and mark that tail unmapped without modifying the
++        # indexer's shared selection buffer (which MTP can reuse).
++        width = indices.shape[1] - 1
++        columns = torch.arange(width, dtype=indices.dtype, device=indices.device)
++        counts = indices[:, -1:]
++        logical = indices[:, :-1].masked_fill(columns >= counts, -1)
++        indices = torch.cat((logical, counts), dim=1)
++        self._attention(
++            q,
++            k,
++            v,
++            indices,
++            table,
++            reqs,
++            prefill,
++            out,
++            k_scale,
++            v_scale,
++            output_gate=gate.reshape_as(q).contiguous(),
++            k_sf=ks,
++            v_sf=vs,
++            backend="cake",
++        )
++
++
++def validate_qsa_nvfp4_binding(
++    cache: torch.Tensor, num_kv_heads: int, block_size: int
++) -> None:
++    if (
++        cache.ndim != 4
++        or cache.dtype != torch.uint8
++        or cache.shape[0] == 0
++        or cache.shape[1:] != (2 * num_kv_heads, block_size, 144)
++    ):
++        raise ValueError(
++            "QSA NVFP4 requires uint8 [blocks, 2*kv_heads, physical_block_size, 144]"
++        )
++    if cache.shape[0] > 1 and cache.stride(0) < cache[0].numel():
++        raise ValueError("QSA NVFP4 KV pages overlap")
++    data, scales, _ = nvfp4_kv_views(cache, num_kv_heads)
++    # Check the actual layer offset and interleaved block stride before writing
++    # vectorized rows; both the data and E4M3 scales occupy one byte per item.
++    for tensor in (*data, *scales):
++        if tensor.data_ptr() % 16 or any(s % 16 for s in tensor.stride()[:-1]):
++            raise ValueError("QSA NVFP4 data and scales must be 16-byte aligned")
++
++
++def qsa_nvfp4_scales(k: torch.Tensor, v: torch.Tensor) -> tuple[float, float]:
++    if any(s.dtype != torch.float32 or s.numel() != 1 for s in (k, v)):
++        raise ValueError("QSA NVFP4 requires scalar float32 global scales")
++    ks, vs = k.item(), v.item()
++    if not (math.isfinite(ks) and ks > 0 and math.isfinite(vs) and vs > 0):
++        raise ValueError("QSA NVFP4 global scales must be finite and positive")
++    return ks, vs
++
++
++def validate_qsa_nvfp4_page(
++    spec: AttentionSpec,
++    requested: int | None,
++    pmu: int | None,
++    *,
++    prefix_caching: bool = False,
++) -> None:
++    if requested is not None and requested != spec.block_size:
++        raise ValueError(
++            f"QSA NVFP4 requested {requested} tokens but hybrid alignment resolved "
++            f"{spec.block_size}. Explicitly select the resolved page for this trial."
++        )
++    if (prefix_caching or pmu is not None) and pmu != spec.block_size:
++        raise ValueError(
++            "QSA NVFP4 sub-page prefix matches are not validated; set "
++            f"--prefix-match-unit {spec.block_size} for local prefix caching"
++        )
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index f735a7575a509d31ad78a9fd877d2168ea361b08..36e9cbb4dba873409f40db6c25378aaf5ed86dd5 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -332,13 +332,13 @@ class BlockPool:
+                     continue
+                 block_start = i * block_size
+                 block_end = block_start + block_size
+-                extra_keys, curr_mm_idx = self._generate_event_extra_keys(
++                extra_keys, curr_mm_idx = self.generate_event_extra_keys(
+                     request, block_start, block_end, curr_mm_idx
+                 )
+                 extra_keys_list.append(extra_keys)
+                 if lookahead_token_ids is not None:
+                     lookahead_token_ids.append(
+-                        self._lookahead_token_ids(request, block_end)
++                        self.get_lookahead_token_ids(request, block_end)
+                     )
+
+             self.kv_event_queue.append(
+@@ -355,7 +355,7 @@ class BlockPool:
+                 )
+             )
+
+-    def _generate_event_extra_keys(
++    def generate_event_extra_keys(
+         self, request: Request, start: int, end: int, start_mm_idx: int
+     ) -> tuple[tuple[Any, ...] | None, int]:
+         # Event extra keys cover the same window as the block hash.
+@@ -365,10 +365,10 @@ class BlockPool:
+             )
+         return generate_block_hash_extra_keys(request, start, end, start_mm_idx)
+
+-    def _lookahead_token_ids(self, request: Request, block_end: int) -> list[int]:
+-        return request.all_token_ids[
+-            block_end : block_end + self.num_hash_lookahead_tokens
+-        ]
++    def get_lookahead_token_ids(self, request: Request, block_end: int) -> list[int]:
++        return request.get_kv_cache_token_ids(
++            block_end, block_end + self.num_hash_lookahead_tokens
++        )
+
+     def _build_block_stored_event(
+         self,
+@@ -440,13 +440,13 @@ class BlockPool:
+             block_start = i * block_size
+             block_end = block_start + block_size
+             cached_hashes.append(maybe_convert_block_hash(block_hashes[i]))
+-            extra_keys, curr_mm_idx = self._generate_event_extra_keys(
++            extra_keys, curr_mm_idx = self.generate_event_extra_keys(
+                 request, block_start, block_end, curr_mm_idx
+             )
+             extra_keys_list.append(extra_keys)
+             if lookahead_token_ids is not None:
+                 lookahead_token_ids.append(
+-                    self._lookahead_token_ids(request, block_end)
++                    self.get_lookahead_token_ids(request, block_end)
+                 )
+
+         if not cached_hashes:
+@@ -576,7 +576,7 @@ class BlockPool:
+                     curr_mm_idx, _ = get_mm_features_in_window(
+                         mm_features, block_start, block_end
+                     )
+-            extra_keys, _ = self._generate_event_extra_keys(
++            extra_keys, _ = self.generate_event_extra_keys(
+                 request, block_start, block_end, curr_mm_idx
+             )
+             self.kv_event_queue.append(
+@@ -595,7 +595,9 @@ class BlockPool:
+                     extra_keys=to_event_extra_keys([extra_keys]),
+                     group_idx=kv_cache_group_id,
+                     session_id=request.session_id,
+-                    lookahead_token_ids=[self._lookahead_token_ids(request, block_end)]
++                    lookahead_token_ids=[
++                        self.get_lookahead_token_ids(request, block_end)
++                    ]
+                     if self.num_hash_lookahead_tokens
+                     else None,
+                 )
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 9f239e82fb877c5f44d5861fe003ad5f2090cc4b..9d745eb03ca049c193003d38658091c65f6cb2e4 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -975,6 +975,9 @@ def get_request_block_hasher(
+     def request_block_hasher(request: Request) -> list[BlockHash]:
+         start_token_idx = len(request.block_hashes) * hash_block_size
+         num_tokens = request.num_tokens - num_hash_lookahead_tokens
++        if request.mtp_context_next_token_id is not None:
++            # The producer never computes target KV past the truncated prompt.
++            num_tokens = min(num_tokens, request.num_prompt_tokens)
+
+         if start_token_idx + hash_block_size > num_tokens:
+             # Early stop when there no new full blocks created.
+@@ -1011,13 +1014,10 @@ def get_request_block_hasher(
+                     hash_end_token_idx,
+                     curr_mm_idx,
+                 )
+-                if num_hash_lookahead_tokens == 1:
+-                    extra_keys = (extra_keys, request.all_token_ids[end_token_idx])
+-                else:
+-                    extra_keys = (
+-                        extra_keys,
+-                        *request.all_token_ids[end_token_idx:hash_end_token_idx],
+-                    )
++                extra_keys = (
++                    extra_keys,
++                    *request.get_kv_cache_token_ids(end_token_idx, hash_end_token_idx),
++                )
+             else:
+                 extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
+                     request, start_token_idx, end_token_idx, curr_mm_idx
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index 34f9153b3af0f8d101e76843bd7818a5a0a51777..50f8074ca8f7dfdef4f7de70a7f3f71bdd941a29 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -54,6 +54,7 @@ class NewRequestData:
+     prefill_token_ids: list[int] | None = None
+     # DeepSeek-V4.1 only: SWA bounded replay; see Request.replay_start.
+     replay_start: int = 0
++    mtp_context_next_token_id: int | None = None
+
+     @classmethod
+     def from_request(
+@@ -80,6 +81,7 @@ class NewRequestData:
+             prompt_is_token_ids=request.prompt_is_token_ids,
+             prefill_token_ids=prefill_token_ids,
+             replay_start=request.replay_start,
++            mtp_context_next_token_id=request.mtp_context_next_token_id,
+         )
+
+     @property
+diff --git a/vllm/v1/engine/input_processor.py b/vllm/v1/engine/input_processor.py
+index 2ddfe5457f937e982d45a4cd95d980b8eba530f0..f495556858e0471768cd39a5fb3b1214f7535e3d 100644
+--- a/vllm/v1/engine/input_processor.py
++++ b/vllm/v1/engine/input_processor.py
+@@ -551,6 +551,29 @@ class InputProcessor:
+                     )
+                 )
+
++        if self.vllm_config.qwen38_p_mtp_context_only:
++            kv_params = (
++                (sampling_params.extra_args or {}).get("kv_transfer_params") or {}
++                if sampling_params is not None
++                else {}
++            )
++            if (
++                sampling_params is None
++                or sampling_params.max_tokens != 1
++                or not isinstance(kv_params, dict)
++                or not kv_params.get("do_remote_decode")
++                or kv_params.get("do_remote_prefill")
++                or not kv_params.get("transfer_id")
++                or "_p_side_truncated" in kv_params
++                or resumable
++                or prompt_embeds is not None
++            ):
++                raise VLLMValidationError(
++                    "Qwen3.8 MTP context-only P requires a one-output-token "
++                    "Mooncake remote-decode request with a transfer ID, no "
++                    "prompt embeddings, and no streaming input."
++                )
++
+         return EngineCoreRequest(
+             request_id=request_id,
+             prompt_token_ids=prompt_token_ids,
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index e5d5a004351086ab5388757dfd28293b269b85b9..44b62acfbcb34e52d3ad7cefc56bf0d26865ce3d 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -104,6 +104,8 @@ class Request:
+
+         # P/D: Connector-specific KV transfer parameters.
+         self.kv_transfer_params: dict[str, Any] | None = None
++        # Mooncake hybrid P may keep the excluded prompt token for MTP KV only.
++        self.mtp_context_next_token_id: int | None = None
+         # E/P/D: Connector-specific encoder-cache transfer parameters.
+         self.ec_transfer_params: dict[str, Any] | None = None
+
+@@ -292,6 +294,55 @@ class Request:
+         if self._block_hasher is not None:
+             self.block_hashes.extend(self._block_hasher(self))
+
++    def truncate_block_hashes(
++        self, hash_block_size: int, num_hash_lookahead_tokens: int = 0
++    ) -> None:
++        """Discard hashes invalidated by truncating the request's tokens."""
++        num_valid_hashes = (
++            max(0, self.num_tokens - num_hash_lookahead_tokens) // hash_block_size
++        )
++        del self.block_hashes[num_valid_hashes:]
++        self._prompt_embeds_per_block_hashes.clear()
++
++    def truncate_prompt_for_remote_prefill(
++        self,
++        hash_block_size: int,
++        num_hash_lookahead_tokens: int,
++        *,
++        retain_mtp_context: bool = False,
++    ) -> bool:
++        """Drop the target's tail row, optionally keeping its token for MTP."""
++        if retain_mtp_context and num_hash_lookahead_tokens != 1:
++            raise ValueError(
++                "MTP prompt-tail context requires one hash lookahead token"
++            )
++        if self.prompt_token_ids is not None:
++            tail_token = self.prompt_token_ids.pop()
++            if retain_mtp_context:
++                self.mtp_context_next_token_id = tail_token
++                # The retained token still contributes to the last page's hash.
++                num_hash_lookahead_tokens -= 1
++        elif self.prompt_embeds is not None:
++            self.prompt_embeds = self.prompt_embeds[:-1]
++        else:
++            return False
++        self._all_token_ids.pop()
++        self.num_prompt_tokens -= 1
++        self.max_tokens = 1
++        self.truncate_block_hashes(hash_block_size, num_hash_lookahead_tokens)
++        return True
++
++    def get_kv_cache_token_ids(self, start: int, end: int) -> list[int]:
++        """Return cache provenance, not the synthetic P output token."""
++        next_token = self.mtp_context_next_token_id
++        if next_token is None:
++            return self.all_token_ids[start:end]
++        boundary = self.num_prompt_tokens
++        tokens = self.all_token_ids[start : min(end, boundary)]
++        if start <= boundary < end:
++            tokens.append(next_token)
++        return tokens
++
+     @property
+     def use_structured_output(self) -> bool:
+         return self.structured_output_request is not None
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index b2040891615d46058ae7ae86cb8a745019653229..e3db4727a3c1184065caeb917ee9623ae2530b56 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -131,6 +131,9 @@ class InputBatch:
+     # adaptive verification with batch-sharded sampling, when the budget binds.
+     num_admitted_draft_tokens: "AdmittedDraftCounts | None" = None
+
++    # Per request-state slot; -1 means use the ordinary next token.
++    mtp_context_next_token_ids: torch.Tensor | None = None
++
+     @classmethod
+     def make_dummy(
+         cls,
+diff --git a/vllm/v1/worker/gpu/spec_decode/mtp/speculator.py b/vllm/v1/worker/gpu/spec_decode/mtp/speculator.py
+index a0064197f756c2601abcac11061216073c43d915..a9f45729d0e868e88720bb150f1671da54463189 100644
+--- a/vllm/v1/worker/gpu/spec_decode/mtp/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/mtp/speculator.py
+@@ -1,8 +1,10 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
++import torch
+ import torch.nn as nn
+
++from vllm.config import VllmConfig
+ from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
+ from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
+     TargetDependentARSpeculator,
+@@ -12,12 +14,18 @@ from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
+ class MTPSpeculator(TargetDependentARSpeculator):
+     share_mtp_topk_indices: bool = False
+
++    def __init__(self, vllm_config: VllmConfig, device: torch.device):
++        super().__init__(vllm_config, device)
++        self.context_only = vllm_config.qwen38_p_mtp_context_only
++
+     def load_draft_model(
+         self,
+         target_model: nn.Module,
+         target_attn_layer_names: set[str],
+     ) -> nn.Module:
+         draft_model = load_eagle_model(target_model, self.vllm_config)
++        if self.context_only and not getattr(draft_model, "mtp_context_only", False):
++            raise RuntimeError("Expected the native Qwen3.8 MTP context-only model")
+         spec_config = self.vllm_config.speculative_config
+         draft_hf_config = (
+             spec_config.draft_model_config.hf_config
+@@ -29,6 +37,7 @@ class MTPSpeculator(TargetDependentARSpeculator):
+         # steps 1+ reuse them.
+         self.share_mtp_topk_indices = (
+             self.vllm_config.parallel_config.prefill_context_parallel_size == 1
++            and not self.context_only
+             and getattr(draft_hf_config, "index_share_for_mtp_iteration", False)
+             and hasattr(draft_model.model, "set_skip_topk")
+             and hasattr(draft_model.model, "compact_topk_indices")
+diff --git a/vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py b/vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py
+index f17a820c4f1f72c57a7e10bf7b8e6ce50847da79..45cad6beb67c1aeeac69f6157300b5fc67be9fe5 100644
+--- a/vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py
+@@ -30,6 +30,8 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
+     hidden states (and, for Gemma4, its KV cache) at each draft step.
+     """
+
++    context_only: bool = False
++
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+         super().__init__(vllm_config, device)
+
+@@ -81,7 +83,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
+
+     def _configure_decode_metadata_update(self) -> None:
+         # With one speculative step there are no draft decode steps to update.
+-        if self.num_speculative_steps == 1:
++        if self.num_speculative_steps == 1 or self.context_only:
+             self.supports_decode_metadata_update = False
+             return
+         super()._configure_decode_metadata_update()
+@@ -97,6 +99,9 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
+             varlen_decode=self.enable_adaptive_verification,
+         )
+
++        if self.context_only:
++            return
++
+         # PIECEWISE cudagraphs are not supported for draft decodes.
+         if cudagraph_mode.decode_mode() == CUDAGraphMode.FULL:
+             cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+@@ -141,7 +146,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
+         )
+         self.on_prefill_end(self.max_num_reqs)
+
+-        if self.num_speculative_steps == 1:
++        if self.num_speculative_steps == 1 or self.context_only:
+             return
+
+         self.on_multi_step_decode_begin(self.max_num_reqs)
+@@ -222,13 +227,14 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
+             )
+         else:
+             hidden_states = last_hidden_states
+-        self._copy_request_inputs(
+-            num_reqs,
+-            input_batch.idx_mapping,
+-            temperature,
+-            seeds,
+-            dummy_run=dummy_run,
+-        )
++        if not self.context_only:
++            self._copy_request_inputs(
++                num_reqs,
++                input_batch.idx_mapping,
++                temperature,
++                seeds,
++                dummy_run=dummy_run,
++            )
+
+         # Get the input ids and last token indices for the speculator.
+         prepare_prefill_inputs(
+@@ -314,8 +320,8 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
+             )
+         self.on_prefill_end(num_reqs)
+
+-        if num_speculative_tokens <= 1:
+-            if num_speculative_tokens == 0:
++        if self.context_only or num_speculative_tokens <= 1:
++            if self.context_only or num_speculative_tokens == 0:
+                 self.draft_tokens[:num_reqs].fill_(-1)
+             return self.draft_tokens[:num_reqs]
+
+@@ -469,6 +475,17 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
+         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+         skip_sample: bool = False,
+     ) -> None:
++        if self.context_only:
++            self._run_model(
++                num_tokens,
++                attn_metadata,
++                slot_mappings,
++                num_tokens_across_dp=num_tokens_across_dp,
++                cudagraph_runtime_mode=cudagraph_runtime_mode,
++                mm_inputs=mm_inputs,
++            )
++            return
++
+         last_token_indices = self.last_token_indices[:num_reqs]
+         positions = self.input_buffers.positions[last_token_indices]
+         # The output hidden state at position P (= positions) and the token id
+@@ -720,8 +737,10 @@ def _prepare_prefill_inputs_kernel(
+     num_rejected_ptr,
+     query_start_loc_ptr,
+     seq_lens_ptr,
++    mtp_context_next_token_ids_ptr,
+     max_num_reqs,
+     BLOCK_SIZE: tl.constexpr,
++    HAS_MTP_CONTEXT_TOKENS: tl.constexpr,
+ ):
+     req_idx = tl.program_id(0)
+     num_reqs = tl.num_programs(0)
+@@ -739,6 +758,9 @@ def _prepare_prefill_inputs_kernel(
+     num_sampled = tl.load(num_sampled_ptr + req_idx)
+     if num_sampled > 0:
+         next_token = tl.load(last_sampled_ptr + req_state_idx).to(tl.int32)
++        if HAS_MTP_CONTEXT_TOKENS:
++            context_token = tl.load(mtp_context_next_token_ids_ptr + req_state_idx)
++            next_token = tl.where(context_token >= 0, context_token, next_token)
+     else:
+         # Chunked prefilling.
+         # Get the next prefill token.
+@@ -819,8 +841,10 @@ def prepare_prefill_inputs(
+         num_rejected,
+         input_batch.query_start_loc,
+         input_batch.seq_lens,
++        input_batch.mtp_context_next_token_ids,
+         max_num_reqs,
+         BLOCK_SIZE=1024,
++        HAS_MTP_CONTEXT_TOKENS=input_batch.mtp_context_next_token_ids is not None,
+     )
+     return last_token_indices
+
+diff --git a/vllm/v1/worker/gpu/states.py b/vllm/v1/worker/gpu/states.py
+index 0a8604e866197c6b0cd76e001166e9213f37ab56..70ee93773b7ab1bd5ba8486731cd1d152bf9bffa 100644
+--- a/vllm/v1/worker/gpu/states.py
++++ b/vllm/v1/worker/gpu/states.py
+@@ -17,6 +17,7 @@ class RequestState:
+         device: torch.device,
+         num_prefill_lookahead: int = 1,
+         use_dense_all_token_ids: bool = False,
++        mtp_context_only: bool = False,
+     ):
+         self.max_num_reqs = max_num_reqs
+         self.max_model_len = max_model_len
+@@ -83,6 +84,11 @@ class RequestState:
+         self.next_prefill_tokens = torch.zeros(
+             num_prefill_lookahead, self.max_num_reqs, dtype=torch.int32, device=device
+         )
++        self.mtp_context_next_token_ids = (
++            StagedWriteTensor(max_num_reqs, dtype=torch.int32, device=device)
++            if mtp_context_only
++            else None
++        )
+
+     @property
+     def num_reqs(self) -> int:
+@@ -95,6 +101,7 @@ class RequestState:
+         all_token_ids: list[int],
+         num_computed_tokens: int,
+         max_tokens: int,
++        mtp_context_next_token_id: int | None = None,
+     ) -> None:
+         assert len(self.free_indices) > 0, "No free indices"
+         req_idx = self.free_indices.pop()
+@@ -116,6 +123,11 @@ class RequestState:
+
+         if self.num_speculative_steps > 0:
+             self.draft_tokens[req_idx].zero_()
++        if self.mtp_context_next_token_ids is not None:
++            self.mtp_context_next_token_ids.stage_write_elem(
++                req_idx,
++                -1 if mtp_context_next_token_id is None else mtp_context_next_token_id,
++            )
+
+     def apply_staged_writes(self) -> None:
+         self.prompt_len.copy_to_uva()
+@@ -123,6 +135,8 @@ class RequestState:
+         self.total_len.apply_write()
+         self.all_token_ids.apply_write()
+         self.num_computed_tokens.apply_write()
++        if self.mtp_context_next_token_ids is not None:
++            self.mtp_context_next_token_ids.apply_write()
+
+     def remove_request(self, req_id: str) -> int | None:
+         """Return the freed slot index, or None if the request was not found."""
+diff --git a/vllm/v1/worker/gpu/warmup.py b/vllm/v1/worker/gpu/warmup.py
+index b1f5aed0b64b676393fca82c3783e502cf52424d..05502a585f77b3f35a21f42c943aef6a2851731b 100644
+--- a/vllm/v1/worker/gpu/warmup.py
++++ b/vllm/v1/worker/gpu/warmup.py
+@@ -448,7 +448,12 @@ def _warmup_kernels(
+                 req_computed[i] += decode_query_len if use_spec else 1
+
+         all_indices = list(range(num_reqs))
+-        use_spec_decode = num_spec_steps > 0
++        # Context-only P never produces drafts to verify. Still exercise the
++        # same context prefill path and leave the target graph sizing intact.
++        use_spec_decode = (
++            num_spec_steps > 0
++            and not model_runner.vllm_config.qwen38_p_mtp_context_only
++        )
+
+         # Decode steps to warm, as (request indices, per-request spec flag).
+         # Under spec decoding the scheduler drops requests the drafter proposed
