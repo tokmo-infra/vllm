@@ -689,7 +689,7 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
                     row_width=(
                         self.get_fp8_ds_mla_row_bytes()
                         if kv_cache_dtype == "fp8_ds_mla"
-                        else head_size
+                        else 304 if kv_cache_dtype == "glm_nvfp4_mla" else head_size
                     ),
                     kv_cache_dtype=kv_cache_dtype,
                 )

@@ -1,0 +1,17 @@
+# syntax=docker/dockerfile:1.7
+FROM rust:1.99.1-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential pkg-config libssl-dev cmake protobuf-compiler python3-dev ca-certificates \
+ && apt-get clean
+WORKDIR /src
+COPY --from=router_src / /src/
+ARG BUILD_JOBS=8
+ENV CARGO_INCREMENTAL=0
+RUN cargo build --release --locked --bin vllm-router -j "$BUILD_JOBS"
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 libgcc-s1 libstdc++6 && apt-get clean
+COPY --from=build /src/target/release/vllm-router /usr/local/bin/vllm-router
+RUN ldd /usr/local/bin/vllm-router > /tmp/router-ldd.txt && ! grep -F 'not found' /tmp/router-ldd.txt \
+ && /usr/local/bin/vllm-router --version
+ENTRYPOINT ["/usr/local/bin/vllm-router"]

@@ -11,6 +11,7 @@ and MooncakeDistributedStore integration.
 """
 
 import dataclasses
+import hashlib
 import math
 import os
 import queue
@@ -38,6 +39,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorTransferResults,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import rdma_utils
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.glm_nvfp4 import (
+    GLM_NVFP4_MLA,
+    glm_layout_manifest,
+    glm_transfer_page_view,
+    group_layer_specs,
+    has_glm_nvfp4_mla,
+    is_glm_nvfp4_mla,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (  # noqa: E501
     ExternalCachedBlockPool,
     MooncakeStoreCoordinator,
@@ -84,6 +93,7 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
+    KVCacheGroupSpec,
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
@@ -121,18 +131,30 @@ def resolve_store_tp_size(extra_config: dict[str, Any]) -> int | None:
 
 
 def _compact_group_cache_tensors(
-    group: Any,
+    group: KVCacheGroupSpec,
     kv_caches: dict[str, torch.Tensor | Sequence[torch.Tensor]],
     num_blocks: int,
-) -> list[torch.Tensor]:
+    *,
+    glm_layout: bool = False,
+) -> tuple[list[torch.Tensor], frozenset[int]]:
     """Return every registered state view for exactly one KV-cache group."""
     missing_layers = [name for name in group.layer_names if name not in kv_caches]
     if missing_layers:
         raise ValueError(f"Missing transferable KV caches for layers: {missing_layers}")
 
     result: list[torch.Tensor] = []
-    for layer_name in group.layer_names:
+    nvfp4_views: set[int] = set()
+    specs = group_layer_specs(group) if glm_layout else {}
+    for layer_name in sorted(specs) if glm_layout else group.layer_names:
         value = kv_caches[layer_name]
+        if glm_layout:
+            spec = specs[layer_name]
+            if not isinstance(value, torch.Tensor):
+                raise ValueError(f"{GLM_NVFP4_MLA} requires one raw view per layer")
+            if is_glm_nvfp4_mla(spec):
+                nvfp4_views.add(len(result))
+            result.append(glm_transfer_page_view(value, spec, num_blocks))
+            continue
         states = (value,) if isinstance(value, torch.Tensor) else value
         if (
             not isinstance(states, Sequence)
@@ -144,7 +166,7 @@ def _compact_group_cache_tensors(
                 "sequence of state tensors"
             )
         result.extend(group_kernel_blocks(state, num_blocks) for state in states)
-    return result
+    return result, frozenset(nvfp4_views)
 
 
 def _rotate_list(values: list[_T], offset: int) -> list[_T]:
@@ -666,7 +688,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
             put_step_rank = (self.tp_rank + group_id) % put_step
             if (cdiv(num_tokens, db.block_size) - 1) % put_step != put_step_rank:
                 continue
-            addr, size = db.prepare_value_for_block(block_id)
+            valid_tokens = (num_tokens - 1) % db.block_size + 1
+            addr, size = db.prepare_value_for_block(block_id, valid_tokens)
             puts.append(
                 (db.key_for(req_meta.block_hashes[hash_idx]), addr, size, db.metadata)
             )
@@ -1218,6 +1241,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             if not self.group_participates[g_idx]:
                 continue
             mask = load_mask_per_group[g_idx]
+            trim_tail = (
+                isinstance(db.store_layout, CompactGroupStoreLayout)
+                and db.store_layout.glm_nvfp4_view_indices
+            )
             chunks: list[tuple[int, int]] = []
             store_shard_ids: list[StoreShardId] = []
             for start, end, block_hash in db.process_tokens(
@@ -1230,9 +1257,27 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     tail_key_boundaries.get(g_idx) if end == token_len else None
                 )
                 if boundary_tokens is not None:
-                    block_hash = req_meta.block_hashes[
-                        boundary_tokens // db.hash_block_size - 1
-                    ]
+                    hash_idx = boundary_tokens // db.hash_block_size - 1
+                    if trim_tail:
+                        # The stored size is keyed by the hash boundary, which
+                        # may be later than the hit but must be in this page.
+                        if (
+                            not end <= boundary_tokens <= start + db.block_size
+                            or boundary_tokens % db.hash_block_size
+                            or not 0 <= hash_idx < len(req_meta.block_hashes)
+                        ):
+                            logger.error(
+                                "Invalid GLM Store tail key for request %s", req_id
+                            )
+                            self._report_load_error(
+                                req_id,
+                                [bid for group in req_meta.block_ids for bid in group],
+                            )
+                            self.set_finished_request(req_id)
+                            self.request_queue.task_done()
+                            return
+                        end = boundary_tokens
+                    block_hash = req_meta.block_hashes[hash_idx]
                 for store_shard_id in db.store_layout.local_shard_ids:
                     key_list.append(db.store_layout.key_for(store_shard_id, block_hash))
                     chunks.append((start, end))
@@ -1529,6 +1574,23 @@ class MooncakeStoreWorker:
             and not extra_config.get("enable_lookup", True)
             and not self.can_put
         )
+        self._glm_store_manifest = ""
+        groups = kv_cache_config.prefix_cacheable_groups
+        if not self._capacity_only and has_glm_nvfp4_mla(groups):
+            if (
+                self.pp_size != 1
+                or self.pcp_size != 1
+                or self.dcp_size != 1
+                or kv_cache_config.hisparse_host_num_blocks is not None
+                or extra_config.get("enable_store_tp_lcm") is True
+                or extra_config.get("store_tp_size") is not None
+            ):
+                raise ValueError(
+                    f"Mooncake Store {GLM_NVFP4_MLA} requires rank-local Store, "
+                    "PP/PCP/DCP=1 and no HiSparse"
+                )
+            self._glm_store_manifest = glm_layout_manifest(groups)
+            self._store_compact_group_payloads = True
         self.cache_config = vllm_config.cache_config
         self._is_hma_required = len(kv_cache_config.kv_cache_groups) > 1
         self.block_size, self.hash_block_size = resolve_kv_cache_block_sizes(
@@ -1690,6 +1752,13 @@ class MooncakeStoreWorker:
         self, extra_config: dict[str, Any]
     ) -> tuple[int | None, str, type[TPShardedStoreLayout] | None]:
         """Select the opt-in TP layout and its Store namespace."""
+        if manifest := getattr(self, "_glm_store_manifest", ""):
+            digest = hashlib.sha256(manifest.encode()).hexdigest()[:32]
+            namespace = (
+                f"@store_format:{GLM_NVFP4_MLA}_v1@store_tp:{self.tp_size}"
+                f"@hash_block:{self.hash_block_size}@layout:{digest}"
+            )
+            return None, namespace, None
         compact_payloads = extra_config.get("store_compact_group_payloads", False)
 
         def compact_namespace(namespace: str) -> str:
@@ -1934,9 +2003,16 @@ class MooncakeStoreWorker:
             for group_idx, (group, db) in enumerate(
                 zip(self._kv_cache_groups, self.token_dbs, strict=True)
             ):
-                group_tensors = _compact_group_cache_tensors(
-                    group, kv_caches, self.num_blocks
+                group_tensors, nvfp4_views = _compact_group_cache_tensors(
+                    group,
+                    kv_caches,
+                    self.num_blocks,
+                    glm_layout=bool(getattr(self, "_glm_store_manifest", "")),
                 )
+                layout = db.store_layout
+                if isinstance(layout, CompactGroupStoreLayout):
+                    layout.glm_nvfp4_view_indices = nvfp4_views
+                layout.register_kv_caches(group_tensors, self.num_blocks)
                 for cache in group_tensors:
                     storage = cache.untyped_storage()
                     base_addr = storage.data_ptr()
@@ -1955,7 +2031,6 @@ class MooncakeStoreWorker:
                             f"KV cache views at {base_addr:#x} expose inconsistent "
                             f"region sizes: {registered_len} and {region_len}."
                         )
-                db.store_layout.register_kv_caches(group_tensors, self.num_blocks)
                 if isinstance(db.store_layout, CompactGroupStoreLayout):
                     logger.info(
                         "Compact Store group %d: layers=%d state_views=%d "
@@ -1966,7 +2041,7 @@ class MooncakeStoreWorker:
                         len(group_tensors),
                         db.store_layout.compact_block_bytes,
                         db.store_layout.compact_segment_count,
-                        db.store_layout.tail_trim_supported,
+                        bool(nvfp4_views) or db.store_layout.tail_trim_supported,
                         db.store_layout.tail_trim_reason,
                     )
         elif not use_group_regions:

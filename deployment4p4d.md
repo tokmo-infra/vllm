@@ -87,7 +87,7 @@ Tokenizer 的 `CACHE_GIB` 参数 P=2、D=16 是兼容参数；共享模式的整
 
 ## 2. 源码与镜像
 
-使用本分支源码和 `integrations/glm53flash/Dockerfile` 构建引擎。P/D 使用同一份 GLM 源码，优化开关在镜像中默认关闭，由第 6 节按角色启用。`integrations/glm53flash/release.json` 校验原生基底、覆盖文件和运行源码。
+本页的 4P4D FP8 镜像使用 `67ca8f23ae3192992af6b099b3cc8041316fe787` 的构建目录和清单。P/D 使用同一份 GLM 源码，优化开关在镜像中默认关闭，由第 6 节按角色启用。`integrations/glm53flash/release.json` 校验原生基底、覆盖文件和运行源码。
 
 | 组件 | 镜像要求 |
 | --- | --- |
@@ -100,7 +100,7 @@ NVFP4 内核在实例初始化时编译为 SM120a。保留挂载的 `/root/.cach
 
 ### 在构建机生成镜像
 
-在仓库根目录执行。构建机应已导入匹配的 GLM 基底，例如 `local/glm53flash-1103:router-policy-fi071-20261107`；它是本地镜像名，不是公开 registry 地址。本地 image ID 不是 registry manifest digest。分发后在各节点核对 ID，`--pull=never` 要求镜像预先就绪。
+在该版本的仓库根目录执行。`git worktree add --detach ../glm53flash-4p4d-fp8 67ca8f23ae3192992af6b099b3cc8041316fe787` 建立独立构建目录。构建机应已导入匹配的 GLM 基底，例如 `local/glm53flash-1103:router-policy-fi071-20261107`；它是本地镜像名，不是公开 registry 地址。本地 image ID 不是 registry manifest digest。分发后在各节点核对 ID，`--pull=never` 要求镜像预先就绪。
 
 ~~~bash
 : "${ENGINE_BASE_IMAGE:?填写匹配的 GLM 原生基底}"

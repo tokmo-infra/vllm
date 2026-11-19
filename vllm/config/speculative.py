@@ -382,6 +382,12 @@ _DRAFT_VLLM_CONFIG_OVERRIDES = (
     ("kv_cache_dtype", "cache_config", "cache_dtype"),
 )
 
+# Both the public request and the resolved target-layer format may be visible
+# by the time a GLM draft is loaded.
+_GLM_NVFP4_KV_DTYPES = frozenset({"nvfp4", "glm_nvfp4_mla"})
+_GLM_NATIVE_FP8_KV_DTYPES = frozenset({"fp8", "fp8_e4m3", "fp8_ds_mla"})
+_GLM_NATIVE_MTP_BACKEND = AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120
+
 
 @config
 class SpeculativeConfig:
@@ -427,7 +433,8 @@ class SpeculativeConfig:
     backend (e.g. DFlash needs a backend that supports non-causal attention)."""
     kv_cache_dtype: CacheDType | None = None
     """KV cache dtype for the draft model. When `None`, the draft inherits the
-    target model's `--kv-cache-dtype`."""
+    target model's `--kv-cache-dtype`. GLM MTP keeps its native packed FP8 KV
+    when the target uses GLM NVFP4 KV."""
     max_model_len: int | None = Field(default=None, ge=1)
     """The maximum model length of the draft model. Used when testing the
     ability to skip speculation for some sequences."""
@@ -1791,13 +1798,50 @@ class SpeculativeConfig:
         """Overlay this config's kernel overrides onto a target VllmConfig.
 
         Only non-None fields override, so an unset field keeps whatever the
-        target resolved.
+        target resolved (except GLM MTP with an NVFP4 target).
         """
+        if self.glm_mtp_needs_fp8_kv(vllm_config):
+            if not self.glm_mtp_has_native_attn_overrides():
+                logger.warning_once(
+                    "Ignoring incompatible GLM MTP attention overrides: "
+                    "an NVFP4 target requires the native packed FP8 draft."
+                )
+            # Preserve the shared layer registry and resolved cache block size.
+            # Re-running VllmConfig validation here would reconfigure the
+            # target; this is just a view for constructing the draft and its
+            # metadata builders.
+            draft_config = copy.copy(vllm_config)
+            draft_config.cache_config = copy.copy(vllm_config.cache_config)
+            draft_config.cache_config.cache_dtype = "fp8_ds_mla"
+            draft_config.cache_config.kv_cache_dtype_skip_layers = []
+            draft_config.attention_config = replace(
+                vllm_config.attention_config, backend=_GLM_NATIVE_MTP_BACKEND
+            )
+            if self.moe_backend is not None:
+                draft_config.kernel_config = replace(
+                    vllm_config.kernel_config, moe_backend=self.moe_backend
+                )
+            return draft_config
         for src, config_name, dst in _DRAFT_VLLM_CONFIG_OVERRIDES:
             if (value := getattr(self, src)) is not None:
                 sub_config = replace(getattr(vllm_config, config_name), **{dst: value})
                 vllm_config = replace(vllm_config, **{config_name: sub_config})
         return vllm_config
+
+    def glm_mtp_needs_fp8_kv(self, vllm_config: VllmConfig) -> bool:
+        """Separate the GLM draft cache from a GLM NVFP4 target cache."""
+        return (
+            self.method == "mtp"
+            and self.draft_model_config is not None
+            and self.draft_model_config.hf_config.model_type == "glm5_next_mtp"
+            and vllm_config.cache_config.cache_dtype in _GLM_NVFP4_KV_DTYPES
+        )
+
+    def glm_mtp_has_native_attn_overrides(self) -> bool:
+        return (
+            self.kv_cache_dtype is None
+            or self.kv_cache_dtype in _GLM_NATIVE_FP8_KV_DTYPES
+        ) and self.attention_backend in (None, _GLM_NATIVE_MTP_BACKEND)
 
     @field_validator("attention_backend", mode="before")
     @classmethod

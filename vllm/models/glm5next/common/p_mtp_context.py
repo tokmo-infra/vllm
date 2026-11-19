@@ -2,7 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Narrow GLM53 producer-only context pass and checkpoint contract."""
 
+import logging
 import os
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+
+logger = logging.getLogger(__name__)
 
 OPT_IN = "VLLM_GLM53_P_MTP_CONTEXT_ONLY"
 PREFIX = "model.layers.45."
@@ -48,24 +55,48 @@ DROPPED_KEYS = frozenset(
 )
 
 
-def p_context_enabled(vllm_config) -> bool:
-    """Validate once at construction; never inspect tensors or synchronize."""
+def p_context_enabled(vllm_config: "VllmConfig") -> bool:
+    """Decide before allocating any weights; unsupported runs keep full MTP."""
     flag = os.environ.get(OPT_IN, "0")
     if flag == "0":
         return False
     if flag != "1":
         raise ValueError(f"{OPT_IN} must be 0 or 1")
 
-    def require(condition, message):
-        if not condition:
-            raise ValueError(f"GLM53 P context-only: {message}")
+    if reason := _incompatible_config(vllm_config):
+        logger.warning("GLM53 P context-only disabled (%s); using full MTP", reason)
+        return False
+    return True
 
-    require(vllm_config.use_v2_model_runner, "requires model runner V2")
+
+def _incompatible_config(vllm_config: "VllmConfig") -> str | None:
+    if not vllm_config.use_v2_model_runner:
+        return "requires model runner V2"
     spec = vllm_config.speculative_config
-    require(spec is not None, "MTP3 must remain enabled")
-    require(spec.method == "mtp" and spec.num_speculative_tokens == 3, "requires MTP3")
-    require(not spec.uses_dynamic_speculative_decoding(), "no dynamic drafting")
-    config = spec.draft_model_config.hf_text_config
+    if spec is None or spec.method != "mtp" or not spec.num_speculative_tokens:
+        return "requires MTP"
+    if (
+        spec.uses_dynamic_speculative_decoding()
+        or spec.parallel_drafting
+        or spec.enable_adaptive_verification
+    ):
+        return "requires fixed, serial MTP"
+    if not spec.glm_mtp_has_native_attn_overrides():
+        return "incompatible draft attention overrides"
+    if spec.draft_load_config is not None:
+        return "independent draft weight loader"
+    draft = spec.draft_model_config
+    target = vllm_config.model_config
+    if (
+        target is None
+        or draft is None
+        or draft.model != (target.model_weights or target.model)
+        or draft.revision != target.revision
+        or draft.code_revision != target.code_revision
+        or draft.quantization != target.quantization
+        or spec.max_model_len is not None
+    ):
+        return "requires the embedded MTP checkpoint"
     geometry = {
         "hidden_size": 4096,
         "moe_intermediate_size": 2048,
@@ -82,40 +113,45 @@ def p_context_enabled(vllm_config) -> bool:
         "index_head_dim": 128,
         "index_n_heads": 32,
     }
-    require(
-        config.model_type in ("glm5_next_text", "glm5_next", "glm5_next_mtp"),
-        "wrong model type",
-    )
-    for field, expected in geometry.items():
-        require(getattr(config, field, None) == expected, f"unsupported {field}")
+    for config in (target.hf_text_config, draft.hf_text_config):
+        if config.model_type not in ("glm5_next_text", "glm5_next", "glm5_next_mtp"):
+            return "wrong model type"
+        if getattr(config, "index_topk", None) is None:
+            return "requires a sparse MLA indexer"
+        for field, expected in geometry.items():
+            if getattr(config, field, None) != expected:
+                return f"unsupported {field}"
     pc = vllm_config.parallel_config
+    if spec.draft_tensor_parallel_size not in (None, pc.tensor_parallel_size):
+        return "draft TP differs from target TP"
     for field in (
         "tensor_parallel_size",
         "pipeline_parallel_size",
         "prefill_context_parallel_size",
         "decode_context_parallel_size",
     ):
-        require(getattr(pc, field, None) == 1, f"requires {field}=1")
-    require(pc.enable_expert_parallel and pc.data_parallel_size == 4, "requires EP4")
-    require(not pc.enable_eplb, "EPLB is unsupported")
-    require(not pc.use_sequence_parallel_moe, "sequence parallel unsupported")
+        if getattr(pc, field) != 1:
+            return f"requires {field}=1"
+    if pc.enable_eplb or pc.use_sequence_parallel_moe:
+        return "EPLB and sequence parallelism are unsupported"
+    # EP/DP and draft depth do not change the retained weights. PD still
+    # requires the peer to use compatible KDA and indexer-tail cache geometry.
     kt = vllm_config.kv_transfer_config
-    require(kt is not None, "requires dedicated producer connector")
-    require(
-        kt.kv_connector == "MultiConnector" and kt.kv_role == "kv_both",
-        "requires producer MultiConnector",
-    )
+    if kt is None or kt.kv_connector != "MultiConnector" or kt.kv_role != "kv_both":
+        return "requires dedicated producer MultiConnector"
     children = kt.kv_connector_extra_config.get("connectors", [])
-    roles = sorted((x.get("kv_connector"), x.get("kv_role")) for x in children)
-    require(
-        roles
-        == [
+    if not isinstance(children, list) or not all(isinstance(x, dict) for x in children):
+        return "invalid producer connector list"
+    roles = [(x.get("kv_connector"), x.get("kv_role")) for x in children]
+    if len(roles) != 2 or not all(
+        role in roles
+        for role in (
             ("MooncakeConnector", "kv_producer"),
             ("MooncakeStoreConnector", "kv_both"),
-        ],
-        "requires P2P producer + Store, never D or mixed roles",
-    )
-    return True
+        )
+    ):
+        return "requires P2P producer + Store, never D or mixed roles"
+    return None
 
 
 def normalize_name(name: str) -> str:

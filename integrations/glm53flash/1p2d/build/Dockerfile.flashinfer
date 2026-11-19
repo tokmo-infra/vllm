@@ -1,0 +1,11 @@
+# syntax=docker/dockerfile:1.7
+FROM python:3.12-slim-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && apt-get clean
+COPY --from=flashinfer_src / /src/
+WORKDIR /src
+ENV BUILD_NVEP=0 BUILD_NCCL_EP=0 BUILD_NIXL_EP=0
+RUN test "$(cat version.txt)" = 0.7.1 \
+ && test -f 3rdparty/cutlass/include/cutlass/cutlass.h \
+ && python -m pip wheel --no-deps --wheel-dir /wheels .
+FROM scratch AS wheels
+COPY --from=build /wheels/ /

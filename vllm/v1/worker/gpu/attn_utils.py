@@ -199,6 +199,7 @@ def init_attn_backend(
     device: torch.device,
     active_layer_names: set[str] | None = None,
     draft_layer_names: set[str] | None = None,
+    draft_vllm_config: VllmConfig | None = None,
 ) -> tuple[list[list[AttentionGroup]], AttentionCGSupportInfo, list[int]]:
     # Phase 1: discover attention groups for each kv cache group.
     attn_groups: list[list[AttentionGroup]] = []
@@ -226,8 +227,9 @@ def init_attn_backend(
         layer_type = cast(type[Any], AttentionLayerBase)
         attn_layers = get_layers_from_vllm_config(vllm_config, layer_type, layer_names)
 
-        group_map: dict[tuple[tuple[str, str], KVCacheSpec, int], AttentionGroup] = {}
-        group_order: list[tuple[tuple[str, str], KVCacheSpec, int]] = []
+        group_map: dict[
+            tuple[tuple[str, str], KVCacheSpec, int, bool], AttentionGroup
+        ] = {}
 
         for layer_name in layer_names:
             attn_backend = attn_layers[layer_name].get_attn_backend()
@@ -252,16 +254,25 @@ def init_attn_backend(
             # counts (e.g. a spec-decode draft head and its target) get separate
             # metadata builders.
             num_heads_q = getattr(attn_layers[layer_name], "num_heads", 0)
-            key = (attn_backend.full_cls_name(), layer_kv_cache_spec, num_heads_q)
+            use_draft_config = (
+                draft_vllm_config is not None
+                and draft_layer_names is not None
+                and layer_name in draft_layer_names
+            )
+            key = (
+                attn_backend.full_cls_name(),
+                layer_kv_cache_spec,
+                num_heads_q,
+                use_draft_config,
+            )
             if key not in group_map:
                 group_map[key] = AttentionGroup(
                     attn_backend, [layer_name], layer_kv_cache_spec, kv_cache_group_id
                 )
-                group_order.append(key)
             else:
                 group_map[key].layer_names.append(layer_name)
 
-        attn_groups.append([group_map[key] for key in group_order])
+        attn_groups.append(list(group_map.values()))
 
     # Phase 2: pick a kernel block size per kv cache group that is supported
     # by all backends within that group.
@@ -289,7 +300,13 @@ def init_attn_backend(
             kernel_block_size = kernel_block_sizes[kv_cache_group_id]
         for group in groups:
             group.create_metadata_builders(
-                vllm_config=vllm_config,
+                vllm_config=(
+                    draft_vllm_config
+                    if draft_vllm_config is not None
+                    and draft_layer_names is not None
+                    and group.layer_names[0] in draft_layer_names
+                    else vllm_config
+                ),
                 device=device,
                 kernel_block_size=kernel_block_size,
                 # Microbatches build attention metadata concurrently, and some
@@ -306,7 +323,12 @@ def init_attn_backend(
                         attn_backend_workspace = builder._get_workspace_buffer()
                 elif hasattr(builder, "set_workspace_buffer"):
                     builder.set_workspace_buffer(attn_backend_workspace)
-    attn_cg_support_info = get_attn_cg_support(attn_groups, vllm_config)
+    attn_cg_support_info = get_attn_cg_support(
+        attn_groups,
+        vllm_config,
+        draft_layer_names=draft_layer_names,
+        draft_vllm_config=draft_vllm_config,
+    )
     return attn_groups, attn_cg_support_info, kernel_block_sizes
 
 
@@ -314,6 +336,9 @@ def get_attn_cg_support(
     attn_groups: list[list[AttentionGroup]],
     vllm_config: VllmConfig,
     checked_layer_names: set[str] | None = None,
+    *,
+    draft_layer_names: set[str] | None = None,
+    draft_vllm_config: VllmConfig | None = None,
 ) -> AttentionCGSupportInfo:
     """Return the weakest CUDA graph support among the checked layers."""
     min_cg_support = AttentionCGSupport.ALWAYS
@@ -326,7 +351,11 @@ def get_attn_cg_support(
                 continue
             builder = group.get_metadata_builder(0)
             cg_support = builder.get_cudagraph_support(
-                vllm_config,
+                draft_vllm_config
+                if draft_vllm_config is not None
+                and draft_layer_names is not None
+                and group.layer_names[0] in draft_layer_names
+                else vllm_config,
                 group.kv_cache_spec,
             )
             if cg_support.value < min_cg_support.value:

@@ -284,6 +284,7 @@ if TYPE_CHECKING:
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
     VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT: bool = False
     VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION: bool = False
+    VLLM_GLM53_P_READY_WAIT: bool = False
     VLLM_HOT_TAIL_ADMISSION_DIAGNOSTICS: bool = False
     VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS: bool = False
     VLLM_SYSTEM_START_DATE: str | None = None
@@ -1992,6 +1993,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION": lambda: (
         os.getenv("VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION", "0") == "1"
     ),
+    "VLLM_GLM53_P_READY_WAIT": lambda: os.getenv("VLLM_GLM53_P_READY_WAIT") == "1",
     # Optional first enrolled/deferred/spent events (max three per scheduler).
     # Does not enable admission budgeting; fault logs remain on regardless.
     "VLLM_HOT_TAIL_ADMISSION_DIAGNOSTICS": lambda: (
@@ -2416,6 +2418,7 @@ def compile_factors() -> dict[str, object]:
         # Scheduler-only experiment/observability; no compiled GPU behavior.
         "VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION",
         "VLLM_HOT_TAIL_ADMISSION_DIAGNOSTICS",
+        "VLLM_GLM53_P_READY_WAIT",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",

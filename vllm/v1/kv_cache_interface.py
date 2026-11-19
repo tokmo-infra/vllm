@@ -57,6 +57,7 @@ class KVQuantMode(IntEnum):
     TURBOQUANT_3BIT_NC = 9
     NVFP4_DS_MLA = 10  # opaque-bytes NVFP4 DS-MLA layouts (FlashMLA sparse)
     ULTRAQUANT_4BIT = 11  # packed FP4 values + UE8M0 group scales
+    GLM_NVFP4_MLA = 12  # opaque 304 B GLM NoPE record, including inline scales
 
     @property
     def is_per_token_head(self) -> bool:
@@ -101,6 +102,8 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
         # Page size is keyed on cache_dtype_str in the MLA specs, not
         # nvfp4_kv_cache_full_dim.
         return KVQuantMode.NVFP4_DS_MLA
+    if kv_cache_dtype == "glm_nvfp4_mla":
+        return KVQuantMode.GLM_NVFP4_MLA
     if kv_cache_dtype.startswith("nvfp4"):
         return KVQuantMode.NVFP4
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("turboquant_"):

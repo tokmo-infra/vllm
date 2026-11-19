@@ -41,6 +41,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     PromMetric,
     PromMetricT,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.glm_nvfp4 import (
+    GLM_NVFP4_MLA,
+    glm_layout_manifest,
+    glm_transfer_page_view,
+    group_layer_specs,
+    is_glm_nvfp4_mla,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
     MooncakeBootstrapServer,
     RegisterWorkerPayload,
@@ -81,6 +88,9 @@ from vllm.v1.worker.utils import select_common_block_size
 logger = init_logger(__name__)
 
 _BOOTSTRAP_MAX_ATTEMPTS: Final[int] = 3
+# A legacy MsgPack decoder expects a map at byte 0 and rejects this frame
+# before it can issue any RDMA writes. Unchanged formats keep the old frame.
+_GLM_WIRE_PREFIX: Final[bytes] = b"glm_nvfp4_mla/v1\x00"
 
 try:
     from mooncake.engine import TransferEngine
@@ -641,6 +651,8 @@ class MooncakeXferMetadata(
     # peer did not send the field, so the run must not be promoted.
     registered_row_offsets: list[int] = msgspec.field(default_factory=list)
     remote_pp_size: int = 1
+    glm_layout: str = ""
+    remote_num_blocks: int = 0
 
 
 class MooncakeXferResponseStatus(IntEnum):
@@ -1200,12 +1212,40 @@ class MooncakeConnectorScheduler:
 class MooncakeConnectorWorker:
     """Implementation of Worker side methods."""
 
+    _glm_layout: str = ""
+    _glm_mamba_groups: frozenset[int] = frozenset()
+
     def __init__(
         self,
         vllm_config: VllmConfig,
         engine_id: str,
         kv_cache_config: "KVCacheConfig",
     ):
+        parallel_config = vllm_config.parallel_config
+        self._layer_specs: dict[str, KVCacheSpec] = {
+            name: spec
+            for group in kv_cache_config.transfer_groups
+            for name, spec in group_layer_specs(group).items()
+        }
+        if any(is_glm_nvfp4_mla(spec) for spec in self._layer_specs.values()):
+            if (
+                parallel_config.pipeline_parallel_size != 1
+                or parallel_config.prefill_context_parallel_size != 1
+                or parallel_config.decode_context_parallel_size != 1
+                or kv_cache_config.hisparse_host_num_blocks is not None
+            ):
+                raise ValueError(
+                    f"Mooncake {GLM_NVFP4_MLA} requires PP/PCP/DCP=1 and no HiSparse"
+                )
+            self._glm_layout = glm_layout_manifest(kv_cache_config.transfer_groups)
+            self._glm_mamba_groups = frozenset(
+                i
+                for i, group in enumerate(kv_cache_config.transfer_groups)
+                if any(
+                    isinstance(spec, MambaSpec)
+                    for spec in group_layer_specs(group).values()
+                )
+            )
         if TransferEngine is None:
             logger.error("Mooncake is not available")
             raise RuntimeError("Mooncake is not available")
@@ -1277,7 +1317,6 @@ class MooncakeConnectorWorker:
             tuple[list[TransferRegion], list[TransferRegion], str | None],
         ] = {}
 
-        assert (parallel_config := vllm_config.parallel_config)
         dp_rank = parallel_config.data_parallel_index
         dp_local_rank = parallel_config.data_parallel_rank_local
         self.dp_rank = dp_local_rank if parallel_config.local_engines_only else dp_rank
@@ -1341,8 +1380,6 @@ class MooncakeConnectorWorker:
         self.cache_config = vllm_config.cache_config
         self.kv_cache_config = kv_cache_config
         self.use_mla = self.model_config.use_mla
-        self._physical_blocks_per_logical_kv_block = 1
-        self._sync_block_size_with_kernel()
 
         self.attn_backends = get_current_attn_backends(vllm_config)
         logger.debug(
@@ -1351,14 +1388,11 @@ class MooncakeConnectorWorker:
         )
 
         self._tp_size: dict[EngineId, int] = {self.engine_id: self.tp_size}
-        self._layer_specs: dict[str, KVCacheSpec] = {}
-        for group in kv_cache_config.transfer_groups:
-            group_spec = group.kv_cache_spec
-            specs_by_layer = getattr(group_spec, "kv_cache_specs", {})
-            for layer_name in group.layer_names:
-                self._layer_specs[layer_name] = specs_by_layer.get(
-                    layer_name, group_spec
-                )
+        self._physical_blocks_per_logical_kv_block = 1
+        # GLM registers manager pages from the actual views. A worker-wide
+        # kernel ratio would also expand the single-page kpool tail ring.
+        if not self._glm_layout:
+            self._sync_block_size_with_kernel()
         self.transfer_topo = TransferTopology(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
@@ -1403,6 +1437,8 @@ class MooncakeConnectorWorker:
 
     def shutdown(self):
         """Cleanup background threads on destruction."""
+        if not hasattr(self, "async_zmq_ctx"):
+            return
         self.async_zmq_ctx.term()
         if not self.is_kv_consumer:
             self._sender_executor.shutdown(wait=False)
@@ -1509,7 +1545,7 @@ class MooncakeConnectorWorker:
             try:
                 identity, metadata_bytes = await self.sender_worker_queue.get()
                 try:
-                    metadata = self._xfer_meta_decoder.decode(metadata_bytes)
+                    metadata = self._decode_xfer_metadata(metadata_bytes)
                     await self.send_kv_to_decode(identity, sock, metadata)
                 except Exception as e:
                     logger.error("Error processing Mooncake xfer request: %s", e)
@@ -1525,6 +1561,17 @@ class MooncakeConnectorWorker:
                 break
             except Exception as e:
                 logger.error("Error in _sender_worker: %s", e)
+
+    def _encode_xfer_metadata(self, meta: MooncakeXferMetadata) -> bytes:
+        prefix = _GLM_WIRE_PREFIX if meta.glm_layout else b""
+        return prefix + self._encoder.encode(meta)
+
+    def _decode_xfer_metadata(self, payload: bytes) -> MooncakeXferMetadata:
+        glm_frame = payload.startswith(_GLM_WIRE_PREFIX)
+        meta = self._xfer_meta_decoder.decode(payload.removeprefix(_GLM_WIRE_PREFIX))
+        if glm_frame != bool(meta.glm_layout):
+            raise ValueError(f"Mooncake {GLM_NVFP4_MLA} handshake framing mismatch")
+        return meta
 
     async def send_kv_to_decode(
         self, identity: bytes, sock: zmq.asyncio.Socket, meta: MooncakeXferMetadata
@@ -1794,7 +1841,11 @@ class MooncakeConnectorWorker:
             ):
                 continue
 
-            if len(send_meta.local_block_ids) != len(remote_block_ids_per_group):
+            if len(send_meta.local_block_ids) != len(remote_block_ids_per_group) or (
+                self._glm_layout
+                and len(remote_block_ids_per_group)
+                != len(self.kv_cache_config.transfer_groups)
+            ):
                 logger.error(
                     "req %s: KV group count mismatch: local=%d, remote=%d",
                     d_req_id,
@@ -1817,9 +1868,10 @@ class MooncakeConnectorWorker:
             for group_index, (local_group, remote_group) in enumerate(
                 zip(send_meta.local_block_ids, remote_block_ids_per_group)
             ):
-                is_mamba_group = isinstance(
-                    group_specs[group_index].kv_cache_spec,
-                    MambaSpec,
+                is_mamba_group = (
+                    group_index in self._glm_mamba_groups
+                    if self._glm_layout
+                    else isinstance(group_specs[group_index].kv_cache_spec, MambaSpec)
                 )
                 if is_mamba_group:
                     # Mamba/GDN prefix caching can use null blocks only as
@@ -1862,6 +1914,22 @@ class MooncakeConnectorWorker:
                 continue
 
             if not any(local_block_ids_by_group):
+                continue
+
+            if self._glm_layout and (
+                any(
+                    not 0 <= block_id < self.kv_cache_config.num_blocks
+                    for group in local_block_ids_by_group
+                    for block_id in group
+                )
+                or any(
+                    not 0 <= block_id < agent_meta.remote_num_blocks
+                    for group in remote_block_ids_by_group
+                    for block_id in group
+                )
+            ):
+                err_reqs.append(d_req_id)
+                err_msg = err_msg or "Mooncake GLM KV block ID out of range"
                 continue
 
             # Normalize before kernel expansion so _contiguous_runs can
@@ -2041,6 +2109,9 @@ class MooncakeConnectorWorker:
             self.kv_cache_config.num_blocks * self._physical_blocks_per_logical_kv_block
         )
 
+        if self._glm_layout and self._layer_specs.keys() - kv_caches.keys():
+            raise ValueError(f"Mooncake {GLM_NVFP4_MLA} is missing transferable layers")
+
         for layer_name, cache in kv_caches.items():
             layer_index = extract_layer_index(layer_name)
             layer_spec = self._layer_specs.get(layer_name)
@@ -2060,6 +2131,18 @@ class MooncakeConnectorWorker:
                 seen_storage_ptrs.add(storage_addr)
                 kv_data_ptrs.append(storage_addr)
                 kv_data_lens.append(storage.nbytes())
+
+            if self._glm_layout:
+                view = glm_transfer_page_view(cache, layer_spec, num_blocks)
+                region_base_addresses.append(view.data_ptr())
+                self.block_len_per_layer.append(view.stride(0) * view.element_size())
+                self.kv_block_len_per_layer.append(view[0].nbytes)
+                self.registered_layer_names.append(layer_name)
+                self.registered_layer_indices.append(layer_index)
+                self.registered_group_indices.append(group_index)
+                self.region_shared_groups.append(())
+                self.region_row_offsets.append(-1)
+                continue
 
             is_mla_region = isinstance(
                 layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)
@@ -2373,9 +2456,13 @@ class MooncakeConnectorWorker:
                 list(groups) for groups in self.region_shared_groups
             ],
             registered_row_offsets=self.region_row_offsets,
+            glm_layout=self._glm_layout,
+            remote_num_blocks=self.kv_cache_config.num_blocks
+            if self._glm_layout
+            else 0,
         )
 
-        encoded_data = self._encoder.encode(metadata)
+        encoded_data = self._encode_xfer_metadata(metadata)
         logger.debug(
             "Size of encoded MooncakeXferMetadata: %d bytes", len(encoded_data)
         )
@@ -2666,6 +2753,8 @@ class MooncakeConnectorWorker:
             tuple(meta.registered_group_indices),
             tuple(tuple(groups) for groups in meta.registered_shared_group_ids),
             tuple(meta.registered_row_offsets),
+            meta.glm_layout,
+            meta.remote_num_blocks,
         )
         cached = self._prepared_transfer_regions.get(cache_key)
         if cached is not None:
@@ -2679,6 +2768,11 @@ class MooncakeConnectorWorker:
             prepared = (local, remote, err)
             self._prepared_transfer_regions[cache_key] = prepared
             return prepared
+
+        if self._glm_layout or meta.glm_layout:
+            err = self._validate_glm_handshake(meta)
+            if err is not None:
+                return finish([], [], err)
 
         shared_groups: list[tuple[int, ...]] | None = self.region_shared_groups
         if len(self.region_shared_groups) != len(self.registered_layer_names):
@@ -2735,6 +2829,15 @@ class MooncakeConnectorWorker:
         )
         if align_err is not None:
             return finish([], [], align_err)
+        if self._glm_layout:
+            # Each side may pad pages differently. Copy only its aligned
+            # logical payload, never the gaps or the rest of a packed row.
+            for local, remote in zip(local_regions, remote_regions, strict=True):
+                if local.kv_block_len != remote.kv_block_len:
+                    return finish(
+                        [], [], f"Mooncake GLM page size mismatch: {local.layer_name}"
+                    )
+            return finish(local_regions, remote_regions, None)
         # Head checks must see every layer name. Coalesce keeps only the first.
         head_err = self._validate_head_resharding_layout(
             meta.remote_tp_size, local_regions
@@ -2768,6 +2871,32 @@ class MooncakeConnectorWorker:
             None,
         )
         return local_regions, remote_regions, None
+
+    def _validate_glm_handshake(self, meta: MooncakeXferMetadata) -> str | None:
+        if not self._glm_layout or meta.glm_layout != self._glm_layout:
+            return f"Mooncake {GLM_NVFP4_MLA} layer format or group manifest mismatch"
+        if meta.remote_tp_size != self.tp_size or meta.remote_pp_size != self.pp_size:
+            return f"Mooncake {GLM_NVFP4_MLA} requires matching P/D TP and PP"
+        names = meta.registered_layer_names
+        groups = self.kv_cache_config.transfer_group_index_by_layer
+        if (
+            len(names) != len(groups)
+            or set(names) != groups.keys()
+            or meta.registered_group_indices != [groups[name] for name in names]
+            or len(meta.registered_layer_indices) != len(names)
+            or len(meta.kv_caches_base_addr) != len(names)
+            or len(meta.block_lens) != len(names)
+            or len(meta.kv_block_lens) != len(names)
+            or any(meta.registered_shared_group_ids)
+            or any(offset != -1 for offset in meta.registered_row_offsets)
+            or meta.remote_num_blocks <= 0
+            or any(
+                not 0 < length <= stride
+                for length, stride in zip(meta.kv_block_lens, meta.block_lens)
+            )
+        ):
+            return f"Mooncake {GLM_NVFP4_MLA} requires one valid region per layer"
+        return None
 
     def _validate_head_resharding_layout(
         self, remote_tp_size: int, local_regions: list[TransferRegion]

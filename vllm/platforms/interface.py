@@ -789,9 +789,25 @@ class Platform:
         # Phase 3: Align block/page sizes when multiple KV dtypes share the
         # block pool (e.g. nvfp4 primary + unquantized skip layers).
         # May override the user's --block-size.
-        if cache_config.kv_cache_dtype_skip_layers:
+        # GLM's block-outermost layout keeps one spec per layer, including
+        # packed FP8 siblings. Do not apply dense K/V skip-layer padding to it.
+        if cache_config.kv_cache_dtype_skip_layers and not cls._uses_glm_nvfp4_mla(
+            vllm_config
+        ):
             cls._align_heterogeneous_kv_block_size(vllm_config, backend_classes[0])
         cls._check_aligned_block_size(vllm_config, backend_classes, pre_block_size)
+
+    @staticmethod
+    def _uses_glm_nvfp4_mla(vllm_config: "VllmConfig") -> bool:
+        from vllm.config.glm_mla_kv import GLM_NVFP4_MLA, is_glm_next_nope
+
+        model_config = vllm_config.model_config
+        return (
+            vllm_config.cache_config.cache_dtype in ("nvfp4", GLM_NVFP4_MLA)
+            and model_config is not None
+            and model_config.use_mla
+            and is_glm_next_nope(model_config.hf_text_config)
+        )
 
     @classmethod
     def _check_aligned_block_size(
@@ -946,6 +962,7 @@ class Platform:
         """
         from math import lcm
 
+        from vllm.config.glm_mla_kv import GLM_NVFP4_ROW_BYTES
         from vllm.config.vllm import set_current_vllm_config
         from vllm.model_executor.models import ModelRegistry
         from vllm.utils.math_utils import cdiv
@@ -970,7 +987,13 @@ class Platform:
         kv_quant_mode = get_kv_quant_mode(cache_config.cache_dtype)
 
         # Compute attention page size for 1 token
-        if model_config.use_mla:
+        glm_nvfp4_mla = cls._uses_glm_nvfp4_mla(vllm_config)
+        if glm_nvfp4_mla:
+            # The CLI dtype is shared by the model, not the physical layout
+            # of the sparse MLA layer. Keep the draft's 528-byte packed FP8
+            # out of KDA alignment; the packed allocator accounts for it per layer.
+            attn_page_size_1_token = GLM_NVFP4_ROW_BYTES
+        elif model_config.use_mla:
             attn_page_size_1_token = MLAAttentionSpec(
                 block_size=1,
                 num_kv_heads=model_config.get_num_kv_heads(parallel_config),
@@ -1083,13 +1106,27 @@ class Platform:
 
         # Use minimum block size that satisfies both backend alignment and
         # mamba page size compatibility
-        attn_block_size = kernel_block_alignment_size * cdiv(
-            mamba_page_size,
-            kernel_block_alignment_size * attn_page_size_1_token,
-        )
-        attn_block_size = backend_block_alignment * cdiv(
-            attn_block_size, backend_block_alignment
-        )
+        if glm_nvfp4_mla:
+            alignment = lcm(
+                128, backend_block_alignment, cache_config.prefix_match_unit or 1
+            )
+            # A user-provided block size is a lower bound, not an additional
+            # alignment: doubling it can waste an entire KDA page per layer.
+            attn_block_size = alignment * cdiv(
+                max(
+                    cache_config.block_size,
+                    cdiv(mamba_page_size, attn_page_size_1_token),
+                ),
+                alignment,
+            )
+        else:
+            attn_block_size = kernel_block_alignment_size * cdiv(
+                mamba_page_size,
+                kernel_block_alignment_size * attn_page_size_1_token,
+            )
+            attn_block_size = backend_block_alignment * cdiv(
+                attn_block_size, backend_block_alignment
+            )
 
         if cache_config.block_size < attn_block_size:
             cache_config.block_size = attn_block_size
@@ -1107,6 +1144,8 @@ class Platform:
         assert attn_page_size >= mamba_page_size
 
         if attn_page_size == mamba_page_size:
+            if glm_nvfp4_mla:
+                cache_config.mamba_page_size_padded = None
             return
 
         if (

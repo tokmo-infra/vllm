@@ -13,6 +13,7 @@ HELPER = "vllm/models/glm5next/common/p_mtp_context.py"
 MTP = "vllm/models/glm5next/common/mtp.py"
 SPEC = "vllm/v1/worker/gpu/spec_decode/mtp/speculator.py"
 RUNNER = "vllm/v1/worker/gpu/model_runner.py"
+TARGET_DEPENDENT_AR = "vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py"
 
 
 @pytest.fixture
@@ -40,14 +41,22 @@ def p_config():
         index_kpool=4,
         index_head_dim=128,
         index_n_heads=32,
+        index_topk=2048,
     )
+    checkpoint = dict(model="glm", revision=None, code_revision=None, quantization=None)
     return NS(
         use_v2_model_runner=True,
-        model_config=NS(hf_text_config=hf),
+        model_config=NS(hf_text_config=hf, model_weights=None, **checkpoint),
         speculative_config=NS(
             method="mtp",
             num_speculative_tokens=3,
-            draft_model_config=NS(hf_text_config=hf),
+            parallel_drafting=False,
+            enable_adaptive_verification=False,
+            draft_tensor_parallel_size=1,
+            draft_load_config=None,
+            max_model_len=None,
+            draft_model_config=NS(hf_text_config=hf, **checkpoint),
+            glm_mtp_has_native_attn_overrides=lambda: True,
             uses_dynamic_speculative_decoding=lambda: False,
         ),
         parallel_config=NS(
@@ -87,10 +96,19 @@ def test_opt_in_requires_an_exact_boolean_flag(helper, monkeypatch, flag):
         helper.p_context_enabled(object())
 
 
-def test_dedicated_glm_producer_retains_mtp3(helper, monkeypatch, p_config):
+@pytest.mark.parametrize(
+    ("dp_size", "ep", "depth"),
+    [(1, False, 1), (2, True, 2), (4, True, 3), (8, True, 5)],
+)
+def test_dedicated_glm_producer_keeps_independent_ep_and_mtp_settings(
+    helper, monkeypatch, p_config, dp_size, ep, depth
+):
     monkeypatch.setenv(helper.OPT_IN, "1")
+    p_config.parallel_config.data_parallel_size = dp_size
+    p_config.parallel_config.enable_expert_parallel = ep
+    p_config.speculative_config.num_speculative_tokens = depth
     assert helper.p_context_enabled(p_config)
-    assert p_config.speculative_config.num_speculative_tokens == 3
+    assert p_config.speculative_config.num_speculative_tokens == depth
 
 
 @pytest.mark.parametrize(
@@ -100,18 +118,25 @@ def test_dedicated_glm_producer_retains_mtp3(helper, monkeypatch, p_config):
         ("hf", "hidden_size", 5120),
         ("hf", "model_type", "llama"),
         ("hf", "num_nextn_predict_layers", 2),
-        ("parallel", "data_parallel_size", 8),
         ("parallel", "tensor_parallel_size", 2),
         ("parallel", "enable_eplb", True),
         ("parallel", "use_sequence_parallel_moe", True),
-        ("spec", "num_speculative_tokens", 5),
+        ("spec", "draft_tensor_parallel_size", 2),
+        ("spec", "draft_load_config", object()),
+        ("spec", "parallel_drafting", True),
+        ("spec", "max_model_len", 2048),
+        ("spec", "enable_adaptive_verification", True),
+        ("spec", "glm_mtp_has_native_attn_overrides", lambda: False),
         ("spec", "uses_dynamic_speculative_decoding", lambda: True),
+        ("draft", "model", "different-checkpoint"),
+        ("draft", "revision", "different-revision"),
+        ("draft", "quantization", "fp8"),
         ("connector", "kv_connector", "MooncakeConnector"),
         ("connector", "kv_role", "kv_consumer"),
     ],
 )
-def test_context_mode_rejects_unsupported_or_decode_configs(
-    helper, monkeypatch, p_config, scope, field, value
+def test_context_mode_falls_back_to_full_mtp_for_unsupported_or_decode_configs(
+    helper, monkeypatch, p_config, scope, field, value, caplog
 ):
     monkeypatch.setenv(helper.OPT_IN, "1")
     target = {
@@ -119,16 +144,18 @@ def test_context_mode_rejects_unsupported_or_decode_configs(
         "hf": p_config.model_config.hf_text_config,
         "parallel": p_config.parallel_config,
         "spec": p_config.speculative_config,
+        "draft": p_config.speculative_config.draft_model_config,
         "connector": p_config.kv_transfer_config,
     }[scope]
     setattr(target, field, value)
-    with pytest.raises(ValueError):
-        helper.p_context_enabled(p_config)
+    assert helper.p_context_enabled(p_config) is False
+    assert "using full MTP" in caplog.text
+    assert p_config.speculative_config.num_speculative_tokens == 3
 
 
 @pytest.mark.parametrize("extra_child", [False, True])
 def test_consumer_or_mixed_connector_cannot_enable_p_pruning(
-    helper, monkeypatch, p_config, extra_child
+    helper, monkeypatch, p_config, extra_child, caplog
 ):
     monkeypatch.setenv(helper.OPT_IN, "1")
     children = p_config.kv_transfer_config.kv_connector_extra_config["connectors"]
@@ -136,8 +163,8 @@ def test_consumer_or_mixed_connector_cannot_enable_p_pruning(
         children.append({"kv_connector": "MooncakeConnector", "kv_role": "kv_consumer"})
     else:
         children[0]["kv_role"] = "kv_consumer"
-    with pytest.raises(ValueError, match="never D or mixed"):
-        helper.p_context_enabled(p_config)
+    assert helper.p_context_enabled(p_config) is False
+    assert "never D or mixed roles" in caplog.text
 
 
 def test_exact_mtp45_partition_keeps_attention_and_never_drops_base_experts(helper):
@@ -217,8 +244,9 @@ def test_loading_coverage_rejects_missing_duplicate_or_unhandled_weights(
 
 
 @pytest.mark.parametrize("producer", [False, True])
+@pytest.mark.parametrize("depth", [1, 3, 5])
 def test_prefill_only_skips_sampling_on_p_and_keeps_d_native_path(
-    source_tree, execute_ast, producer
+    source_tree, execute_ast, producer, depth
 ):
     base_prefill = Mock(return_value="native_decode_path")
     base = type("NativeSpeculator", (), {"_prefill": base_prefill})
@@ -232,20 +260,51 @@ def test_prefill_only_skips_sampling_on_p_and_keeps_d_native_path(
     )["MTPSpeculator"]()
     speculator.model = NS(p_mtp_context_only=producer)
     speculator._run_model = Mock()
-    speculator.draft_tokens = torch.full((3, 3), 7, dtype=torch.int64)
+    speculator.draft_tokens = torch.full((3, depth), 7, dtype=torch.int64)
     args = (2, 5, {"attention": "unchanged"}, {"slots": "unchanged"}, None)
     result = speculator._prefill(*args)
     if producer:
         speculator._run_model.assert_called_once_with(*args[1:], "none", None)
         base_prefill.assert_not_called()
         assert result is None and torch.equal(
-            speculator.draft_tokens[:2], torch.full((2, 3), -1)
+            speculator.draft_tokens[:2], torch.full((2, depth), -1)
         )
         assert (speculator.draft_tokens[2] == 7).all()
     else:
         base_prefill.assert_called_once_with(*args, "none", None)
         speculator._run_model.assert_not_called()
         assert result == "native_decode_path" and (speculator.draft_tokens == 7).all()
+
+
+@pytest.mark.parametrize("producer,depth", [(True, 5), (False, 1), (False, 5)])
+def test_context_only_captures_prefill_but_never_the_recycle_graph(
+    source_tree, execute_ast, producer, depth
+):
+    cls = next(
+        n
+        for n in source_tree(TARGET_DEPENDENT_AR).body
+        if isinstance(n, ast.ClassDef) and n.name == "TargetDependentARSpeculator"
+    )
+    method = next(
+        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "capture"
+    )
+    capture = execute_ast([method], {"logger": Mock()})["capture"]
+    prefill, decode = Mock(use_breakable_cg=False), Mock()
+    runner = Mock(
+        num_speculative_steps=depth,
+        p_mtp_context_only=producer,
+        supports_decode_metadata_update=True,
+        prefill_cudagraph_manager=prefill,
+        decode_cudagraph_manager=decode,
+    )
+    capture(runner)
+    prefill.capture.assert_called_once()
+    assert prefill.capture.call_args.args[4] is runner.target_attn_groups
+    if producer or depth == 1:
+        decode.capture.assert_not_called()
+    else:
+        decode.capture.assert_called_once()
+        assert decode.capture.call_args.args[4] is runner.attn_groups
 
 
 @pytest.mark.parametrize("method_name", ["compute_logits", "get_top_tokens"])

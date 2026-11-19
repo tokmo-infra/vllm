@@ -80,16 +80,23 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     draft_model_config = speculative_config.draft_model_config
+    mixed_glm_mtp = speculative_config.glm_mtp_needs_fp8_kv(vllm_config)
     vllm_config = speculative_config.apply_draft_overrides(vllm_config)
     draft_load_config = get_pp_safe_draft_load_config(
         get_draft_load_config(vllm_config)
     )
     if draft_load_config is not vllm_config.load_config:
-        vllm_config = replace(vllm_config, load_config=draft_load_config)
+        if mixed_glm_mtp:
+            # apply_draft_overrides already made an isolated config view.
+            vllm_config.load_config = draft_load_config
+        else:
+            vllm_config = replace(vllm_config, load_config=draft_load_config)
     with set_model_tag("eagle_head"):
         eagle_model = get_model(
             vllm_config=vllm_config, model_config=draft_model_config
         )
+    if mixed_glm_mtp:
+        eagle_model.validate_fp8_kv_cache(vllm_config)
 
     target_language_model = (
         target_model.get_language_model()

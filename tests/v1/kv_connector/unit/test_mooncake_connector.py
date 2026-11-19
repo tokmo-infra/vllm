@@ -3,6 +3,8 @@
 
 import asyncio
 import contextlib
+import ctypes
+import dataclasses
 import errno
 import socket
 import threading
@@ -11,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
+import msgspec
 import pytest
 import torch
 import zmq.asyncio
@@ -48,12 +51,17 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import
     MooncakeBootstrapServer,
     RegisterWorkerPayload,
 )
+from vllm.v1.attention.backend import MultipleOf
+from vllm.v1.attention.backends.cpu_attn import CPUAttentionBackend
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheLayout,
+    MambaSpec,
     MLAAttentionSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.request import RequestStatus
 
@@ -1110,7 +1118,24 @@ def test_scheduler_request_finished():
 @contextlib.contextmanager
 def patch_worker_dependencies():
     """Helper to mock all distributed and network dependencies for Worker tests."""
+
+    class TestAttentionBackend(CPUAttentionBackend):
+        @staticmethod
+        def get_supported_kernel_block_sizes(kv_cache_spec=None):
+            return [MultipleOf(1)]
+
+    fallback_backend = (
+        patch.object(
+            mooncake_connector,
+            "get_current_attn_backends",
+            return_value=[TestAttentionBackend],
+        )
+        if mooncake_connector.current_platform.is_unspecified()
+        else contextlib.nullcontext()
+    )
     with (
+        fallback_backend,
+        patch.object(mooncake_connector.current_platform, "set_device"),
         patch(
             "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector.TransferEngine",
             FakeMooncakeWrapper,
@@ -1844,6 +1869,185 @@ def test_register_kv_caches_supports_mixed_mla_and_eagle_shapes():
     ]
     assert worker.registered_layer_indices == [0, 1]
     assert len(worker.kv_caches_base_addr) == 2
+
+
+def _glm_p2p_config() -> KVCacheConfig:
+    block_size = 16
+    main = MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        cache_dtype_str="glm_nvfp4_mla",
+        state_content_bytes=304,
+    )
+    mla = {
+        "model.layers.0.mla_attn": main,
+        "model.layers.0.indexer": dataclasses.replace(
+            main, cache_dtype_str=None, tokens_per_state=4, state_content_bytes=132
+        ),
+        "model.layers.2.mtp_attn": dataclasses.replace(
+            main, cache_dtype_str="fp8_ds_mla", state_content_bytes=656
+        ),
+    }
+    kda = {
+        "model.layers.1.linear_attn": MambaSpec(
+            block_size=32,
+            shapes=((8,), (4,)),
+            dtypes=(torch.bfloat16, torch.float32),
+            mamba_cache_mode="align",
+        )
+    }
+    return KVCacheConfig(
+        num_blocks=5,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(list(mla), UniformTypeKVCacheSpecs(block_size, mla)),
+            KVCacheGroupSpec(
+                ["model.layers.0.tail"],
+                CircularBufferSpec(
+                    block_size=4,
+                    num_kv_heads=2,
+                    head_size=4,
+                    head_size_v=0,
+                    dtype=torch.bfloat16,
+                ),
+            ),
+            KVCacheGroupSpec(list(kda), UniformTypeKVCacheSpecs(32, kda)),
+        ],
+    )
+
+
+def _registered_peer_meta(worker, req_blocks):
+    return MooncakeXferMetadata(
+        remote_hostname="peer",
+        remote_port=1234,
+        remote_tp_size=worker.tp_size,
+        remote_tp_rank=0,
+        req_blocks=req_blocks,
+        glm_layout=worker._glm_layout,
+        remote_num_blocks=worker.kv_cache_config.num_blocks,
+        registered_layer_names=worker.registered_layer_names,
+        registered_layer_indices=worker.registered_layer_indices,
+        registered_group_indices=worker.registered_group_indices,
+        kv_caches_base_addr=worker.kv_caches_base_addr,
+        block_lens=worker.block_len_per_layer,
+        kv_block_lens=worker.kv_block_len_per_layer,
+    )
+
+
+@pytest.mark.asyncio
+async def test_glm_nvfp4_p2p_copies_native_group_pages_without_stride_gaps():
+    config = _glm_p2p_config()
+    main, indexer, mtp, tail, kda = config.transfer_group_index_by_layer
+
+    def packed_views(padding, value):
+        raw = torch.full((5, 16384 + padding), value, dtype=torch.uint8)
+        return {
+            main: raw[:, 0:4864].view(5, 1, 16, 304),
+            indexer: raw[:, 4864:5392].view(5, 1, 4, 132),
+            mtp: raw[:, 5392:15888].view(5, 1, 16, 656),
+            tail: raw[:, 15888:15952].view(torch.bfloat16).view(5, 2, 4, 4),
+            kda: raw[:, 15952:15984],
+        }, raw
+
+    src, _ = packed_views(0, 23)
+    dst, dst_raw = packed_views(512, 0)
+    with mooncake_register_worker(config) as (p, p_register):
+        p.register_kv_caches(src)
+        p_register.assert_called_once()
+        assert len(p_register.call_args.args[0]) == 1
+        with mooncake_register_worker(config) as (d, _):
+            d.register_kv_caches(dict(reversed(list(dst.items()))))
+            peer = _registered_peer_meta(d, {"req": ("xfer", [[2], [3], [0, 4]])})
+            wire = d._encode_xfer_metadata(peer)
+
+        # An old producer expecting unframed MsgPack must refuse the new frame.
+        with pytest.raises(msgspec.DecodeError):
+            p._xfer_meta_decoder.decode(wire)
+        peer = p._decode_xfer_metadata(wire)
+        local, remote, error = p._prepare_transfer_regions(peer)
+        assert error is None
+        assert [r.kv_block_len for r in local] == [4864, 528, 10496, 64, 32]
+        req = SendBlockMeta("p-req", "xfer", [[3, 1], [1], [1]], asyncio.Event())
+        args = ([("req", req)], peer, local, remote)
+        src_ptrs, dst_ptrs, lengths, err_reqs, err = await p._build_transfer_params(
+            *args
+        )
+        assert err is None and not err_reqs
+        for from_addr, to_addr, size in zip(src_ptrs, dst_ptrs, lengths, strict=True):
+            ctypes.memmove(to_addr, from_addr, size)
+
+        # Reject a destination block outside its registered storage before RDMA.
+        peer.req_blocks["req"][1][0][-1] = 5
+        assert await p._build_transfer_params(*args) == (
+            [],
+            [],
+            [],
+            ["req"],
+            "Mooncake GLM KV block ID out of range",
+        )
+
+    for layer in (main, indexer, mtp):
+        assert torch.equal(dst[layer][2], src[layer][1])
+    assert torch.equal(dst[tail][3], src[tail][1])
+    assert torch.equal(dst[kda][4], src[kda][1])
+    assert torch.count_nonzero(dst_raw[:, 15984:]) == 0
+    assert torch.count_nonzero(dst_raw[2, 15888:]) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch", ["legacy", "dtype", "group", "region", "tp"])
+async def test_glm_nvfp4_p2p_rejects_bad_handshake_before_write(mismatch):
+    config = _glm_p2p_config()
+    shapes = [(5, 1, 16, 304), (5, 1, 4, 132), (5, 1, 16, 656), (5, 2, 4, 4), (5, 32)]
+    dtypes = [torch.uint8] * 3 + [torch.bfloat16, torch.int8]
+    caches = {
+        name: torch.empty(shape, dtype=dtype)
+        for name, shape, dtype in zip(
+            config.transfer_group_index_by_layer, shapes, dtypes, strict=True
+        )
+    }
+    with mooncake_register_worker(config) as (p, _):
+        p.register_kv_caches(caches)
+        peer = _registered_peer_meta(p, {})
+        if mismatch == "legacy":
+            peer.glm_layout = ""
+            peer.remote_num_blocks = 0
+            assert "glm_layout" not in msgspec.msgpack.decode(
+                p._encode_xfer_metadata(peer)
+            )
+        elif mismatch == "dtype":
+            peer.glm_layout = peer.glm_layout.replace("fp8_ds_mla", "fp8")
+        elif mismatch == "group":
+            peer.registered_group_indices = [0] * len(caches)
+        elif mismatch == "region":
+            peer.kv_block_lens = [n - 1 for n in peer.kv_block_lens]
+        else:
+            peer.remote_tp_size = 2
+        with patch.object(p.engine, "batch_transfer_sync_write") as write:
+            sock = AsyncMock()
+            await p.send_kv_to_decode(b"D", sock, peer)
+            response = p._xfer_resp_decoder.decode(
+                sock.send_multipart.call_args.args[0][1]
+            )
+            assert response.status == MooncakeXferResponseStatus.ERROR
+            assert "glm" in response.err_msg.lower()
+            write.assert_not_called()
+
+
+def test_glm_nvfp4_p2p_refuses_non_contiguous_payload_before_registration():
+    config = _glm_p2p_config()
+    group = config.kv_cache_groups[0]
+    name = group.layer_names[0]
+    config.kv_cache_groups = [
+        KVCacheGroupSpec([name], group.kv_cache_spec.kv_cache_specs[name])
+    ]
+    tensor = torch.empty((5, 1, 16, 608), dtype=torch.uint8)[..., ::2]
+    with mooncake_register_worker(config) as (p, register):
+        with pytest.raises(ValueError, match="contiguous, non-overlapping pages"):
+            p.register_kv_caches({name: tensor})
+        register.assert_not_called()
 
 
 def test_packed_and_unpacked_region_lengths_fail_homogeneous_tp_handshake():

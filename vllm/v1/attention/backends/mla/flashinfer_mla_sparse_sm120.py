@@ -67,7 +67,7 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
                 "FLASHINFER_MLA_SPARSE_SM120 only supports decoder self-attention"
             )
 
-        if kv_cache_dtype != "fp8_ds_mla":
+        if kv_cache_dtype not in ("fp8_ds_mla", "glm_nvfp4_mla"):
             raise NotImplementedError(
                 "FLASHINFER_MLA_SPARSE_SM120 requires the packed fp8_ds_mla "
                 f"KV cache layout; got kv_cache_dtype={kv_cache_dtype!r}."
@@ -97,6 +97,21 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
             )
         self.kv_scale_format = _kv_scale_format_for_model(model_type)
 
+        self.glm_fp4_ops = None
+        if kv_cache_dtype == "glm_nvfp4_mla":
+            from vllm.v1.attention.backends.mla.glm_nvfp4 import GlmNvfp4Ops
+
+            text = vllm_config.model_config.hf_text_config
+            if isinstance(self.index_group, HiSparseMLAIndexGroup):
+                raise NotImplementedError("GLM 304-byte KV + HiSparse staging is not validated")
+            assert self.topk_indices_buffer is not None
+            self.glm_fp4_ops = GlmNvfp4Ops(
+                heads=num_heads, scale=scale,
+                selector_width=self.topk_indices_buffer.shape[1],
+                max_batch=vllm_config.scheduler_config.max_num_batched_tokens,
+                max_k=text.index_topk + text.index_kpool - 1,
+            )
+
         from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
 
         if not has_flashinfer_sparse_mla_sm120():
@@ -108,6 +123,14 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
 
         self.supports_quant_query_input = False
         self._workspace_buffer: torch.Tensor | None = None
+
+    def do_kv_cache_update(self, kv_c_normed, k_pe, kv_cache, slot_mapping, kv_cache_dtype, k_scale):
+        if self.glm_fp4_ops is None:
+            return super().do_kv_cache_update(kv_c_normed, k_pe, kv_cache, slot_mapping, kv_cache_dtype, k_scale)
+        if kv_cache.numel() and slot_mapping.numel():
+            if k_pe.numel():
+                raise ValueError("GLM_NEXT NVFP4 format has no independent RoPE payload")
+            self.glm_fp4_ops.write(kv_c_normed, kv_cache, slot_mapping.flatten())
 
     def forward_mqa(
         self,
@@ -124,6 +147,27 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
         index_group = self.index_group
+        if self.glm_fp4_ops is not None:
+            group = self.index_group
+            if group is not None and self.dcp_world_size == 1:
+                slots, counts = group.convert_logical_to_physical_topk(
+                    self.index_group_index, topk_indices, attn_metadata,
+                    block_stride_rows=None, return_valid_counts=True)
+            else:
+                slots, counts = triton_convert_req_index_to_global_index(
+                    attn_metadata.req_id_per_token[:num_actual_toks], attn_metadata.block_table,
+                    topk_indices, BLOCK_SIZE=attn_metadata.block_size,
+                    NUM_TOPK_TOKENS=topk_indices.shape[1], return_valid_counts=True)
+            # Pass the original strided page view. The physical address is
+            # page_base + block_id * page_pitch + row_in_page * 304.
+            output = torch.empty_like(q)
+            cut = min(attn_metadata.num_decode_tokens, num_actual_toks)
+            for start, end, mode in ((0, cut, 'decode'), (cut, num_actual_toks, 'extend')):
+                if start < end:
+                    rows = slice(start, end)
+                    self.glm_fp4_ops.read_into(output[rows], q[rows], kv_c_and_k_pe_cache,
+                                               slots[rows], counts[rows], mode)
+            return output, None
         if isinstance(index_group, HiSparseMLAIndexGroup):
             num_decode_tokens = attn_metadata.num_decode_tokens
             physical_kv_cache = index_group.physical_kv_cache(self.index_group_index)

@@ -360,6 +360,10 @@ def _canonicalize_sparse_mla_kv_cache_dtype(
     kv_cache_dtype: CacheDType,
 ) -> CacheDType:
     backend_name = attn_backend.get_name()
+    if kv_cache_dtype == "glm_nvfp4_mla":
+        if backend_name != "FLASHINFER_MLA_SPARSE_SM120":
+            raise ValueError(f"{backend_name} does not implement GLM's 304-byte KV record")
+        return kv_cache_dtype
     if backend_name == "FLASHMLA_SPARSE" and is_quantized_kv_cache(kv_cache_dtype):
         # The NVFP4 DS-MLA format is used as-is; any other quantized dtype
         # (fp8, fp8_e4m3, ...) is served via the fp8_ds_mla format.
@@ -503,6 +507,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
 
         dtype = torch.get_default_dtype()
+        if kv_cache_dtype == "nvfp4":
+            from vllm.config.glm_mla_kv import GLM_NVFP4_MLA, is_glm_next_nope
+
+            text_config = get_current_vllm_config().model_config.hf_text_config
+            if use_sparse and is_glm_next_nope(text_config):
+                kv_cache_dtype = GLM_NVFP4_MLA
         if attn_backend is not None:
             assert attn_backend.is_mla(), (
                 f"MLAAttention: attn_backend must be an MLA backend, "
@@ -523,7 +533,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             self.attn_backend, kv_cache_dtype
         )
         if normalized_kv_cache_dtype != kv_cache_dtype:
-            if cache_config is not None:
+            if cache_config is not None and cache_config.cache_dtype != "nvfp4":
                 cache_config.cache_dtype = normalized_kv_cache_dtype
             kv_cache_dtype = normalized_kv_cache_dtype
             logger.info_once(
@@ -737,6 +747,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         # [B, H=1, N, C] -> [B, N, C]
         self.kv_cache = kv_cache.squeeze(1)
+        fp4_ops = getattr(self.impl, "glm_fp4_ops", None)
+        if fp4_ops is not None and self.kv_cache.numel():
+            fp4_ops.prepare_cache(self.kv_cache)
         if (
             self._vllm_config.kernel_config.enable_jit_warmup
             and self._uses_flat_kv_cache()
@@ -961,6 +974,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # Opaque per-token byte formats stay as raw uint8
             "fp8_ds_mla",
             "nvfp4_ds_mla",
+            "glm_nvfp4_mla",
         ):
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
@@ -1367,7 +1381,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             state_content_bytes=(
                 cast(MLAAttentionImpl, self.impl).get_fp8_ds_mla_row_bytes()
                 if self.kv_cache_dtype == "fp8_ds_mla"
-                else {"nvfp4_ds_mla": 352}.get(self.kv_cache_dtype)
+                else {"nvfp4_ds_mla": 352, "glm_nvfp4_mla": 304}.get(self.kv_cache_dtype)
             ),
         )
         if self.sliding_window is not None:

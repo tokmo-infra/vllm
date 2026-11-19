@@ -3284,7 +3284,20 @@ class VllmConfig:
 
     @model_validator(mode="after")
     def validate_nvfp4_kv_cache_with_mla(self) -> "VllmConfig":
+        from vllm.config.glm_mla_kv import is_glm_next_nope
+
         if self.model_config is None:
+            return self
+        if self.cache_config.cache_dtype == "nvfp4" and is_glm_next_nope(
+            self.model_config.hf_text_config
+        ):
+            pc = self.parallel_config
+            if pc.prefill_context_parallel_size > 1 or pc.decode_context_parallel_size > 1:
+                raise ValueError("GLM sparse NVFP4 KV does not implement context-parallel softmax merging")
+            if self.attention_config.hisparse_config is not None:
+                raise ValueError("GLM sparse NVFP4 KV does not implement HiSparse host staging")
+            # The per-layer backend will validate platform and native reader.
+            # Do not change the public dtype: other groups have different ABIs.
             return self
         # The ds_mla layouts are MLA-only by construction; the plain nvfp4
         # layout (head_size//2 + head_size//16) does not apply to MLA.

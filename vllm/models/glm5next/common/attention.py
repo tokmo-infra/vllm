@@ -116,7 +116,13 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
         # ``tokens_per_state`` is the KV-spec representation of kpool
         # compression in the current cache-layout API.
         assert isinstance(spec, MLAAttentionSpec)
-        return replace(spec, tokens_per_state=self._index_kpool)
+        # MTP constructs its caches with a private FP8 CacheConfig snapshot.
+        # The runner's final block size is resolved after model construction.
+        return replace(
+            spec,
+            block_size=vllm_config.cache_config.block_size,
+            tokens_per_state=self._index_kpool,
+        )
 
     def get_attn_backend(self):
         return Glm5NextIndexerBackend
@@ -162,9 +168,10 @@ class Glm5NextTailCache(DeepseekV32IndexerCache):
         span = self._index_kpool + vllm_config.num_speculative_tokens
         ring = self._index_kpool * next_power_of_2(cdiv(span, self._index_kpool))
         # ring must divide the attention block size (a multiple of 128).
-        assert self.cache_config.block_size % ring == 0, (
+        block_size = vllm_config.cache_config.block_size
+        assert block_size % ring == 0, (
             f"Glm5NextTailCache: cache_config.block_size "
-            f"({self.cache_config.block_size}) must be a multiple of the "
+            f"({block_size}) must be a multiple of the "
             f"tail ring ({ring})"
         )
         return CircularBufferSpec(

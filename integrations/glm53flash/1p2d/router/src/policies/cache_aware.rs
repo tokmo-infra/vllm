@@ -1,0 +1,834 @@
+/*
+    Cache-Aware Load Balancing Router
+
+    This router combines two strategies to optimize both cache utilization and request distribution:
+
+    1. Cache-Aware Routing (Approximate Tree)
+    2. Load Balancing (Shortest Queue with Balance Thresholds)
+
+    The router dynamically switches between these strategies based on load conditions:
+    - Uses load balancing when the system is imbalanced
+    - Uses cache-aware routing when the system is balanced
+
+    A system is considered imbalanced if both conditions are met:
+    1. (max - min) > min(abs_threshold, mean_healthy_load)
+    2. max > rel_threshold * min
+
+    Strategy Details:
+
+    1. Cache-Aware Routing (Approximate Tree)
+    -------------------------------------------
+    This strategy maintains an approximate radix tree for each worker based on request history,
+    eliminating the need for direct cache state queries. The tree stores raw text characters
+    instead of token IDs to avoid tokenization overhead.
+
+    Process:
+    a. For each request, find the worker with the highest prefix match
+    b. If match rate > cache_threshold:
+    Route to the worker with highest match (likely has relevant data cached)
+    c. If match rate ≤ cache_threshold:
+    Route to the worker with smallest tree size (most available cache capacity)
+    d. Background maintenance:
+    Periodically evict least recently used leaf nodes to prevent memory overflow
+
+    2. Load Balancing (Shortest Queue)
+    -------------------------------------------
+    This strategy tracks pending request counts per worker and routes new requests
+    to the least busy worker when the system is detected to be imbalanced.
+
+    Configuration Parameters:
+    ------------------------
+    1. cache_threshold: (float, 0.0 to 1.0)
+    Minimum prefix match ratio to use highest-match routing.
+    Below this threshold, routes to worker with most available cache space.
+
+    2. balance_abs_threshold: (integer)
+    Absolute difference cap for load imbalance detection.
+    At low concurrency the threshold scales down to mean healthy-worker demand.
+
+    3. balance_rel_threshold: (float)
+    Relative ratio threshold for load imbalance detection.
+    System is potentially imbalanced if max_load > min_load * rel_threshold
+    Used in conjunction with abs_threshold to determine final imbalance state.
+
+    4. eviction_interval_secs: (integer)
+    Interval between LRU eviction cycles for the approximate trees.
+
+    5. max_tree_size: (integer)
+    Maximum nodes per tree. When exceeded, LRU leaf nodes are evicted
+    during the next eviction cycle.
+*/
+
+use super::{get_healthy_worker_indices, CacheAwareConfig, LoadBalancingPolicy, RequestHeaders};
+use crate::core::Worker;
+use crate::metrics::RouterMetrics;
+use crate::policies::normalize_model_key;
+use crate::tree::Tree;
+use dashmap::DashMap;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+use tracing::{debug, info};
+
+/// Backend candidate for a side-effect-free cache-affinity query.
+#[derive(Debug, Clone, Copy)]
+pub struct CacheAwareCandidate<'a> {
+    pub target_id: &'a str,
+    pub kv_pressure: f64,
+}
+
+/// Cache-affinity result committed separately by the caller.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CacheAwarePlacement {
+    pub target_id: String,
+    pub match_rate: f32,
+}
+
+/// Cache-aware routing policy
+///
+/// Routes requests based on cache affinity when load is balanced,
+/// switches to shortest-queue routing when load is imbalanced.
+/// Maintains separate trees per model for multi-model support.
+#[derive(Debug)]
+pub struct CacheAwarePolicy {
+    config: CacheAwareConfig,
+    trees: Arc<DashMap<String, Arc<Tree>>>, // model_id -> Arc<Tree>
+    eviction_handle: Option<thread::JoinHandle<()>>,
+    coupled_kv: Option<super::coupled_kv::CoupledKv>,
+}
+
+impl CacheAwarePolicy {
+    pub fn new() -> Self {
+        Self::with_config(CacheAwareConfig::default())
+    }
+
+    pub fn with_config(config: CacheAwareConfig) -> Self {
+        let trees = Arc::new(DashMap::<String, Arc<Tree>>::new());
+
+        // Start background eviction thread if configured
+        let eviction_handle = if config.eviction_interval_secs > 0 {
+            let trees_clone = Arc::clone(&trees);
+            let max_tree_size = config.max_tree_size;
+            let interval = config.eviction_interval_secs;
+
+            Some(thread::spawn(move || loop {
+                thread::sleep(Duration::from_secs(interval));
+
+                // Evict for all model trees
+                for entry in trees_clone.iter() {
+                    let model_id = entry.key();
+                    let tree = entry.value();
+                    tree.evict_tenant_by_size(max_tree_size);
+                    debug!(
+                        "Cache eviction completed for model {}, max_size: {}",
+                        model_id, max_tree_size
+                    );
+                }
+            }))
+        } else {
+            None
+        };
+
+        Self {
+            config,
+            trees,
+            eviction_handle,
+            coupled_kv: super::coupled_kv::CoupledKv::from_env(),
+        }
+    }
+
+    /// Select by the product of text-prefix affinity and current KV headroom.
+    pub fn evaluate_initial_placement(
+        &self,
+        model_id: &str,
+        request_text: &str,
+        candidates: &[CacheAwareCandidate<'_>],
+    ) -> Option<CacheAwarePlacement> {
+        let tree = self.trees.get(normalize_model_key(model_id));
+        let input_chars = request_text.chars().count();
+        candidates
+            .iter()
+            .map(|candidate| {
+                let matched_chars = tree.as_ref().map_or(0, |tree| {
+                    tree.prefix_match_tenant_char_count(request_text, candidate.target_id)
+                });
+                let affinity = if input_chars == 0 {
+                    0.0
+                } else {
+                    matched_chars as f64 / input_chars as f64
+                };
+                let headroom = 1.0 - candidate.kv_pressure.clamp(0.0, 1.0);
+                (candidate, affinity, headroom, (1.0 + affinity) * headroom)
+            })
+            .max_by(|left, right| {
+                left.3
+                    .total_cmp(&right.3)
+                    .then_with(|| left.2.total_cmp(&right.2))
+                    .then_with(|| left.1.total_cmp(&right.1))
+                    .then_with(|| right.0.target_id.cmp(left.0.target_id))
+            })
+            .map(|(candidate, affinity, _, _)| CacheAwarePlacement {
+                target_id: candidate.target_id.to_string(),
+                match_rate: affinity as f32,
+            })
+    }
+
+    /// Update the affinity tree after the selected target is committed.
+    pub fn commit_placement(&self, model_id: &str, request_text: &str, target_id: &str) {
+        if request_text.is_empty() {
+            return;
+        }
+        self.trees
+            .entry(normalize_model_key(model_id).to_string())
+            .or_insert_with(|| Arc::new(Tree::new()))
+            .insert(request_text, target_id);
+    }
+
+    /// Remove one unavailable target from a model's affinity tree.
+    pub fn remove_placement_target(&self, model_id: &str, target_id: &str) {
+        if let Some(tree) = self.trees.get(normalize_model_key(model_id)) {
+            tree.remove_tenant(target_id);
+        }
+    }
+
+    /// Add a single worker to the tree (incremental update)
+    pub fn add_worker(&self, worker: &dyn Worker) {
+        let tree_key = normalize_model_key(worker.model_id());
+        let tree = self
+            .trees
+            .entry(tree_key.to_string())
+            .or_insert_with(|| Arc::new(Tree::new()));
+        tree.insert("", worker.url());
+    }
+
+    /// Add a worker by URL and model (for backward compatibility)
+    pub fn add_worker_by_url(&self, url: &str, model_id: &str) {
+        let tree = self
+            .trees
+            .entry(model_id.to_string())
+            .or_insert_with(|| Arc::new(Tree::new()));
+        tree.insert("", url);
+    }
+
+    /// Remove a worker from the tree
+    pub fn remove_worker(&self, worker: &dyn Worker) {
+        let tree_key = normalize_model_key(worker.model_id());
+        if let Some(tree) = self.trees.get(tree_key) {
+            tree.remove_tenant(worker.url());
+        }
+    }
+
+    /// Remove a worker by URL (removes from all model trees for backward compatibility)
+    pub fn remove_worker_by_url(&self, url: &str) {
+        // Remove from all trees since we don't know which model it belongs to
+        for tree_ref in self.trees.iter() {
+            tree_ref.value().remove_tenant(url);
+        }
+    }
+
+    /// Run cache eviction to prevent unbounded growth
+    pub fn evict_cache(&self, max_size: usize) {
+        for tree_ref in self.trees.iter() {
+            let model_id = tree_ref.key();
+            let tree = tree_ref.value();
+            tree.evict_tenant_by_size(max_size);
+            debug!(
+                "Cache eviction for model {}, max_size: {}",
+                model_id, max_size
+            );
+        }
+    }
+
+    /// Rank demand first, then instance demand so idle ranks on a busy HTTP
+    /// instance do not steal the entire next low-concurrency burst.
+    fn least_busy(workers: &[Arc<dyn Worker>], indices: &[usize]) -> Option<usize> {
+        let mut instances: HashMap<&str, (usize, usize)> = HashMap::new();
+        for idx in get_healthy_worker_indices(workers) {
+            let worker = &workers[idx];
+            let totals = instances.entry(worker.base_url()).or_default();
+            totals.0 = totals.0.saturating_add(worker.load());
+            totals.1 = totals.1.saturating_add(worker.processed_requests());
+        }
+        indices.iter().copied().min_by_key(|&idx| {
+            let worker = &workers[idx];
+            let (instance_load, instance_processed) = instances[worker.base_url()];
+            (
+                worker.load(),
+                instance_load,
+                instance_processed,
+                worker.processed_requests(),
+                worker.dp_rank().unwrap_or(0),
+                worker.base_url(),
+                worker.url(),
+            )
+        })
+    }
+
+    fn select_worker_min_load(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        healthy_indices: &[usize],
+        model_id: &str,
+        max_load: usize,
+        min_load: usize,
+    ) -> Option<usize> {
+        // Log load balancing trigger (only compute worker loads if debug enabled)
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let worker_loads: Vec<(&str, usize)> =
+                workers.iter().map(|w| (w.url(), w.load())).collect();
+            debug!(
+                "Load balancing triggered | max: {} | min: {} | workers: {:?}",
+                max_load, min_load, worker_loads
+            );
+        }
+
+        RouterMetrics::record_load_balancing_event();
+        RouterMetrics::set_load_range(max_load, min_load);
+
+        // Use shortest queue when imbalanced
+        let min_load_idx = Self::least_busy(workers, healthy_indices)?;
+
+        // Even in imbalanced mode, update the tree to maintain cache state
+        if let Some(text) = request_text {
+            // Get the tree reference without locking the entire HashMap
+            // DashMap only locks the specific shard containing this key
+            let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
+
+            if let Some(tree) = tree {
+                let worker_url = workers[min_load_idx].url();
+                tree.insert(text, worker_url);
+            } else {
+                debug!(
+                    "Warning: No tree found for model '{}', skipping cache update",
+                    model_id
+                );
+            }
+        }
+
+        // Increment processed counter
+        workers[min_load_idx].increment_processed();
+        RouterMetrics::record_processed_request(workers[min_load_idx].url());
+        RouterMetrics::record_policy_decision(self.name(), workers[min_load_idx].url());
+
+        Some(min_load_idx)
+    }
+}
+
+impl LoadBalancingPolicy for CacheAwarePolicy {
+    fn select_worker_with_headers(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        _headers: Option<&RequestHeaders>,
+    ) -> Option<usize> {
+        let healthy_indices = get_healthy_worker_indices(workers);
+        if let Some(balance) = &self.coupled_kv {
+            let idx = balance.select(workers)?;
+            workers[idx].increment_processed();
+            RouterMetrics::record_processed_request(workers[idx].url());
+            RouterMetrics::record_policy_decision("coupled_kv", workers[idx].url());
+            return Some(idx);
+        }
+
+        if healthy_indices.is_empty() {
+            return None;
+        }
+
+        // Determine the model for this set of workers (router pre-filters by model)
+        // All workers should be from the same model
+        let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
+
+        // Unavailable workers must not skew the balancing threshold. At low
+        // concurrency, a fixed CLI threshold of 64 never notices a busy peer.
+        // Scale it down to the healthy pool's mean demand; keep it as a cap.
+        let (min_load, max_load, total_load) =
+            healthy_indices
+                .iter()
+                .fold((usize::MAX, 0usize, 0usize), |(min, max, total), &idx| {
+                    let load = workers[idx].load();
+                    (min.min(load), max.max(load), total.saturating_add(load))
+                });
+        let effective_abs = self
+            .config
+            .balance_abs_threshold
+            .min(total_load / healthy_indices.len());
+        let is_imbalanced = max_load.saturating_sub(min_load) > effective_abs
+            && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
+
+        debug!(
+            "Load status for model: max_load={}, min_load={}, is_imbalanced={}",
+            max_load, min_load, is_imbalanced
+        );
+
+        if is_imbalanced {
+            return self.select_worker_min_load(
+                workers,
+                request_text,
+                &healthy_indices,
+                model_id,
+                max_load,
+                min_load,
+            );
+        }
+
+        // Use cache-aware routing when balanced
+        let text = request_text.unwrap_or("");
+
+        // Get the tree reference without locking the entire HashMap
+        // DashMap only locks the specific shard containing this key
+        let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
+
+        let keys: Vec<_> = self.trees.iter().map(|entry| entry.key().clone()).collect();
+        debug!("Available tree keys: {:?}", keys);
+
+        let Some(tree) = tree else {
+            let selected_idx = Self::least_busy(workers, &healthy_indices)?;
+
+            workers[selected_idx].increment_processed();
+            RouterMetrics::record_processed_request(workers[selected_idx].url());
+            RouterMetrics::record_policy_decision(self.name(), workers[selected_idx].url());
+
+            return Some(selected_idx);
+        };
+        debug!("Using cache-aware routing for model '{}'", model_id);
+        // Now we work with the tree without holding the HashMap lock
+        // Match the deepest eligible prefix once, not once per worker.
+        let eligible_urls: Vec<&str> = healthy_indices
+            .iter()
+            .map(|&idx| workers[idx].url())
+            .collect();
+        let result = tree.prefix_match_candidates(text, &eligible_urls);
+        let match_rate = if result.input_char_count == 0 {
+            0.0
+        } else {
+            result.matched_char_count as f32 / result.input_char_count as f32
+        };
+
+        debug!(
+            "Cache match for model '{}': matched_chars={}, input_chars={}, match_rate={:.2}",
+            model_id, result.matched_char_count, result.input_char_count, match_rate
+        );
+        // Equal-prefix owners are equally useful: prefer the least busy one
+        // instead of pinning all requests to the radix node's cached tenant.
+        let matching: Vec<usize> = if match_rate > self.config.cache_threshold {
+            healthy_indices
+                .iter()
+                .copied()
+                .filter(|&idx| {
+                    result
+                        .tenants
+                        .iter()
+                        .any(|tenant| tenant.as_ref() == workers[idx].url())
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let selected_idx = Self::least_busy(workers, &matching)
+            .or_else(|| Self::least_busy(workers, &healthy_indices));
+
+        if let Some(idx) = selected_idx {
+            // Update the tree with this request (use worker URL directly, no allocation)
+            tree.insert(text, workers[idx].url());
+
+            // Increment processed counter
+            workers[idx].increment_processed();
+            RouterMetrics::record_processed_request(workers[idx].url());
+            RouterMetrics::record_policy_decision(self.name(), workers[idx].url());
+
+            return Some(idx);
+        }
+
+        None
+    }
+
+    fn name(&self) -> &'static str {
+        "cache_aware"
+    }
+
+    fn needs_request_text(&self) -> bool {
+        true // Cache-aware policy needs request text for cache affinity
+    }
+
+    fn on_request_complete(&self, worker_url: &str, success: bool) {
+        // Could track success rates per worker for more intelligent routing
+        if !success {
+            // Optionally reduce affinity for failed requests
+            tracing::debug!(
+                "Request to {} completed with success={}",
+                worker_url,
+                success
+            );
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn select_worker_pair_with_headers(
+        &self,
+        prefill_workers: &[Arc<dyn Worker>],
+        decode_workers: &[Arc<dyn Worker>],
+        request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<(usize, usize)> {
+        // DEPRECATED: This method is no longer used when separate policies are configured.
+        // The PD router now uses separate policies for prefill and decode selection.
+        // This implementation remains for backward compatibility when a single policy is used.
+
+        // In PD mode with single policy:
+        // - Prefill: Use cache-aware routing for better cache utilization
+        // - Decode: Use least-load routing for better load distribution
+
+        // Select prefill worker using cache-aware logic
+        let prefill_idx =
+            self.select_worker_with_headers(prefill_workers, request_text, headers)?;
+
+        // Select decode worker using least-load logic
+        let healthy_decode = get_healthy_worker_indices(decode_workers);
+        if healthy_decode.is_empty() {
+            return None;
+        }
+
+        let decode_idx = healthy_decode
+            .iter()
+            .min_by_key(|&&idx| decode_workers[idx].load())
+            .copied()?;
+
+        Some((prefill_idx, decode_idx))
+    }
+
+    fn requires_initialization(&self) -> bool {
+        true // Cache-aware policy requires init_workers() to set up trees
+    }
+
+    fn init_workers(&self, workers: &[Arc<dyn Worker>]) {
+        // Group workers by model
+        info!(
+            "Initializing workers for cache-aware policy: {}",
+            workers
+                .iter()
+                .map(|w| w.url())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let mut model_workers: HashMap<String, Vec<&Arc<dyn Worker>>> = HashMap::new();
+        for worker in workers {
+            let tree_key = normalize_model_key(worker.model_id());
+            model_workers
+                .entry(tree_key.to_string())
+                .or_default()
+                .push(worker);
+        }
+
+        // Initialize tree for each model
+        for (tree_key, model_workers) in model_workers {
+            info!(
+                "Creating tree for model key: '{}' with {} workers",
+                tree_key,
+                model_workers.len()
+            );
+            let tree = self
+                .trees
+                .entry(tree_key)
+                .or_insert_with(|| Arc::new(Tree::new()))
+                .clone();
+            for worker in model_workers {
+                tree.insert("", worker.url());
+            }
+        }
+    }
+}
+
+impl Default for CacheAwarePolicy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for CacheAwarePolicy {
+    fn drop(&mut self) {
+        // Note: We can't properly stop the eviction thread since it's in an infinite loop
+        // In a production system, we'd use a channel or atomic flag to signal shutdown
+        if let Some(handle) = self.eviction_handle.take() {
+            // The thread will continue running until the program exits
+            // This is acceptable for now since the router typically runs for the lifetime of the program
+            drop(handle);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{BasicWorker, WorkerType};
+
+    #[test]
+    fn test_cache_aware_with_balanced_load() {
+        // Create policy without eviction thread for testing
+        let config = CacheAwareConfig {
+            eviction_interval_secs: 0, // Disable eviction thread
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
+                "http://w1:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w2:8000".to_string(),
+                WorkerType::Regular,
+            )),
+        ];
+
+        // Initialize the policy with workers
+        policy.init_workers(&workers);
+
+        // First request should be distributed
+        let idx1 = policy.select_worker(&workers, Some("hello world")).unwrap();
+
+        // Same request should go to same worker (cache hit)
+        let idx2 = policy.select_worker(&workers, Some("hello world")).unwrap();
+        assert_eq!(idx1, idx2);
+
+        // Similar request should also go to same worker
+        let idx3 = policy.select_worker(&workers, Some("hello")).unwrap();
+        assert_eq!(idx1, idx3);
+    }
+
+    #[test]
+    fn test_cache_aware_with_imbalanced_load() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 5,
+            balance_rel_threshold: 2.0,
+            eviction_interval_secs: 0, // Disable eviction thread
+            max_tree_size: 10000,
+        });
+
+        let worker1 = BasicWorker::new("http://w1:8000".to_string(), WorkerType::Regular);
+        let worker2 = BasicWorker::new("http://w2:8000".to_string(), WorkerType::Regular);
+
+        // Create significant load imbalance
+        for _ in 0..20 {
+            worker1.increment_load();
+        }
+        // worker2 has load 0
+
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(worker1), Arc::new(worker2)];
+        policy.init_workers(&workers);
+
+        // Should select worker2 (lower load) despite cache affinity
+        for _ in 0..5 {
+            let idx = policy.select_worker(&workers, Some("test")).unwrap();
+            assert_eq!(idx, 1); // Should always pick worker2
+        }
+    }
+
+    #[test]
+    fn test_cache_aware_worker_removal() {
+        let config = CacheAwareConfig {
+            eviction_interval_secs: 0, // Disable eviction thread
+            ..Default::default()
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(BasicWorker::new(
+                "http://w1:8000".to_string(),
+                WorkerType::Regular,
+            )),
+            Arc::new(BasicWorker::new(
+                "http://w2:8000".to_string(),
+                WorkerType::Regular,
+            )),
+        ];
+
+        policy.init_workers(&workers);
+
+        // Route some requests
+        policy.select_worker(&workers, Some("test1"));
+        policy.select_worker(&workers, Some("test2"));
+
+        // Remove a worker
+        policy.remove_worker_by_url("http://w1:8000");
+        workers[0].set_healthy(false);
+
+        // All requests should now go to worker2
+        let idx = policy.select_worker(&workers, Some("test1")).unwrap();
+        assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn initial_placement_combines_affinity_and_headroom_without_mutation() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let candidates = [
+            CacheAwareCandidate {
+                target_id: "rank-0",
+                kv_pressure: 0.2,
+            },
+            CacheAwareCandidate {
+                target_id: "rank-1",
+                kv_pressure: 0.1,
+            },
+        ];
+        assert_eq!(
+            policy
+                .evaluate_initial_placement("model", "shared suffix", &candidates)
+                .unwrap()
+                .target_id,
+            "rank-1"
+        );
+        policy.commit_placement("model", "shared first", "rank-0");
+        let equal_pressure = [
+            CacheAwareCandidate {
+                target_id: "rank-0",
+                kv_pressure: 0.1,
+            },
+            CacheAwareCandidate {
+                target_id: "rank-1",
+                kv_pressure: 0.1,
+            },
+        ];
+        assert_eq!(
+            policy
+                .evaluate_initial_placement("model", "shared second", &equal_pressure)
+                .unwrap()
+                .target_id,
+            "rank-0"
+        );
+    }
+    fn cli_policy() -> CacheAwarePolicy {
+        CacheAwarePolicy::with_config(CacheAwareConfig {
+            balance_abs_threshold: 64,
+            balance_rel_threshold: 1.5,
+            eviction_interval_secs: 0,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn test_cache_aware_equal_prefix_rotates_without_repeated_text_scans() {
+        let policy = cli_policy();
+        let workers: Vec<Arc<dyn Worker>> = (0..4)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://w{i}:8000"),
+                    WorkerType::Regular,
+                )) as _
+            })
+            .collect();
+        policy.init_workers(&workers);
+        let text = "真实SWE共同长前缀".repeat(20_000);
+        for worker in &workers {
+            policy.commit_placement("default", &text, worker.url());
+        }
+        let mut counts = [0usize; 4];
+        for _ in 0..32 {
+            let idx = policy.select_worker(&workers, Some(&text)).unwrap();
+            counts[idx] += 1;
+        }
+        assert_eq!(counts, [8; 4]);
+    }
+
+    #[test]
+    fn test_cache_aware_low_concurrency_overrides_busy_affinity() {
+        let policy = cli_policy();
+        let workers: Vec<Arc<dyn Worker>> = (0..3)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://w{i}:8000"),
+                    WorkerType::Regular,
+                )) as _
+            })
+            .collect();
+        policy.init_workers(&workers);
+        policy.commit_placement("default", "shared prompt", workers[0].url());
+        workers[0].increment_load();
+        workers[2].set_healthy(false);
+        // Healthy mean is zero: the idle healthy peer wins over busy cache affinity.
+        assert_eq!(
+            policy.select_worker(&workers, Some("shared prompt")),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn test_cache_aware_unavailable_load_does_not_break_healthy_affinity() {
+        for circuit_open in [false, true] {
+            let policy = cli_policy();
+            let workers: Vec<Arc<dyn Worker>> = (0..3)
+                .map(|i| {
+                    Arc::new(BasicWorker::new(
+                        format!("http://w{i}:8000"),
+                        WorkerType::Regular,
+                    )) as _
+                })
+                .collect();
+            policy.init_workers(&workers);
+            policy.commit_placement("default", "shared prompt", workers[1].url());
+            for worker in &workers[..2] {
+                for _ in 0..8 {
+                    worker.increment_load();
+                }
+            }
+            for _ in 0..1000 {
+                workers[2].increment_load();
+            }
+            if circuit_open {
+                workers[2].circuit_breaker().force_open();
+            } else {
+                workers[2].set_healthy(false);
+            }
+            assert_eq!(
+                policy.select_worker(&workers, Some("shared prompt")),
+                Some(1)
+            );
+        }
+    }
+
+    #[test]
+    fn test_cache_aware_uses_shorter_healthy_prefix_when_deepest_owner_unavailable() {
+        let policy = cli_policy();
+        let workers: Vec<Arc<dyn Worker>> = (0..3)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://w{i}:8000"),
+                    WorkerType::Regular,
+                )) as _
+            })
+            .collect();
+        policy.init_workers(&workers);
+        policy.commit_placement("default", "shared prefix long suffix", workers[0].url());
+        policy.commit_placement("default", "shared prefix ", workers[1].url());
+        workers[0].set_healthy(false);
+        assert_eq!(
+            policy.select_worker(&workers, Some("shared prefix long suffix")),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn test_cache_aware_missing_tree_uses_fair_load_fallback() {
+        let policy = cli_policy();
+        let workers: Vec<Arc<dyn Worker>> = (0..4)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://w{i}:8000"),
+                    WorkerType::Regular,
+                )) as _
+            })
+            .collect();
+        let mut counts = [0usize; 4];
+        for _ in 0..32 {
+            counts[policy.select_worker(&workers, None).unwrap()] += 1;
+        }
+        assert_eq!(counts, [8; 4]);
+    }
+}

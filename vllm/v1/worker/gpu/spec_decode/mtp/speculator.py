@@ -51,7 +51,7 @@ class MTPSpeculator(TargetDependentARSpeculator):
             cudagraph_runtime_mode,
             mm_inputs,
         )
-        # Shape stays MTP3, but no draft feedback or logits are produced on P.
+        # Keep the configured draft shape, but do not produce feedback or logits.
         self.draft_tokens[:num_reqs].fill_(-1)
 
     def load_draft_model(

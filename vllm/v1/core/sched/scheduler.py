@@ -83,6 +83,8 @@ logger = init_logger(__name__)
 
 
 class Scheduler(SchedulerInterface):
+    ready_wait_probe = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -440,6 +442,14 @@ class Scheduler(SchedulerInterface):
             {} if self.log_stats and self.connector is not None else None
         )
         self._kv_fetch_counts: dict[str, int] = dict.fromkeys(KV_FETCH_STAGES, 0)
+
+        if envs.VLLM_GLM53_P_READY_WAIT:
+            from vllm.v1.core.sched.ready_wait import ReadyWait
+
+            if ReadyWait.producer(vllm_config.kv_transfer_config):
+                self.ready_wait_probe = ReadyWait(
+                    self.parallel_config.data_parallel_rank, logger
+                )
 
         self._hot_tail_budget = None
         if envs.VLLM_EXPERIMENTAL_HOT_TAIL_ADMISSION:
@@ -915,6 +925,9 @@ class Scheduler(SchedulerInterface):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
+        probe = self.ready_wait_probe
+        direct = {} if probe is not None and probe.ready else None
+        fallback = "other_queue"
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state != PauseState.PAUSED_ALL:
             step_skipped_waiting: deque[Request] = deque()
@@ -922,6 +935,8 @@ class Scheduler(SchedulerInterface):
 
             def skip_request(from_queue: RequestQueue) -> None:
                 request_to_skip = from_queue.pop_request()
+                if direct is not None and request_to_skip.request_id in probe.ready:
+                    direct.setdefault(request_to_skip.request_id, "other_skip")
                 self.deferred_waiting.add(request_to_skip)
                 if self._holds_kv_blocks(request_to_skip):
                     step_skipped_kv_holding.appendleft(request_to_skip)
@@ -935,11 +950,15 @@ class Scheduler(SchedulerInterface):
                 if not request_queue and self._pause_state == PauseState.UNPAUSED:
                     request_queue = self.waiting
                 if not request_queue or input_budget <= draft_slots:
+                    if direct is not None and request_queue:
+                        fallback = "token_input"
                     break
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
                 if num_running >= self.max_num_active_reqs:
+                    if direct is not None:
+                        fallback = "seq"
                     break
 
                 request = request_queue.peek_request()
@@ -1132,6 +1151,8 @@ class Scheduler(SchedulerInterface):
                 elif defer_prefills and num_computed_tokens < request.num_tokens - 1:
                     # DP prefill balancing: defer this step's local prefill
                     # compute to a cadence-aligned step.
+                    if direct is not None:
+                        direct[request_id] = "other_cadence"
                     break
                 else:
                     request_token_budget = min(token_budget, input_budget - draft_slots)
@@ -1167,6 +1188,8 @@ class Scheduler(SchedulerInterface):
                         ):
                             if padded_num_tokens > request_token_budget:
                                 # Prefer to not schedule than schedule un-padded.
+                                if direct is not None:
+                                    direct[request_id] = "token_padding"
                                 break
                             num_new_tokens = padded_num_tokens
                             pad_spec_decode = True
@@ -1183,6 +1206,8 @@ class Scheduler(SchedulerInterface):
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
+                        if direct is not None:
+                            direct[request_id] = "token_unchunked"
                         break
 
                     num_new_tokens = min(num_new_tokens, request_token_budget)
@@ -1197,6 +1222,8 @@ class Scheduler(SchedulerInterface):
                             num_external_computed_tokens,
                         )
                         if num_new_tokens == 0:
+                            if direct is not None:
+                                direct[request_id] = "other_alignment"
                             break
                         if (
                             pad_spec_decode
@@ -1235,6 +1262,8 @@ class Scheduler(SchedulerInterface):
 
                     if num_new_tokens == 0:
                         # The request cannot be scheduled.
+                        if direct is not None:
+                            direct[request_id] = "other_encoder_or_lookahead"
                         break
 
                 # During async KV load, no forward pass is run yet.
@@ -1293,6 +1322,8 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    if direct is not None:
+                        direct[request_id] = "kv_alloc"
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
@@ -1346,6 +1377,8 @@ class Scheduler(SchedulerInterface):
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
+                    if probe is not None:
+                        probe.admitted(request_id)
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                     # Set num_computed_tokens even though KVs are not yet loaded.
                     # request.num_computed_tokens will not be used anywhere until
@@ -1425,6 +1458,15 @@ class Scheduler(SchedulerInterface):
             if not defer_prefills:
                 _, num_waiting = self.get_request_counts()
                 self.prefill_capacity_bound = num_waiting > len(self.deferred_waiting)
+
+        if direct is not None:
+            if self._pause_state == PauseState.PAUSED_ALL:
+                fallback = "other_pause"
+            elif preempted_reqs:
+                fallback = "other_preemption"
+            elif token_budget == 0:
+                fallback = "token_budget"
+            probe.missed(num_scheduled_tokens, direct, fallback)
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -2741,6 +2783,10 @@ class Scheduler(SchedulerInterface):
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
+        if self.ready_wait_probe is not None:
+            self.ready_wait_probe.discard(
+                request.request_id, request.status.name.lower()
+            )
         self._forget_hot_tail(request)
 
         if self.aux_output_connector is not None:
@@ -3007,6 +3053,8 @@ class Scheduler(SchedulerInterface):
 
     def shutdown(self) -> None:
         logger.debug_once("[shutdown] Scheduler: start")
+        if self.ready_wait_probe is not None:
+            self.ready_wait_probe.close()
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:
@@ -3296,6 +3344,8 @@ class Scheduler(SchedulerInterface):
             assert req_id in self.requests
             req = self.requests[req_id]
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                if self.ready_wait_probe is not None:
+                    self.ready_wait_probe.received(req_id)
                 self.finished_recving_kv_req_ids.add(req_id)
                 self._set_kv_fetch_stage(req, KV_FETCH_COMPLETED_WAITING)
             else:
@@ -3420,6 +3470,8 @@ class Scheduler(SchedulerInterface):
                 and request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
             ):
                 affected_req_ids.add(req_id)
+                if self.ready_wait_probe is not None:
+                    self.ready_wait_probe.discard(req_id, "failed_recv")
                 self._forget_hot_tail(request)
                 if self.recompute_kv_load_failures:
                     request.num_computed_tokens = 0
@@ -3463,6 +3515,9 @@ class Scheduler(SchedulerInterface):
             )
         )
 
+        if self.ready_wait_probe is not None:
+            for req_id in async_failed_req_ids:
+                self.ready_wait_probe.discard(req_id, "failed_recv")
         total_failed_requests = len(async_failed_req_ids)
         total_failed_tokens = num_failed_tokens
 

@@ -178,11 +178,20 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
         "fp8",
         "fp8_e4m3",
         "fp8_ds_mla",
+        "glm_nvfp4_mla",
     ]
 
     @staticmethod
     def get_name() -> str:
         return "FLASHINFER_MLA_SPARSE_SM120"
+
+    @classmethod
+    def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
+        # Native GLM NVFP4 takes a byte pitch; it does not flatten hybrid
+        # pages. Do not force padding to an entire 64-row MLA page.
+        if getattr(spec, "cache_dtype_str", None) == "glm_nvfp4_mla":
+            return spec
+        return super().customize_spec(spec)
 
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
@@ -215,6 +224,14 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
     ) -> str | None:
         from vllm.config import get_current_vllm_config
         from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
+
+        if kv_cache_dtype == "glm_nvfp4_mla":
+            from vllm.config.glm_mla_kv import is_glm_next_nope
+
+            cfg = get_current_vllm_config().model_config
+            if dtype != torch.bfloat16 or cfg is None or not is_glm_next_nope(cfg.hf_text_config):
+                return "304-byte GLM KV requires BF16 sparse NoPE GLM_NEXT"
+            return None
 
         if not has_flashinfer_sparse_mla_sm120():
             return (

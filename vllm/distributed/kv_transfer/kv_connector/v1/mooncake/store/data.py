@@ -17,6 +17,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorWorkerMetadata,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.glm_nvfp4 import (
+    GLM_NVFP4_ROW_BYTES,
+)
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import is_non_overlapping_and_dense
@@ -335,7 +338,9 @@ class RankLocalStoreLayout(StoreLayout):
         sizes = blen[None, :] * block_counts[:, None]
         return addrs.tolist(), sizes.tolist(), bids.tolist()
 
-    def prepare_value_for_block(self, block_id: int) -> tuple[list[int], list[int]]:
+    def prepare_value_for_block(
+        self, block_id: int, valid_tokens: int | None = None
+    ) -> tuple[list[int], list[int]]:
         length = len(self.block_len)
         return (
             [
@@ -358,7 +363,8 @@ class CompactGroupStoreLayout(RankLocalStoreLayout):
     verified MLA page shaped logically as ``(heads, states, content_bytes)``;
     when that shape matches every registered view, partial final blocks can
     omit unused token states. Other cache kinds (notably Mamba/KDA) retain the
-    complete logical state.
+    complete logical state. The GLM format separately trims only its verified
+    token-major NVFP4 views, to the boundary named by the Store key.
     """
 
     def __init__(
@@ -368,9 +374,11 @@ class CompactGroupStoreLayout(RankLocalStoreLayout):
         hash_block_size: int,
         *,
         tail_shape: tuple[int, int, int] | None = None,
+        glm_nvfp4_view_indices: frozenset[int] = frozenset(),
     ) -> None:
         super().__init__(metadata, block_size, hash_block_size)
         self.tail_shape = tail_shape
+        self.glm_nvfp4_view_indices = glm_nvfp4_view_indices
         self._views: list[
             tuple[
                 int,
@@ -465,7 +473,7 @@ class CompactGroupStoreLayout(RankLocalStoreLayout):
         self.compact_segment_count = 0
         tail_shape_matches = self.tail_shape is not None
 
-        for cache in kv_caches:
+        for view_idx, cache in enumerate(kv_caches):
             if cache.ndim < 2 or cache.shape[0] != num_blocks:
                 raise ValueError(
                     "Compact Store views must have manager blocks on dimension 0; "
@@ -485,6 +493,12 @@ class CompactGroupStoreLayout(RankLocalStoreLayout):
             runs = self._logical_runs(inner_shape, inner_strides, element_size)
             if not runs:
                 raise ValueError("Compact Store view has no active elements")
+            if view_idx in self.glm_nvfp4_view_indices and (
+                element_size != 1
+                or inner_shape != (self.block_size, GLM_NVFP4_ROW_BYTES)
+                or runs != [(0, self.block_size * GLM_NVFP4_ROW_BYTES)]
+            ):
+                raise ValueError("Compact Store requires token-major GLM NVFP4 pages")
             max_end = max(offset + length for offset, length in runs)
             if not self._has_proven_non_overlapping_layout(
                 tuple(cache.shape),
@@ -533,9 +547,13 @@ class CompactGroupStoreLayout(RankLocalStoreLayout):
 
         self.tail_trim_supported = False
         self.tail_trim_reason = (
-            "disabled; retain full logical pages"
-            if tail_shape_matches
-            else "disabled; retain full logical pages (MLA shape unverified)"
+            "GLM NVFP4 views only"
+            if self.glm_nvfp4_view_indices
+            else (
+                "disabled; retain full logical pages"
+                if tail_shape_matches
+                else "disabled; retain full logical pages (MLA shape unverified)"
+            )
         )
 
     def _runs_for_tokens(
@@ -574,9 +592,14 @@ class CompactGroupStoreLayout(RankLocalStoreLayout):
     ) -> tuple[list[int], list[int]]:
         addrs: list[int] = []
         sizes: list[int] = []
-        for view in self._views:
+        for view_idx, view in enumerate(self._views):
             base_addr, block_stride, _, _, _, _ = view
-            for offset, length in self._runs_for_tokens(view, valid_tokens):
+            runs = (
+                [(0, valid_tokens * GLM_NVFP4_ROW_BYTES)]
+                if view_idx in self.glm_nvfp4_view_indices
+                else self._runs_for_tokens(view, valid_tokens)
+            )
+            for offset, length in runs:
                 addrs.append(base_addr + block_id * block_stride + offset)
                 sizes.append(length)
         return addrs, sizes
@@ -624,8 +647,14 @@ class CompactGroupStoreLayout(RankLocalStoreLayout):
 
         return all_addrs, all_sizes, selected_block_ids
 
-    def prepare_value_for_block(self, block_id: int) -> tuple[list[int], list[int]]:
-        return self._block_values(block_id, self.block_size)
+    def prepare_value_for_block(
+        self, block_id: int, valid_tokens: int | None = None
+    ) -> tuple[list[int], list[int]]:
+        if valid_tokens is None:
+            valid_tokens = self.block_size
+        if not 0 < valid_tokens <= self.block_size:
+            raise ValueError(f"Invalid Store page span: {valid_tokens} tokens")
+        return self._block_values(block_id, valid_tokens)
 
 
 class TPShardedStoreLayout(StoreLayout):
@@ -878,9 +907,11 @@ class ChunkedTokenDatabase:
     def set_block_len(self, block_len: list[int]):
         self._rank_local_layout().set_block_len(block_len)
 
-    def prepare_value_for_block(self, block_id: int) -> tuple[list[int], list[int]]:
+    def prepare_value_for_block(
+        self, block_id: int, valid_tokens: int | None = None
+    ) -> tuple[list[int], list[int]]:
         """Return addresses and sizes for one physical block slot."""
-        return self._rank_local_layout().prepare_value_for_block(block_id)
+        return self._rank_local_layout().prepare_value_for_block(block_id, valid_tokens)
 
     def process_tokens(
         self,

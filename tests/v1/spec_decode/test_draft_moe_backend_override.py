@@ -30,6 +30,7 @@ class _CacheConfig:
 
 @dataclass
 class _SpeculativeConfig:
+    method: str = "eagle"
     attention_backend: str | None = None
     moe_backend: str | None = None
     kv_cache_dtype: str | None = None
@@ -37,6 +38,7 @@ class _SpeculativeConfig:
     draft_load_config: object = None
 
     apply_draft_overrides = SpeculativeConfig.apply_draft_overrides
+    glm_mtp_needs_fp8_kv = SpeculativeConfig.glm_mtp_needs_fp8_kv
 
 
 @dataclass

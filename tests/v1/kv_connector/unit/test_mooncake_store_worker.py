@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import contextlib
+import ctypes
 import itertools
 import json
 import logging
@@ -56,7 +57,9 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
+    MLAAttentionSpec,
     RSWASpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
@@ -285,6 +288,7 @@ class _FakeKVTransferConfig:
         extra_config: dict[str, object] | None = None,
     ) -> None:
         self.kv_role = kv_role
+        self.kv_load_failure_policy = "fail"
         self.kv_connector_extra_config = extra_config or {}
 
     def get_from_extra_config(self, key: str, default: object) -> object:
@@ -2484,6 +2488,132 @@ def test_worker_init_excludes_nonprefix_cache_groups(monkeypatch):
     assert [db.block_size for db in store_worker.token_dbs] == [800, 800]
 
 
+@pytest.mark.parametrize(
+    "boundary,expected_nvfp4_bytes", [(12, 12 * 304), (16, 16 * 304)]
+)
+def test_glm_nvfp4_store_uses_key_span_and_keeps_fp8_layout(
+    monkeypatch, boundary, expected_nvfp4_bytes
+):
+    store = MagicMock()
+    store.setup.return_value = 0
+    store.register_buffer.return_value = 0
+    _install_fake_mooncake(monkeypatch, store)
+    _patch_worker_runtime(monkeypatch)
+    monkeypatch.setattr(worker.MooncakeStoreConfig, "load_from_config", _make_config)
+
+    def make_worker(is_nvfp4, *, reverse=False, extra=None):
+        vllm_config = _make_vllm_config(
+            extra_config={"cache_prefix": "same", **(extra or {})}
+        )
+        vllm_config.cache_config.cache_dtype = "nvfp4" if is_nvfp4 else "fp8"
+        vllm_config.cache_config.enable_prefix_caching = True
+        vllm_config.cache_config.prefix_match_unit = 4
+        vllm_config.speculative_config = SimpleNamespace(
+            use_eagle_block_drop=lambda: True
+        )
+        specs = {
+            name: MLAAttentionSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=512,
+                dtype=torch.uint8,
+                cache_dtype_str="glm_nvfp4_mla"
+                if name == "main" and is_nvfp4
+                else "fp8_ds_mla",
+                state_content_bytes=304 if name == "main" and is_nvfp4 else 656,
+            )
+            for name in (["mtp", "main"] if reverse else ["main", "mtp"])
+        }
+        groups = [
+            KVCacheGroupSpec(
+                list(specs), UniformTypeKVCacheSpecs(16, specs), is_eagle_group=True
+            ),
+            KVCacheGroupSpec(
+                ["tail"],
+                CircularBufferSpec(
+                    block_size=4, num_kv_heads=2, head_size=4, dtype=torch.bfloat16
+                ),
+            ),
+        ]
+        cfg = KVCacheConfig(
+            10, [], groups, hash_block_size=4, cache_hit_alignment_tokens=4
+        )
+        return worker.MooncakeStoreWorker(vllm_config, cfg)
+
+    p = make_worker(True)
+    d = make_worker(True, reverse=True)
+    fp8 = make_worker(False)
+    fp8_compact = make_worker(False, extra={"store_compact_group_payloads": True})
+    hashes = [BlockHash(bytes([idx])) for idx in range(1, 5)]
+    db = p.token_dbs[0]
+    key = db.key_for(hashes[boundary // 4 - 1])
+    assert key == d.token_dbs[0].key_for(hashes[boundary // 4 - 1])
+    assert "@store_format:glm_nvfp4_mla_v1" in key
+    assert fp8.token_dbs[0].key_for(hashes[0]).startswith("same@test-model@tp_rank:")
+    assert "@store_format:compact_group_views_v1" in fp8_compact.token_dbs[0].key_for(
+        hashes[0]
+    )
+    assert key not in {fp8.token_dbs[0].key_for(h) for h in hashes}
+
+    p_main = torch.full((10, 1, 16, 304), 91, dtype=torch.uint8)
+    p_mtp = torch.full((10, 1, 16, 656), 16, dtype=torch.uint8)
+    d_raw = torch.zeros((10, 16 * 304 + 32), dtype=torch.uint8)
+    d_main = d_raw[:, 16:-16].view(10, 1, 16, 304)
+    d_mtp = torch.zeros_like(p_mtp)
+    _register_with_mocked_threads(p, {"main": p_main.view(20, 1, 8, 304), "mtp": p_mtp})
+    _register_with_mocked_threads(d, {"mtp": d_mtp, "main": d_main})
+
+    sender = _make_store_sending_thread(
+        store, coord=p.coord, token_databases=p.token_dbs
+    )
+    put = ReqMeta(
+        "save", boundary, ([1],), hashes, boundary_puts=[BoundaryPut(0, 1, boundary)]
+    )
+    [(put_key, put_addrs, put_sizes, _)] = sender._boundary_puts(put)
+    assert put_key == key
+    assert put_sizes == [expected_nvfp4_bytes, 16 * 656]
+    payload = b"".join(
+        ctypes.string_at(addr, size)
+        for addr, size in zip(put_addrs, put_sizes, strict=True)
+    )
+
+    store.batch_is_exist.side_effect = lambda keys: [int(k == key) for k in keys]
+    assert fp8.lookup(16, hashes).hit_length == 0
+    assert fp8_compact.lookup(16, hashes).hit_length == 0
+    # The EAGLE proof drops one hash unit while using the same stored page.
+    result = d.lookup(boundary + 1, hashes)
+    assert result.hit_length == boundary - 4
+    assert result.tail_key_boundaries == (TailKeyBoundary(0, boundary),)
+
+    def get(keys, addrs, sizes):
+        assert keys == [key]
+        assert sizes == [put_sizes]
+        offset = 0
+        for addr, size in zip(addrs[0], sizes[0], strict=True):
+            ctypes.memmove(addr, payload[offset : offset + size], size)
+            offset += size
+        return [offset]
+
+    store.batch_get_into_multi_buffers.side_effect = get
+    receiver = _make_store_recving_thread(store)
+    receiver.coord = d.coord
+    receiver.token_databases = d.token_dbs
+    req = _make_load_req(
+        "load",
+        hashes,
+        token_len=result.hit_length,
+        tail_key_boundaries=result.tail_key_boundaries,
+    )
+    req.block_ids[0][0] = 2
+    receiver._handle_request(req)
+    store.batch_get_into_multi_buffers.assert_called_once()
+    assert receiver.get_and_clear_finished_requests() == {"load"}
+    assert torch.equal(d_main[2, :, :boundary], p_main[1, :, :boundary])
+    assert torch.count_nonzero(d_main[2, :, boundary:]) == 0
+    assert torch.count_nonzero(d_raw[:, -16:]) == 0
+    assert torch.equal(d_mtp[2], p_mtp[1])
+
+
 def _make_two_full_attention_groups_kv_cache_config():
     """Two full-attention groups with different block sizes: no hybrid
     layers, but block-level failure reporting is still unsupported."""
@@ -3739,6 +3869,7 @@ def _make_bare_worker(
     worker.store_replicate_config = SimpleNamespace()
     worker.enable_group_semantics = False
     worker._supports_group_ids = False
+    worker._retire_enabled = False
     worker._kv_connector_stats_lock = threading.Lock()
     worker.kv_connector_stats = MooncakeStoreConnectorStats()
 

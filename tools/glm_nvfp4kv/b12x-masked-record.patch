@@ -1,0 +1,85 @@
+--- a/flashinfer/experimental/b12x/attention/_shared/mla/io.py
++++ b/flashinfer/experimental/b12x/attention/_shared/mla/io.py
+@@ -510,7 +510,8 @@
+                 # at [292, 296).  292 is not 8B-aligned, so load the 8-aligned
+                 # pair at [288, 296) (rope scale, latent scale) and keep the
+                 # second word -- same nc.v2 pattern as the DSV4 footer.
+-                f1 = Uint32(0)
++                # Invalid index: shared-memory sentinel; on-disk scales are nonnegative.
++                f1 = Uint32(0xBF800000)  # -1.0
+                 if idx_raw >= Int32(0):
+                     block_idx = idx_raw // _section_pbs
+                     local_idx = idx_raw - block_idx * _section_pbs
+--- a/flashinfer/experimental/b12x/attention/_shared/mla/io_mg.py
++++ b/flashinfer/experimental/b12x/attention/_shared/mla/io_mg.py
+@@ -250,7 +250,8 @@
+                 idx_raw = Int32(-1)
+                 if cand_pos < g_end:
+                     idx_raw = Int32(topk_indices[cand_pos])
+-                f1 = Uint32(0)
++                # Invalid index: shared-memory sentinel; on-disk scales are nonnegative.
++                f1 = Uint32(0xBF800000)  # -1.0
+                 if idx_raw >= Int32(0):
+                     block_idx = idx_raw // page_block_size
+                     local_idx = idx_raw - block_idx * page_block_size
+--- a/flashinfer/experimental/b12x/attention/_shared/mla/decode_math.py
++++ b/flashinfer/experimental/b12x/attention/_shared/mla/decode_math.py
+@@ -932,6 +932,9 @@
+                 latent_scale,
+                 kv_smem_stride=kv_smem_stride,
+             )
++            if cutlass.const_expr(latent_scale_per_token):
++                if latent_scale == Float32(-1.0):
++                    b0, b1 = Uint32(0), Uint32(0)
+             a_byte = a_row * Int32(q_nope_bf16_stride * 2) + (ko + a_col) * Int32(2)
+             a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(
+                 _smem_byte(q_nope_bf16_base_addr, a_byte)
+@@ -1529,10 +1532,15 @@
+     # This is the single NVFP4 decode dequant point shared by QK and P.V.
+     # Apply the outer scale before BF16 packing so both MMAs consume the same
+     # true-magnitude latent; the separate RoPE path never calls this helper.
+-    return pack_f32x2_to_bfloat2(
++    pair = pack_f32x2_to_bfloat2(
+         (v0 * scale_f) * outer,
+         (v1 * scale_f) * outer,
+     )
++    if cutlass.const_expr(latent_scale_per_token):
++        # Zero the MMA operand, not its multiplier: a masked E4M3 can be NaN.
++        if outer == Float32(-1.0):
++            pair = Uint32(0)
++    return pair
+ 
+ 
+ @cute.jit
+--- a/flashinfer/experimental/b12x/attention/_shared/mla/prefill_mg.py
++++ b/flashinfer/experimental/b12x/attention/_shared/mla/prefill_mg.py
+@@ -970,6 +970,9 @@
+                 latent_scale,
+                 kv_smem_stride=kv_smem_stride,
+             )
++            if cutlass.const_expr(latent_scale_per_token):
++                if latent_scale == Float32(-1.0):
++                    b0, b1 = Uint32(0), Uint32(0)
+             a_byte = a_row * Int32(q_nope_bf16_stride * 2) + (ko + a_col) * Int32(2)
+             a00, a01, a02, a03 = ldmatrix_m8n8x4_b16(
+                 _smem_byte(q_nope_bf16_g0_addr, a_byte)
+@@ -4118,6 +4121,8 @@
+                 ),
+             ]
+         )
++    if latent_scale_per_token:
++        spec_fields.append(key_field("masked_record_zero_operand", 1))
+     compile_spec = KernelCompileSpec.from_fields(
+         "attention.mla.sm120.prefill_mg",
+         # v4: latent_scale == 1.0 is folded out at trace time, producing a
+--- a/flashinfer/experimental/b12x/attention/_shared/mla/kernel.py
++++ b/flashinfer/experimental/b12x/attention/_shared/mla/kernel.py
+@@ -2354,6 +2354,8 @@
+                     dims=(DimKey.dynamic(),),
+                 )
+             )
++    if latent_scale_per_token:
++        spec_fields.append(key_field("masked_record_zero_operand", 1))
+     compile_spec = KernelCompileSpec.from_fields(
+         "attention.mla.sm120.decode",
+         # v18: latent_scale == 1.0 is folded out at trace time, producing a

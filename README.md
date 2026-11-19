@@ -58,4 +58,4 @@ Router 显式开启 prompt ID 复用和 length-capped 交接；不执行token容
 
 ## 1P2D 部署
 
-P主机两个EP4实例，D主机各一个EP8实例，共24GPU。P使用相同的NVFP4融合与MTP context-only配置；D保留完整MTP3，seq16 / batch1024 / graph64。启动命令见[deployment1p2d.md](deployment1p2d.md)，不把4P4D的D容量参数直接套入1P2D。
+82 上两个 EP4 Prefill，83、84 各一个 EP8 Decode，共 24 张 GPU。P 每 DP seq24 / batch4096；D 每 DP seq32 / batch1024 / graph128。P、D 使用 NVFP4 KV、MTP3、原生异步和匹配粒度 256；Router 在 82，Mooncake Master 在 83，三台 Store 各带 2 TB L3。镜像构建和启动命令见 [1P2D 部署](deployment1p2d.md)。

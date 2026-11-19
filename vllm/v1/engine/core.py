@@ -666,6 +666,8 @@ class EngineCore:
             return {}, False
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        if (probe := getattr(self.scheduler, "ready_wait_probe", None)) is not None:
+            probe.submitted(scheduler_output.num_scheduled_tokens)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
@@ -727,6 +729,8 @@ class EngineCore:
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
+            if (probe := getattr(self.scheduler, "ready_wait_probe", None)) is not None:
+                probe.submitted(scheduler_output.num_scheduled_tokens)
             if not self.is_mm_encoder_only:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 

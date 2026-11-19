@@ -31,6 +31,7 @@ from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
 from vllm.models.glm5next.nvidia.ops.fused_eh_norm import fused_eh_norm
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 from .model import (
     Glm5NextDecoderLayer,
@@ -77,12 +78,14 @@ class _PContextBlock(nn.Module):
 
 
 class Glm5NextMultiTokenPredictorLayer(nn.Module):
-    def __init__(self, vllm_config: VllmConfig, prefix: str) -> None:
+    def __init__(
+        self, vllm_config: VllmConfig, prefix: str, *, p_mtp_context_only: bool = False
+    ) -> None:
         super().__init__()
         assert vllm_config.speculative_config is not None
         config = vllm_config.speculative_config.draft_model_config.hf_text_config
         self.config = config
-        self.p_mtp_context_only = p_context_enabled(vllm_config)
+        self.p_mtp_context_only = p_mtp_context_only
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -154,16 +157,20 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
 
 
 class Glm5NextMultiTokenPredictor(nn.Module):
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(
+        self, *, vllm_config: VllmConfig, prefix: str = "", p_mtp_context_only: bool
+    ):
         super().__init__()
         config = vllm_config.model_config.hf_text_config
-        self.p_mtp_context_only = p_context_enabled(vllm_config)
+        self.p_mtp_context_only = p_mtp_context_only
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = config.num_nextn_predict_layers
         self.layers = torch.nn.ModuleDict(
             {
                 str(idx): Glm5NextMultiTokenPredictorLayer(
-                    vllm_config, f"{prefix}.layers.{idx}"
+                    vllm_config,
+                    f"{prefix}.layers.{idx}",
+                    p_mtp_context_only=p_mtp_context_only,
                 )
                 for idx in range(
                     self.mtp_start_layer_idx,
@@ -279,7 +286,9 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         self.p_mtp_context_only = p_context_enabled(vllm_config)
         self.quant_config = vllm_config.quant_config
         self.model = Glm5NextMultiTokenPredictor(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+            vllm_config=vllm_config,
+            prefix=maybe_prefix(prefix, "model"),
+            p_mtp_context_only=self.p_mtp_context_only,
         )
         self.set_moe_parameters()
         if self.p_mtp_context_only:
@@ -288,6 +297,24 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         self.is_fused_shared_expert_enabled = is_model_fused_shared_expert_compatible(
             self.model.layers.values(), Glm5NextMoE, "mtp_block.mlp"
         )
+
+    def validate_fp8_kv_cache(self, vllm_config: VllmConfig) -> None:
+        """Verify the actual draft MLA record before binding any cache views."""
+        if not self.model._mtp_mla_attns:
+            raise ValueError("GLM MTP has no draft MLA layers")
+        for wrapper in self.model._mtp_mla_attns:
+            mla = wrapper.mla_attn
+            spec = mla.get_kv_cache_spec(vllm_config)
+            if (
+                not isinstance(spec, MLAAttentionSpec)
+                or spec.cache_dtype_str != "fp8_ds_mla"
+                or spec.dtype != torch.uint8
+                or spec.state_content_bytes != 528
+            ):
+                raise ValueError(
+                    f"{mla.layer_name}: GLM MTP requires 528-byte packed FP8 KV; "
+                    f"got {spec}"
+                )
 
     def set_moe_parameters(self):
         if self.p_mtp_context_only:

@@ -9,6 +9,7 @@ never addressed by the logical view.
 
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -20,9 +21,19 @@ from tests.v1.attention.utils import (
     create_common_attn_metadata,
     dense_kv_cache_views,
 )
+from vllm.config import CacheConfig, ParallelConfig
 from vllm.config.compilation import CompilationConfig, CUDAGraphMode
+from vllm.models.glm5next.common.attention import (
+    Glm5NextIndexerCache,
+    Glm5NextTailCache,
+)
+from vllm.models.glm5next.common.kda import Glm5NextLinearAttention
 from vllm.v1.attention.backend import AttentionBackend, AttentionCGSupport, MultipleOf
-from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlockCopy,
+    get_kv_cache_config_from_groups,
+    get_kv_cache_groups,
+)
 from vllm.v1.hisparse.binding import allocate_hisparse_kv_caches
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -33,6 +44,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
     MLAAttentionSpec,
     SparseCacheRole,
+    UniformTypeKVCacheSpecs,
     compute_layout_strides,
 )
 from vllm.v1.worker.gpu import attn_utils
@@ -197,6 +209,132 @@ def test_attention_checks_preserve_global_and_target_scoped_support():
         )
         == "_DraftBackend"
     )
+
+
+def test_shared_indexer_spec_has_separate_target_and_draft_metadata(monkeypatch):
+    class Builder:
+        requires_block_table_width = False
+
+        def __init__(self, spec, layer_names, config, device):
+            self.config = config
+
+        def get_cudagraph_support(self, config, spec):
+            assert config is self.config
+            return AttentionCGSupport.ALWAYS
+
+    backend = SimpleNamespace(
+        full_cls_name=lambda: ("test", "indexer"),
+        get_builder_cls=lambda: Builder,
+        get_supported_kernel_block_sizes=lambda spec: [256],
+    )
+    names = ["target.indexer", "draft.indexer"]
+    layers = {name: SimpleNamespace(get_attn_backend=lambda: backend) for name in names}
+    monkeypatch.setattr(attn_utils, "get_shared_kv_cache_layers", lambda _: {})
+    monkeypatch.setattr(attn_utils, "get_layers_from_vllm_config", lambda *args: layers)
+    indexer_spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        tokens_per_state=4,
+        cache_role=SparseCacheRole.INDEXER,
+    )
+    kv_config = KVCacheConfig(
+        num_blocks=1,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                names, UniformTypeKVCacheSpecs(256, dict.fromkeys(names, indexer_spec))
+            ),
+        ],
+    )
+    target, draft = (
+        SimpleNamespace(
+            cache_config=CacheConfig(cache_dtype=dtype),
+            parallel_config=ParallelConfig(),
+        )
+        for dtype in ("nvfp4", "fp8_ds_mla")
+    )
+    groups, _, _ = attn_utils.init_attn_backend(
+        kv_config,
+        target,
+        torch.device("cpu"),
+        draft_layer_names={names[1]},
+        draft_vllm_config=draft,
+    )
+    assert [g.layer_names for g in groups[0]] == [[n] for n in names]
+    assert [g.get_metadata_builder().config for g in groups[0]] == [target, draft]
+
+    groups, _, _ = attn_utils.init_attn_backend(
+        kv_config,
+        draft,
+        torch.device("cpu"),
+        active_layer_names={names[1]},
+    )
+    assert [g.layer_names for g in groups[0]] == [[names[1]]]
+    assert groups[0][0].get_metadata_builder().config is draft
+
+
+@pytest.mark.parametrize("num_spec_tokens,ring", [(1, 8), (3, 8), (5, 16)])
+def test_glm_mixed_kv_allocates_each_layer_in_its_own_dtype(num_spec_tokens, ring):
+    config = MagicMock()
+    config.attention_config.hisparse_config = None
+    config.cache_config = CacheConfig(
+        cache_dtype="nvfp4",
+        block_size=256,
+        mamba_block_size=256,
+        enable_prefix_caching=False,
+    )
+    config.cache_config.kv_cache_layout = "BLHNC"
+    config.scheduler_config.disable_hybrid_kv_cache_manager = False
+    config.speculative_config = None
+    config.num_speculative_tokens = num_spec_tokens
+    indexer = Glm5NextIndexerCache.__new__(Glm5NextIndexerCache)
+    indexer.cache_config = config.cache_config
+    indexer.dtype, indexer.head_dim, indexer._index_kpool = torch.uint8, 132, 4
+    tail = Glm5NextTailCache.__new__(Glm5NextTailCache)
+    tail.cache_config = config.cache_config
+    tail.head_dim, tail._index_kpool = 128, 4
+    specs = {
+        name: MLAAttentionSpec(
+            block_size=256,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.uint8,
+            cache_dtype_str=dtype,
+            state_content_bytes=width,
+        )
+        for name, dtype, width in (
+            ("target", "glm_nvfp4_mla", 304),
+            ("draft", "fp8_ds_mla", 528),
+        )
+    }
+    specs["indexer"] = indexer.get_kv_cache_spec(config)
+    specs["tail"] = tail.get_kv_cache_spec(config)
+    kda = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
+    kda.cache_config = config.cache_config
+    kda.model_config = SimpleNamespace(dtype=torch.bfloat16)
+    kda.tp_size, kda.num_heads, kda.head_dim, kda.conv_size = 1, 1, 16, 4
+    kda.num_spec = num_spec_tokens
+    kda.kda_prefill_backend = "triton"
+    specs["kda"] = kda.get_kv_cache_spec(config)
+    groups = get_kv_cache_groups(config, specs)
+    kv_config = get_kv_cache_config_from_groups(config, groups, 4 * 1024 * 1024)
+    views = allocate_kv_cache(kv_config, torch.device("cpu"), KVCacheLayout.BLHNC)
+    for name, dtype, shape in (
+        ("target", torch.uint8, (1, 256, 304)),
+        ("draft", torch.uint8, (1, 256, 528)),
+        ("indexer", torch.uint8, (1, 64, 132)),
+        ("tail", torch.bfloat16, (2, ring, 128)),
+    ):
+        assert views[name].dtype == dtype
+        assert views[name].shape[1:] == shape
+    kda.bind_kv_cache(views["kda"])
+    assert tuple(state.dtype for state in kda.kv_cache) == (
+        torch.bfloat16,
+        torch.float32,
+    )
+    assert 3 + num_spec_tokens in kda.kv_cache[0].shape[1:]
 
 
 def test_varlen_cudagraph_unsupported_backend_checks_scoped_bounds():

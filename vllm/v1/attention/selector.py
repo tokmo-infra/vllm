@@ -120,7 +120,7 @@ def get_attn_backend(
     """Selects which attention backend to use and lazily imports it."""
     if kv_cache_dtype is not None:
         valid_cache_dtypes = get_args(CacheDType)
-        assert kv_cache_dtype in valid_cache_dtypes, (
+        assert kv_cache_dtype in valid_cache_dtypes or kv_cache_dtype == "glm_nvfp4_mla", (
             f"Invalid kv_cache_dtype: {kv_cache_dtype}. "
             f"Valid values are: {valid_cache_dtypes}"
         )
