@@ -277,16 +277,18 @@ class Scheduler(SchedulerInterface):
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
 
-        # Grammar compilation failures to finish as per-request errors in
-        # update_from_output.
-        self.grammar_compile_error_reqs: dict[str, RequestError] = {}
+        # Request errors found during scheduling are delivered in update_from_output.
+        self.request_error_reqs: dict[str, RequestError] = {}
         self.encoder_cache_mismatch_reqs: set[str] = set()
 
         # Encoder-related.
         # Calculate encoder cache size if applicable
+        self.skip_kimi_decode_vision = vllm_config.skip_kimi_decode_vision
         supports_mm_inputs = vllm_config.model_config.supports_multimodal_inputs
         mm_budget = (
-            MultiModalBudget(vllm_config, mm_registry) if supports_mm_inputs else None
+            MultiModalBudget(vllm_config, mm_registry)
+            if supports_mm_inputs and not self.skip_kimi_decode_vision
+            else None
         )
 
         # NOTE: Text-only encoder-decoder models are implemented as
@@ -1325,6 +1327,28 @@ class Scheduler(SchedulerInterface):
                     num_computed_tokens = request.num_computed_tokens
 
                     if self._ec_transfer_pending(request, num_computed_tokens):
+                        skip_request(request_queue)
+                        continue
+
+                if self.skip_kimi_decode_vision and request.has_encoder_inputs:
+                    transfer = request.kv_transfer_params or {}
+                    has_remote_kv = not load_kv_async or all(
+                        transfer.get(key)
+                        for key in (
+                            "remote_engine_id",
+                            "remote_bootstrap_addr",
+                            "transfer_id",
+                        )
+                    )
+                    if not has_remote_kv or any(
+                        feature.mm_position.offset + feature.mm_position.length
+                        > num_computed_tokens
+                        for feature in request.mm_features
+                    ):
+                        self.request_error_reqs[request_id] = RequestError(
+                            code="kv_transfer_error",
+                            message="Image tokens require prefilled KV on decode.",
+                        )
                         skip_request(request_queue)
                         continue
 
@@ -2627,8 +2651,8 @@ class Scheduler(SchedulerInterface):
         for request in continuing_reqs:
             self._enqueue_waiting_request(request)
 
-        request_errors = self.grammar_compile_error_reqs
-        self.grammar_compile_error_reqs = {}
+        request_errors = self.request_error_reqs
+        self.request_error_reqs = {}
         error_req_ids = set(request_errors)
         error_req_ids.update(self.encoder_cache_mismatch_reqs)
         self.encoder_cache_mismatch_reqs.clear()
@@ -3702,7 +3726,7 @@ class Scheduler(SchedulerInterface):
             if not struct_output_req or struct_output_req.grammar is None:
                 return False
             if isinstance(struct_output_req.grammar, Exception):
-                self.grammar_compile_error_reqs[request.request_id] = RequestError(
+                self.request_error_reqs[request.request_id] = RequestError(
                     code="validation_error",
                     message=f"Invalid structured outputs: {struct_output_req.grammar}",
                 )

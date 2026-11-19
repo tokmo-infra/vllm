@@ -7,6 +7,7 @@ import errno
 import socket
 import threading
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -18,6 +19,7 @@ import torch
 import zmq.asyncio
 
 from tests.v1.attention.utils import dense_kv_cache_views
+from tests.v1.core.utils import create_requests
 from vllm import envs
 from vllm.config import KVTransferConfig, set_current_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import (
@@ -55,6 +57,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import
     MooncakeBootstrapServer,
     RegisterWorkerPayload,
 )
+from vllm.multimodal.inputs import PlaceholderRange
+from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -1958,6 +1962,64 @@ def _remote_prefill_request(request_id: int, block_size: int):
         }
     )
     return request
+
+
+@pytest.mark.parametrize(
+    "handoff", ["covered", "no_prefill", "invalid_handoff", "tail"]
+)
+def test_kimi_decode_without_vision_needs_cached_image_tokens(tmp_path, handoff):
+    KimiK3Config(architectures=["KimiK31ForConditionalGeneration"]).save_pretrained(
+        tmp_path
+    )
+    original = create_vllm_config(
+        model=str(tmp_path),
+        kv_connector="MooncakeConnector",
+        kv_role="kv_consumer",
+        skip_tokenizer_init=True,
+    )
+    config = replace(original, additional_config={"skip_kimi_decode_vision": True})
+    assert config.model_config.multimodal_config.get_limit_per_prompt("image") > 0
+    assert config.model_config.multimodal_config.skip_mm_profiling
+    assert not config.compilation_config.cudagraph_mm_encoder
+    scheduler = create_scheduler(config)
+
+    block_size = config.cache_config.block_size
+    prompt_length = 2 * block_size
+    image = PlaceholderRange(
+        offset=prompt_length - 1 if handoff == "tail" else 4, length=1
+    )
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=prompt_length,
+        block_size=block_size,
+        mm_positions=[[image]],
+    )
+    if handoff != "no_prefill":
+        request.kv_transfer_params = _remote_prefill_request(
+            1, block_size
+        ).kv_transfer_params
+        if handoff == "invalid_handoff":
+            request.kv_transfer_params.pop("remote_bootstrap_addr")
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert not output.scheduled_encoder_inputs
+    if handoff in ("covered", "tail"):
+        assert not output.num_scheduled_tokens
+        scheduler.update_from_output(
+            output,
+            create_model_runner_output(reqs=[], finished_recving={request.request_id}),
+        )
+        output = scheduler.schedule()
+        assert not output.scheduled_encoder_inputs
+    if handoff == "covered":
+        assert output.num_scheduled_tokens == {request.request_id: 1}
+    else:
+        assert not output.num_scheduled_tokens
+        replies = scheduler.update_from_output(output, create_model_runner_output([]))
+        (reply,) = replies[request.client_index].outputs
+        assert reply.error.code == "kv_transfer_error"
+        assert request.status == RequestStatus.FINISHED_ERROR
 
 
 @pytest.mark.parametrize("kv_lease_duration", [None, 30])

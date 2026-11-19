@@ -137,6 +137,7 @@ def create_vllm_config(
     kv_role: str = "kv_consumer",
     disable_hybrid_kv_cache_manager: bool | None = None,
     num_speculative_tokens: int | None = None,
+    skip_tokenizer_init: bool = False,
 ) -> VllmConfig:
     """Initialize VllmConfig For Testing."""
     model_config = ModelConfig(
@@ -145,6 +146,7 @@ def create_vllm_config(
         dtype=dtype,
         seed=42,
         hf_overrides=hf_overrides or {},
+        skip_tokenizer_init=skip_tokenizer_init,
     )
     scheduler_config = SchedulerConfig(
         max_num_seqs=max_num_seqs,

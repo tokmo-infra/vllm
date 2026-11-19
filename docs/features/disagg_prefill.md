@@ -87,6 +87,17 @@ decode = client.chat.completions.create(
 
 If `messages` has non-text content, or `echo` or `return_prompt_text` is set, the ids are ignored and `messages` is rendered instead, so it must match the prefill request. Otherwise `kv_transfer_params["prompt_token_ids"]` must be a non-empty list of non-negative integers, or the request fails with HTTP 400, as it always does on `/v1/chat/completions/batch`.
 
+## Kimi K3/K3.1 decode without a vision tower
+
+For a Kimi K3/K3.1 deployment with a Mooncake prefill worker, pass
+`--additional-config '{"skip_kimi_decode_vision":true}'` on the decode worker.
+Keep image inputs enabled on both workers and use `kv_role="kv_consumer"` with
+`kv_load_failure_policy="fail"` on decode. The prefill worker runs the vision
+tower and projector. Decode still processes the image request in its frontend
+to preserve the image hashes and token positions for prefix caching, and uses
+the prompt KV from prefill to decode. A request fails if its available KV does
+not cover all image tokens at admission or after preemption.
+
 ## Generate API output modes
 
 When the prefill and decode stages use the [Generate API](../serving/online_serving/token_in_token_out.md) (`/inference/v1/generate`), only the decode response reaches the client, so set `output_mode` on the decode request only. A proxy that reuses the client's request body for the prefill request must reset `output_mode` to `tokens` there. A prefill instance started with `--tokens-only` has no tokenizer and rejects `output_mode: "text"` with a 400.

@@ -84,6 +84,7 @@ from vllm.model_executor.models.kimi_k25_vit import (
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    StageMissingLayer,
     WeightsMapper,
     init_vllm_registered_model,
     is_pp_missing_parameter,
@@ -1769,15 +1770,42 @@ class KimiK3ForConditionalGeneration(
         self.device = current_platform.current_device()
 
         with self._mark_tower_model(vllm_config, "image"):
-            self.vision_tower = MoonViT3dPretrainedModel(
-                config.vision_config,
-                quant_config=self._maybe_ignore_quant_config(quant_config),
-                input_norm=build_mm_input_norm(vllm_config.model_config),
-                prefix=maybe_prefix(prefix, "vision_tower"),
+            if vllm_config.skip_kimi_decode_vision:
+                self.vision_tower = StageMissingLayer("image_tower")
+                self.mm_projector = StageMissingLayer("image_tower")
+                logger.info_once(
+                    "Kimi Mooncake decode omitted vision tower and projector."
+                )
+            else:
+                self._init_vision_modules(vllm_config, prefix)
+
+        self.quant_config = quant_config
+        with self._mark_language_model(vllm_config):
+            self.language_model = init_vllm_registered_model(
+                vllm_config=vllm_config,
+                hf_config=config.text_config,
+                prefix=maybe_prefix(prefix, "language_model"),
+                architectures=["KimiLinearForCausalLM"],
             )
-            if is_meta_module(self.vision_tower):
-                pass
-            elif self._maybe_ignore_quant_config(quant_config) is not None:
+        self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
+            self.language_model.make_empty_intermediate_tensors
+        )
+        self.media_placeholder: int = self.config.media_placeholder_token_id
+
+    def _init_vision_modules(self, vllm_config: VllmConfig, prefix: str) -> None:
+        config = self.config
+        model_config = self.model_config
+        vision_quant_config = self._maybe_ignore_quant_config(vllm_config.quant_config)
+        self.vision_tower = MoonViT3dPretrainedModel(
+            config.vision_config,
+            quant_config=vision_quant_config,
+            input_norm=build_mm_input_norm(model_config),
+            prefix=maybe_prefix(prefix, "vision_tower"),
+        )
+        if not isinstance(self.vision_tower, StageMissingLayer) and not is_meta_module(
+            self.vision_tower
+        ):
+            if vision_quant_config is not None:
                 self.vision_tower = self.vision_tower.to(device=self.device)
             else:
                 self.vision_tower = self.vision_tower.to(
@@ -1793,7 +1821,6 @@ class KimiK3ForConditionalGeneration(
 
                 merge_height, merge_width = config.vision_config.merge_kernel_size
                 mm_config = model_config.get_multimodal_config()
-                assert mm_config is not None
                 register_kimi_k3_vision_fa4_warmup(
                     KimiK3VisionFA4WarmupConfig(
                         num_heads=vision_attn.num_heads,
@@ -1811,30 +1838,19 @@ class KimiK3ForConditionalGeneration(
                     )
                 )
 
-            self.mm_projector = KimiK25MultiModalProjector(
-                config=config.vision_config,
-                out_hidden_size=config.text_config.hidden_size,
-                use_data_parallel=self.use_data_parallel,
-                quant_config=self._maybe_ignore_quant_config(quant_config),
-                prefix=maybe_prefix(prefix, "mm_projector"),
-            )
-            if not is_meta_module(self.mm_projector):
-                self.mm_projector = self.mm_projector.to(
-                    device=self.device, dtype=model_config.dtype
-                )
-
-        self.quant_config = quant_config
-        with self._mark_language_model(vllm_config):
-            self.language_model = init_vllm_registered_model(
-                vllm_config=vllm_config,
-                hf_config=config.text_config,
-                prefix=maybe_prefix(prefix, "language_model"),
-                architectures=["KimiLinearForCausalLM"],
-            )
-        self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
-            self.language_model.make_empty_intermediate_tensors
+        self.mm_projector = KimiK25MultiModalProjector(
+            config=config.vision_config,
+            out_hidden_size=config.text_config.hidden_size,
+            use_data_parallel=self.use_data_parallel,
+            quant_config=vision_quant_config,
+            prefix=maybe_prefix(prefix, "mm_projector"),
         )
-        self.media_placeholder: int = self.config.media_placeholder_token_id
+        if not isinstance(self.mm_projector, StageMissingLayer) and not is_meta_module(
+            self.mm_projector
+        ):
+            self.mm_projector = self.mm_projector.to(
+                device=self.device, dtype=model_config.dtype
+            )
 
     def process_weights_after_loading(self) -> None:
         self.language_model.process_weights_after_loading()

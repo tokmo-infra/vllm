@@ -690,6 +690,13 @@ class VllmConfig:
         """
         return 1 + self.num_speculative_tokens
 
+    @property
+    def skip_kimi_decode_vision(self) -> bool:
+        return (
+            isinstance(self.additional_config, dict)
+            and self.additional_config.get("skip_kimi_decode_vision") is True
+        )
+
     def get_decode_cudagraph_query_lens(self, decode_query_len: int) -> dict[int, int]:
         """Map each uniform decode query length of a target-shaped runner, whose
         widest is `decode_query_len`, to the most requests its batches have.
@@ -1473,6 +1480,8 @@ class VllmConfig:
             return
 
         self._resolve_mm_encoder_only()
+        if self.skip_kimi_decode_vision:
+            self._configure_kimi_decode_vision()
 
         if self.is_mm_encoder_only and self.cache_config.enable_prefix_caching:
             # Such an instance publishes encoder embeddings and runs no language
@@ -3001,6 +3010,30 @@ class VllmConfig:
                 "An EC producer-only instance requires a multimodal model."
             )
         mm_config.mm_encoder_only = True
+
+    def _configure_kimi_decode_vision(self) -> None:
+        model = self.model_config
+        mm_config = model.multimodal_config if model is not None else None
+        transfer = self.kv_transfer_config
+        if (
+            model is None
+            or model.architecture
+            not in ("KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration")
+            or mm_config is None
+            or mm_config.get_limit_per_prompt("image") == 0
+            or transfer is None
+            or transfer.kv_connector != "MooncakeConnector"
+            or transfer.kv_role != "kv_consumer"
+            or transfer.kv_load_failure_policy != "fail"
+            or self.ec_transfer_config is not None
+        ):
+            raise ValueError(
+                "skip_kimi_decode_vision requires an image-enabled Kimi K3/K3.1 "
+                "Mooncake KV consumer with kv_load_failure_policy='fail' "
+                "and no EC connector."
+            )
+        mm_config.skip_mm_profiling = True
+        self.compilation_config.cudagraph_mm_encoder = False
 
     def _resolve_mm_processor_device(self) -> None:
         """Settle `--mm-processor-device=auto` now that the EC role is known.
