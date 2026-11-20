@@ -58,14 +58,14 @@ BUILD_PARENT=/data/build/glm53flash-1p2d BUILD_JOBS=8 \
 
 | 用途 | 默认镜像 |
 | --- | --- |
-| P 和 D | `local/glm53flash-nvfp4kv:d50c0828c8dd62` |
+| P 和 D | `local/glm53flash-nvfp4kv:runtime-8660fd7c21ae` |
 | Mooncake Master 和 Store | `local/glm53flash-mooncake:source-71973589` |
 | Router | `router:glm53flash-source-1099991` |
 
 ~~~bash
 # 构建机
 set -o pipefail
-docker save local/glm53flash-nvfp4kv:d50c0828c8dd62 \
+docker save local/glm53flash-nvfp4kv:runtime-8660fd7c21ae \
   local/glm53flash-mooncake:source-71973589 router:glm53flash-source-1099991 \
   | zstd -T4 -3 -o glm53flash-1p2d-images.tar.zst
 
@@ -114,7 +114,7 @@ INTERNAL_API_KEY_FILE='<ABSOLUTE_PATH_TO_INTERNAL_API_KEY_FILE>'
 SERVICE_PREFIX=glm53flash-1p2d
 MODEL_DIR='/data/models/GLM-5.3-Flash-NVFP4'
 SERVICE_ROOT='/data/services'
-COMPILE_CACHE_ROOT='/var/cache/glm53flash-1p2d/d50c0828c8dd62'
+COMPILE_CACHE_ROOT='/var/cache/glm53flash-1p2d/runtime-8660fd7c21ae'
 L3_MOUNT='/data'
 L2_P_GIB=700; L2_D1_GIB=750; L2_D2_GIB=750
 ~~~
@@ -155,7 +155,7 @@ test -n "$INTERNAL_API_KEY"
 MODEL_NAME=glm-5.3-flash
 here="$PWD/integrations/glm53flash/1p2d"
 
-P_IMAGE="${ENGINE_IMAGE:-local/glm53flash-nvfp4kv:d50c0828c8dd62}"
+P_IMAGE="${ENGINE_IMAGE:-local/glm53flash-nvfp4kv:runtime-8660fd7c21ae}"
 D_IMAGE="$P_IMAGE"
 MASTER_IMAGE="${MOONCAKE_IMAGE:-local/glm53flash-mooncake:source-71973589}"
 STORE_IMAGE="$MASTER_IMAGE"
@@ -476,7 +476,7 @@ Master、Store、vLLM 和 Router 使用 Docker 的 `unless-stopped` 策略：进
 | 重启对象 | 核对与恢复 |
 | --- | --- |
 | Router | 核对两个 `--prefill` 的 HTTP 和 bootstrap 端口、两个 `--decode` 的 HTTP 地址。`OPENAI_API_KEY` 与 P/D 内部 key 一致。确认 `/workers` 为 24/24，再发一条实际推理请求。 |
-| vLLM P | 复用同 GPU 槽位的系统盘编译缓存。等两个 /health 通过、两个 bootstrap 的 /query 各登记 4 个 DP，再重启 Router 刷新 engine_id。IP 和端口保持原值时也按这个顺序。 |
+| vLLM P | 同一实例沿用原 HTTP、bootstrap 地址及同 GPU 槽位的编译缓存。`/health` 就绪且 `/query` 登记齐 4 个 DP 后发送真实请求。相同 engine ID 下，D 在旧 worker 端口失效时重新查目录；若重建时更换了 engine ID，核对 Router 注册并按需刷新。 |
 | vLLM D1 / D2 | 复用本机 d0 编译缓存，核对 D 的 IP、HTTP、GPU 槽位和 NVFP4 格式。等 /health 和 Router 对应 D 的 8 个 DP 恢复。D 地址或端口变化时，更新 --decode 后重建 Router。 |
 | Mooncake Master 或 Store | Master 先就绪，再启动或重连各 Store。核对 Master RPC、metadata、Store RPC 与健康端口，以及 RDMA 地址和 L3 挂载目录。Master 指标显示三台 L2 共 2200 GiB 后做一次新 KV 的写入和读回；旧缓存按冷缓存处理。若 Master 地址变更或 vLLM 客户端未恢复，更新各实例 work/mooncake.json 后重启受影响的 vLLM；涉及 P 时最后刷新 Router。 |
 

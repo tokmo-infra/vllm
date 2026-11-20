@@ -9,6 +9,7 @@ import time
 from collections import defaultdict
 from collections.abc import Collection
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Final
@@ -2430,10 +2431,50 @@ class MooncakeConnectorWorker:
             return None
         return self.xfer_stats.clone_and_reset()
 
+    @asynccontextmanager
+    async def _pull_socket(self, addr, peer, pull_metas):
+        # A container restart can preserve engine_id but change the ZMQ port.
+        # Only rediscover before sending any descriptors. Never replay a READ
+        # after send/recv ambiguity, and never substitute another TP/PP rank.
+        for attempt in range(2):
+            with make_zmq_socket(
+                self.async_zmq_ctx,
+                addr,
+                zmq.DEALER,
+                bind=False,
+                linger=0,
+                immediate=True,
+            ) as sock:
+                if await sock.poll(timeout=2000, flags=zmq.POLLOUT) & zmq.POLLOUT:
+                    sock.setsockopt(zmq.SNDTIMEO, 2000)
+                    yield sock
+                    return
+            if attempt or peer is None:
+                break
+            engine, tp, pp = peer
+            bootstrap = next(iter(pull_metas.values())).remote_bootstrap_addr
+            await self._refresh_directory(bootstrap)
+            fresh = self._remote_agents.get(engine, {}).get(tp, {}).get(pp)
+            if not fresh or fresh == addr:
+                break
+            logger.info(
+                "Refreshed Mooncake peer %s TP%s PP%s: %s -> %s",
+                engine,
+                tp,
+                pp,
+                addr,
+                fresh,
+            )
+            addr = fresh
+        raise ConnectionError(
+            f"Mooncake peer unavailable before sending KV descriptors: {addr}"
+        )
+
     async def receive_kv_from_single_worker(
         self,
         worker_addr: str,
         pull_metas: dict[ReqId, PullReqMeta],
+        peer: tuple[EngineId, int, int] | None = None,
     ):
         req_ids = set(pull_metas)
         metadata = MooncakeXferMetadata(
@@ -2472,9 +2513,7 @@ class MooncakeConnectorWorker:
 
         # Send query for the request.
         try:
-            with make_zmq_socket(
-                self.async_zmq_ctx, worker_addr, zmq.DEALER, bind=False, linger=0
-            ) as sock:
+            async with self._pull_socket(worker_addr, peer, pull_metas) as sock:
                 # If something goes wrong, let P wait timeout first (in asyncio.wait()).
                 sock.setsockopt(
                     zmq.RCVTIMEO, (envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT + 60) * 1000
@@ -2627,7 +2666,7 @@ class MooncakeConnectorWorker:
         remote_tp_ranks = self.transfer_topo.handshake_target_ranks(
             self._tp_size[remote_engine_id]
         )
-        worker_addrs: list[str] = []
+        worker_addrs: list[tuple[str, int, int]] = []
         selected_remote_pp: dict[int, list[int]] = {}
         for remote_tp_rank in remote_tp_ranks:
             pp_to_addr = self._remote_agents[remote_engine_id][remote_tp_rank]
@@ -2636,7 +2675,7 @@ class MooncakeConnectorWorker:
             else:
                 pp_ranks = sorted(pp_to_addr)
             selected_remote_pp[remote_tp_rank] = pp_ranks
-            worker_addrs.extend(pp_to_addr[pp_rank] for pp_rank in pp_ranks)
+            worker_addrs.extend((pp_to_addr[pp], remote_tp_rank, pp) for pp in pp_ranks)
 
         count = len(worker_addrs)
         logger.debug(
@@ -2648,10 +2687,19 @@ class MooncakeConnectorWorker:
         )
         for pull_meta in pull_metas.values():
             pull_meta.pull_tasks_count = count
-        for worker_addr in worker_addrs:
+        for worker_addr, tp, pp in worker_addrs:
             asyncio.create_task(
-                self.receive_kv_from_single_worker(worker_addr, pull_metas)
+                self.receive_kv_from_single_worker(
+                    worker_addr, pull_metas, (remote_engine_id, tp, pp)
+                )
             )
+
+    async def _refresh_directory(self, remote_bootstrap_addr: str):
+        if remote_bootstrap_addr not in self._pending_bootstrap_queries:
+            self._pending_bootstrap_queries[remote_bootstrap_addr] = asyncio.Event()
+            await self._connect_to_prefiller_bootstrap(remote_bootstrap_addr)
+        else:
+            await self._pending_bootstrap_queries[remote_bootstrap_addr].wait()
 
     async def handle_new_engine_id(
         self,
@@ -2659,11 +2707,7 @@ class MooncakeConnectorWorker:
         pull_metas: dict[ReqId, PullReqMeta],
     ):
         remote_bootstrap_addr = next(iter(pull_metas.values())).remote_bootstrap_addr
-        if remote_bootstrap_addr not in self._pending_bootstrap_queries:
-            self._pending_bootstrap_queries[remote_bootstrap_addr] = asyncio.Event()
-            await self._connect_to_prefiller_bootstrap(remote_bootstrap_addr)
-        else:
-            await self._pending_bootstrap_queries[remote_bootstrap_addr].wait()
+        await self._refresh_directory(remote_bootstrap_addr)
 
         if remote_engine_id not in self._remote_agents:
             self._handle_failed_recv(

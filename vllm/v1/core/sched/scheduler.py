@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -289,6 +290,14 @@ class Scheduler(SchedulerInterface):
         self.use_eagle = False
         self.use_eagle_block_drop = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
+        # A context-only MTP producer writes the draft layer KV but never
+        # publishes draft vocabulary IDs. Keep worker geometry and KV lookahead.
+        if os.environ.get("VLLM_GLM53_P_MTP_CONTEXT_ONLY") == "1":
+            from vllm.models.glm5next.common.p_mtp_context import p_context_enabled
+
+            if p_context_enabled(vllm_config):
+                self.num_spec_tokens = 0
+                logger.info("Context-only MTP producer: scheduling target tokens only")
         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
         # DSV41 SWA bounded replay: groups that declare a replay window are rebuilt
         # after a prefix hit by recomputing its trailing tokens. One window
@@ -926,7 +935,9 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         probe = self.ready_wait_probe
-        direct = {} if probe is not None and probe.ready else None
+        direct: dict[str, str] | None = (
+            {} if probe is not None and probe.ready else None
+        )
         fallback = "other_queue"
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state != PauseState.PAUSED_ALL:
@@ -935,7 +946,11 @@ class Scheduler(SchedulerInterface):
 
             def skip_request(from_queue: RequestQueue) -> None:
                 request_to_skip = from_queue.pop_request()
-                if direct is not None and request_to_skip.request_id in probe.ready:
+                if (
+                    probe is not None
+                    and direct is not None
+                    and request_to_skip.request_id in probe.ready
+                ):
                     direct.setdefault(request_to_skip.request_id, "other_skip")
                 self.deferred_waiting.add(request_to_skip)
                 if self._holds_kv_blocks(request_to_skip):
@@ -1459,7 +1474,7 @@ class Scheduler(SchedulerInterface):
                 _, num_waiting = self.get_request_counts()
                 self.prefill_capacity_bound = num_waiting > len(self.deferred_waiting)
 
-        if direct is not None:
+        if probe is not None and direct is not None:
             if self._pause_state == PauseState.PAUSED_ALL:
                 fallback = "other_pause"
             elif preempted_reqs:

@@ -355,6 +355,7 @@ def make_zmq_socket(
     linger: int | None = None,
     router_handover: bool = False,
     listener: socket.socket | None = None,
+    immediate: bool = False,
 ) -> zmq.Socket | zmq.asyncio.Socket:  # type: ignore[name-defined]
     """Make a ZMQ socket with the proper bind/connect semantics.
 
@@ -382,6 +383,9 @@ def make_zmq_socket(
 
     if identity is not None:
         socket.setsockopt(zmq.IDENTITY, identity)
+
+    if immediate:
+        socket.setsockopt(zmq.IMMEDIATE, 1)
 
     if linger is not None:
         socket.setsockopt(zmq.LINGER, linger)

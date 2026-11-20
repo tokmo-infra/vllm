@@ -1172,6 +1172,7 @@ def patch_worker_dependencies():
         # Mock ZMQ socket
         mock_socket_object = AsyncMock()
         mock_socket_object.setsockopt = MagicMock()
+        mock_socket_object.poll.return_value = zmq.POLLOUT
         mock_socket_ctx = MagicMock()
         mock_socket_ctx.__enter__.return_value = mock_socket_object
         mock_make_zmq.return_value = mock_socket_ctx
@@ -1310,7 +1311,9 @@ async def test_receive_kv_selects_remote_pp_workers(
         }
         seen_addrs: list[str] = []
 
-        async def fake_receive(worker_addr: str, metas: dict[str, PullReqMeta]):
+        async def fake_receive(worker_addr: str, metas: dict[str, PullReqMeta], peer):
+            engine_id, tp, pp = peer
+            assert decode_worker._remote_agents[engine_id][tp][pp] == worker_addr
             seen_addrs.append(worker_addr)
             for meta in metas.values():
                 meta.pull_tasks_count -= 1
@@ -1670,6 +1673,7 @@ async def test_kv_consumuer(monkeypatch):
             zmq.DEALER,
             bind=False,
             linger=0,
+            immediate=True,
         )
         sent_payload = mocks["mock_socket_object"].send.call_args[0][0]
         sent_meta = decode_worker._xfer_meta_decoder.decode(sent_payload)

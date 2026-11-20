@@ -5,4 +5,4 @@ COPY b12x/ /usr/local/lib/python3.12/dist-packages/b12x/
 COPY _flashinfer_filelock.py /usr/local/lib/python3.12/dist-packages/_flashinfer_filelock.py
 COPY flashinfer/experimental/b12x/ /usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x/
 RUN python3 -c 'from vllm.v1.attention.backends.mla.glm_nvfp4 import GlmNvfp4Ops; from b12x.attention import sparse_mla; from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla; import flashinfer; assert flashinfer.__version__ == "0.7.1"'
-LABEL glm53flash.nvfp4kv.sources=d50c0828c8dd62
+LABEL glm53flash.nvfp4kv.sources=runtime-8660fd7c21ae
