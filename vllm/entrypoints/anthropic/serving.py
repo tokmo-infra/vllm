@@ -608,12 +608,19 @@ class AnthropicServingMessages(OpenAIServingChat):
                 chat_template_kwargs=anthropic_request.chat_template_kwargs,
             )
 
+        kv = anthropic_request.kv_transfer_params or {}
+        producer = (
+            kv.get("do_remote_decode") is True
+            and bool(kv.get("transfer_id"))
+            and anthropic_request.max_tokens == 1
+        )
         return ChatCompletionRequest(
             model=anthropic_request.model,
             messages=openai_messages,
             max_tokens=anthropic_request.max_tokens,
             max_completion_tokens=anthropic_request.max_tokens,
-            stop=anthropic_request.stop_sequences,
+            stop=[] if producer else anthropic_request.stop_sequences,
+            ignore_eos=producer,
             temperature=anthropic_request.temperature,
             top_p=anthropic_request.top_p,
             top_k=anthropic_request.top_k,

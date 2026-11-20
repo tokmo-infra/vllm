@@ -70,7 +70,22 @@ async def create_responses(request: ResponsesRequest, raw_request: Request):
             status_code=generator.error.code,
         )
     elif isinstance(generator, ResponsesResponse):
-        return JSONResponse(content=generator.model_dump(mode="json", by_alias=True))
+        body = generator.model_dump(mode="json", by_alias=True)
+        # The deployed PD router reads Chat-style accounting fields on its
+        # private producer hop. Preserve the canonical Responses fields and
+        # reuse the very same measured counts, including an observed zero.
+        params = request.kv_transfer_params or {}
+        if (
+            params.get("do_remote_decode") is True
+            and params.get("transfer_id")
+            and generator.usage is not None
+        ):
+            usage = body["usage"]
+            usage["prompt_tokens"] = usage["input_tokens"]
+            usage["prompt_tokens_details"] = {
+                "cached_tokens": usage["input_tokens_details"]["cached_tokens"]
+            }
+        return JSONResponse(content=body)
 
     return StreamingResponse(
         content=_convert_stream_to_sse_events(generator), media_type="text/event-stream"

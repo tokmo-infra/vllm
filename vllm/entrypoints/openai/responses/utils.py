@@ -396,7 +396,11 @@ def _construct_message_from_response_item(
             "reasoning": reasoning,
         }
     elif isinstance(item, ResponseOutputMessage):
-        output_text = item.content[0].text
+        # Preserve the entire historical reply, including split text parts.
+        output_text = "".join(
+            part.text if part.type == "output_text" else part.refusal
+            for part in item.content
+        )
         if prev_assistant_msg:
             previous_content = prev_assistant_msg.get("content")
             if previous_content is None:

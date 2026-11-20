@@ -2,6 +2,8 @@
 
 P使用 `cache_aware`，D使用 `round_robin`。同一套Router命令支持1P2D和4P4D，配套模型服务使用vLLM同名分支的部署文档。Router不加载估算Tokenizer或token容量JSON，Program scheduling保持关闭。
 
+Responses 的 `tools` 同时接受扁平函数定义和 `{"type":"function","function":{...}}` 包装。Router 转发前展开 `name`、`description`、`parameters`、`strict`；同名字段值冲突时返回 HTTP 400（`invalid_function_tool`）。续聊仍在 `input` 中携带完整历史。
+
 ## 字段作用与使用案例
 
 | 字段 | 配置 | 作用与使用案例 |

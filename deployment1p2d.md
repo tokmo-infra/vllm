@@ -48,6 +48,8 @@ BUILD_PARENT=/data/build/glm53flash-1p2d BUILD_JOBS=8 \
 
 ### 从源码构建
 
+两种构建方式都会用 `runtime-production.sha256` 校验覆盖后的文件，覆盖层与 82–84 的 `compat-78159a469b9a` 运行文件逐字节一致。仓库中的 Python 源码保留格式和类型检查；构建时恢复部署快照的字节内容。1P2D 使用随仓库提供的 Router 源码，PD 模块对应 `responses-tools-ecee97b77d8e`。
+
 Buildx 先构建 FlashInfer 和 Mooncake wheel，编译 vLLM CUDA/Rust 基底（SM120），再应用同一份 NVFP4 KV 覆盖层；Router 使用 Cargo 锁定依赖编译。基础 CUDA/PyTorch 镜像和系统依赖由构建机获取。`GLM_BUILDER` 可指定已有 Buildx builder，`GLM_BUILD_PROXY` 可传入依赖下载代理。
 
 ~~~bash
@@ -58,15 +60,15 @@ BUILD_PARENT=/data/build/glm53flash-1p2d BUILD_JOBS=8 \
 
 | 用途 | 默认镜像 |
 | --- | --- |
-| P 和 D | `local/glm53flash-nvfp4kv:runtime-8660fd7c21ae` |
+| P 和 D | `local/glm53flash-nvfp4kv:compat-78159a469b9a` |
 | Mooncake Master 和 Store | `local/glm53flash-mooncake:source-71973589` |
-| Router | `router:glm53flash-source-1099991` |
+| Router | `router:glm53flash-responses-tools-ecee97b77d8e` |
 
 ~~~bash
 # 构建机
 set -o pipefail
-docker save local/glm53flash-nvfp4kv:runtime-8660fd7c21ae \
-  local/glm53flash-mooncake:source-71973589 router:glm53flash-source-1099991 \
+docker save local/glm53flash-nvfp4kv:compat-78159a469b9a \
+  local/glm53flash-mooncake:source-71973589 router:glm53flash-responses-tools-ecee97b77d8e \
   | zstd -T4 -3 -o glm53flash-1p2d-images.tar.zst
 
 # P / D1 / D2 导入镜像包
@@ -114,7 +116,7 @@ INTERNAL_API_KEY_FILE='<ABSOLUTE_PATH_TO_INTERNAL_API_KEY_FILE>'
 SERVICE_PREFIX=glm53flash-1p2d
 MODEL_DIR='/data/models/GLM-5.3-Flash-NVFP4'
 SERVICE_ROOT='/data/services'
-COMPILE_CACHE_ROOT='/var/cache/glm53flash-1p2d/runtime-8660fd7c21ae'
+COMPILE_CACHE_ROOT='/var/cache/glm53flash-1p2d/d50c0828c8dd62'
 L3_MOUNT='/data'
 L2_P_GIB=700; L2_D1_GIB=750; L2_D2_GIB=750
 ~~~
@@ -155,11 +157,11 @@ test -n "$INTERNAL_API_KEY"
 MODEL_NAME=glm-5.3-flash
 here="$PWD/integrations/glm53flash/1p2d"
 
-P_IMAGE="${ENGINE_IMAGE:-local/glm53flash-nvfp4kv:runtime-8660fd7c21ae}"
+P_IMAGE="${ENGINE_IMAGE:-local/glm53flash-nvfp4kv:compat-78159a469b9a}"
 D_IMAGE="$P_IMAGE"
 MASTER_IMAGE="${MOONCAKE_IMAGE:-local/glm53flash-mooncake:source-71973589}"
 STORE_IMAGE="$MASTER_IMAGE"
-ROUTER_IMAGE="${ROUTER_IMAGE:-router:glm53flash-source-1099991}"
+ROUTER_IMAGE="${ROUTER_IMAGE:-router:glm53flash-responses-tools-ecee97b77d8e}"
 ~~~
 
 ### 2. Mooncake Master · D1
@@ -458,14 +460,14 @@ docker run -d --pull=never --name "$SERVICE_PREFIX-router" \
 
 ~~~bash
 curl -fsS "$MASTER_METRICS_URL" | grep '^master_total_capacity_bytes '
-curl -fsS -H "Authorization: Bearer $INTERNAL_API_KEY" "$P0_URL/v1/models"
+curl -fsS "$ROUTER_URL/v1/models"
 curl -fsS "$ROUTER_URL/workers" |
   python3 -c 'import json,sys; w=json.load(sys.stdin)["workers"]; print(sum(x["is_healthy"] for x in w), "/", len(w))'
 ~~~
 
 默认 L2 总量为 2200 GiB，Router 为 24/24 路健康。
 
-推理请求直接向 Router 的 `/v1/chat/completions` 发送，模型填写 `glm-5.3-flash`。此版 Router 的 `/v1/models` 会透传后端鉴权；运维查模型名用上面的带 key 命令。
+推理请求直接向 Router 的 `/v1/chat/completions` 发送，模型填写 `glm-5.3-flash`。模型列表从 Router 的 `/v1/models` 获取，入口沿用推理请求的认证配置。Responses 的图片支持 URL 字符串和带 url 的对象；未指定 detail 时为 auto。
 
 ## 服务重启后的检查
 
@@ -483,6 +485,8 @@ Master、Store、vLLM 和 Router 使用 Docker 的 `unless-stopped` 策略：进
 地址或端口变更时，同步三台的 `deploy.env` 后重建受影响的容器。客户端入口变化时，更新 `ROUTER_BASE_URL`。
 
 ## 发送推理请求
+
+Responses 的 `tools` 同时接受扁平函数定义和 `{"type":"function","function":{...}}` 包装。Router 转发前展开 `name`、`description`、`parameters`、`strict`；同名字段值冲突时返回 HTTP 400（`invalid_function_tool`）。续聊仍在 `input` 中携带完整历史。
 
 客户端统一访问 P 节点上的 Router，`ROUTER_BASE_URL` 是客户端可达地址，含 `/v1`。模型名为 `glm-5.3-flash`，推理请求默认无需 API key。以下是流式请求，示例使用 `max` 思考（也可填 `high`），输出上限为 4096 token（含思考）。
 

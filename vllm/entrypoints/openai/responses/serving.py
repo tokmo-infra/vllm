@@ -521,6 +521,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 ),
                 lora_request=lora_request,
                 priority=self._get_priority(request, raw_request),
+                data_parallel_rank=self._get_data_parallel_rank(raw_request),
                 trace_headers=trace_headers,
                 session_id=session_id,
                 reasoning_parser_kwargs=reasoning_parser_kwargs,
@@ -645,6 +646,7 @@ class OpenAIServingResponses(GenerateBaseServing):
         trace_headers: Mapping[str, str] | None = None,
         session_id: str | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        data_parallel_rank: int | None = None,
     ):
         max_model_len = self.model_config.max_model_len
         cache_salt = cast(str | None, engine_input.get("cache_salt"))
@@ -667,6 +669,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 sampling_params,
                 sub_request_id,
                 lora_request=lora_request,
+                data_parallel_rank=data_parallel_rank,
                 trace_headers=trace_headers,
                 priority=priority,
                 session_id=session_id,

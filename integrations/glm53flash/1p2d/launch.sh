@@ -13,10 +13,10 @@ if [[ "$phase" == model || "$phase" == router || "$phase" == health ]]; then
   API_KEY=$(cat -- "$KEY_FILE")
   test -n "$API_KEY"
 fi
-export P_IMAGE="${ENGINE_IMAGE:-local/glm53flash-nvfp4kv:runtime-8660fd7c21ae}" D_IMAGE="${ENGINE_IMAGE:-local/glm53flash-nvfp4kv:runtime-8660fd7c21ae}"
+export P_IMAGE="${ENGINE_IMAGE:-local/glm53flash-nvfp4kv:compat-78159a469b9a}" D_IMAGE="${ENGINE_IMAGE:-local/glm53flash-nvfp4kv:compat-78159a469b9a}"
 export MASTER_IMAGE="${MOONCAKE_IMAGE:-local/glm53flash-mooncake:source-71973589}"
 export STORE_IMAGE="$MASTER_IMAGE"
-export ROUTER_IMAGE="${ROUTER_IMAGE:-router:glm53flash-source-1099991}"
+export ROUTER_IMAGE="${ROUTER_IMAGE:-router:glm53flash-responses-tools-ecee97b77d8e}"
 export NODE_ID
 export NODE_IP="${NODE_IP:-11.8.0.$NODE_ID}"
 export MASTER_IP="${MASTER_IP:-11.8.0.83}"
@@ -203,7 +203,7 @@ start_model() {
   if ! cmp -s "$here/numa_wrapper.sh" "$BASE_WORK/numa_wrapper.sh"; then
     install -m 0755 "$here/numa_wrapper.sh" "$BASE_WORK/numa_wrapper.sh"
   fi
-  cache_dir="/var/cache/glm53flash-1p2d/runtime-8660fd7c21ae/$slot"
+  cache_dir="/var/cache/glm53flash-1p2d/d50c0828c8dd62/$slot"
   install -d -m 0700 "$cache_dir"
   write_mc_config "$role_work/mooncake.json" "$hcas"
   engine_id="$SERVICE_PREFIX-$slot-$NODE_ID-$(cat /proc/sys/kernel/random/uuid)"

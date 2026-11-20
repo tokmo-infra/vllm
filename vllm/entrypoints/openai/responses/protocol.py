@@ -151,13 +151,25 @@ def _default_input_image_details(value: Any) -> Any:
     changed = False
     for part in content:
         new_part = part
-        if (
-            isinstance(part, dict)
-            and part.get("type") == "input_image"
-            and "detail" not in part
-        ):
-            new_part = {**part, "detail": "auto"}
-            changed = True
+        if isinstance(part, dict) and part.get("type") == "input_image":
+            ref = part.get("image_url")
+            # Accept the Chat wrapper, but leave conflicting options invalid.
+            if (
+                isinstance(ref, dict)
+                and set(ref) <= {"url", "detail"}
+                and isinstance(ref.get("url"), str)
+                and (
+                    "detail" not in part
+                    or "detail" not in ref
+                    or part["detail"] == ref["detail"]
+                )
+            ):
+                new_part = {**part, "image_url": ref["url"]}
+                if "detail" in ref:
+                    new_part["detail"] = ref["detail"]
+            if "detail" not in new_part:
+                new_part = {**new_part, "detail": "auto"}
+            changed |= new_part is not part
         new_content.append(new_part)
 
     return {**value, "content": new_content} if changed else value
@@ -545,6 +557,14 @@ class ResponsesRequest(OpenAIBaseModel):
         if self.ec_transfer_params:
             extra_args["ec_transfer_params"] = self.ec_transfer_params
 
+        # For the internal one-token PD producer leg Mooncake publishes KV on
+        # length completion. The subsequent decode leg keeps caller settings.
+        producer_leg = bool(
+            self.kv_transfer_params
+            and self.kv_transfer_params.get("do_remote_decode") is True
+            and self.kv_transfer_params.get("transfer_id")
+            and self.max_output_tokens == 1
+        )
         return SamplingParams.from_optional(
             temperature=temperature,
             watermarking=self.watermarking,
@@ -553,13 +573,13 @@ class ResponsesRequest(OpenAIBaseModel):
             min_p=min_p,
             max_tokens=max_tokens,
             logprobs=self.top_logprobs if self.is_include_output_logprobs() else None,
-            stop=stop,
-            stop_token_ids=self.stop_token_ids,
+            stop=[] if producer_leg else stop,
+            stop_token_ids=[] if producer_leg else self.stop_token_ids,
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
             repetition_penalty=repetition_penalty,
             seed=self.seed,
-            ignore_eos=self.ignore_eos,
+            ignore_eos=True if producer_leg else self.ignore_eos,
             output_kind=(
                 RequestOutputKind.DELTA if self.stream else RequestOutputKind.FINAL_ONLY
             ),
@@ -655,6 +675,23 @@ class ResponsesRequest(OpenAIBaseModel):
                 continue
 
             item_type = item.get("type")
+
+            # Explicit history from stateless clients may omit the outer
+            # message discriminator but retain assistant output_text parts.
+            # Only infer it for unambiguous output; input/tool items keep
+            # their SDK validation and explicit discriminators take precedence.
+            if "type" not in item and item.get("role") == "assistant":
+                parts = item.get("content")
+                if (
+                    isinstance(parts, list)
+                    and parts
+                    and all(
+                        isinstance(p, dict) and p.get("type") == "output_text"
+                        for p in parts
+                    )
+                ):
+                    item = {**item, "type": "message"}
+                    item_type = "message"
 
             if item_type == "function_call":
                 try:

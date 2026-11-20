@@ -80,6 +80,23 @@ async def create_messages(request: AnthropicMessagesRequest, raw_request: Reques
 
     elif isinstance(generator, AnthropicMessagesResponse):
         resp = generator.model_dump(exclude_none=True)
+        # Private Mooncake P leg: expose the same measured counters that the
+        # PD router reads for Chat and Responses. Public D responses retain
+        # Anthropic's uncached/read/creation breakdown. Missing data stays missing.
+        kv = request.kv_transfer_params or {}
+        usage = generator.usage
+        if (
+            kv.get("do_remote_decode") is True
+            and kv.get("transfer_id")
+            and request.max_tokens == 1
+            and usage is not None
+            and usage.cache_read_input_tokens is not None
+        ):
+            read = usage.cache_read_input_tokens
+            resp["usage"]["prompt_tokens"] = (
+                usage.input_tokens + read + (usage.cache_creation_input_tokens or 0)
+            )
+            resp["usage"]["prompt_tokens_details"] = {"cached_tokens": read}
         logger.debug("Anthropic Messages Response: %s", resp)
         return JSONResponse(content=resp)
 

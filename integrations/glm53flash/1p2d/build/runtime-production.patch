@@ -1,0 +1,186 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py
+@@ -2438,12 +2438,7 @@
+         # after send/recv ambiguity, and never substitute another TP/PP rank.
+         for attempt in range(2):
+             with make_zmq_socket(
+-                self.async_zmq_ctx,
+-                addr,
+-                zmq.DEALER,
+-                bind=False,
+-                linger=0,
+-                immediate=True,
++                self.async_zmq_ctx, addr, zmq.DEALER, bind=False, linger=0, immediate=True
+             ) as sock:
+                 if await sock.poll(timeout=2000, flags=zmq.POLLOUT) & zmq.POLLOUT:
+                     sock.setsockopt(zmq.SNDTIMEO, 2000)
+@@ -2457,18 +2452,9 @@
+             fresh = self._remote_agents.get(engine, {}).get(tp, {}).get(pp)
+             if not fresh or fresh == addr:
+                 break
+-            logger.info(
+-                "Refreshed Mooncake peer %s TP%s PP%s: %s -> %s",
+-                engine,
+-                tp,
+-                pp,
+-                addr,
+-                fresh,
+-            )
++            logger.info("Refreshed Mooncake peer %s TP%s PP%s: %s -> %s", engine, tp, pp, addr, fresh)
+             addr = fresh
+-        raise ConnectionError(
+-            f"Mooncake peer unavailable before sending KV descriptors: {addr}"
+-        )
++        raise ConnectionError(f"Mooncake peer unavailable before sending KV descriptors: {addr}")
+ 
+     async def receive_kv_from_single_worker(
+         self,
+@@ -2689,9 +2675,7 @@
+             pull_meta.pull_tasks_count = count
+         for worker_addr, tp, pp in worker_addrs:
+             asyncio.create_task(
+-                self.receive_kv_from_single_worker(
+-                    worker_addr, pull_metas, (remote_engine_id, tp, pp)
+-                )
++                self.receive_kv_from_single_worker(worker_addr, pull_metas, (remote_engine_id, tp, pp))
+             )
+ 
+     async def _refresh_directory(self, remote_bootstrap_addr: str):
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -935,9 +935,7 @@
+             assert len(scheduled_loras) <= self.lora_config.max_loras
+ 
+         probe = self.ready_wait_probe
+-        direct: dict[str, str] | None = (
+-            {} if probe is not None and probe.ready else None
+-        )
++        direct = {} if probe is not None and probe.ready else None
+         fallback = "other_queue"
+         # Next, schedule the WAITING requests.
+         if not preempted_reqs and self._pause_state != PauseState.PAUSED_ALL:
+@@ -946,11 +944,7 @@
+ 
+             def skip_request(from_queue: RequestQueue) -> None:
+                 request_to_skip = from_queue.pop_request()
+-                if (
+-                    probe is not None
+-                    and direct is not None
+-                    and request_to_skip.request_id in probe.ready
+-                ):
++                if direct is not None and request_to_skip.request_id in probe.ready:
+                     direct.setdefault(request_to_skip.request_id, "other_skip")
+                 self.deferred_waiting.add(request_to_skip)
+                 if self._holds_kv_blocks(request_to_skip):
+@@ -1474,7 +1468,7 @@
+                 _, num_waiting = self.get_request_counts()
+                 self.prefill_capacity_bound = num_waiting > len(self.deferred_waiting)
+ 
+-        if probe is not None and direct is not None:
++        if direct is not None:
+             if self._pause_state == PauseState.PAUSED_ALL:
+                 fallback = "other_pause"
+             elif preempted_reqs:
+diff --git a/vllm/entrypoints/openai/responses/api_router.py b/vllm/entrypoints/openai/responses/api_router.py
+--- a/vllm/entrypoints/openai/responses/api_router.py
++++ b/vllm/entrypoints/openai/responses/api_router.py
+@@ -75,16 +75,10 @@
+         # private producer hop. Preserve the canonical Responses fields and
+         # reuse the very same measured counts, including an observed zero.
+         params = request.kv_transfer_params or {}
+-        if (
+-            params.get("do_remote_decode") is True
+-            and params.get("transfer_id")
+-            and generator.usage is not None
+-        ):
++        if params.get("do_remote_decode") is True and params.get("transfer_id") and generator.usage is not None:
+             usage = body["usage"]
+             usage["prompt_tokens"] = usage["input_tokens"]
+-            usage["prompt_tokens_details"] = {
+-                "cached_tokens": usage["input_tokens_details"]["cached_tokens"]
+-            }
++            usage["prompt_tokens_details"] = {"cached_tokens": usage["input_tokens_details"]["cached_tokens"]}
+         return JSONResponse(content=body)
+ 
+     return StreamingResponse(
+diff --git a/vllm/entrypoints/openai/responses/protocol.py b/vllm/entrypoints/openai/responses/protocol.py
+--- a/vllm/entrypoints/openai/responses/protocol.py
++++ b/vllm/entrypoints/openai/responses/protocol.py
+@@ -153,20 +153,16 @@
+         new_part = part
+         if isinstance(part, dict) and part.get("type") == "input_image":
+             ref = part.get("image_url")
+-            # Accept the Chat wrapper, but leave conflicting options invalid.
+-            if (
+-                isinstance(ref, dict)
+-                and set(ref) <= {"url", "detail"}
+-                and isinstance(ref.get("url"), str)
+-                and (
+-                    "detail" not in part
+-                    or "detail" not in ref
++            if isinstance(ref, dict) and set(ref) <= {"url", "detail"}:
++                # Accept the Chat image-url wrapper without changing image data
++                # or transport. Conflicting/unknown options remain invalid.
++                if isinstance(ref.get("url"), str) and (
++                    "detail" not in part or "detail" not in ref
+                     or part["detail"] == ref["detail"]
+-                )
+-            ):
+-                new_part = {**part, "image_url": ref["url"]}
+-                if "detail" in ref:
+-                    new_part["detail"] = ref["detail"]
++                ):
++                    new_part = {**part, "image_url": ref["url"]}
++                    if "detail" in ref:
++                        new_part["detail"] = ref["detail"]
+             if "detail" not in new_part:
+                 new_part = {**new_part, "detail": "auto"}
+             changed |= new_part is not part
+@@ -682,13 +678,9 @@
+             # their SDK validation and explicit discriminators take precedence.
+             if "type" not in item and item.get("role") == "assistant":
+                 parts = item.get("content")
+-                if (
+-                    isinstance(parts, list)
+-                    and parts
+-                    and all(
+-                        isinstance(p, dict) and p.get("type") == "output_text"
+-                        for p in parts
+-                    )
++                if isinstance(parts, list) and parts and all(
++                    isinstance(p, dict) and p.get("type") == "output_text"
++                    for p in parts
+                 ):
+                     item = {**item, "type": "message"}
+                     item_type = "message"
+diff --git a/vllm/entrypoints/anthropic/api_router.py b/vllm/entrypoints/anthropic/api_router.py
+--- a/vllm/entrypoints/anthropic/api_router.py
++++ b/vllm/entrypoints/anthropic/api_router.py
+@@ -86,10 +86,8 @@
+         kv = request.kv_transfer_params or {}
+         usage = generator.usage
+         if (
+-            kv.get("do_remote_decode") is True
+-            and kv.get("transfer_id")
+-            and request.max_tokens == 1
+-            and usage is not None
++            kv.get("do_remote_decode") is True and kv.get("transfer_id")
++            and request.max_tokens == 1 and usage is not None
+             and usage.cache_read_input_tokens is not None
+         ):
+             read = usage.cache_read_input_tokens
+diff --git a/vllm/entrypoints/anthropic/serving.py b/vllm/entrypoints/anthropic/serving.py
+--- a/vllm/entrypoints/anthropic/serving.py
++++ b/vllm/entrypoints/anthropic/serving.py
+@@ -610,8 +610,7 @@
+ 
+         kv = anthropic_request.kv_transfer_params or {}
+         producer = (
+-            kv.get("do_remote_decode") is True
+-            and bool(kv.get("transfer_id"))
++            kv.get("do_remote_decode") is True and bool(kv.get("transfer_id"))
+             and anthropic_request.max_tokens == 1
+         )
+         return ChatCompletionRequest(
