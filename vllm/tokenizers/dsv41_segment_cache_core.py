@@ -57,8 +57,7 @@ class SegmentCache:
             )
         if config["model"]["type"] != "BPE":
             raise ValueError("Unsupported BPE configuration")
-        # Every admitted request has add_special_tokens=False, so the native
-        # tokenizer post-processor is disabled for both full and segment encode.
+        # The caller only admits requests whose IDs match add_special_tokens=False.
         added = config["added_tokens"]
         if any(
             any(t.get(k, False) for k in ("lstrip", "rstrip", "single_word"))

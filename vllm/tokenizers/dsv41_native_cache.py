@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 from prometheus_client import Counter, Gauge, Histogram
 from tokenizers import Tokenizer
+from tokenizers.processors import ByteLevel
 
 from vllm.tokenizers.dsv41_segment_cache_core import SegmentCache
 
@@ -58,6 +59,12 @@ class NativeCache:
         # The original tokenizer pool can mutate padding/truncation. Keep a private
         # immutable backend for exact segment encoding rather than sharing it.
         backend = Tokenizer.from_str(tokenizer.backend_tokenizer.to_str())
+        # ByteLevel post-processing only adjusts offsets. Its single-input IDs
+        # are identical with or without add_special_tokens (as with no processor).
+        processor = backend.post_processor
+        self._special_tokens_preserve_ids = processor is None or isinstance(
+            processor, ByteLevel
+        )
         self.cache = SegmentCache(
             SimpleNamespace(backend_tokenizer=backend), None, int(gib * 1024**3)
         )
@@ -85,13 +92,15 @@ class NativeCache:
                 self.last_evictions = 0
                 self.epoch = epoch
                 SIZE.labels(self.rank).set(0)
-        # Keep offsets, multimodal, BOS/EOS and unsupported encoding options on
-        # the original tokenizer path. Post-tokenization remains fully native.
+        add_special_tokens = kwargs.get("add_special_tokens")
         safe = (
             not want_offsets
             and not prompt.get("multi_modal_data")
             and not prompt.get("multi_modal_uuids")
-            and kwargs.get("add_special_tokens") is False
+            and (
+                add_special_tokens is False
+                or (add_special_tokens is True and self._special_tokens_preserve_ids)
+            )
             and set(kwargs) <= {"add_special_tokens", "truncation", "max_length"}
         )
         if not safe:

@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from tokenizers import AddedToken, Tokenizer, decoders, models, pre_tokenizers
+from tokenizers.processors import ByteLevel, TemplateProcessing
 from transformers import TokenizersBackend
 
 from vllm.tokenizers.dsv41_native_cache import EVICTIONS, SIZE, NativeCache
@@ -46,6 +47,40 @@ def test_native_cache_misses_and_hits_keep_exact_token_ids(cache_tokenizer, text
         for _ in range(2):
             actual = cache.try_encode(prompt, {"add_special_tokens": False})
             assert actual == expected
+
+
+@pytest.mark.parametrize("post_processor", [None, ByteLevel(trim_offsets=True)])
+def test_cache_reuses_responses_tokens_with_id_preserving_processor(
+    cache_tokenizer, post_processor
+):
+    cache_tokenizer.backend_tokenizer.post_processor = post_processor
+    cache = NativeCache(cache_tokenizer, gib=1 / 1024, rank="responses")
+    text = "中文🙂<sp>  second turn\n"
+    kwargs = {"add_special_tokens": True, "truncation": True, "max_length": 100}
+    expected = cache_tokenizer(text, **kwargs)["input_ids"]
+    assert cache.try_encode({"prompt": text}, kwargs) == expected
+    assert cache.cache.snapshot()["reused_tokens"] == 0
+    assert cache.try_encode({"prompt": text}, kwargs) == expected
+    assert cache.cache.snapshot()["reused_tokens"] == len(expected) - 1
+    # A shorter budget must still delegate truncation to the native tokenizer.
+    assert cache.try_encode({"prompt": text}, {**kwargs, "max_length": 2}) is None
+    assert cache.try_encode({"prompt": text}, kwargs, want_offsets=True) is None
+
+
+def test_cache_defers_to_native_special_token_insertion(cache_tokenizer):
+    special_id = cache_tokenizer.convert_tokens_to_ids("<sp>")
+    cache_tokenizer.backend_tokenizer.post_processor = TemplateProcessing(
+        single="<sp> $A", special_tokens=[("<sp>", special_id)]
+    )
+    cache = NativeCache(cache_tokenizer, gib=1 / 1024, rank="bos")
+    prompt = {"prompt": "a"}
+    plain = cache_tokenizer("a", add_special_tokens=False)["input_ids"]
+    assert cache_tokenizer("a", add_special_tokens=True)["input_ids"] == [
+        special_id,
+        *plain,
+    ]
+    assert cache.try_encode(prompt, {"add_special_tokens": True}) is None
+    assert cache.try_encode(prompt, {"add_special_tokens": False}) == plain
 
 
 def _metric_value(metric, name, rank):
