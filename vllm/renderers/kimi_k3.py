@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from functools import cached_property
 from typing import Any, cast
 
 from transformers import PreTrainedTokenizerBase
@@ -32,8 +33,19 @@ _K31_THINKING_EFFORTS = ("low", "medium", "high", "max")
 
 def _merge_k3_media_io_kwargs(
     media_io_kwargs: dict[str, dict[str, Any]] | None,
+    video_defaults: dict[str, Any] | None = None,
 ) -> dict[str, dict[str, Any]] | None:
-    return merge_media_io_kwargs(_K3_MEDIA_IO_DEFAULTS, media_io_kwargs)
+    defaults = _K3_MEDIA_IO_DEFAULTS
+    if video_defaults:
+        defaults = {**defaults, "video": video_defaults}
+    merged = merge_media_io_kwargs(defaults, media_io_kwargs)
+    if merged and video_defaults:
+        # The frame plan must use the checkpoint config, not a request's.
+        merged["video"] = {
+            **merged["video"],
+            "media_proc_cfg": video_defaults["media_proc_cfg"],
+        }
+    return merged
 
 
 def _dump_k3_template_value(value: Any) -> Any:
@@ -169,6 +181,13 @@ class KimiK3Renderer(BaseRenderer[HfTokenizer]):
     def _prepare_tokenizer(self, tokenizer: HfTokenizer) -> None:
         attach_cache(self.config, tokenizer)
 
+    @cached_property
+    def _video_media_io_defaults(self) -> dict[str, Any] | None:
+        if self.mm_processor is None:
+            return None
+        get_kwargs = getattr(self.mm_processor.info, "get_video_loader_kwargs", None)
+        return get_kwargs() if get_kwargs is not None else None
+
     def _apply_chat_template(
         self,
         conversation: list[dict[str, Any]],
@@ -212,7 +231,9 @@ class KimiK3Renderer(BaseRenderer[HfTokenizer]):
             messages,
             self.model_config,
             content_format="string",
-            media_io_kwargs=_merge_k3_media_io_kwargs(params.media_io_kwargs),
+            media_io_kwargs=_merge_k3_media_io_kwargs(
+                params.media_io_kwargs, self._video_media_io_defaults
+            ),
             mm_processor_kwargs=params.mm_processor_kwargs,
         )
 
@@ -236,7 +257,9 @@ class KimiK3Renderer(BaseRenderer[HfTokenizer]):
             messages,
             self.model_config,
             content_format="string",
-            media_io_kwargs=_merge_k3_media_io_kwargs(params.media_io_kwargs),
+            media_io_kwargs=_merge_k3_media_io_kwargs(
+                params.media_io_kwargs, self._video_media_io_defaults
+            ),
             mm_processor_kwargs=params.mm_processor_kwargs,
         )
 

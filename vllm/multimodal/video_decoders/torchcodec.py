@@ -44,15 +44,16 @@ def decode_torchcodec(
         seek_mode=seek_mode,
         device=device,
     )
-    check_frame_pixel_limit(
-        decoder.metadata.width or 0,
-        decoder.metadata.height or 0,
-    )
+    width = decoder.metadata.width or 0
+    height = decoder.metadata.height or 0
+    check_frame_pixel_limit(width, height)
     source = loader_cls._prepare_source(
         TorchCodecVideoBackendMixin.get_torchcodec_metadata(decoder)
     )
     frame_idx = loader_cls.compute_frames_index_to_sample(
-        source=source, target=target, **sampling_kwargs
+        source=source,
+        target=target,
+        **{**sampling_kwargs, "frame_size": (width, height)},
     )
     frames, valid = TorchCodecVideoBackendMixin.decode_torchcodec_frames(
         decoder, frame_idx, device=device

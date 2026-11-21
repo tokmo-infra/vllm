@@ -4,6 +4,7 @@
 
 import math
 from collections.abc import Hashable, Iterable
+from functools import cached_property
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -122,9 +123,12 @@ from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.utils.torch_utils import aux_stream, is_meta_module
 
 from ..common.mm_preprocess import (
+    KIMI_K3_VIDEO_PLACEHOLDER,
     KimiK3DummyInputsBuilder,
     KimiK3MultiModalProcessor,
     KimiK3ProcessingInfo,
+    encode_kimi_k3_videos,
+    get_kimi_k3_media_proc_cfg,
 )
 from .specialized_decode.runtime import specialized_decode_config
 
@@ -1747,6 +1751,8 @@ class KimiK3ForConditionalGeneration(
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality == "image":
             return "<|kimi_image_placeholder|>"
+        if modality == "video":
+            return KIMI_K3_VIDEO_PLACEHOLDER
         raise ValueError(f"Unsupported modality: {modality}")
 
     def __init__(
@@ -1769,7 +1775,7 @@ class KimiK3ForConditionalGeneration(
         self.hidden_size = config.text_config.hidden_size
         self.device = current_platform.current_device()
 
-        with self._mark_tower_model(vllm_config, "image"):
+        with self._mark_tower_model(vllm_config, {"image", "video"}):
             if vllm_config.skip_kimi_decode_vision:
                 self.vision_tower = StageMissingLayer("image_tower")
                 self.mm_projector = StageMissingLayer("image_tower")
@@ -2105,7 +2111,27 @@ class KimiK3ForConditionalGeneration(
         )
         return media_features
 
+    @cached_property
+    def _video_patches_per_forward(self) -> int:
+        return get_kimi_k3_media_proc_cfg(self.model_config)["in_patch_limit"]
+
+    def _embed_videos(self, **kwargs: object) -> list[torch.Tensor]:
+        return encode_kimi_k3_videos(
+            lambda pixel_values, grid_thws: self._process_media_input(
+                KimiK25MediaPixelInputs(
+                    type="pixel_values", pixel_values=pixel_values, grid_thws=grid_thws
+                )
+            ),
+            cast(torch.Tensor, kwargs["video_pixel_values"]),
+            cast(torch.Tensor, kwargs["video_grid_thws"]),
+            cast(torch.Tensor, kwargs["video_num_chunks"]),
+            self.vision_tower.merge_kernel_size,
+            self._video_patches_per_forward,
+        )
+
     def embed_multimodal(self, **kwargs: object) -> NestedTensors | None:
+        if kwargs.get("video_pixel_values") is not None:
+            return self._embed_videos(**kwargs)
         media_input = self._parse_and_validate_media_input(**kwargs)
         if media_input is None:
             return None
