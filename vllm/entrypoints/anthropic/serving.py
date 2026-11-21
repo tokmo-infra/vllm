@@ -901,6 +901,20 @@ class AnthropicServingMessages(OpenAIServingChat):
             merge_inline_system=self._merge_inline_system,
             disabled_thinking_effort=disabled_thinking_effort,
         )
+        if (
+            request.max_tokens == 1
+            and not request.stream
+            and request.kv_transfer_params
+            and request.kv_transfer_params.get("do_remote_decode") is True
+            and not request.kv_transfer_params.get("do_remote_prefill")
+        ):
+            kv_config = self.engine_client.vllm_config.kv_transfer_config
+            if kv_config and kv_config.has_connector("MooncakeConnector"):
+                # Mooncake publishes prompt KV on a length-capped producer step.
+                # The decode request handles the caller's generation stop rules.
+                chat_req.min_tokens = 1
+                chat_req.ignore_eos = True
+                chat_req.stop = []
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("Convert to OpenAI request %s", chat_req.model_dump_json())
         generator = await self.create_chat_completion(chat_req, raw_request)

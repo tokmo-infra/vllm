@@ -25,6 +25,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, Field, ValidationError
 
+from vllm.config.kv_transfer import KVTransferConfig
 from vllm.entrypoints.anthropic.api_router import attach_router
 from vllm.entrypoints.anthropic.protocol import (
     AnthropicCountTokensRequest,
@@ -187,6 +188,56 @@ class TestImageContentBlocks:
             "type": "image_url",
             "image_url": {"url": "https://example.com/cat.png"},
         }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("connector", "transfer", "limit", "stream", "force_length"),
+    [
+        ("MooncakeConnector", {"do_remote_decode": True}, 1, False, True),
+        ("MooncakeConnector", {"do_remote_prefill": True}, 1, False, False),
+        ("MooncakeConnector", None, 1, False, False),
+        ("MooncakeConnector", {"do_remote_decode": True}, 2, False, False),
+        ("MooncakeConnector", {"do_remote_decode": True}, 1, True, False),
+        ("NixlConnector", {"do_remote_decode": True}, 1, False, False),
+    ],
+)
+async def test_messages_mooncake_producer_sampling(
+    connector, transfer, limit, stream, force_length, monkeypatch
+):
+    service = AnthropicServingMessages.__new__(AnthropicServingMessages)
+    config = KVTransferConfig(
+        kv_connector="MultiConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={"connectors": [{"kv_connector": connector}]},
+    )
+    service.engine_client = SimpleNamespace(
+        vllm_config=SimpleNamespace(kv_transfer_config=config)
+    )
+    service._merge_inline_system = False
+    service.disabled_thinking_effort_resolver = SimpleNamespace(
+        resolve_for=AsyncMock(return_value="none")
+    )
+    create_chat = AsyncMock()
+    monkeypatch.setattr(service, "create_chat_completion", create_chat)
+    request = AnthropicMessagesRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "Hello"}],
+        max_tokens=limit,
+        stop_sequences=["STOP"],
+        stream=stream,
+        kv_transfer_params=transfer,
+    )
+    await service.create_messages(request)
+    call = create_chat.await_args
+    assert call is not None
+    chat = call.args[0]
+    sampling = chat.to_sampling_params(limit, {})
+    assert sampling.ignore_eos is force_length
+    assert sampling.min_tokens == int(force_length)
+    assert sampling.stop == ([] if force_length else ["STOP"])
+    assert request.stop_sequences == ["STOP"]
+    assert chat.kv_transfer_params == transfer
 
 
 # ======================================================================
