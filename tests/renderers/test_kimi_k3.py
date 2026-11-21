@@ -100,6 +100,25 @@ def model_with_jinja_template(tmp_path: Path) -> str:
     return str(tmp_path)
 
 
+def test_cache_is_attached_to_the_renderer_owned_tokenizer(
+    model_with_jinja_template, monkeypatch
+):
+    tokenizer = TokenizersBackend.from_pretrained(model_with_jinja_template)
+    prepared = []
+    monkeypatch.setattr(
+        "vllm.renderers.kimi_k3.attach_cache",
+        lambda config, tokenizer: prepared.append(tokenizer),
+    )
+    renderer = KimiK3Renderer(
+        MockVllmConfig(MockModelConfig(), MockParallelConfig()), tokenizer
+    )
+    try:
+        assert prepared == [renderer.get_tokenizer()]
+        assert prepared[0] is not tokenizer
+    finally:
+        renderer.shutdown()
+
+
 def test_kimi_k3_sync_render_rejects_jinja_fallback(model_with_jinja_template):
     config = VllmConfig(
         model_config=ModelConfig(

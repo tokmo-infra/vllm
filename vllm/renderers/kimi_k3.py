@@ -156,7 +156,6 @@ class KimiK3Renderer(BaseRenderer[HfTokenizer]):
 
     def __init__(self, config: VllmConfig, tokenizer: HfTokenizer | None) -> None:
         super().__init__(config, tokenizer)
-        attach_cache(config, tokenizer)
 
         self._thinking_efforts = (
             _K31_THINKING_EFFORTS
@@ -166,6 +165,9 @@ class KimiK3Renderer(BaseRenderer[HfTokenizer]):
         self._apply_chat_template_async = make_async(
             self._apply_chat_template, executor=self._executor
         )
+
+    def _prepare_tokenizer(self, tokenizer: HfTokenizer) -> None:
+        attach_cache(self.config, tokenizer)
 
     def _apply_chat_template(
         self,
