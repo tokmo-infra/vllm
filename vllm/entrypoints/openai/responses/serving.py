@@ -11,6 +11,7 @@ from typing import Any, Final, cast
 
 from fastapi import Request
 from openai.types.responses import (
+    ResponseError,
     ResponseOutputItem,
     ResponseOutputItemDoneEvent,
     ResponseOutputMessage,
@@ -18,7 +19,6 @@ from openai.types.responses import (
     ResponseStatus,
 )
 from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
-from pydantic import TypeAdapter
 
 from vllm import envs
 from vllm.config.utils import replace
@@ -41,10 +41,12 @@ from vllm.entrypoints.openai.responses.context import (
 )
 from vllm.entrypoints.openai.responses.harmony import harmony_to_response_output
 from vllm.entrypoints.openai.responses.protocol import (
+    FailedResponsesResponse,
     InputTokensDetails,
     OutputTokensDetails,
     ResponseCompletedEvent,
     ResponseCreatedEvent,
+    ResponseFailedEvent,
     ResponseIncompleteEvent,
     ResponseInProgressEvent,
     ResponseInputOutputItem,
@@ -942,12 +944,14 @@ class OpenAIServingResponses(GenerateBaseServing):
         )
 
         if request.store:
-            async with self.response_store_lock:
-                stored_response = self.response_store.get(response.id)
-                # If the response is already cancelled, don't update it.
-                if stored_response is None or stored_response.status != "cancelled":
-                    self.response_store[response.id] = response
+            await self._store_finished_response(response)
         return response
+
+    async def _store_finished_response(self, response: ResponsesResponse) -> None:
+        async with self.response_store_lock:
+            stored_response = self.response_store.get(response.id)
+            if stored_response is None or stored_response.status != "cancelled":
+                self.response_store[response.id] = response
 
     def _topk_logprobs(
         self,
@@ -1145,6 +1149,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 if getattr(event, "type", "unknown") in (
                     "response.completed",
                     "response.incomplete",
+                    "response.failed",
                 ):
                     return
                 current_index += 1
@@ -1402,6 +1407,10 @@ class OpenAIServingResponses(GenerateBaseServing):
                 )
             )
 
+            async def empty_async_generator():
+                if False:
+                    yield
+
             try:
                 async for event_data in processor(
                     request,
@@ -1415,34 +1424,45 @@ class OpenAIServingResponses(GenerateBaseServing):
                     _increment_sequence_number_and_return,
                 ):
                     yield event_data
-            except GenerationError as e:
-                error_json = self._convert_generation_error_to_streaming_response(e)
-                yield _increment_sequence_number_and_return(
-                    TypeAdapter(StreamingResponsesResponse).validate_json(error_json)
+                final_response = await self.responses_full_generator(
+                    request,
+                    sampling_params,
+                    empty_async_generator(),
+                    context,
+                    model_name,
+                    tokenizer,
+                    request_metadata,
+                    created_time=created_time,
                 )
-                return
+            except GenerationError as exc:
+                final_response = self.create_error_response(exc)
+            except Exception:
+                logger.exception("Streaming response %s failed", request.request_id)
+                final_response = self.create_error_response(
+                    "Internal server error",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
 
-            async def empty_async_generator():
-                # A hack to trick Python to think this is a generator but
-                # in fact it immediately returns.
-                if False:
-                    yield
-
-            final_response = await self.responses_full_generator(
-                request,
-                sampling_params,
-                empty_async_generator(),
-                context,
-                model_name,
-                tokenizer,
-                request_metadata,
-                created_time=created_time,
-            )
             terminal_event: StreamingResponsesResponse
-            if (
-                isinstance(final_response, ResponsesResponse)
-                and final_response.status == "incomplete"
-            ):
+            if isinstance(final_response, ErrorResponse):
+                failed = FailedResponsesResponse.model_validate(
+                    {
+                        **initial_response,
+                        "status": "failed",
+                        "error": ResponseError(
+                            code="server_error"
+                            if final_response.error.code >= 500
+                            else "invalid_prompt",
+                            message=final_response.error.message,
+                        ),
+                    }
+                )
+                if request.store:
+                    await self._store_finished_response(failed)
+                terminal_event = ResponseFailedEvent(
+                    type="response.failed", sequence_number=-1, response=failed
+                )
+            elif final_response.status == "incomplete":
                 terminal_event = ResponseIncompleteEvent(
                     type="response.incomplete",
                     sequence_number=-1,

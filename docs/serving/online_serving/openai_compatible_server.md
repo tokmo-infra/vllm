@@ -203,6 +203,9 @@ The following extra parameters are supported:
 Our Responses API is compatible with [OpenAI's Responses API](https://platform.openai.com/docs/api-reference/responses);
 you can use the [official OpenAI Python client](https://github.com/openai/openai-python) to interact with it.
 
+A stream that fails during generation ends with `response.failed`. Its response
+contains the original ID, a `failed` status, and an error code and message.
+
 Code example: [examples/tool_calling/openai_responses_client_with_tools.py](../../../examples/tool_calling/openai_responses_client_with_tools.py)
 
 To get prompt token IDs before generation, use

@@ -1856,6 +1856,51 @@ async def test_responses_stream_truncated_by_length_reports_incomplete():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["engine", "iterator"])
+async def test_responses_failure_after_delta_ends_background_stream(failure):
+    serving = _make_serving_instance()
+    request = ResponsesRequest(input="hi", tools=[], stream=True, store=True)
+    context = _make_simple_context_with_output("hello", [10])
+
+    async def generate():
+        yield context
+        if failure == "iterator":
+            raise RuntimeError("private backend detail")
+        yield _make_simple_context_with_output("", [], finish_reason="error")
+
+    await serving._run_background_request_stream(
+        request,
+        sampling_params=SamplingParams(max_tokens=16),
+        result_generator=generate(),
+        context=context,
+        model_name="test-model",
+        tokenizer=MagicMock(),
+        request_metadata=RequestResponseMetadata(request_id=request.request_id),
+    )
+
+    async def replay():
+        return [
+            event
+            async for event in serving.responses_background_stream_generator(
+                request.request_id
+            )
+        ]
+
+    events = await asyncio.wait_for(replay(), timeout=2)
+    assert [e.delta for e in events if e.type == "response.output_text.delta"] == [
+        "hello"
+    ]
+    assert [e.sequence_number for e in events] == list(range(len(events)))
+    final = events[-1]
+    assert final.type == "response.failed"
+    assert final.response.id == request.request_id
+    assert final.response.status == "failed"
+    assert final.response.error.code == "server_error"
+    assert final.response.error.message == "Internal server error"
+    assert serving.response_store[request.request_id] == final.response
+
+
+@pytest.mark.asyncio
 async def test_background_stream_replay_stops_on_response_incomplete():
     """Replaying a stored background stream must end at ``response.incomplete``
     as it does at ``response.completed``, instead of waiting for more events."""
