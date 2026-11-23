@@ -234,6 +234,10 @@ class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
     type: Literal["function"] = "function"
 
 
+class DeepSeekThinking(OpenAIBaseModel):
+    type: Literal["enabled", "disabled"]
+
+
 class ChatCompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -277,6 +281,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "part of the standard OpenAI API specification."
         ),
     )
+    thinking: DeepSeekThinking | None = None
     thinking_token_budget: ThinkingTokenBudget = None
     include_reasoning: bool = True
     parallel_tool_calls: bool | None = True
@@ -618,6 +623,19 @@ class ChatCompletionRequest(OpenAIBaseModel):
             tool_calls = msg.get("tool_calls")
             if tool_calls is not None and not isinstance(tool_calls, list):
                 msg["tool_calls"] = list(tool_calls)
+        return self
+
+    @model_validator(mode="after")
+    def _apply_native_thinking(self) -> "ChatCompletionRequest":
+        if self.thinking is not None:
+            enabled = (
+                self.thinking.type == "enabled" and self.reasoning_effort != "none"
+            )
+            self.chat_template_kwargs = {
+                **(self.chat_template_kwargs or {}),
+                "thinking": enabled,
+                "enable_thinking": enabled,
+            }
         return self
 
     _grammar_from_parser: bool = PrivateAttr(default=False)

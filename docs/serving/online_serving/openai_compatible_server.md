@@ -97,6 +97,10 @@ completion = client.chat.completions.create(
 The `X-Request-Id` HTTP request header can be enabled with
 `--enable-request-id-headers`.
 
+On a DeepSeek-V4.1 P/D worker, use
+`--middleware vllm.entrypoints.serve.middleware.pd_request_id.PDRequestIdMiddleware`
+to log the incoming handoff ID for Chat Completions, Responses and Messages.
+
 ??? code
 
     ```python

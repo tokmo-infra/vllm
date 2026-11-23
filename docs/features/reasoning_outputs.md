@@ -338,6 +338,11 @@ for output in outputs:
 
 ## Automatic `enable_thinking` Activation
 
+On the DeepSeek-V4.1-Flash deployment, Chat Completions accepts a top-level
+`thinking` object with `type` set to `"enabled"` or `"disabled"`. An explicit
+switch overrides the template's thinking flags. Setting `reasoning_effort` to
+`"none"` disables thinking even when the switch is enabled.
+
 Some models (such as Gemma 4, DeepSeek-V4-Pro and IBM Granite 3.2) require `enable_thinking: true` in their chat template kwargs to activate thinking mode — without it, reasoning tokens are never generated regardless of other settings.
 
 When you set `reasoning_effort` in a Chat Completions request (or `reasoning.effort` in a Responses API request), vLLM automatically injects `enable_thinking` into the chat template kwargs:

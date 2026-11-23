@@ -32,6 +32,8 @@ def _normalize_messages(
     # and ValueError (400) instead of the reference's asserts.
     result = [dict(message) for message in copy.deepcopy(messages)]
     image_idx = 0
+    pending_ids: set[str] | None = None
+    implicit_single = False
     for message in result:
         image_indices = message["_image_indices"] = []
         role = message.get("role")
@@ -60,6 +62,32 @@ def _normalize_messages(
                         f"got {part_type!r}"
                     )
             message["content"] = "\n\n".join(parts)
+
+        if role == "assistant" and (calls := message.get("tool_calls")):
+            # The reference corpus also contains positional calls without IDs.
+            pending_ids = {
+                call.get("id") or call["function"].get("id") or f"call_{i}"
+                for i, call in enumerate(calls)
+            }
+            implicit_single = len(calls) == 1 and not (
+                calls[0].get("id") or calls[0]["function"].get("id")
+            )
+        elif role == "tool":
+            result_id = message.get("tool_call_id") or (
+                "call_0" if implicit_single else None
+            )
+            if not pending_ids or result_id not in pending_ids:
+                raise ValueError("tool_call_id does not match a pending tool call")
+            pending_ids.remove(result_id)
+        # Messages represents images attached to a tool result as a separate
+        # image-only user message, including between parallel tool results.
+        elif pending_ids and not (
+            role == "user"
+            and image_indices
+            and isinstance(content, list)
+            and len(image_indices) == len(content)
+        ):
+            pending_ids = None
     return result
 
 

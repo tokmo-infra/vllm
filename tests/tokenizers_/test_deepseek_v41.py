@@ -357,3 +357,126 @@ def test_dropped_developer_only_image_leaves_text_prompt(render_with_media):
     assert "<｜deepseek_image｜>" not in prompt["prompt"]
     assert "multi_modal_data" not in prompt
     assert "multi_modal_uuids" not in prompt
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_native_thinking_switch(enabled):
+    request = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "hello"}],
+        thinking={"type": "enabled" if enabled else "disabled"},
+        chat_template_kwargs={"drop_thinking": False},
+    )
+    kwargs = request.build_chat_params(None, "openai").chat_template_kwargs
+    assert kwargs["drop_thinking"] is False
+    assert kwargs["enable_thinking"] is enabled
+    assert render(request.messages, **kwargs).endswith(
+        "<think>" if enabled else "</think>"
+    )
+
+
+def test_reject_invalid_native_thinking():
+    with pytest.raises(ValueError, match="thinking"):
+        ChatCompletionRequest(messages=[], thinking={"type": "unknown"})
+
+
+def test_native_thinking_effort_and_template_precedence():
+    messages = [{"role": "user", "content": "hello"}]
+    for mode, effort, expected in [
+        ("enabled", "none", False),
+        ("disabled", "high", False),
+        ("enabled", "high", True),
+    ]:
+        request = ChatCompletionRequest(
+            messages=messages,
+            thinking={"type": mode},
+            reasoning_effort=effort,
+            chat_template_kwargs={"thinking": not expected},
+        )
+        kwargs = request.build_chat_params(None, "openai").chat_template_kwargs
+        assert kwargs["thinking"] is kwargs["enable_thinking"] is expected
+    assert ChatCompletionRequest(messages=messages).chat_template_kwargs is None
+
+
+@pytest.mark.parametrize("ids", [["unknown"], ["c1", "c1"]])
+def test_reject_mismatched_tool_results(ids):
+    messages = [
+        {"role": "user", "content": "lookup"},
+        {"role": "assistant", "tool_calls": [tool_call("c1"), tool_call("c2")]},
+        *[{"role": "tool", "tool_call_id": i, "content": "value"} for i in ids],
+    ]
+    with pytest.raises(ValueError, match="tool_call_id"):
+        render(messages)
+
+
+def test_anthropic_parallel_tool_result_with_image():
+    from vllm.entrypoints.anthropic.protocol import AnthropicMessagesRequest
+    from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
+
+    request = AnthropicMessagesRequest.model_validate(
+        {
+            "model": "ds",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": "look up both"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": i, "name": i, "input": {}}
+                        for i in ("first", "second")
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "second",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "url",
+                                        "url": "https://example.org/a.png",
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "first",
+                            "content": "failed",
+                            "is_error": True,
+                        },
+                    ],
+                },
+            ],
+        }
+    )
+    chat = AnthropicServingMessages.to_chat_completion_request(request)
+    prompt = render(chat.messages)
+    assert IMAGE_PLACEHOLDER in prompt and "failed" in prompt
+
+
+def test_responses_tool_result_after_history_expansion():
+    from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+    from vllm.entrypoints.openai.responses.utils import construct_input_messages
+
+    history = [
+        {"role": "user", "content": "lookup"},
+        {"type": "function_call", "call_id": "c1", "name": "lookup", "arguments": "{}"},
+    ]
+    for result_id in ("c1", "other"):
+        result = {
+            "type": "function_call_output",
+            "call_id": result_id,
+            "output": "value",
+        }
+        request = ResponsesRequest.model_validate(
+            {"model": "ds", "input": [*history, result]}
+        )
+        messages = construct_input_messages(request_input=request.input)
+        if result_id == "c1":
+            assert "<tool_result>value</tool_result>" in render(messages)
+        else:
+            with pytest.raises(ValueError, match="tool_call_id"):
+                render(messages)
