@@ -105,56 +105,6 @@ diff --git a/vllm/entrypoints/openai/responses/api_router.py b/vllm/entrypoints/
          return JSONResponse(content=body)
  
      return StreamingResponse(
-diff --git a/vllm/entrypoints/openai/responses/protocol.py b/vllm/entrypoints/openai/responses/protocol.py
---- a/vllm/entrypoints/openai/responses/protocol.py
-+++ b/vllm/entrypoints/openai/responses/protocol.py
-@@ -153,20 +153,16 @@
-         new_part = part
-         if isinstance(part, dict) and part.get("type") == "input_image":
-             ref = part.get("image_url")
--            # Accept the Chat wrapper, but leave conflicting options invalid.
--            if (
--                isinstance(ref, dict)
--                and set(ref) <= {"url", "detail"}
--                and isinstance(ref.get("url"), str)
--                and (
--                    "detail" not in part
--                    or "detail" not in ref
-+            if isinstance(ref, dict) and set(ref) <= {"url", "detail"}:
-+                # Accept the Chat image-url wrapper without changing image data
-+                # or transport. Conflicting/unknown options remain invalid.
-+                if isinstance(ref.get("url"), str) and (
-+                    "detail" not in part or "detail" not in ref
-                     or part["detail"] == ref["detail"]
--                )
--            ):
--                new_part = {**part, "image_url": ref["url"]}
--                if "detail" in ref:
--                    new_part["detail"] = ref["detail"]
-+                ):
-+                    new_part = {**part, "image_url": ref["url"]}
-+                    if "detail" in ref:
-+                        new_part["detail"] = ref["detail"]
-             if "detail" not in new_part:
-                 new_part = {**new_part, "detail": "auto"}
-             changed |= new_part is not part
-@@ -682,13 +678,9 @@
-             # their SDK validation and explicit discriminators take precedence.
-             if "type" not in item and item.get("role") == "assistant":
-                 parts = item.get("content")
--                if (
--                    isinstance(parts, list)
--                    and parts
--                    and all(
--                        isinstance(p, dict) and p.get("type") == "output_text"
--                        for p in parts
--                    )
-+                if isinstance(parts, list) and parts and all(
-+                    isinstance(p, dict) and p.get("type") == "output_text"
-+                    for p in parts
-                 ):
-                     item = {**item, "type": "message"}
-                     item_type = "message"
 diff --git a/vllm/entrypoints/anthropic/api_router.py b/vllm/entrypoints/anthropic/api_router.py
 --- a/vllm/entrypoints/anthropic/api_router.py
 +++ b/vllm/entrypoints/anthropic/api_router.py

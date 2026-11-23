@@ -30,15 +30,15 @@
 | 图片输入 | P、D 均加载视觉模块，推理端不配置额外的每请求图片张数上限。图片尺寸、总上下文和显存仍受模型与引擎约束。 |
 | 分词缓存 | 每台模型主机共享一个 16 GiB 池，每个 API 进程另有 128 MiB 私有 L1（每个 P 实例 4 个 API 进程，每个 D 实例 1 个）。两个 P 实例共用 P 主机的池；D1 和 D2 各有自己的池。D 复用 P 返回的 prompt IDs。运行时 `VLLM_GLM53_TOKENIZER_CACHE_GIB` 在 P 为 2、D 为 16，共享池上限均为 16。 |
 | Router | P 为 `cache_aware`，D 为 `round_robin`；开启 prompt ID 复用和 P 单 token 完成交接。32 GiB 内存上限、禁用 Swap，CPU 核数沿用宿主机；客户端访问 `ROUTER_BASE_URL`，推理请求无需客户端 key；Router 到 P/D 使用内部 API key。 |
-| Mooncake | P→D 使用 RDMA；Store 异步查询与读回，启用紧凑 KV 及旧检查点回收（仅 P）。Master 在 D1，淘汰高水位为 98%；L3 按需写盘，Store 使用 LRU。 |
+| Mooncake | P→D 使用 RDMA；Store 异步查询与读回，启用紧凑 KV 及旧检查点回收（仅 P）。Master 在 D1，淘汰高水位为 95%；L3 按需写盘，Store 使用 LRU。 |
 
 ## 构建镜像
 
-Linux x86_64 构建机，在本分支根目录执行。两种构建产出同一套应用镜像。FlashInfer 主包为 0.7.1（含调优键补丁）；B12X 取 `1658f0bf` 的源码，只补入 B12X 和其私有锁模块，并使用本仓库的 NVFP4 读取补丁。Mooncake SDK、Master、Store 来自同一份 `71973589` 源码和配套补丁；Router 使用仓库内的 `1099991` 源码快照。
+Linux x86_64 构建机，在本分支根目录执行。两种构建产出同一套应用镜像。FlashInfer 主包为 0.7.1（含调优键补丁）；B12X 取 `1658f0bf` 的源码，只补入 B12X 和其私有锁模块，并使用本仓库的 NVFP4 读取补丁。Mooncake SDK、Master、Store 来自同一份 `71973589` 源码和配套补丁；Router 使用仓库内的 GLM 1103 配套源码快照。
 
 ### 基于已有的 vLLM 基镜像
 
-基镜像为 `local/glm53flash-1103:source-67ca8f23`；构建时覆盖与现场镜像一致的 KV、MTP、Mooncake connector 和调度观测模块。此命令同时从源码构建 Router 和 Mooncake。已有配套 Router、Mooncake 镜像时，子命令 `overlay` 只构建引擎。
+基镜像为 `local/glm53flash-1103:source-67ca8f23`；构建时叠加 NVFP4 KV、MTP、Mooncake connector、调度观测及 API 兼容模块。此命令同时从源码构建 Router 和 Mooncake。已有配套 Router、Mooncake 镜像时，子命令 `overlay` 只构建引擎。
 
 ~~~bash
 mkdir -p /data/build/glm53flash-1p2d
@@ -48,7 +48,7 @@ BUILD_PARENT=/data/build/glm53flash-1p2d BUILD_JOBS=8 \
 
 ### 从源码构建
 
-两种构建方式都会用 `runtime-production.sha256` 校验覆盖后的文件，覆盖层与 82–84 的 `compat-78159a469b9a` 运行文件逐字节一致。仓库中的 Python 源码保留格式和类型检查；构建时恢复部署快照的字节内容。1P2D 使用随仓库提供的 Router 源码，PD 模块对应 `responses-tools-ecee97b77d8e`。
+两种构建方式均校验 vLLM 源码和覆盖层的文件哈希；Router 使用随本仓库提供的源码快照并独立校验。GLM-5.3-Flash 保持原厂始终思考行为，原生档位为 low、high、max。Responses 流式终态与实际生成状态一致。新版引擎镜像包含 Chat 工具终态和流式计量修复；此标签为构建目标，线上版本以实际容器为准。
 
 Buildx 先构建 FlashInfer 和 Mooncake wheel，编译 vLLM CUDA/Rust 基底（SM120），再应用同一份 NVFP4 KV 覆盖层；Router 使用 Cargo 锁定依赖编译。基础 CUDA/PyTorch 镜像和系统依赖由构建机获取。`GLM_BUILDER` 可指定已有 Buildx builder，`GLM_BUILD_PROXY` 可传入依赖下载代理。
 
@@ -60,20 +60,22 @@ BUILD_PARENT=/data/build/glm53flash-1p2d BUILD_JOBS=8 \
 
 | 用途 | 默认镜像 |
 | --- | --- |
-| P 和 D | `local/glm53flash-nvfp4kv:compat-78159a469b9a` |
+| P 和 D | `local/glm53flash-nvfp4kv:compat-api-v7-20261124` |
 | Mooncake Master 和 Store | `local/glm53flash-mooncake:source-71973589` |
-| Router | `router:glm53flash-responses-tools-ecee97b77d8e` |
+| Router | `router:glm53flash-api-v7-20261124` |
 
 ~~~bash
 # 构建机
 set -o pipefail
-docker save local/glm53flash-nvfp4kv:compat-78159a469b9a \
-  local/glm53flash-mooncake:source-71973589 router:glm53flash-responses-tools-ecee97b77d8e \
+docker save local/glm53flash-nvfp4kv:compat-api-v7-20261124 \
+  local/glm53flash-mooncake:source-71973589 router:glm53flash-api-v7-20261124 \
   | zstd -T4 -3 -o glm53flash-1p2d-images.tar.zst
 
 # P / D1 / D2 导入镜像包
 zstd -dc glm53flash-1p2d-images.tar.zst | sudo docker load
 ~~~
+
+单张内联图片默认上限为 4 MiB（4,194,304 字节，按 Base64 解码后的图片大小计算）。超限 JPEG/PNG 在选路前压缩到上限内，P/D 使用同一份字节；无法压到上限或超限格式不受支持时返回 HTTP 400。上限可通过 `VLLM_ROUTER_GLM_INLINE_IMAGE_MAX_BYTES` 调整。纯文本、外链和上限内的图片原样转发。外链由 vLLM 按后端网络和媒体域名配置获取。Chat 的视频块使用 `video_url`，Responses 使用 `input_video`，Messages 及其 token 计数接口使用 `video`。内联视频由 Router 在选路前处理一次；P 和 D 收到相同内容。远端 URL 由引擎按媒体访问策略读取。当前模型每个 prompt 最多一段视频；验收的是画面输入，转码输出不含音轨。
 
 ## 启动服务
 
@@ -98,6 +100,7 @@ P1_HTTP_PORT=18493; P1_BOOTSTRAP_PORT=19093; P1_DP_RPC_PORT=19650
 D1_HTTP_PORT=18483; D1_BOOTSTRAP_PORT=19083; D1_DP_RPC_PORT=19550
 D2_HTTP_PORT=18483; D2_BOOTSTRAP_PORT=19083; D2_DP_RPC_PORT=19550
 ROUTER_PORT=18300; ROUTER_METRICS_PORT=18301
+ROUTER_REQUEST_TIMEOUT_SECS=3600
 MASTER_RPC_PORT=61241; MASTER_METADATA_PORT=61242; MASTER_METRICS_PORT=61243
 STORE_RPC_PORT=61244; STORE_HEALTH_PORT=61245
 
@@ -157,11 +160,11 @@ test -n "$INTERNAL_API_KEY"
 MODEL_NAME=glm-5.3-flash
 here="$PWD/integrations/glm53flash/1p2d"
 
-P_IMAGE="${ENGINE_IMAGE:-local/glm53flash-nvfp4kv:compat-78159a469b9a}"
+P_IMAGE="${ENGINE_IMAGE:-local/glm53flash-nvfp4kv:compat-api-v7-20261124}"
 D_IMAGE="$P_IMAGE"
 MASTER_IMAGE="${MOONCAKE_IMAGE:-local/glm53flash-mooncake:source-71973589}"
 STORE_IMAGE="$MASTER_IMAGE"
-ROUTER_IMAGE="${ROUTER_IMAGE:-router:glm53flash-responses-tools-ecee97b77d8e}"
+ROUTER_IMAGE="${ROUTER_IMAGE:-router:glm53flash-api-v7-20261124}"
 ~~~
 
 ### 2. Mooncake Master · D1
@@ -182,7 +185,7 @@ docker run -d --pull=never --restart unless-stopped --name "$SERVICE_PREFIX-mast
   --entrypoint mooncake_master "$MASTER_IMAGE" \
   --rpc_port="$MASTER_RPC_PORT" --enable_http_metadata_server=true \
   --http_metadata_server_host="$MASTER_METADATA_BIND_HOST" --http_metadata_server_port="$MASTER_METADATA_PORT" \
-  --metrics_port="$MASTER_METRICS_PORT" --eviction_high_watermark_ratio=0.98 \
+  --metrics_port="$MASTER_METRICS_PORT" --eviction_high_watermark_ratio=0.95 \
   --enable_offload=true --offload_on_evict=true \
   --allocation_strategy=local_first --logtostderr=true
 
@@ -432,7 +435,11 @@ for port in "$P0_BOOTSTRAP_PORT" "$P1_BOOTSTRAP_PORT"; do
 done
 ~~~
 
-在 P 启动 Router。推理入口使用 `ROUTER_BASE_URL`，指标端口为 `ROUTER_METRICS_PORT`。
+在 P 启动 Router。推理入口使用 `ROUTER_BASE_URL`，指标端口为 `ROUTER_METRICS_PORT`。`ROUTER_REQUEST_TIMEOUT_SECS` 默认 3600 秒，限制 Router 到任一上游的单次 HTTP 调用，包含响应体读取。
+
+内网无鉴权是本部署的默认策略。需要客户端鉴权时，把 `ROUTER_CLIENT_VALIDATION_URLS` 设为可信身份服务的 HTTPS 校验地址（多个用逗号分隔），与 P/D 的内部 key 独立。客户端使用 `Authorization: Bearer <CLIENT_KEY>`；校验服务对有效 key 返回 200，对无效、过期或已撤销的 key 返回 401/403。Router 逐请求核验；没有有效凭证返回 401，身份服务不可用返回 503。启用后，模型列表、健康检查与推理请求均使用有效客户端凭证。
+
+已有部署调整此值时，排空在途请求后用新参数重建 Router 容器，沿用原 IP、端口和镜像；`docker restart` 沿用旧参数。vLLM、Mooncake 和 KV 缓存保持原样。
 
 ~~~bash
 docker run -d --pull=never --name "$SERVICE_PREFIX-router" \
@@ -442,6 +449,7 @@ docker run -d --pull=never --name "$SERVICE_PREFIX-router" \
   --log-driver local --log-opt max-size=128m --log-opt max-file=5 \
   -e OPENAI_API_KEY="$INTERNAL_API_KEY" -e NVIDIA_VISIBLE_DEVICES=void \
   -e NO_PROXY='*' -e no_proxy='*' \
+  -e API_KEY_VALIDATION_URLS="${ROUTER_CLIENT_VALIDATION_URLS:-}" -e VLLM_ROUTER_GLM_INLINE_IMAGE_MAX_BYTES \
   -e VLLM_ROUTER_PD_REUSE_PROMPT_IDS=1 \
   -e VLLM_ROUTER_PD_PREFILL_FORCE_LENGTH_CAP=1 \
   --entrypoint /usr/local/bin/vllm-router "$ROUTER_IMAGE" \
@@ -453,21 +461,38 @@ docker run -d --pull=never --name "$SERVICE_PREFIX-router" \
   --prefill-policy cache_aware --decode-policy round_robin \
   --max-tree-size 2147483648 --eviction-interval 120 --max-concurrent-requests 4096 \
   --disable-retries --log-level warn \
-  --request-timeout-secs 600 --worker-startup-timeout-secs 7200
+  --request-timeout-secs "$ROUTER_REQUEST_TIMEOUT_SECS" --worker-startup-timeout-secs 7200
 ~~~
 
 ### 验收 · P
 
 ~~~bash
 curl -fsS "$MASTER_METRICS_URL" | grep '^master_total_capacity_bytes '
-curl -fsS "$ROUTER_URL/v1/models"
-curl -fsS "$ROUTER_URL/workers" |
+router_headers=()
+if [[ -n ${ROUTER_CLIENT_VALIDATION_URLS:-} ]]; then
+  router_headers=(-H "Authorization: Bearer ${ROUTER_CLIENT_API_KEY:?填写健康检查凭证}")
+fi
+curl -fsS "${router_headers[@]}" "$ROUTER_URL/v1/models"
+curl -fsS "${router_headers[@]}" "$ROUTER_URL/workers" |
   python3 -c 'import json,sys; w=json.load(sys.stdin)["workers"]; print(sum(x["is_healthy"] for x in w), "/", len(w))'
 ~~~
 
 默认 L2 总量为 2200 GiB，Router 为 24/24 路健康。
 
 推理请求直接向 Router 的 `/v1/chat/completions` 发送，模型填写 `glm-5.3-flash`。模型列表从 Router 的 `/v1/models` 获取，入口沿用推理请求的认证配置。Responses 的图片支持 URL 字符串和带 url 的对象；未指定 detail 时为 auto。
+
+### 接口与验收范围
+
+| 项目 | 当前结论 |
+| --- | --- |
+| 三协议核心功能 | 线上已验证 Chat、Responses、Messages 的 JSON/SSE、完整历史多轮、JSON Schema、内联 PNG、单工具调用和工具结果回填。未知模型返回 404，典型非法输入返回 400；Responses 输出预算用完发送 `response.incomplete`。Messages token 计数已通过。 |
+| Chat 工具和计量 | GLM Chat 同时返回 `reasoning_content` 与兼容字段 `reasoning`，内容相同。新版引擎的 CPU 回归覆盖实际工具调用以 `finish_reason=tool_calls` 正常结束、预算截断仍为 `length`，以及最终 usage 只发一块；上线后复跑真实请求。账单按每个请求的最终累计 usage 记一次。 |
+| 参数、工具及异常边界 | 待验收温度、top_p、惩罚项和 logit_bias 的默认值、上下界及实际效果，停止串范围，非法 Schema 及其流式组合，并行/禁用工具与错误/乱序 ID，实际权限、限流及客户端断开取消。CPU 回归已验证可选鉴权按请求检查（无效或撤销返回 401，身份服务不可用返回 503），以及 Responses 的 completed、incomplete 和 failed 流式终态。 |
+| 多模态及复杂历史 | 内联图片、多轮图和超过 4 MiB 的 Responses 样本已验证；CPU 已验证 HTTP URL 图片解码、损坏图片拒绝及三协议视频输入；多图、更多格式尺寸及复杂历史的覆盖范围以实测记录为准。视频端到端画面理解须用新镜像实际推理复验；CPU 的协议转换和媒体预处理验收与模型回答质量分别记录。Responses 不存储会话，续聊使用完整历史。 |
+| Token 与缓存 | 线上已验证三协议缓存字段和 L2 跨 P 读回；三台 L3 隔离池 NVMe 冷读逐字节一致。GLM 原厂同版本的逐项 Token 对照、长前缀命中率、4 小时缓存 TTL 和生产请求实际 L3 命中待取证。 |
+| 超时、性能及交付 | 1P2D 部署默认 Router 上游单次 HTTP 调用总超时为 3600 秒，包含响应体读取。持续出流不会重置计时。网关和客户端超时需配齐；1 小时端到端长任务未验收。正式分长度 TTFT/TPOT、效果评测使用 GLM 自身基线；额度和技术支持按交付约定另验。 |
+
+本部署保留模型原生思考，不支持联网搜索。DeepSeek 规范仅用于对照验收方法；未经实测的项目不计通过。
 
 ## 服务重启后的检查
 
@@ -501,12 +526,15 @@ curl -fsS -N "${ROUTER_BASE_URL%/}/chat/completions" \
   "messages": [{"role": "user", "content": "请用三句话介绍前缀缓存。"}],
   "reasoning_effort": "max",
   "max_tokens": 4096,
-  "stream": true
+  "stream": true,
+  "stream_options": {"include_usage": true}
 }
 JSON
 ~~~
 
 流正常结束时返回 `data: [DONE]`；整包 JSON 使用 `"stream": false`。经 SSH 转发时，`ROUTER_BASE_URL` 填 `http://127.0.0.1:<LOCAL_FORWARD_PORT>/v1`。
+
+收到实际工具调用且生成正常结束时，流式和非流式 Chat 都返回 `finish_reason=tool_calls`；输出上限导致的截断仍返回 `length`。流式 Chat 的最终计量位于 `[DONE]` 前 `choices: []` 的 usage 块。仅在 `stream_options` 同时启用 `include_usage` 与 `continuous_usage_stats` 时才发过程累计值；过程值供展示，账单采用最终块。
 
 图片请求使用同一接口。将消息的 `content` 改成数组，其中问题用 `text`，每张图用一个 `image_url`，例如：
 

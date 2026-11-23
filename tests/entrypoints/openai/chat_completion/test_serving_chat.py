@@ -139,8 +139,10 @@ def gptoss_speculative_server(default_server_args: list[str]):
     )
     server_args = default_server_args + [
         "--speculative-config",
-        f'{{"model": "{GPT_OSS_SPECULATOR_NAME}", '
-        f'"method": "eagle3", "num_speculative_tokens": 3}}',
+        (
+            f'{{"model": "{GPT_OSS_SPECULATOR_NAME}", '
+            f'"method": "eagle3", "num_speculative_tokens": 3}}'
+        ),
         f"--attention-backend={attention_backend}",
     ]
     # gpt-oss requires AITER unified attention on ROCm
@@ -879,7 +881,9 @@ async def test_chat_streaming_metrics_ride_on_usage_chunk():
         ({"include_usage": True}, False, True, False),
         ({"include_usage": True, "continuous_usage_stats": True}, False, True, True),
         ({"include_usage": False, "continuous_usage_stats": True}, False, False, False),
-        (None, True, True, True),
+        (None, True, True, False),
+        ({"include_usage": True}, True, True, False),
+        ({"include_usage": True, "continuous_usage_stats": True}, True, True, True),
     ],
 )
 async def test_streaming_reasoning_usage_counts_across_deltas(

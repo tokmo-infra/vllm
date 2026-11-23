@@ -1,6 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 //! HTTP router implementations
 
 pub mod dp_utils;
+mod glm_media;
 pub mod logprobs_merge;
 pub mod openai_router;
 pub mod pd_router;

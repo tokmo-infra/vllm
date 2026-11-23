@@ -6,9 +6,9 @@ mode=${1:-source}
 jobs=${BUILD_JOBS:-8}
 work=$(mktemp -d "${BUILD_PARENT:-/tmp}/glm53-1p2d.XXXXXXXX")
 base=${ENGINE_BASE_IMAGE:-local/glm53flash-1103:source-67ca8f23}
-engine=${ENGINE_IMAGE:-local/glm53flash-nvfp4kv:compat-78159a469b9a}
+engine=${ENGINE_IMAGE:-local/glm53flash-nvfp4kv:compat-api-v7-20261124}
 mc=${MOONCAKE_IMAGE:-local/glm53flash-mooncake:source-71973589}
-router=${ROUTER_IMAGE:-router:glm53flash-responses-tools-ecee97b77d8e}
+router=${ROUTER_IMAGE:-router:glm53flash-api-v7-20261124}
 fi_repo=https://github.com/flashinfer-ai/flashinfer.git
 pin_dir="$root/tools/glm_nvfp4kv"
 patchdir="$root/integrations/glm53flash/patches"
@@ -40,7 +40,6 @@ if [[ "$mode" != overlay ]]; then
   cp -a "$here/../router" "$work/router"
   (
     cd "$work/router"
-    patch --batch --fuzz=0 -p1 < "$here/router-production.patch"
     sha256sum -c "$here/router-production.sha256" >/dev/null
   )
   "${build[@]}" -f "$here/Dockerfile.router" --build-context "router_src=$work/router" \

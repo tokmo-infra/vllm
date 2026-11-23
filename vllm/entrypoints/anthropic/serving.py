@@ -34,6 +34,7 @@ from vllm.entrypoints.anthropic.protocol import (
     AnthropicTool,
     AnthropicToolChangeDefinition,
     AnthropicUsage,
+    AnthropicVideoBlock,
 )
 from vllm.entrypoints.generate.base.protocol import (
     JsonSchemaResponseFormat,
@@ -487,6 +488,8 @@ class AnthropicServingMessages(OpenAIServingChat):
         elif block.type == "image" and block.source:
             image_url = cls._convert_image_source_to_url(block.source)
             content_parts.append({"type": "image_url", "image_url": {"url": image_url}})
+        elif isinstance(block, AnthropicVideoBlock):
+            content_parts.append(block.to_chat_part())
         elif block.type == "thinking" and block.thinking is not None:
             reasoning_parts.append(block.thinking)
         elif block.type == "redacted_thinking":
@@ -538,9 +541,9 @@ class AnthropicServingMessages(OpenAIServingChat):
     def _convert_user_tool_result(
         cls, block, openai_messages: list[dict[str, Any]]
     ) -> None:
-        """Convert user tool_result with text and image support."""
+        """Emit tool text followed by its ordered visual inputs."""
         tool_text = ""
-        tool_image_urls: list[str] = []
+        tool_media: list[dict[str, Any]] = []
         tool_reference: list[dict[str, Any]] = []
 
         if isinstance(block.content, str):
@@ -557,7 +560,13 @@ class AnthropicServingMessages(OpenAIServingChat):
                     source = item.get("source", {})
                     url = cls._convert_image_source_to_url(source)
                     if url:
-                        tool_image_urls.append(url)
+                        tool_media.append(
+                            {"type": "image_url", "image_url": {"url": url}}
+                        )
+                elif item_type in ("video", "input_video", "video_url"):
+                    tool_media.append(
+                        AnthropicVideoBlock.model_validate(item).to_chat_part()
+                    )
                 elif item_type == "tool_reference":
                     ref_name = item.get("tool_name") or item.get("name")
                     if ref_name:
@@ -574,16 +583,8 @@ class AnthropicServingMessages(OpenAIServingChat):
             }
         )
 
-        if tool_image_urls:
-            openai_messages.append(
-                {
-                    "role": "user",
-                    "content": [  # type: ignore[dict-item]
-                        {"type": "image_url", "image_url": {"url": img}}
-                        for img in tool_image_urls
-                    ],
-                }
-            )
+        if tool_media:
+            openai_messages.append({"role": "user", "content": tool_media})
 
         if tool_reference:
             openai_messages.append(

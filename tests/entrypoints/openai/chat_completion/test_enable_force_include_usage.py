@@ -52,18 +52,11 @@ async def test_chat_with_enable_force_include_usage(
         temperature=0.0,
         stream=True,
     )
-    last_completion_tokens = 0
+    usage = []
     async for chunk in stream:
-        assert chunk.usage.prompt_tokens >= 0
-        assert (
-            last_completion_tokens == 0
-            or chunk.usage.completion_tokens > last_completion_tokens
-            or (
-                not chunk.choices
-                and chunk.usage.completion_tokens == last_completion_tokens
-            )
-        )
-        assert chunk.usage.total_tokens == (
-            chunk.usage.prompt_tokens + chunk.usage.completion_tokens
-        )
-        last_completion_tokens = chunk.usage.completion_tokens
+        if chunk.usage is not None:
+            assert not chunk.choices
+            usage.append(chunk.usage)
+    assert len(usage) == 1
+    assert usage[0].completion_tokens == 10
+    assert usage[0].total_tokens == usage[0].prompt_tokens + usage[0].completion_tokens

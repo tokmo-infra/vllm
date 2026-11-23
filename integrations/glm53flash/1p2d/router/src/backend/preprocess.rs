@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 //! Chat+tokenize for gRPC workers: **only** `vllm-chat` + `vllm-tokenizer`.
 //!
 //! There is no HuggingFace/minijinja fallback. If those crates are not
@@ -436,7 +439,8 @@ fn user_content_text(content: &UserMessageContent) -> Result<String> {
                     crate::protocols::spec::ContentPart::Text { text: part } => {
                         text.push_str(part);
                     }
-                    crate::protocols::spec::ContentPart::ImageUrl { .. } => {
+                    crate::protocols::spec::ContentPart::ImageUrl { .. }
+                    | crate::protocols::spec::ContentPart::VideoUrl { .. } => {
                         return Err(anyhow!(
                             "multimodal chat is not supported by the token_ids-only gRPC path"
                         ));

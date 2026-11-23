@@ -10,8 +10,10 @@ ENV CARGO_INCREMENTAL=0
 RUN cargo build --release --locked --bin vllm-router -j "$BUILD_JOBS"
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 libgcc-s1 libstdc++6 && apt-get clean
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 libgcc-s1 libstdc++6 ffmpeg && apt-get clean
 COPY --from=build /src/target/release/vllm-router /usr/local/bin/vllm-router
-RUN ldd /usr/local/bin/vllm-router > /tmp/router-ldd.txt && ! grep -F 'not found' /tmp/router-ldd.txt \
+RUN ffmpeg -hide_banner -version >/dev/null && ffprobe -hide_banner -version >/dev/null \
+ && ffmpeg -hide_banner -encoders 2>/dev/null | grep -qw libx264 \
+ && ldd /usr/local/bin/vllm-router > /tmp/router-ldd.txt && ! grep -F 'not found' /tmp/router-ldd.txt \
  && /usr/local/bin/vllm-router --version
 ENTRYPOINT ["/usr/local/bin/vllm-router"]

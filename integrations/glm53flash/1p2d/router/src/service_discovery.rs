@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 use crate::routers::RouterTrait;
 
 use futures::{StreamExt, TryStreamExt};
@@ -601,7 +604,7 @@ mod tests {
             )),
             router_manager: None, // Test doesn't need router manager
             response_storage: Arc::new(crate::data_connector::MemoryResponseStorage::new()),
-            api_key_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            auth_client: reqwest::Client::new(),
             api_key_validation_urls: Arc::new(Vec::new()),
         });
 

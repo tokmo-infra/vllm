@@ -16,6 +16,8 @@ from openai.types.responses import (
     ResponseContentPartDoneEvent,
     ResponseCustomToolCallInputDeltaEvent,
     ResponseCustomToolCallInputDoneEvent,
+    ResponseError,
+    ResponseErrorEvent,
     ResponseFunctionToolCall,
     ResponseInputItemParam,
     ResponseMcpCallArgumentsDeltaEvent,
@@ -40,16 +42,27 @@ from openai.types.responses import (
     ResponseCompletedEvent as OpenAIResponseCompletedEvent,
 )
 from openai.types.responses import ResponseCreatedEvent as OpenAIResponseCreatedEvent
+from openai.types.responses import ResponseFailedEvent as OpenAIResponseFailedEvent
+from openai.types.responses import (
+    ResponseIncompleteEvent as OpenAIResponseIncompleteEvent,
+)
 from openai.types.responses import (
     ResponseInProgressEvent as OpenAIResponseInProgressEvent,
 )
 from openai.types.responses.response import IncompleteDetails, ToolChoice
+from openai.types.responses.response_input_content_param import (
+    ResponseInputContentParam,
+)
 from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from openai_harmony import Message as OpenAIHarmonyMessage
 from pydantic import (
+    BaseModel,
     BeforeValidator,
+    ConfigDict,
+    Discriminator,
     Field,
+    Tag,
     ValidationError,
     field_serializer,
     model_validator,
@@ -61,6 +74,8 @@ from vllm.entrypoints.generate.base.protocol import (
     PerRequestMetrics,
     StopParam,
     TopLogprobsParam,
+    VideoInputURL,
+    contains_video_part,
     resolve_return_mm_kwargs_alias,
     validate_cache_salt,
 )
@@ -135,7 +150,51 @@ class ResponseRawMessageAndToken(OpenAIBaseModel):
 ResponseInputOutputMessage: TypeAlias = (
     list[ChatCompletionMessageParam] | list[ResponseRawMessageAndToken]
 )
-ResponseInputOutputItem: TypeAlias = ResponseInputItemParam | ResponseOutputItem
+
+
+class ResponseInputVideo(BaseModel):
+    """vLLM extension for video input, also accepting the Chat URL wrapper."""
+
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["input_video", "video_url"]
+    video_url: VideoInputURL
+
+    @model_validator(mode="before")
+    @classmethod
+    def unwrap_video_url(cls, value):
+        if isinstance(value, dict):
+            ref = value.get("video_url")
+            if isinstance(ref, dict) and set(ref) == {"url"}:
+                return {**value, "video_url": ref["url"]}
+        return value
+
+
+class ResponseVideoInputMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    role: Literal["user"]
+    type: Literal["message"] = "message"
+    id: str | None = None
+    status: Literal["in_progress", "completed", "incomplete"] | None = None
+    content: list[
+        Annotated[
+            ResponseInputContentParam | ResponseInputVideo, Field(discriminator="type")
+        ]
+    ]
+
+
+def _input_item_kind(item: Any) -> str:
+    if isinstance(item, ResponseVideoInputMessage):
+        return "video_message"
+    if isinstance(item, dict) and contains_video_part(item.get("content")):
+        return "video_message"
+    return "sdk"
+
+
+ResponseInputOutputItem: TypeAlias = Annotated[
+    Annotated[ResponseInputItemParam | ResponseOutputItem, Tag("sdk")]
+    | Annotated[ResponseVideoInputMessage, Tag("video_message")],
+    Discriminator(_input_item_kind),
+]
 
 
 def _default_input_image_details(value: Any) -> Any:
@@ -654,6 +713,15 @@ class ResponsesRequest(OpenAIBaseModel):
         """
         if not isinstance(data, dict):
             return data
+        previous = data.get("previous_input_messages")
+        if isinstance(previous, list) and any(
+            isinstance(m, dict) and contains_video_part(m.get("content"))
+            for m in previous
+        ):
+            raise VLLMValidationError(
+                "Replay videos in input, not previous_input_messages",
+                parameter="previous_input_messages",
+            )
         input_data = data.get("input")
 
         # Early return for None, strings, or bytes
@@ -675,6 +743,13 @@ class ResponsesRequest(OpenAIBaseModel):
                 continue
 
             item_type = item.get("type")
+            if item_type in (
+                "function_call_output",
+                "custom_tool_call_output",
+            ) and contains_video_part(item.get("output")):
+                raise VLLMValidationError(
+                    "Video input must be in a user message", parameter="input"
+                )
 
             # Explicit history from stateless clients may omit the outer
             # message discriminator but retain assistant output_text parts.
@@ -826,7 +901,9 @@ class ResponsesRequest(OpenAIBaseModel):
 class ResponsesResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"resp_{random_uuid()}")
     created_at: int = Field(default_factory=lambda: int(time.time()))
-    # error: Optional[ResponseError] = None
+    error: ResponseError | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     incomplete_details: IncompleteDetails | None = None
     instructions: str | None = None
     metadata: Metadata | None = None
@@ -981,6 +1058,14 @@ class ResponseCompletedEvent(OpenAIResponseCompletedEvent):
     response: ResponsesResponse  # type: ignore[override]
 
 
+class ResponseIncompleteEvent(OpenAIResponseIncompleteEvent):
+    response: ResponsesResponse  # type: ignore[override]
+
+
+class ResponseFailedEvent(OpenAIResponseFailedEvent):
+    response: ResponsesResponse  # type: ignore[override]
+
+
 class ResponseCreatedEvent(OpenAIResponseCreatedEvent):
     response: ResponsesResponse  # type: ignore[override]
 
@@ -993,6 +1078,9 @@ StreamingResponsesResponse: TypeAlias = (
     ResponseCreatedEvent
     | ResponseInProgressEvent
     | ResponseCompletedEvent
+    | ResponseIncompleteEvent
+    | ResponseFailedEvent
+    | ResponseErrorEvent
     | ResponseOutputItemAddedEvent
     | ResponseOutputItemDoneEvent
     | ResponseContentPartAddedEvent

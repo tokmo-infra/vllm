@@ -3,13 +3,16 @@
 """Pydantic models for Anthropic API protocol."""
 
 import time
+from collections.abc import Sequence
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 import vllm.envs as envs
 from vllm.entrypoints.generate.base.protocol import (
     MMPayload,
+    VideoInputURL,
+    contains_video_part,
     resolve_return_mm_kwargs_alias,
 )
 
@@ -82,7 +85,52 @@ class AnthropicContentBlock(BaseModel):
         return self
 
 
-def _reject_tool_changes(content: str | list[AnthropicContentBlock] | None) -> None:
+class VideoURLSource(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["url"]
+    url: VideoInputURL
+
+
+class VideoBase64Source(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["base64"]
+    media_type: str = Field(pattern=r"^video/[\w.+-]+$")
+    data: str = Field(min_length=1)
+
+
+class AnthropicVideoBlock(BaseModel):
+    """Input-only vLLM extension; the video bytes are decoded by MediaConnector."""
+
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["video"]
+    source: Annotated[VideoURLSource | VideoBase64Source, Field(discriminator="type")]
+
+    def to_chat_part(self) -> dict[str, Any]:
+        source = self.source
+        url = (
+            source.url
+            if isinstance(source, VideoURLSource)
+            else f"data:{source.media_type};base64,{source.data}"
+        )
+        return {"type": "video_url", "video_url": {"url": url}}
+
+
+AnthropicInputBlock = AnthropicContentBlock | AnthropicVideoBlock
+
+
+def _check_video_role(
+    role: str, content: str | Sequence[AnthropicInputBlock] | None
+) -> None:
+    if role == "user" or content is None or isinstance(content, str):
+        return
+    for block in content:
+        if isinstance(block, AnthropicVideoBlock) or (
+            block.type == "tool_result" and contains_video_part(block.content)
+        ):
+            raise ValueError("Video input is only supported in user messages")
+
+
+def _reject_tool_changes(content: str | Sequence[AnthropicInputBlock] | None) -> None:
     if content is None or isinstance(content, str):
         return
     for block in content:
@@ -96,10 +144,11 @@ class AnthropicMessage(BaseModel):
     """Message structure."""
 
     role: Literal["user", "assistant", "system"]
-    content: str | list[AnthropicContentBlock]
+    content: str | list[AnthropicInputBlock]
 
     @model_validator(mode="after")
     def validate_tool_change_role(self) -> "AnthropicMessage":
+        _check_video_role(self.role, self.content)
         if self.role != "system":
             _reject_tool_changes(self.content)
         return self
@@ -315,6 +364,7 @@ class AnthropicMessagesRequest(BaseModel):
     @field_validator("system")
     @classmethod
     def validate_system(cls, v):
+        _check_video_role("system", v)
         _reject_tool_changes(v)
         return v
 
@@ -440,6 +490,7 @@ class AnthropicCountTokensRequest(BaseModel):
     @field_validator("system")
     @classmethod
     def validate_system(cls, v):
+        _check_video_role("system", v)
         _reject_tool_changes(v)
         return v
 

@@ -11,6 +11,8 @@ from typing import Any, Final, cast
 
 from fastapi import Request
 from openai.types.responses import (
+    ResponseError,
+    ResponseErrorEvent,
     ResponseOutputItem,
     ResponseOutputItemDoneEvent,
     ResponseOutputMessage,
@@ -18,7 +20,6 @@ from openai.types.responses import (
     ResponseStatus,
 )
 from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
-from pydantic import TypeAdapter
 
 from vllm import envs
 from vllm.config.utils import replace
@@ -45,6 +46,8 @@ from vllm.entrypoints.openai.responses.protocol import (
     OutputTokensDetails,
     ResponseCompletedEvent,
     ResponseCreatedEvent,
+    ResponseFailedEvent,
+    ResponseIncompleteEvent,
     ResponseInProgressEvent,
     ResponseInputOutputItem,
     ResponseInputOutputMessage,
@@ -192,7 +195,7 @@ class OpenAIServingResponses(GenerateBaseServing):
         # FIXME: If enable_store=True, this may cause a memory leak since we
         # never remove events from the store.
         self.event_store: dict[
-            str, tuple[deque[StreamingResponsesResponse], asyncio.Event]
+            str, tuple[deque[StreamingResponsesResponse], asyncio.Event, asyncio.Event]
         ] = {}
 
         self.background_tasks: dict[str, asyncio.Task] = {}
@@ -1078,13 +1081,15 @@ class OpenAIServingResponses(GenerateBaseServing):
     ):
         event_deque: deque[StreamingResponsesResponse] = deque()
         new_event_signal = asyncio.Event()
-        self.event_store[request.request_id] = (event_deque, new_event_signal)
+        finished = asyncio.Event()
+        self.event_store[request.request_id] = (event_deque, new_event_signal, finished)
         generator = self.responses_stream_generator(request, *args, **kwargs)
         try:
             async for event in generator:
                 event_deque.append(event)
                 new_event_signal.set()  # Signal new event available
         finally:
+            finished.set()
             new_event_signal.set()
 
     async def _run_background_request(
@@ -1116,7 +1121,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 value=response_id,
             )
 
-        event_deque, new_event_signal = self.event_store[response_id]
+        event_deque, new_event_signal, finished = self.event_store[response_id]
         start_index = 0 if starting_after is None else starting_after + 1
         current_index = start_index
 
@@ -1127,10 +1132,17 @@ class OpenAIServingResponses(GenerateBaseServing):
             while current_index < len(event_deque):
                 event = event_deque[current_index]
                 yield event
-                if getattr(event, "type", "unknown") == "response.completed":
+                if event.type in (
+                    "response.completed",
+                    "response.incomplete",
+                    "response.failed",
+                    "error",
+                ):
                     return
                 current_index += 1
 
+            if finished.is_set():
+                return
             await new_event_signal.wait()
 
     async def retrieve_responses(
@@ -1366,7 +1378,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 output=[],
                 status="in_progress",
                 usage=None,
-            ).model_dump(mode="json", by_alias=True)
+            )
             yield _increment_sequence_number_and_return(
                 ResponseCreatedEvent(
                     type="response.created",
@@ -1395,10 +1407,17 @@ class OpenAIServingResponses(GenerateBaseServing):
                     _increment_sequence_number_and_return,
                 ):
                     yield event_data
-            except GenerationError as e:
-                error_json = self._convert_generation_error_to_streaming_response(e)
+            except GenerationError:
+                failed = initial_response.model_copy(
+                    update={
+                        "status": "failed",
+                        "error": ResponseError(
+                            code="server_error", message="Generation failed."
+                        ),
+                    }
+                )
                 yield _increment_sequence_number_and_return(
-                    TypeAdapter(StreamingResponsesResponse).validate_json(error_json)
+                    self._terminal_stream_event(failed)
                 )
                 return
 
@@ -1418,10 +1437,40 @@ class OpenAIServingResponses(GenerateBaseServing):
                 request_metadata,
                 created_time=created_time,
             )
-            yield _increment_sequence_number_and_return(
-                ResponseCompletedEvent(
-                    type="response.completed",
+            if isinstance(final_response, ErrorResponse):
+                event = ResponseErrorEvent(
+                    type="error",
                     sequence_number=-1,
-                    response=final_response,
+                    code="generation_error",
+                    message="Generation did not complete.",
+                    param=None,
                 )
-            )
+            else:
+                event = self._terminal_stream_event(final_response)
+            yield _increment_sequence_number_and_return(event)
+
+    @staticmethod
+    def _terminal_stream_event(
+        response: ResponsesResponse,
+    ) -> StreamingResponsesResponse:
+        match response.status:
+            case "completed":
+                return ResponseCompletedEvent(
+                    type="response.completed", sequence_number=-1, response=response
+                )
+            case "incomplete":
+                return ResponseIncompleteEvent(
+                    type="response.incomplete", sequence_number=-1, response=response
+                )
+            case "failed":
+                return ResponseFailedEvent(
+                    type="response.failed", sequence_number=-1, response=response
+                )
+            case _:
+                return ResponseErrorEvent(
+                    type="error",
+                    sequence_number=-1,
+                    code=f"response_{response.status}",
+                    message="Generation did not complete.",
+                    param=None,
+                )

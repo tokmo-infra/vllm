@@ -39,7 +39,11 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionToolsParam,
 )
-from vllm.entrypoints.openai.responses.protocol import ResponseInputOutputItem
+from vllm.entrypoints.openai.responses.protocol import (
+    ResponseInputOutputItem,
+    ResponseInputVideo,
+    ResponseVideoInputMessage,
+)
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.renderers.chat_utils import make_tool_call_id
@@ -318,6 +322,17 @@ def _construct_message_from_response_item(
     prev_assistant_msg = (
         prev_msg if prev_msg and prev_msg.get("role") == "assistant" else None
     )
+
+    if isinstance(item, ResponseVideoInputMessage):
+        return {
+            "role": "user",
+            "content": [
+                {"type": "video_url", "video_url": {"url": part.video_url}}
+                if isinstance(part, ResponseInputVideo)
+                else part
+                for part in item.content
+            ],
+        }  # type: ignore[return-value]
 
     tool_call: ChatCompletionMessageToolCallParam | None = None
     if isinstance(item, ResponseFunctionToolCall):

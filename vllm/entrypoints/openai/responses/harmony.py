@@ -38,6 +38,7 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
 from vllm.entrypoints.openai.responses.protocol import (
     ResponseInputOutputItem,
     ResponsesRequest,
+    ResponseVideoInputMessage,
 )
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
@@ -157,6 +158,10 @@ def response_input_to_harmony(
     Returns None for reasoning items with empty or absent content so
     the caller can skip them.
     """
+    if isinstance(response_msg, ResponseVideoInputMessage):
+        raise VLLMValidationError(
+            "Harmony does not support video input", parameter="input"
+        )
     if not isinstance(response_msg, dict):
         response_msg = response_msg.model_dump()
     if "type" not in response_msg or response_msg["type"] == "message":

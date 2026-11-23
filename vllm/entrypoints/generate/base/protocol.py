@@ -35,6 +35,23 @@ TopLogprobsParam: TypeAlias = Annotated[
 
 MMPayload: TypeAlias = Literal["tensors", "none"]
 
+# Input extensions for Responses and Messages. Keep the original URL/bytes;
+# the existing media connector enforces access rules and decodes the video.
+VideoInputURL: TypeAlias = Annotated[
+    str,
+    Field(pattern=r"^(?:https?://[^/\s]+|file:///.|data:video/[\w.+-]+;base64,\S)"),
+]
+
+
+def contains_video_part(content: Any) -> bool:
+    """Inspect a content list without looking inside text or tool arguments."""
+    return isinstance(content, list) and any(
+        isinstance(part, dict)
+        and part.get("type") in ("video", "input_video", "video_url")
+        for part in content
+    )
+
+
 _CACHE_SALT_FORBIDDEN_CHARS = frozenset("@/\\\x00")
 _MAX_CACHE_SALT_LENGTH = 128
 

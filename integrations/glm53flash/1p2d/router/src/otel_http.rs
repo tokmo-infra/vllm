@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 use axum::http::HeaderMap;
 use tracing::{field::Empty, info_span, Instrument, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -62,6 +65,9 @@ pub fn prepare_client_request(
     incoming_headers: Option<&HeaderMap>,
     options: ClientRequestOptions<'_>,
 ) -> PreparedClientRequest {
+    if let Some(id) = incoming_headers.and_then(|headers| headers.get("x-router-request-id")) {
+        request = request.header("x-router-request-id", id);
+    }
     let span = if crate::otel_trace::is_otel_enabled() {
         let span = info_span!(
             target: "otel_trace",

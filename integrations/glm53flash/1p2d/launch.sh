@@ -13,14 +13,15 @@ if [[ "$phase" == model || "$phase" == router || "$phase" == health ]]; then
   API_KEY=$(cat -- "$KEY_FILE")
   test -n "$API_KEY"
 fi
-export P_IMAGE="${ENGINE_IMAGE:-local/glm53flash-nvfp4kv:compat-78159a469b9a}" D_IMAGE="${ENGINE_IMAGE:-local/glm53flash-nvfp4kv:compat-78159a469b9a}"
+export P_IMAGE="${ENGINE_IMAGE:-local/glm53flash-nvfp4kv:compat-api-v7-20261124}" D_IMAGE="${ENGINE_IMAGE:-local/glm53flash-nvfp4kv:compat-api-v7-20261124}"
 export MASTER_IMAGE="${MOONCAKE_IMAGE:-local/glm53flash-mooncake:source-71973589}"
 export STORE_IMAGE="$MASTER_IMAGE"
-export ROUTER_IMAGE="${ROUTER_IMAGE:-router:glm53flash-responses-tools-ecee97b77d8e}"
+export ROUTER_IMAGE="${ROUTER_IMAGE:-router:glm53flash-api-v7-20261124}"
 export NODE_ID
 export NODE_IP="${NODE_IP:-11.8.0.$NODE_ID}"
 export MASTER_IP="${MASTER_IP:-11.8.0.83}"
 export ROUTER_IP="${ROUTER_IP:-11.8.0.82}"
+ROUTER_REQUEST_TIMEOUT_SECS="${ROUTER_REQUEST_TIMEOUT_SECS:-3600}"
 export P_IP="${P_IP:-11.8.0.82}"
 export D1_IP="${D1_IP:-11.8.0.83}" D2_IP="${D2_IP:-11.8.0.84}"
 export P_HOSTS="$P_IP"
@@ -107,7 +108,7 @@ if [ "$NODE_IP" = "$MASTER_IP" ]; then
     --entrypoint mooncake_master "$MASTER_IMAGE" \
     --rpc_port=61241 --enable_http_metadata_server=true \
     --http_metadata_server_host=0.0.0.0 --http_metadata_server_port=61242 \
-    --metrics_port=61243 --eviction_high_watermark_ratio=0.98 \
+    --metrics_port=61243 --eviction_high_watermark_ratio=0.95 \
     --enable_offload=true --offload_on_evict=true \
     --allocation_strategy=local_first --logtostderr=true
 fi
@@ -301,6 +302,7 @@ if [ "$NODE_IP" = "$ROUTER_IP" ]; then
     --log-driver local --log-opt max-size=128m --log-opt max-file=5 \
     -e OPENAI_API_KEY="$API_KEY" -e NVIDIA_VISIBLE_DEVICES=void \
     -e NO_PROXY='*' -e no_proxy='*' \
+    -e API_KEY_VALIDATION_URLS="${ROUTER_CLIENT_VALIDATION_URLS:-}" -e VLLM_ROUTER_GLM_INLINE_IMAGE_MAX_BYTES \
     -e VLLM_ROUTER_PD_REUSE_PROMPT_IDS=1 \
     -e VLLM_ROUTER_PD_PREFILL_FORCE_LENGTH_CAP=1 \
     --entrypoint /usr/local/bin/vllm-router "$ROUTER_IMAGE" \
@@ -311,7 +313,7 @@ if [ "$NODE_IP" = "$ROUTER_IP" ]; then
     --prefill-policy cache_aware --decode-policy round_robin \
     --max-tree-size 2147483648 --eviction-interval 120 --max-concurrent-requests 4096 \
     --disable-retries --log-level warn \
-    --request-timeout-secs 600 --worker-startup-timeout-secs 7200
+    --request-timeout-secs "$ROUTER_REQUEST_TIMEOUT_SECS" --worker-startup-timeout-secs 7200
 fi
 
 ;;
@@ -353,7 +355,11 @@ done
 for ip in $D_HOSTS; do
   check_model "http://$ip:18483" 8 32 1024 128 FULL_DECODE_ONLY
 done
-curl -fsS "http://$ROUTER_IP:18300/workers" |
+router_headers=()
+if [[ -n ${ROUTER_CLIENT_VALIDATION_URLS:-} ]]; then
+  router_headers=(-H "Authorization: Bearer ${ROUTER_CLIENT_API_KEY:?set a valid client key for health checks}")
+fi
+curl -fsS "${router_headers[@]}" "http://$ROUTER_IP:18300/workers" |
   python3 -c '
 import json, sys
 w = json.load(sys.stdin)["workers"]
