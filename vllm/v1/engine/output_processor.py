@@ -205,6 +205,7 @@ class RequestState:
         temperature: float | None = None,
         stream_input: bool = False,
         remote_prefill_cached_tokens: int | None = None,
+        remote_prefill_cache_creation_tokens: int | None = None,
     ):
         self.request_id = request_id
         self.external_req_id = external_req_id
@@ -232,6 +233,7 @@ class RequestState:
         self.num_cached_tokens = 0
         self.num_cache_creation_tokens = 0
         self.remote_prefill_cached_tokens = remote_prefill_cached_tokens
+        self.remote_prefill_cache_creation_tokens = remote_prefill_cache_creation_tokens
         # Per-sequence spec-decode accumulator; arrives once (on finish) via
         # EngineCoreOutput, then attached to this sequence's CompletionOutput.
         self.spec_decode_metrics: RequestSpecDecodeMetrics | None = None
@@ -286,6 +288,7 @@ class RequestState:
         stream_interval: int,
     ) -> "RequestState":
         remote_prefill_cached_tokens = None
+        remote_prefill_cache_creation_tokens = None
         if sampling_params := request.sampling_params:
             # In a remote prefill scenario, report cached tokens
             # as cache hit rate on the remote P worker.
@@ -297,6 +300,11 @@ class RequestState:
                     cached = kv_transfer_params.get("remote_prefill_cached_tokens")
                     if isinstance(cached, int):
                         remote_prefill_cached_tokens = cached
+                    created = kv_transfer_params.get(
+                        "remote_prefill_cache_creation_tokens"
+                    )
+                    if type(created) is int and created >= 0:
+                        remote_prefill_cache_creation_tokens = created
             if not sampling_params.detokenize:
                 tokenizer = None
             output_kind = sampling_params.output_kind
@@ -348,6 +356,7 @@ class RequestState:
             stream_interval=stream_interval,
             stream_input=request.resumable,
             remote_prefill_cached_tokens=remote_prefill_cached_tokens,
+            remote_prefill_cache_creation_tokens=remote_prefill_cache_creation_tokens,
         )
         if state.stats is not None and sampling_params is not None:
             state.stats.is_watermarked = bool(sampling_params.watermarking)
@@ -800,6 +809,10 @@ class OutputProcessor:
                     )
                 if req_state.remote_prefill_cached_tokens is not None:
                     req_state.num_cached_tokens = req_state.remote_prefill_cached_tokens
+                if req_state.remote_prefill_cache_creation_tokens is not None:
+                    req_state.num_cache_creation_tokens = (
+                        req_state.remote_prefill_cache_creation_tokens
+                    )
                 req_state.is_prefilling = False
 
             if engine_core_output.spec_decode_metrics is not None:

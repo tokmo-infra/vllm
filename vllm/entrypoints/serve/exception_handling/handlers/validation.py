@@ -192,4 +192,8 @@ async def validation_exception_handler(req: Request, exc: RequestValidationError
             param=param,
         )
     )
+    if req.url.path.rstrip("/") in ("/v1/messages", "/v1/messages/count_tokens"):
+        from vllm.entrypoints.anthropic.api_router import translate_error_response
+
+        return translate_error_response(err)
     return JSONResponse(err.model_dump(), status_code=HTTPStatus.BAD_REQUEST)

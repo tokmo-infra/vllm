@@ -591,3 +591,23 @@ def test_text_piece_cache_clears_an_idle_api_on_epoch_change(tmp_path):
         )
     finally:
         cache.close()
+
+
+@pytest.mark.parametrize("result_ids", [["absent"], ["call_0", "call_0"], ["lookup:0"]])
+def test_k31_rejects_unmatched_tool_results(result_ids):
+    renderer = _make_renderer(StubTokenizer([1]), model_type="kimi_k31")
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }
+            ],
+        },
+        *({"role": "tool", "tool_call_id": i, "content": "result"} for i in result_ids),
+    ]
+    with pytest.raises(VLLMValidationError, match="tool result ID"):
+        renderer.render_messages(messages, ChatParams())

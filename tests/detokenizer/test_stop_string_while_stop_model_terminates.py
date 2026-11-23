@@ -46,6 +46,18 @@ def _make_request(stop, include_stop_str_in_output: bool, min_tokens: int = 0):
     return req
 
 
+@pytest.mark.parametrize("split", [0, 4, 6, 7, 8, 9])
+def test_stop_only_in_output_channel(split):
+    request = _make_request(["END", ">A"], False)
+    request.sampling_params.stop_after_token_ids = list(map(ord, "<R>"))
+    detok = _DummyDetokenizer(request)
+    tokens = list(map(ord, "END!<R>AENDtrailing"))
+    assert detok.update(tokens[:split], False) is None
+    assert detok.update(tokens[split:], False) == "END"
+    assert detok.output_text == "END!<R>A"
+    assert detok.output_token_ids == tokens[:11]
+
+
 def test_stop_string_while_stop_token_terminates(include_stop_str_in_output: bool):
     """This test verifies that the detokenizer correctly handles the case where
     the generated token sequence contains both:

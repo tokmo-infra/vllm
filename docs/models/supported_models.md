@@ -657,6 +657,14 @@ These models primarily accept the [`LLM.generate`](./generative_models.md#llmgen
 | `UnlimitedOCRForCausalLM` | Unlimited-OCR | T + I<sup>+</sup> | `baidu/Unlimited-OCR`, etc. | ✅︎ | ✅︎ |
 | `UnlimitedOCRForCausalLM` | Unlimited-OCR-2 | T + I<sup>+</sup> | `baidu/Unlimited-OCR-2` | | |
 
+Kimi K3.1 serving uses a default output budget of 131072 tokens and accepts
+`low`, `high`, and `max` reasoning effort (default `max`). Its Chat API
+requires temperature 1, top-p 0.95, one choice and zero frequency and
+presence penalties. Chat responses expose `reasoning_content` and
+`prompt_tokens_details.cache_write_tokens`, including in streamed usage.
+K3.1 applies user-supplied stop strings after the visible response channel
+opens. A match in the reasoning channel leaves generation running.
+
 Unlimited-OCR-2's optional page-count guard respects sampling constraints, preserving EOS
 when it is the only remaining permitted token.
 

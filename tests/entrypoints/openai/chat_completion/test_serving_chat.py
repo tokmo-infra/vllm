@@ -647,6 +647,7 @@ def _build_minimal_metrics_serving_chat(
     enable_force_include_usage: bool = False,
 ) -> OpenAIServingChat:
     serving = OpenAIServingChat.__new__(OpenAIServingChat)
+    serving.is_kimi_k31 = False
     serving.response_role = "assistant"
     serving.parser_cls = None
     serving.enable_auto_tools = False

@@ -45,6 +45,11 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 from vllm.entrypoints.openai.chat_completion.stream_processor import (
     ChatStreamProcessor,
 )
+from vllm.entrypoints.openai.kimi_k31 import (
+    K31_DEFAULT_OUTPUT_TOKENS,
+    K31_SAMPLING,
+    validate_k31_request,
+)
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.engine.protocol import (
     CompletionTokenUsageInfo,
@@ -187,6 +192,14 @@ class OpenAIServingChat(GenerateBaseServing):
             if mc.generation_config not in ("auto", "vllm")
             else getattr(mc, "override_generation_config", {}).get("max_new_tokens")
         )
+        self.is_kimi_k31 = mc.hf_config.model_type == "kimi_k31"
+        if self.is_kimi_k31:
+            self.default_sampling_params = {
+                **self.default_sampling_params,
+                **K31_SAMPLING,
+                "max_tokens": K31_DEFAULT_OUTPUT_TOKENS,
+            }
+
         # NOTE(woosuk): While OpenAI's chat completion API supports browsing
         # for some models, currently vLLM doesn't support it. Please use the
         # Responses API instead.
@@ -282,6 +295,19 @@ class OpenAIServingChat(GenerateBaseServing):
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)
             return error_check_ret
+
+        if self.is_kimi_k31:
+            try:
+                validate_k31_request(request, request.reasoning_effort)
+                if request.tool_choice is not None and not isinstance(
+                    request.tool_choice, str
+                ):
+                    raise VLLMValidationError(
+                        "Kimi K3.1 supports auto, none and required tool_choice",
+                        parameter="tool_choice",
+                    )
+            except VLLMValidationError as exc:
+                return self.create_error_response(exc)
 
         self._preflight(request.n or 1)
 
@@ -381,6 +407,10 @@ class OpenAIServingChat(GenerateBaseServing):
                     max_tokens,
                     self.default_sampling_params,
                 )
+                if self.is_kimi_k31 and request.stop:
+                    sampling_params.stop_after_token_ids = tokenizer.encode(
+                        "<|open|>response<|sep|>", add_special_tokens=False
+                    )
 
             self._log_inputs(
                 sub_request_id,
@@ -509,7 +539,9 @@ class OpenAIServingChat(GenerateBaseServing):
                     data = chunk.model_dump_json()
                 else:
                     data = chunk.model_dump_json(
-                        exclude_unset=True, exclude_none=not chunk.choices
+                        context="kimi_k31" if self.is_kimi_k31 else None,
+                        exclude_unset=True,
+                        exclude_none=not chunk.choices,
                     )
                 yield f"data: {data}\n\n"
         except Exception as e:

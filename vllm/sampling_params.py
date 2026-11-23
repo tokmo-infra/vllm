@@ -451,6 +451,9 @@ class SamplingParams(
     """If provided, forces the engine to emit this predetermined sequence of
     token IDs during decoding instead of sampling randomly. Real logprobs are
     still computed. Conflict checking is performed at the engine level."""
+    stop_after_token_ids: list[int] | None = None
+    """Internal output-channel marker. When set, match stop strings only after
+    this token sequence has been generated."""
 
     @staticmethod
     def from_optional(

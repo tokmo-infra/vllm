@@ -22,10 +22,13 @@ from vllm.entrypoints.serve.exception_handling.handlers.validation import (
 )
 
 
-def _fake_request(log_error_stack: bool = False) -> SimpleNamespace:
+def _fake_request(
+    log_error_stack: bool = False, path: str = "/v1/chat/completions"
+) -> SimpleNamespace:
     """Minimal stand-in for a FastAPI Request - just enough for the
     handler to read req.app.state.args.log_error_stack."""
     return SimpleNamespace(
+        url=SimpleNamespace(path=path),
         app=SimpleNamespace(
             state=SimpleNamespace(args=SimpleNamespace(log_error_stack=log_error_stack))
         ),
@@ -269,3 +272,17 @@ class TestValidationErrorBodyIsBounded:
 
         assert "'loc': 'body.input.0.content'" in message
         assert "EasyInputMessageParam" not in message
+
+
+@pytest.mark.parametrize("path", ["/v1/messages", "/v1/messages/count_tokens"])
+@pytest.mark.asyncio
+async def test_messages_validation_uses_native_error(path):
+    exc = RequestValidationError(
+        [{"loc": ("body", "messages"), "msg": "expected list"}]
+    )
+    response = await validation_exception_handler(_fake_request(path=path), exc)
+    assert response.status_code == 400
+    payload = json.loads(response.body)
+    assert payload["type"] == "error"
+    assert payload["error"]["type"] == "invalid_request_error"
+    assert "messages" in payload["error"]["message"]

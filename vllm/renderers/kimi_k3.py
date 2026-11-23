@@ -84,6 +84,8 @@ def _apply_k3_thinking_kwargs(
 
 def _normalize_k3_tool_messages(
     conversation: list[ConversationMessage],
+    *,
+    strict_tool_ids: bool = False,
 ) -> list[dict[str, Any]]:
     """Reorder tool-result messages to match assistant tool_call order.
 
@@ -99,6 +101,10 @@ def _normalize_k3_tool_messages(
 
     while i < len(conversation):
         message = conversation[i]
+        if strict_tool_ids and message.get("role") == "tool":
+            raise VLLMValidationError(
+                "Tool result has no preceding tool call", parameter="tool_call_id"
+            )
         normalized.append(dict(message))
         i += 1
 
@@ -122,8 +128,16 @@ def _normalize_k3_tool_messages(
             call_target = (position, name)
             aliases = [f"{name}:{position}"]
             if tool_call_id := tool_call.get("id"):
-                aliases.insert(0, str(tool_call_id))
+                aliases = (
+                    [str(tool_call_id)]
+                    if strict_tool_ids
+                    else [str(tool_call_id), *aliases]
+                )
             for alias in aliases:
+                if strict_tool_ids and alias in targets_by_id:
+                    raise VLLMValidationError(
+                        "Duplicate assistant tool call ID", parameter="tool_call_id"
+                    )
                 targets_by_id.setdefault(alias, call_target)
 
         # Collect consecutive tool messages.
@@ -135,6 +149,7 @@ def _normalize_k3_tool_messages(
 
         # Try to resolve every tool message in the block.
         resolved: list[tuple[int, int, dict[str, Any]]] = []
+        matched: set[int] = set()
         for order, tool_message in enumerate(conversation[block_start:i]):
             tool_call_id = tool_message.get("tool_call_id")
             resolved_target = (
@@ -142,11 +157,18 @@ def _normalize_k3_tool_messages(
                 if tool_call_id is not None
                 else None
             )
+            if strict_tool_ids and (
+                resolved_target is None or resolved_target[0] in matched
+            ):
+                raise VLLMValidationError(
+                    "Unknown or duplicate tool result ID", parameter="tool_call_id"
+                )
             if resolved_target is None:
                 normalized.extend(dict(item) for item in conversation[block_start:i])
                 break
 
             position, name = resolved_target
+            matched.add(position)
             enriched = dict(tool_message)
             enriched["tool"] = name
             enriched["index"] = position + 1
@@ -215,6 +237,8 @@ class KimiK3Renderer(BaseRenderer[HfTokenizer]):
         # re-tokenization of the rendered string downstream.
         kwargs = params.get_apply_chat_template_kwargs()
         _apply_k3_thinking_kwargs(kwargs, self._thinking_efforts)
+        if self.model_config.hf_config.model_type == "kimi_k31":
+            kwargs.setdefault("thinking_effort", "max")
         if params.tool_choice not in (None, "auto"):
             kwargs["tool_choice"] = _dump_k3_template_value(params.tool_choice)
         if params.response_format is not None:
@@ -237,7 +261,10 @@ class KimiK3Renderer(BaseRenderer[HfTokenizer]):
             mm_processor_kwargs=params.mm_processor_kwargs,
         )
 
-        rendered_conversation = _normalize_k3_tool_messages(conversation)
+        rendered_conversation = _normalize_k3_tool_messages(
+            conversation,
+            strict_tool_ids=self.model_config.hf_config.model_type == "kimi_k31",
+        )
         prompt = parse_dec_only_prompt(
             self._apply_chat_template(rendered_conversation, params)
         )
@@ -263,7 +290,10 @@ class KimiK3Renderer(BaseRenderer[HfTokenizer]):
             mm_processor_kwargs=params.mm_processor_kwargs,
         )
 
-        rendered_conversation = _normalize_k3_tool_messages(conversation)
+        rendered_conversation = _normalize_k3_tool_messages(
+            conversation,
+            strict_tool_ids=self.model_config.hf_config.model_type == "kimi_k31",
+        )
         token_ids = await self._apply_chat_template_async(rendered_conversation, params)
         prompt = parse_dec_only_prompt(token_ids)
         if mm_data is not None:

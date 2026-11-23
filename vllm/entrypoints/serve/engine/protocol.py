@@ -10,6 +10,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    model_serializer,
     model_validator,
 )
 
@@ -126,6 +127,13 @@ class PromptTokenUsageInfo(OpenAIBaseModel):
     (e.g. `image`, `audio`, `video`). A breakdown of the multimodal
     placeholder tokens already counted in `prompt_tokens`; `None` when the
     request has no multimodal input."""
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler, info):
+        data = handler(self)
+        if info.context == "kimi_k31" and "created_cache_tokens" in data:
+            data["cache_write_tokens"] = data.pop("created_cache_tokens")
+        return data
 
 
 class CompletionTokenUsageInfo(OpenAIBaseModel):

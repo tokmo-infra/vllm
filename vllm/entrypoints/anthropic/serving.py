@@ -133,6 +133,7 @@ def _to_anthropic_stop_reason(
     stop_reason: int | str | None,
     tool_used: bool,
     tool_complete: bool,
+    kimi_k31: bool = False,
 ) -> tuple[
     Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"] | None,
     str | None,
@@ -154,7 +155,7 @@ def _to_anthropic_stop_reason(
     # vLLM reports the matched stop string in stop_reason (a str);
     # an int stop-token-id or None (natural EOS) is not a stop sequence.
     if isinstance(stop_reason, str):
-        return "stop_sequence", stop_reason
+        return ("end_turn" if kimi_k31 else "stop_sequence"), stop_reason
     if finish_reason == "tool_calls" or tool_used:
         return "tool_use", None
     return "end_turn", None
@@ -909,6 +910,18 @@ class AnthropicServingMessages(OpenAIServingChat):
         """
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("Received messages request %s", request.model_dump_json())
+        if (
+            self.is_kimi_k31
+            and request.thinking
+            and request.thinking.type
+            in (
+                "disabled",
+                "between_tools",
+            )
+        ):
+            return self.create_error_response(
+                "Kimi K3.1 always reasons", param="thinking"
+            )
         disabled_thinking_effort = (
             await self.disabled_thinking_effort_resolver.resolve_for(request)
         )
@@ -925,7 +938,7 @@ class AnthropicServingMessages(OpenAIServingChat):
             return generator
 
         elif isinstance(generator, ChatCompletionResponse):
-            return self.messages_full_converter(generator)
+            return self.messages_full_converter(generator, kimi_k31=self.is_kimi_k31)
 
         return generator
 
@@ -933,12 +946,15 @@ class AnthropicServingMessages(OpenAIServingChat):
         self, *args: Any, **kwargs: Any
     ) -> AsyncGenerator[str, None]:
         return self.message_stream_converter(
-            self.chat_completion_stream_generator_raw(*args, **kwargs)
+            self.chat_completion_stream_generator_raw(*args, **kwargs),
+            kimi_k31=self.is_kimi_k31,
         )
 
     def messages_full_converter(
         self,
         generator: ChatCompletionResponse,
+        *,
+        kimi_k31: bool = False,
     ) -> AnthropicMessagesResponse:
         result = AnthropicMessagesResponse(
             id=generator.id,
@@ -955,6 +971,7 @@ class AnthropicServingMessages(OpenAIServingChat):
             tool_used=bool(choice.message.tool_calls),
             # Their arguments are json-decoded below, so parsed calls are complete.
             tool_complete=bool(choice.message.tool_calls),
+            kimi_k31=kimi_k31,
         )
 
         content: list[AnthropicContentBlock] = []
@@ -996,6 +1013,8 @@ class AnthropicServingMessages(OpenAIServingChat):
     async def message_stream_converter(
         self,
         generator: AsyncGenerator[ChatCompletionStreamResponse | ErrorResponse, None],
+        *,
+        kimi_k31: bool = False,
     ) -> AsyncGenerator[str, None]:
         try:
 
@@ -1141,6 +1160,7 @@ class AnthropicServingMessages(OpenAIServingChat):
                             finish_reason or "stop",
                             stop_sequence,
                             tool_used=tool_used,
+                            kimi_k31=kimi_k31,
                             tool_complete=(
                                 tool_used and _is_json("".join(last_tool_args))
                             ),
@@ -1330,6 +1350,18 @@ class AnthropicServingMessages(OpenAIServingChat):
         raw_request: Request | None = None,
     ) -> AnthropicCountTokensResponse | ErrorResponse:
         """Implements Anthropic's messages.count_tokens endpoint."""
+        if (
+            self.is_kimi_k31
+            and request.thinking
+            and request.thinking.type
+            in (
+                "disabled",
+                "between_tools",
+            )
+        ):
+            return self.create_error_response(
+                "Kimi K3.1 always reasons", param="thinking"
+            )
         disabled_thinking_effort = (
             await self.disabled_thinking_effort_resolver.resolve_for(request)
         )

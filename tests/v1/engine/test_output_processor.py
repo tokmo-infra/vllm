@@ -258,6 +258,7 @@ def test_remote_prefill_cached_tokens_override(do_remote_prefill: bool):
     kv_transfer_params = {
         "do_remote_prefill": do_remote_prefill,
         "remote_prefill_cached_tokens": 5,
+        "remote_prefill_cache_creation_tokens": 2,
     }
     request = EngineCoreRequest(
         request_id="request-0-int",
@@ -294,8 +295,10 @@ def test_remote_prefill_cached_tokens_override(do_remote_prefill: bool):
     request_output = processed.request_outputs[0]
     if do_remote_prefill:
         assert request_output.num_cached_tokens == 5
+        assert request_output.num_cache_creation_tokens == 2
     else:
         assert request_output.num_cached_tokens == len(prompt_tokens) - 1
+        assert request_output.num_cache_creation_tokens == 0
 
 
 def test_request_stream_interval_raises_but_not_below_engine_default(

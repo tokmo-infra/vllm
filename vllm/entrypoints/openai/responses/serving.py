@@ -32,6 +32,11 @@ from vllm.entrypoints.generate.base.serving import (
     build_per_request_timing_metrics,
 )
 from vllm.entrypoints.mcp.tool_server import ToolServer
+from vllm.entrypoints.openai.kimi_k31 import (
+    K31_DEFAULT_OUTPUT_TOKENS,
+    K31_SAMPLING,
+    validate_k31_request,
+)
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.responses.context import (
     ConversationContext,
@@ -158,6 +163,14 @@ class OpenAIServingResponses(GenerateBaseServing):
             if mc.generation_config not in ("auto", "vllm")
             else getattr(mc, "override_generation_config", {}).get("max_new_tokens")
         )
+
+        self.is_kimi_k31 = mc.hf_config.model_type == "kimi_k31"
+        if self.is_kimi_k31:
+            self.default_sampling_params = {
+                **self.default_sampling_params,
+                **K31_SAMPLING,
+                "max_tokens": K31_DEFAULT_OUTPUT_TOKENS,
+            }
 
         # If False (default), the "store" option is (silently) ignored and the
         # response is not stored. If True, the response is stored in memory.
@@ -336,6 +349,13 @@ class OpenAIServingResponses(GenerateBaseServing):
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)
             return error_check_ret
+        if self.is_kimi_k31:
+            try:
+                validate_k31_request(
+                    request, request.reasoning.effort if request.reasoning else None
+                )
+            except VLLMValidationError as exc:
+                return self.create_error_response(exc)
         maybe_validation_error = self._validate_create_responses_input(request)
         if maybe_validation_error is not None:
             return maybe_validation_error
@@ -440,6 +460,10 @@ class OpenAIServingResponses(GenerateBaseServing):
             sampling_params = request.to_sampling_params(
                 default_max_tokens, self.default_sampling_params
             )
+            if self.is_kimi_k31 and request.stop:
+                sampling_params.stop_after_token_ids = tokenizer.encode(
+                    "<|open|>response<|sep|>", add_special_tokens=False
+                )
 
             trace_headers = (
                 None

@@ -90,10 +90,12 @@ class ChatMessage(OpenAIBaseModel):
     reasoning: str | None = None
 
     @model_serializer(mode="wrap")
-    def _serialize(self, handler):
+    def _serialize(self, handler, info):
         data = handler(self)
         if len(data.get("tool_calls", [])) == 0:
             data.pop("tool_calls", None)
+        if info.context == "kimi_k31" and "reasoning" in data:
+            data["reasoning_content"] = data.pop("reasoning")
         return data
 
 

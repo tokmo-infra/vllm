@@ -82,6 +82,8 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
         else:
             self.stop = params.stop
         self.min_tokens = params.min_tokens
+        self._pending_stop_marker = params.stop_after_token_ids
+        self._stop_start_offset = 0
         self.include_stop_str_in_output = params.include_stop_str_in_output
 
         # Number of chars to hold back when stop strings are to be excluded
@@ -124,6 +126,15 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
             self.output_text += self.decode_next(new_token_id)
             if token_offsets is not None:
                 token_offsets.append(len(self.output_text))
+                marker = self._pending_stop_marker
+                if (
+                    marker
+                    and new_token_id == marker[-1]
+                    and self.num_output_tokens() >= len(marker)
+                    and self.token_ids[-len(marker) :] == marker
+                ):
+                    self._stop_start_offset = len(self.output_text)
+                    self._pending_stop_marker = None
 
         if skipped_stop_token_id is not None:
             # Cleanup after skipping detokenization.
@@ -133,7 +144,11 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
 
         # 2) Evaluate stop strings.
         stop_string = None
-        if token_offsets is not None and self.num_output_tokens() > self.min_tokens:
+        if (
+            token_offsets is not None
+            and not self._pending_stop_marker
+            and self.num_output_tokens() > self.min_tokens
+        ):
             # Support min_tokens, see https://github.com/vllm-project/vllm/pull/22014
             stop_check_offset = token_offsets[max(self.min_tokens - num_prev_tokens, 0)]
             stop = check_stop_strings(
@@ -141,6 +156,7 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
                 new_char_count=len(self.output_text) - stop_check_offset,
                 stop=self.stop,
                 include_in_output=self.include_stop_str_in_output,
+                start_offset=self._stop_start_offset,
             )
             if stop is not None:
                 stop_string, truncate_to = stop
@@ -327,6 +343,7 @@ def check_stop_strings(
     new_char_count: int,
     stop: list[str],
     include_in_output: bool,
+    start_offset: int = 0,
 ) -> tuple[str, int] | None:
     """Check if any stop strings are matched and truncate sequence
     output text accordingly.
@@ -352,7 +369,10 @@ def check_stop_strings(
     for stop_str in stop:
         stop_string_len = len(stop_str)
         # Avoid searching already-searched text.
-        stop_index = output_text.find(stop_str, 1 - new_char_count - stop_string_len)
+        begin = max(
+            start_offset, len(output_text) + 1 - new_char_count - stop_string_len
+        )
+        stop_index = output_text.find(stop_str, begin)
         if stop_index == -1:
             continue
 
