@@ -190,7 +190,10 @@ K3.1 Chat and Responses accept
 Responses also accepts the existing `30m` option. Chat and Messages pass
 through additional TTL strings, including `2h`. For Messages, use
 `cache_control={"type":"ephemeral","ttl":"1h"}`.
-To enforce Kimi cache lifetimes across prefill workers, configure a shared
+Without an explicit TTL, this deployment reuses retained prefixes until
+capacity eviction (LRU), even after five minutes of inactivity. Such requests
+do not read or renew timed leases. With an explicit TTL, the first write
+starts a separate logical lifetime. Configure a shared
 Redis namespace on the prefills with `VLLM_K31_CACHE_LEASE_NAMESPACE` and
 `VLLM_K31_CACHE_LEASE_URL_FILE`. The file contains a Redis connection URL.
 Use a deployment-specific namespace, TLS and a service credential. Install

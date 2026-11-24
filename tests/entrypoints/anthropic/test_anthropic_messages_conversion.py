@@ -1774,6 +1774,20 @@ def test_k31_messages_forwards_cache_ttl_to_chat(ttl):
     }
 
 
+@pytest.mark.parametrize("fields", [{}, {"cache_control": {"type": "ephemeral"}}])
+def test_k31_messages_without_ttl_use_capacity_cache(fields):
+    request = AnthropicMessagesRequest(
+        model="kimi-k3.1-pro",
+        max_tokens=32,
+        messages=[{"role": "user", "content": "hello"}],
+        **fields,
+    )
+    chat = _convert(request)
+    assert "k31_requested_cache_ttl" not in (
+        chat.to_sampling_params(32, {}).extra_args or {}
+    )
+
+
 def test_other_models_ignore_top_level_cache_control():
     payload = dict(
         max_tokens=32,

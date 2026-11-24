@@ -733,7 +733,10 @@ class AnthropicServingMessages(OpenAIServingChat):
             )
 
         extensions: dict[str, Any] = {}
-        if anthropic_request.cache_control is not None:
+        if (
+            anthropic_request.cache_control is not None
+            and "ttl" in anthropic_request.cache_control.model_fields_set
+        ):
             extensions["prompt_cache_options"] = {
                 "mode": "implicit",
                 "ttl": anthropic_request.cache_control.ttl,

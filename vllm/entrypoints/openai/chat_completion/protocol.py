@@ -788,13 +788,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
             prompt_logprobs = self.top_logprobs
 
         extra_args: dict[str, Any] = dict(self.vllm_xargs or {})
+        extra_args.pop("k31_requested_cache_ttl", None)
         if is_k31_model_name(self.model):
             options = (self.model_extra or {}).get("prompt_cache_options")
-            extra_args["k31_requested_cache_ttl"] = (
-                options.get("ttl", "5m") if isinstance(options, dict) else "5m"
-            )
-        else:
-            extra_args.pop("k31_requested_cache_ttl", None)
+            if isinstance(options, dict) and options.get("ttl") is not None:
+                extra_args["k31_requested_cache_ttl"] = options["ttl"]
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
