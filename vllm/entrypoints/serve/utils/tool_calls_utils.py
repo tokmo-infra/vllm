@@ -51,8 +51,10 @@ def resolve_finish_reason(
     not force a single named tool, for which OpenAI reports ``stop``.
     """
     finish_reason = engine_finish_reason or "stop"
-    forced_named_tool = request is not None and isinstance(
-        request.tool_choice, ChatCompletionNamedToolChoiceParam
+    forced_named_tool = (
+        request is not None
+        and not request._deepseek_chat
+        and isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam)
     )
     if tool_calls_made and finish_reason == "stop" and not forced_named_tool:
         return "tool_calls"

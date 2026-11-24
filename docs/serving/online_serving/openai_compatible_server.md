@@ -34,6 +34,10 @@ We currently support the following OpenAI APIs:
 - [Translation API](./speech_to_text.md#translations-api) (`/v1/audio/translations`)
     - Only applicable to [Automatic Speech Recognition (ASR) models](../../models/supported_models.md#transcription).
 
+### DeepSeek V4.1 Flash Chat Completions
+
+When serving `deepseek-v4.1-flash` or `deepseek-v4.1-flash-1017`, Chat Completions exposes reasoning under both `reasoning` and `reasoning_content`. Measured prompt cache hits and misses are available in `usage.prompt_cache_hit_tokens` and `usage.prompt_cache_miss_tokens`. Streaming returns usage alongside the final choice, including when `stream_options.include_usage` is false. The Chat output budget accepts 1 through 393216 tokens, subject to the available context window.
+
 ## Completions API
 
 In your terminal, you can [install](../../getting_started/installation/README.md) vLLM, then start the server with the [`vllm serve`](../../configuration/serve_args.md) command. (You can also use our [Docker](../../deployment/docker.md) image.)

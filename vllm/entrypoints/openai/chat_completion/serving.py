@@ -3,6 +3,7 @@
 
 import asyncio
 import itertools
+import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
@@ -26,6 +27,7 @@ from vllm.entrypoints.generate.base.serving import (
     clamp_prompt_logprobs,
     format_token_id_placeholder,
 )
+from vllm.entrypoints.openai.chat_completion import deepseek_v41
 from vllm.entrypoints.openai.chat_completion.message_assembly import (
     assemble_chat_message_fields,
 )
@@ -482,7 +484,7 @@ class OpenAIServingChat(GenerateBaseServing):
         mm_token_counts: dict[str, int] | None = None,
     ) -> AsyncGenerator[str, None]:
         try:
-            async for chunk in self.chat_completion_stream_generator_raw(
+            chunks = self.chat_completion_stream_generator_raw(
                 request,
                 result_generator,
                 request_id,
@@ -492,14 +494,19 @@ class OpenAIServingChat(GenerateBaseServing):
                 request_metadata,
                 chat_template_kwargs=chat_template_kwargs,
                 mm_token_counts=mm_token_counts,
-            ):
-                if isinstance(chunk, ErrorResponse):
-                    data = chunk.model_dump_json()
-                else:
-                    data = chunk.model_dump_json(
-                        exclude_unset=True, exclude_none=not chunk.choices
-                    )
-                yield f"data: {data}\n\n"
+            )
+            if request._deepseek_chat:
+                async for payload in deepseek_v41.stream_chunks(chunks, request):
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            else:
+                async for chunk in chunks:
+                    if isinstance(chunk, ErrorResponse):
+                        data = chunk.model_dump_json()
+                    else:
+                        data = chunk.model_dump_json(
+                            exclude_unset=True, exclude_none=not chunk.choices
+                        )
+                    yield f"data: {data}\n\n"
         except Exception as e:
             logger.exception("Error serializing chat completion stream.")
             data = self.create_streaming_error_response(e)
@@ -569,6 +576,8 @@ class OpenAIServingChat(GenerateBaseServing):
         include_usage, include_continuous_usage = should_include_usage(
             stream_options, self.enable_force_include_usage
         )
+        if request._deepseek_chat:
+            include_usage, include_continuous_usage = True, False
 
         last_res: RequestOutput | None = None
         try:
@@ -874,7 +883,7 @@ class OpenAIServingChat(GenerateBaseServing):
                     else None,
                 )
                 final_usage.prompt_tokens_details = _make_prompt_tokens_details(
-                    self.enable_prompt_tokens_details,
+                    self.enable_prompt_tokens_details or request._deepseek_chat,
                     num_cached_tokens,
                     num_cache_creation_tokens,
                     mm_token_counts,
@@ -1110,7 +1119,7 @@ class OpenAIServingChat(GenerateBaseServing):
             else None,
         )
         usage.prompt_tokens_details = _make_prompt_tokens_details(
-            self.enable_prompt_tokens_details,
+            self.enable_prompt_tokens_details or request._deepseek_chat,
             final_res.num_cached_tokens,
             final_res.num_cache_creation_tokens,
             mm_token_counts,

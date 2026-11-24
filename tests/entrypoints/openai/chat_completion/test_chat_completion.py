@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import Any
+
 import openai  # use the official client for correctness check
 import pytest
 import pytest_asyncio
@@ -9,6 +11,53 @@ from tests.utils import RemoteOpenAIServer
 
 # any model with a chat template defined in tokenizer_config should work here
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
+
+
+def test_deepseek_chat_wire_contract():
+    # Only HTTP admission and serialization depend on the served protocol name.
+    # Small weights suffice to exercise the actual streaming endpoint.
+    import httpx
+
+    name = "deepseek-v4.1-flash-1017"
+    args = ["--served-model-name", name, "--max-model-len", "256", "--enforce-eager"]
+    with (
+        RemoteOpenAIServer(MODEL_NAME, args) as server,
+        httpx.Client(timeout=60) as client,
+    ):
+        url = server.url_for("v1", "chat", "completions")
+        body = {"model": name, "messages": [{"role": "user", "content": "Reply OK"}]}
+        invalid_options: list[dict[str, Any]] = [
+            {"max_tokens": 393217},
+            {"thinking": {"type": "invalid"}},
+            {"reasoning_effort": "invalid"},
+        ]
+        for bad in invalid_options:
+            assert client.post(url, json={**body, **bad}).status_code == 400
+        result = client.post(url, json={**body, "max_tokens": 2})
+        result.raise_for_status()
+        assert "reasoning_content" in result.json()["choices"][0]["message"]
+        import json
+
+        for include_usage in (True, False):
+            stream = client.post(
+                url,
+                json={
+                    **body,
+                    "max_tokens": 2,
+                    "stream": True,
+                    "stream_options": {"include_usage": include_usage},
+                },
+            )
+            stream.raise_for_status()
+            events = [
+                line[6:] for line in stream.iter_lines() if line.startswith("data: ")
+            ]
+            assert events.pop() == "[DONE]"
+            chunks = list(map(json.loads, events))
+            assert all(len(chunk["choices"]) == 1 for chunk in chunks)
+            assert all(("usage" in chunk) == include_usage for chunk in chunks[:-1])
+            assert chunks[-1]["usage"]["completion_tokens"] > 0
+            assert chunks[-1]["choices"][0]["finish_reason"] in {"stop", "length"}
 
 
 @pytest.fixture(scope="module")

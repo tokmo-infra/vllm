@@ -11,7 +11,12 @@ from typing import cast
 import pytest
 
 from tests.tokenizers_.test_deepseek_v4 import FakeHfTokenizer
-from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.entrypoints.openai.chat_completion import deepseek_v41
+from vllm.entrypoints.openai.chat_completion.protocol import (
+    ChatCompletionRequest,
+    ChatCompletionStreamResponse,
+)
+from vllm.entrypoints.serve.utils.tool_calls_utils import resolve_finish_reason
 from vllm.renderers.chat_utils import BaseMultiModalItemTracker
 from vllm.renderers.deepseek_v4 import DeepseekV4Renderer
 from vllm.renderers.params import ChatParams
@@ -372,6 +377,80 @@ def test_native_thinking_switch(enabled):
     assert render(request.messages, **kwargs).endswith(
         "<think>" if enabled else "</think>"
     )
+
+
+@pytest.mark.parametrize("include_usage", [True, False, None])
+@pytest.mark.asyncio
+async def test_native_chat_final_usage_and_reasoning(include_usage):
+    req = ChatCompletionRequest(
+        messages=[],
+        stream=True,
+        stream_options=(
+            {"include_usage": include_usage} if include_usage is not None else None
+        ),
+    )
+    deepseek_v41.prepare_request(req)
+
+    async def source():
+        for choice in [
+            {"index": 0, "delta": {"reasoning": "work"}},
+            {"index": 0, "delta": {"content": "answer"}, "finish_reason": "stop"},
+        ]:
+            yield ChatCompletionStreamResponse(model="ds", choices=[choice])
+        yield ChatCompletionStreamResponse(
+            model="ds",
+            choices=[],
+            usage={
+                "prompt_tokens": 19,
+                "completion_tokens": 2,
+                "total_tokens": 21,
+                "prompt_tokens_details": {"cached_tokens": 7},
+            },
+        )
+
+    chunks = [item async for item in deepseek_v41.stream_chunks(source(), req)]
+    assert [item["choices"][0]["delta"] for item in chunks] == [
+        {"reasoning_content": "work", "reasoning": "work"},
+        {"content": "answer"},
+        {},
+    ]
+    assert [item["choices"][0].get("finish_reason") for item in chunks] == [
+        None,
+        None,
+        "stop",
+    ]
+    assert all(("usage" in item) == bool(include_usage) for item in chunks[:-1])
+    assert all(item.get("usage") is None for item in chunks[:-1])
+    assert chunks[-1]["usage"]["prompt_cache_hit_tokens"] == 7
+    assert chunks[-1]["usage"]["prompt_cache_miss_tokens"] == 12
+
+
+def test_native_chat_preserves_extended_schema_format():
+    schema = {"name": "result", "schema": {"type": "object"}}
+    req = ChatCompletionRequest(
+        messages=[], response_format={"type": "json_schema", "json_schema": schema}
+    )
+    deepseek_v41.prepare_request(req)
+    assert req.response_format is not None
+    assert req.response_format.type == "json_schema"
+
+
+def test_native_chat_tool_controls():
+    tool = {"type": "function", "function": {"name": "lookup"}}
+    req = ChatCompletionRequest(messages=[], tools=[tool], tool_choice="none")
+    deepseek_v41.prepare_request(req)
+    assert req.tools is None
+    req = ChatCompletionRequest(messages=[], tools=[tool], tool_choice=tool)
+    deepseek_v41.prepare_request(req)
+    assert req.tools and req.chat_template_kwargs
+    assert req.chat_template_kwargs["thinking"]
+    req = ChatCompletionRequest(
+        messages=[], tools=[tool], tool_choice=tool, thinking={"type": "disabled"}
+    )
+    assert resolve_finish_reason("stop", req, True) == "stop"
+    deepseek_v41.prepare_request(req)
+    assert resolve_finish_reason("stop", req, True) == "tool_calls"
+    assert resolve_finish_reason("length", req, True) == "length"
 
 
 def test_reject_invalid_native_thinking():

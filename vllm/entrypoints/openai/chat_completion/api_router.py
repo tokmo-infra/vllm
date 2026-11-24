@@ -7,6 +7,7 @@ from http import HTTPStatus
 from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from vllm.entrypoints.openai.chat_completion import deepseek_v41
 from vllm.entrypoints.openai.chat_completion.batch_serving import OpenAIServingChatBatch
 from vllm.entrypoints.openai.chat_completion.protocol import (
     BatchChatCompletionRequest,
@@ -64,6 +65,15 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     if handler is None:
         raise NotImplementedError("The model does not support Chat Completions API")
 
+    if deepseek_v41.is_flash(handler.models.model_name()):
+        try:
+            deepseek_v41.prepare_request(request)
+        except ValueError as exc:
+            error = handler.create_error_response(str(exc))
+            return JSONResponse(
+                content=error.model_dump(), status_code=error.error.code
+            )
+
     generator = await handler.create_chat_completion(request, raw_request)
 
     if isinstance(generator, ErrorResponse):
@@ -72,8 +82,11 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         )
 
     elif isinstance(generator, ChatCompletionResponse):
+        payload = generator.model_dump()
+        if request._deepseek_chat:
+            payload = deepseek_v41.wire_fields(payload)
         return JSONResponse(
-            content=generator.model_dump(),
+            content=payload,
             headers=metrics_header(metrics_header_format),
         )
 
