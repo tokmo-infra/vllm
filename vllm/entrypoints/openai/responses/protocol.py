@@ -335,7 +335,7 @@ class ResponsesRequest(OpenAIBaseModel):
             "and vLLM will ignore it."
         ),
     )
-    prompt_cache_options: PromptCacheOptionsParam | K31PromptCacheOptions | None = (
+    prompt_cache_options: K31PromptCacheOptions | PromptCacheOptionsParam | None = (
         Field(
             default=None,
             description=(
@@ -484,13 +484,10 @@ class ResponsesRequest(OpenAIBaseModel):
 
     @field_validator("prompt_cache_options", mode="before")
     @classmethod
-    def _parse_cache_options(
-        cls, value: object, info: ValidationInfo
-    ) -> PromptCacheOptionsParam | K31PromptCacheOptions | None:
-        if value is None:
-            return None
-        if is_k31_model_name(info.data.get("model")):
-            return K31PromptCacheOptions.model_validate(value)
+    def _parse_cache_options(cls, value: object, info: ValidationInfo) -> object:
+        if value is None or is_k31_model_name(info.data.get("model")):
+            # K31 accepts its native options as well as the existing Responses schema.
+            return value
         return PromptCacheOptionsParam.model_validate(value)
 
     @field_validator("prompt_cache_retention", mode="before")

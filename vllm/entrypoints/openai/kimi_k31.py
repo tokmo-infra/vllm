@@ -4,7 +4,7 @@
 
 from typing import TYPE_CHECKING, Literal
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 from vllm.exceptions import VLLMValidationError
 
@@ -27,12 +27,9 @@ def is_k31_model_name(name: str | None) -> bool:
     )
 
 
-K31CacheTTL = Literal["5m", "1h"]
-
-
 class K31PromptCacheOptions(BaseModel):
     mode: Literal["implicit"] = "implicit"
-    ttl: K31CacheTTL = "5m"
+    ttl: Literal["5m", "1h"] = "5m"
 
     def to_response(self) -> "K31PromptCacheOptions":
         return self
@@ -40,24 +37,13 @@ class K31PromptCacheOptions(BaseModel):
 
 class K31MessageCacheControl(BaseModel):
     type: Literal["ephemeral"]
-    ttl: K31CacheTTL = "5m"
+    ttl: str = "5m"
 
 
 def validate_k31_request(
     request: "ChatCompletionRequest | ResponsesRequest",
     effort: str | None,
 ) -> None:
-    # Chat allows arbitrary extension fields. Validate this extension before
-    # scheduling; Responses already parses it as part of the request schema.
-    options = (request.model_extra or {}).get("prompt_cache_options")
-    if options is not None:
-        try:
-            K31PromptCacheOptions.model_validate(options)
-        except ValidationError as exc:
-            raise VLLMValidationError(
-                "Expected implicit prompt caching with a 5m or 1h TTL",
-                parameter="prompt_cache_options",
-            ) from exc
     for name, expected in {
         **K31_SAMPLING,
         "presence_penalty": 0,

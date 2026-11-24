@@ -270,12 +270,18 @@ def test_k31_responses_cache_options(options, ttl):
 
 
 @pytest.mark.parametrize(
-    "options", [{"ttl": "30m"}, {"ttl": "2h"}, {"mode": "explicit"}]
+    "options,mode", [({"ttl": "30m"}, "implicit"), ({"mode": "explicit"}, "explicit")]
 )
-def test_k31_responses_rejects_non_kimi_cache_options(options):
+def test_k31_responses_preserves_existing_cache_options(options, mode):
+    result = _echoed_response(model="kimi-k3.1-pro", prompt_cache_options=options)
+    assert result["prompt_cache_options"]["ttl"] == "30m"
+    assert result["prompt_cache_options"]["mode"] == mode
+
+
+def test_k31_responses_rejects_unknown_cache_options():
     with pytest.raises(ValidationError, match="prompt_cache_options"):
         ResponsesRequest(
-            model="kimi-k3.1-pro", input="hi", prompt_cache_options=options
+            model="kimi-k3.1-pro", input="hi", prompt_cache_options={"ttl": "2h"}
         )
 
 

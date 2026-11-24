@@ -185,9 +185,11 @@ For Kimi K3.1, set `stream_options.include_usage` to `true` to receive the
 final Chat usage chunk. Omitting it or setting it to `false` omits that chunk,
 including when the server uses `--enable-force-include-usage`.
 
-The K3.1 Chat and Responses request validators accept
+K3.1 Chat and Responses accept
 `prompt_cache_options={"mode":"implicit","ttl":"5m"}` or the `1h` tier.
-Messages accepts `cache_control={"type":"ephemeral","ttl":"1h"}`.
+Responses also accepts the existing `30m` option. Chat and Messages pass
+through additional TTL strings, including `2h`. For Messages, use
+`cache_control={"type":"ephemeral","ttl":"1h"}`.
 The cache backend controls actual retention. Messages includes measured
 reasoning tokens in `usage.output_tokens_details.thinking_tokens`; a measured
 zero cache write also yields zero for both `usage.cache_creation` tiers.

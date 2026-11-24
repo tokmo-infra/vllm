@@ -1740,7 +1740,7 @@ class TestZeroTokenPrewarm:
 # ======================================================================
 
 
-@pytest.mark.parametrize("ttl", ["5m", "1h"])
+@pytest.mark.parametrize("ttl", ["5m", "1h", "2h"])
 def test_k31_messages_forwards_cache_ttl_to_chat(ttl):
     request = AnthropicMessagesRequest(
         model="kimi-k3.1-pro",
@@ -1754,14 +1754,12 @@ def test_k31_messages_forwards_cache_ttl_to_chat(ttl):
     }
 
 
-def test_k31_messages_rejects_invalid_ttl_without_changing_other_models():
+def test_other_models_ignore_top_level_cache_control():
     payload = dict(
         max_tokens=32,
         messages=[{"role": "user", "content": "hi"}],
         cache_control={"type": "ephemeral", "ttl": "2h"},
     )
-    with pytest.raises(ValidationError, match="cache_control.ttl"):
-        AnthropicMessagesRequest(model="kimi-k3.1-pro", **payload)
     generic = AnthropicMessagesRequest(model="test-model", **payload)
     assert "prompt_cache_options" not in (_convert(generic).model_extra or {})
 

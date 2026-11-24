@@ -1023,11 +1023,8 @@ def test_k31_chat_cache_options(ttl):
         messages=[{"role": "user", "content": "Hello"}],
         prompt_cache_options={"mode": "implicit", "ttl": ttl},
     )
-    if ttl in {"5m", "1h"}:
-        validate_k31_request(request, None)
-    else:
-        with pytest.raises(VLLMValidationError, match="5m or 1h"):
-            validate_k31_request(request, None)
+    validate_k31_request(request, None)
+    assert request.model_dump()["prompt_cache_options"]["ttl"] == ttl
 
 
 @pytest.mark.asyncio
