@@ -53,7 +53,11 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionStreamResponse,
     ChatMessage,
 )
-from vllm.entrypoints.serve.engine.protocol import PromptTokenUsageInfo, UsageInfo
+from vllm.entrypoints.serve.engine.protocol import (
+    CompletionTokenUsageInfo,
+    PromptTokenUsageInfo,
+    UsageInfo,
+)
 from vllm.entrypoints.serve.exception_handling.error_response import (
     create_error_response,
 )
@@ -814,6 +818,28 @@ class TestBuildAnthropicUsage:
         assert result.input_tokens == 100  # 100 - 0 - 0
         assert result.cache_read_input_tokens == 0
         assert result.cache_creation_input_tokens == 0
+
+    @pytest.mark.parametrize("writes", [None, 0, 32])
+    def test_k31_uses_measured_usage_for_native_fields(self, writes):
+        usage = UsageInfo(
+            prompt_tokens=100,
+            completion_tokens=12,
+            completion_tokens_details=CompletionTokenUsageInfo(reasoning_tokens=9),
+            prompt_tokens_details=PromptTokenUsageInfo(created_cache_tokens=writes),
+        )
+        wire = _build_anthropic_usage(usage, kimi_k31=True).model_dump(
+            exclude_unset=True
+        )
+        assert wire["output_tokens_details"] == {"thinking_tokens": 9}
+        if writes == 0:
+            assert wire["cache_creation"] == {
+                "ephemeral_5m_input_tokens": 0,
+                "ephemeral_1h_input_tokens": 0,
+            }
+        else:
+            assert "cache_creation" not in wire
+        assert wire["input_tokens"] == 100 - (writes or 0)
+        assert "output_tokens_details" not in _build_anthropic_usage(usage).model_dump()
 
     def test_all_tokens_cached(self):
         """When all tokens are cached, input_tokens should be 0."""
@@ -1712,6 +1738,32 @@ class TestZeroTokenPrewarm:
 # ======================================================================
 # cache_salt pass-through (Issue #46688)
 # ======================================================================
+
+
+@pytest.mark.parametrize("ttl", ["5m", "1h"])
+def test_k31_messages_forwards_cache_ttl_to_chat(ttl):
+    request = AnthropicMessagesRequest(
+        model="kimi-k3.1-pro",
+        max_tokens=32,
+        messages=[{"role": "user", "content": "hello"}],
+        cache_control={"type": "ephemeral", "ttl": ttl},
+    )
+    assert _convert(request).model_dump()["prompt_cache_options"] == {
+        "mode": "implicit",
+        "ttl": ttl,
+    }
+
+
+def test_k31_messages_rejects_invalid_ttl_without_changing_other_models():
+    payload = dict(
+        max_tokens=32,
+        messages=[{"role": "user", "content": "hi"}],
+        cache_control={"type": "ephemeral", "ttl": "2h"},
+    )
+    with pytest.raises(ValidationError, match="cache_control.ttl"):
+        AnthropicMessagesRequest(model="kimi-k3.1-pro", **payload)
+    generic = AnthropicMessagesRequest(model="test-model", **payload)
+    assert "prompt_cache_options" not in (_convert(generic).model_extra or {})
 
 
 class TestCacheSalt:

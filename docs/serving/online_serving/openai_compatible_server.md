@@ -181,6 +181,17 @@ With `--enable-prompt-tokens-details`, `/v1/chat/completions/batch` sums `cached
 
 With `--reasoning-parser`, `/v1/chat/completions/batch` sums `reasoning_tokens` across conversations in `usage.completion_tokens_details`, as `/v1/chat/completions` does for one conversation, also when `include_reasoning` is `false`.
 
+For Kimi K3.1, set `stream_options.include_usage` to `true` to receive the
+final Chat usage chunk. Omitting it or setting it to `false` omits that chunk,
+including when the server uses `--enable-force-include-usage`.
+
+The K3.1 Chat and Responses request validators accept
+`prompt_cache_options={"mode":"implicit","ttl":"5m"}` or the `1h` tier.
+Messages accepts `cache_control={"type":"ephemeral","ttl":"1h"}`.
+The cache backend controls actual retention. Messages includes measured
+reasoning tokens in `usage.output_tokens_details.thinking_tokens`; a measured
+zero cache write also yields zero for both `usage.cache_creation` tiers.
+
 #### Extra parameters
 
 The following [sampling parameters](../../api/README.md#inference-parameters) are supported.

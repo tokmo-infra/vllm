@@ -55,6 +55,7 @@ from pydantic import (
     Field,
     PrivateAttr,
     ValidationError,
+    ValidationInfo,
     field_serializer,
     field_validator,
     model_validator,
@@ -71,6 +72,7 @@ from vllm.entrypoints.generate.base.protocol import (
     resolve_return_mm_kwargs_alias,
     validate_cache_salt,
 )
+from vllm.entrypoints.openai.kimi_k31 import K31PromptCacheOptions, is_k31_model_name
 from vllm.entrypoints.serve.engine.protocol import OpenAIBaseModel
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
@@ -333,12 +335,14 @@ class ResponsesRequest(OpenAIBaseModel):
             "and vLLM will ignore it."
         ),
     )
-    prompt_cache_options: PromptCacheOptionsParam | None = Field(
-        default=None,
-        description=(
-            "Prompt-caching options. Accepted and echoed in the response; "
-            "vLLM does not act on them."
-        ),
+    prompt_cache_options: PromptCacheOptionsParam | K31PromptCacheOptions | None = (
+        Field(
+            default=None,
+            description=(
+                "Prompt-caching options. Accepted and echoed in the response; "
+                "vLLM does not act on them."
+            ),
+        )
     )
     prompt_cache_retention: PromptCacheRetention | None = Field(
         default=None,
@@ -477,6 +481,17 @@ class ResponsesRequest(OpenAIBaseModel):
         ),
     )
     # --8<-- [end:responses-extra-params]
+
+    @field_validator("prompt_cache_options", mode="before")
+    @classmethod
+    def _parse_cache_options(
+        cls, value: object, info: ValidationInfo
+    ) -> PromptCacheOptionsParam | K31PromptCacheOptions | None:
+        if value is None:
+            return None
+        if is_k31_model_name(info.data.get("model")):
+            return K31PromptCacheOptions.model_validate(value)
+        return PromptCacheOptionsParam.model_validate(value)
 
     @field_validator("prompt_cache_retention", mode="before")
     @classmethod
@@ -924,7 +939,7 @@ class ResponsesResponse(OpenAIBaseModel):
     max_tool_calls: int | None = None
     previous_response_id: str | None = None
     prompt: ResponsePrompt | None = None
-    prompt_cache_options: PromptCacheOptions | None = None
+    prompt_cache_options: PromptCacheOptions | K31PromptCacheOptions | None = None
     prompt_cache_key: str | None = None
     prompt_cache_retention: PromptCacheRetention | None = None
     reasoning: Reasoning | None = None

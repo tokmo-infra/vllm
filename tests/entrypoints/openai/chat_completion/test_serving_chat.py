@@ -37,6 +37,7 @@ from vllm.entrypoints.openai.chat_completion.serving import (
     _make_completion_tokens_details,
     _make_prompt_tokens_details,
 )
+from vllm.entrypoints.openai.kimi_k31 import validate_k31_request
 from vllm.entrypoints.openai.models.serving import (
     BaseModelPath,
     OpenAIModelRegistry,
@@ -1013,6 +1014,46 @@ async def test_chat_full_generator_gives_each_choice_parser_the_prompt():
     )
 
     assert prompts == [[7, 8], [7, 8]]
+
+
+@pytest.mark.parametrize("ttl", ["5m", "1h", "30m", "2h"])
+def test_k31_chat_cache_options(ttl):
+    request = ChatCompletionRequest(
+        model="kimi-k3.1-pro",
+        messages=[{"role": "user", "content": "Hello"}],
+        prompt_cache_options={"mode": "implicit", "ttl": ttl},
+    )
+    if ttl in {"5m", "1h"}:
+        validate_k31_request(request, None)
+    else:
+        with pytest.raises(VLLMValidationError, match="5m or 1h"):
+            validate_k31_request(request, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_usage", [None, False, True])
+async def test_k31_stream_usage_is_opt_in_even_with_server_force(include_usage):
+    serving = _build_minimal_metrics_serving_chat(
+        False, enable_force_include_usage=True
+    )
+    serving.is_kimi_k31 = True
+    chunks = await _collect_metrics_stream_chunks(
+        serving,
+        ChatCompletionRequest(
+            model="kimi-k3.1-pro",
+            messages=[{"role": "user", "content": "Hello"}],
+            stream=True,
+            stream_options=None
+            if include_usage is None
+            else {"include_usage": include_usage},
+        ),
+    )
+    assert chunks and all("error" not in chunk for chunk in chunks)
+    usage_chunks = [chunk for chunk in chunks if chunk.get("usage")]
+    assert usage_chunks == ([chunks[-1]] if include_usage else [])
+    if include_usage:
+        assert all("usage" in chunk and chunk["usage"] is None for chunk in chunks[:-1])
+        assert chunks[-1]["choices"] == []
 
 
 @pytest.mark.asyncio

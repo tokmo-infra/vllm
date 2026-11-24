@@ -18,6 +18,7 @@ from fastapi import Request
 from vllm.config import ModelConfig
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.protocol import (
+    AnthropicCacheCreation,
     AnthropicContentBlock,
     AnthropicContextManagement,
     AnthropicCountTokensRequest,
@@ -30,6 +31,7 @@ from vllm.entrypoints.anthropic.protocol import (
     AnthropicMessagesRequest,
     AnthropicMessagesResponse,
     AnthropicOutputConfig,
+    AnthropicOutputTokensDetails,
     AnthropicStreamEvent,
     AnthropicThinkingConfig,
     AnthropicTool,
@@ -90,7 +92,7 @@ class _CountTokensChatRequest(ChatCompletionRequest):
 
 
 def _build_anthropic_usage(
-    usage: UsageInfo | None,
+    usage: UsageInfo | None, *, kimi_k31: bool = False
 ) -> AnthropicUsage:
     """Build an AnthropicUsage from UsageInfo.
 
@@ -107,13 +109,17 @@ def _build_anthropic_usage(
     `completion_tokens` follows `UsageInfo` and may be `None` on
     intermediate stream chunks; we coerce to `0` for the wire format.
     """
-    kwargs = {}
+    kwargs: dict[str, Any] = {}
     if usage is None:
         kwargs["input_tokens"] = 0
         kwargs["output_tokens"] = 0
     else:
         kwargs["output_tokens"] = usage.completion_tokens or 0
         input_tokens = usage.prompt_tokens
+        if kimi_k31 and usage.completion_tokens_details is not None:
+            kwargs["output_tokens_details"] = AnthropicOutputTokensDetails(
+                thinking_tokens=usage.completion_tokens_details.reasoning_tokens
+            )
 
         if (details := usage.prompt_tokens_details) is not None:
             if (cache_read := details.cached_tokens) is not None:
@@ -123,6 +129,12 @@ def _build_anthropic_usage(
             if (cache_creation := details.created_cache_tokens) is not None:
                 input_tokens -= cache_creation
                 kwargs["cache_creation_input_tokens"] = cache_creation
+                # Positive writes require per-tier counters from the cache.
+                # A measured zero determines both tiers without an estimate.
+                if kimi_k31 and cache_creation == 0:
+                    kwargs["cache_creation"] = AnthropicCacheCreation(
+                        ephemeral_5m_input_tokens=0, ephemeral_1h_input_tokens=0
+                    )
 
         kwargs["input_tokens"] = max(0, input_tokens)
     return AnthropicUsage(**kwargs)
@@ -715,6 +727,12 @@ class AnthropicServingMessages(OpenAIServingChat):
                 chat_template_kwargs=anthropic_request.chat_template_kwargs,
             )
 
+        extensions: dict[str, Any] = {}
+        if anthropic_request.cache_control is not None:
+            extensions["prompt_cache_options"] = {
+                "mode": "implicit",
+                "ttl": anthropic_request.cache_control.ttl,
+            }
         return ChatCompletionRequest(
             model=anthropic_request.model,
             messages=openai_messages,
@@ -731,6 +749,7 @@ class AnthropicServingMessages(OpenAIServingChat):
             ec_transfer_params=anthropic_request.ec_transfer_params,
             vllm_xargs=anthropic_request.vllm_xargs,
             chat_template_kwargs=anthropic_request.chat_template_kwargs,
+            **extensions,
         )
 
     @classmethod
@@ -960,7 +979,7 @@ class AnthropicServingMessages(OpenAIServingChat):
             id=generator.id,
             content=[],
             model=generator.model,
-            usage=_build_anthropic_usage(generator.usage),
+            usage=_build_anthropic_usage(generator.usage, kimi_k31=kimi_k31),
             kv_transfer_params=generator.kv_transfer_params,
             ec_transfer_params=generator.ec_transfer_params,
         )
@@ -1143,7 +1162,9 @@ class AnthropicServingMessages(OpenAIServingChat):
                             model=origin_chunk.model,
                             stop_reason=None,
                             stop_sequence=None,
-                            usage=_build_anthropic_usage(origin_chunk.usage),
+                            usage=_build_anthropic_usage(
+                                origin_chunk.usage, kimi_k31=kimi_k31
+                            ),
                         ),
                     )
                     first_item = False
@@ -1174,7 +1195,9 @@ class AnthropicServingMessages(OpenAIServingChat):
                     chunk = AnthropicStreamEvent(
                         type="message_delta",
                         delta=stop_delta,
-                        usage=_build_anthropic_usage(origin_chunk.usage),
+                        usage=_build_anthropic_usage(
+                            origin_chunk.usage, kimi_k31=kimi_k31
+                        ),
                     )
                     data = chunk.model_dump_json(exclude_unset=True)
                     yield wrap_data_with_event(data, "message_delta")

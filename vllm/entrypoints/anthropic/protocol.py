@@ -6,13 +6,14 @@ import time
 from http import HTTPStatus
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 
 import vllm.envs as envs
 from vllm.entrypoints.generate.base.protocol import (
     MMPayload,
     resolve_return_mm_kwargs_alias,
 )
+from vllm.entrypoints.openai.kimi_k31 import K31MessageCacheControl, is_k31_model_name
 
 
 class AnthropicError(BaseModel):
@@ -53,6 +54,15 @@ def translate_error_type(status_code: int) -> str:
     return "invalid_request_error"
 
 
+class AnthropicCacheCreation(BaseModel):
+    ephemeral_5m_input_tokens: int
+    ephemeral_1h_input_tokens: int
+
+
+class AnthropicOutputTokensDetails(BaseModel):
+    thinking_tokens: int
+
+
 class AnthropicUsage(BaseModel):
     """Token usage information."""
 
@@ -60,6 +70,12 @@ class AnthropicUsage(BaseModel):
     output_tokens: int
     cache_creation_input_tokens: int | None = None
     cache_read_input_tokens: int | None = None
+    cache_creation: AnthropicCacheCreation | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    output_tokens_details: AnthropicOutputTokensDetails | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class AnthropicContentBlock(BaseModel):
@@ -272,6 +288,7 @@ class AnthropicMessagesRequest(BaseModel):
     model: str
     messages: list[AnthropicMessage]
     max_tokens: int
+    cache_control: K31MessageCacheControl | None = None
     metadata: dict[str, Any] | None = None
     output_config: AnthropicOutputConfig | None = None
     thinking: AnthropicThinkingConfig | None = None
@@ -358,6 +375,12 @@ class AnthropicMessagesRequest(BaseModel):
             "Will be accessible by the template."
         ),
     )
+
+    @field_validator("cache_control", mode="before")
+    @classmethod
+    def _parse_cache_control(cls, value: object, info: ValidationInfo) -> object:
+        # Other models historically ignore this top-level extension.
+        return value if is_k31_model_name(info.data.get("model")) else None
 
     @field_validator("model")
     @classmethod

@@ -53,6 +53,7 @@ from vllm.entrypoints.openai.responses.context import (
     SimpleContext,
 )
 from vllm.entrypoints.openai.responses.protocol import (
+    PromptCacheOptionsParam,
     ResponseCompletedEvent,
     ResponseCreatedEvent,
     ResponseIncompleteEvent,
@@ -188,7 +189,7 @@ def test_extract_tool_types(monkeypatch: pytest.MonkeyPatch) -> None:
 def _echoed_response(**request_fields) -> dict:
     """Build a request with the given fields and return the response as JSON."""
     request = ResponsesRequest(
-        model="test-model",
+        model=request_fields.pop("model", "test-model"),
         input="Alice and Bob are going to a science fair on Friday.",
         **request_fields,
     )
@@ -260,6 +261,24 @@ def test_prompt_cache_options_rejects_unknown_ttl() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "options,ttl", [({}, "5m"), ({"ttl": "5m"}, "5m"), ({"ttl": "1h"}, "1h")]
+)
+def test_k31_responses_cache_options(options, ttl):
+    result = _echoed_response(model="kimi-k3.1-pro", prompt_cache_options=options)
+    assert result["prompt_cache_options"] == {"mode": "implicit", "ttl": ttl}
+
+
+@pytest.mark.parametrize(
+    "options", [{"ttl": "30m"}, {"ttl": "2h"}, {"mode": "explicit"}]
+)
+def test_k31_responses_rejects_non_kimi_cache_options(options):
+    with pytest.raises(ValidationError, match="prompt_cache_options"):
+        ResponsesRequest(
+            model="kimi-k3.1-pro", input="hi", prompt_cache_options=options
+        )
+
+
 def test_prompt_cache_options_request_accepts_prewarm() -> None:
     request = ResponsesRequest(
         model="test-model",
@@ -267,7 +286,7 @@ def test_prompt_cache_options_request_accepts_prewarm() -> None:
         prompt_cache_options={"mode": "explicit", "prewarm": True},
     )
 
-    assert request.prompt_cache_options is not None
+    assert isinstance(request.prompt_cache_options, PromptCacheOptionsParam)
     assert request.prompt_cache_options.prewarm is True
 
 

@@ -538,6 +538,14 @@ class OpenAIServingChat(GenerateBaseServing):
                 if isinstance(chunk, ErrorResponse):
                     data = chunk.model_dump_json()
                 else:
+                    if (
+                        self.is_kimi_k31
+                        and request.stream_options
+                        and request.stream_options.include_usage
+                        and chunk.usage is None
+                    ):
+                        # Keep usage:null on content chunks in an opted-in Kimi stream.
+                        chunk.usage = None
                     data = chunk.model_dump_json(
                         context="kimi_k31" if self.is_kimi_k31 else None,
                         exclude_unset=True,
@@ -613,7 +621,7 @@ class OpenAIServingChat(GenerateBaseServing):
 
         stream_options = request.stream_options
         include_usage, include_continuous_usage = should_include_usage(
-            stream_options, self.enable_force_include_usage
+            stream_options, self.enable_force_include_usage and not self.is_kimi_k31
         )
 
         last_res: RequestOutput | None = None
