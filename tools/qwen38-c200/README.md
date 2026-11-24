@@ -28,7 +28,7 @@ bash tools/qwen38-c200/build.sh --base-image "$FLASHINFER_WHEEL" qwen38-nvfp4:c2
 同一条构建命令。脚本会校验该镜像 ID 与实测底座完全相同。
 
 两条路线都基于 vLLM `e0d00e4b8eb0c89ec30921d0695cfdd409e9c211`，自动应用
-`common.patch` 与角色补丁，并在镜像构建时对改过的 P/D Python 文件做哈希校验。
+`common.patch`、`api-protocol.patch` 与角色补丁，并在镜像构建时校验 P/D Python 文件哈希。
 请以脚本准备的固定版本为实验基线。把同一镜像分发至三台机器，并记录
 `docker image inspect --format '{{.Id}}' qwen38-nvfp4:c200` 的结果。
 
@@ -176,22 +176,29 @@ docker run -d --name "qwen38-$D_NAME" --gpus all "${model_run[@]}" \
   --data-parallel-rpc-port 19900 --gpu-memory-utilization .96 --max-num-batched-tokens 1024 \
   --engram-config '{"cpu_offload":false,"embedding_across_dp":true}' \
   --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":128}' \
+  --enable-force-include-usage \
   --kv-transfer-config "$d_kv"
 ~~~
 
 ## 6. 启动 Router（P 主机）
 
-从原实验制品库获取 GLM5.3 Flash 分支的实测 Router 镜像。设置
-`ROUTER_IMAGE` 为已导入的镜像。实测镜像配置 ID：
-`sha256:764cfed279c25ff8ec808bbb929c87250161cf8e853a5e606532395d05ba3381`；
-`/usr/local/bin/vllm-router` SHA-256：
-`b366ce030714f6a95c5b30ffc93f5287bf611fd6d5161c20beb84c0ea73b04de`。
-导入镜像后，用上述镜像 ID 和二进制哈希校验制品。
+三接口部署使用固定的 GLM5.3 Flash Router 源码 `0966e4b11b`。构建脚本核对源码清单，
+镜像记录源码提交。Router 选路、P/D 地址和 Mooncake 仍使用本页参数。
+
+~~~bash
+export ROUTER_IMAGE=router:qwen38-three-apis
+bash tools/qwen38-c200/build-api-router.sh "$ROUTER_IMAGE"
+~~~
+
+原 C200 成绩来自旧 Router（镜像 ID
+`sha256:764cfed279c25ff8ec808bbb929c87250161cf8e853a5e606532395d05ba3381`）与原引擎；
+部署三接口版后用相同数据和计分规则重新测量。
 
 ~~~bash
 docker run -d --name qwen38-router --network host --memory 32g --memory-swap 32g \
   -e NVIDIA_VISIBLE_DEVICES=void -e NO_PROXY='*' -e no_proxy='*' \
-  -e VLLM_ROUTER_PD_REUSE_PROMPT_IDS=1 --entrypoint /usr/local/bin/vllm-router "$ROUTER_IMAGE" \
+  -e VLLM_ROUTER_PD_REUSE_PROMPT_IDS=1 -e VLLM_ROUTER_PD_PREFILL_FORCE_LENGTH_CAP=1 \
+  --entrypoint /usr/local/bin/vllm-router "$ROUTER_IMAGE" \
   --host 0.0.0.0 --port 18300 --prometheus-host 0.0.0.0 --prometheus-port 18301 \
   --vllm-pd-disaggregation --kv-connector mooncake \
   --prefill "http://$P_IP:18410" 19710 --prefill "http://$P_IP:18111" 19310 \
@@ -200,6 +207,19 @@ docker run -d --name qwen38-router --network host --memory 32g --memory-swap 32g
   --prefill-policy cache_aware --decode-policy round_robin \
   --enable-trace --otlp-traces-endpoint "$P_IP:18430" --otel-sampling-ratio 0.1
 ~~~
+
+### 三接口约定
+
+| 路由 | 客户端行为 |
+| --- | --- |
+| `/v1/chat/completions` | 指定、自动或必选工具实际完成时返回 `tool_calls`；预算截断返回 `length`。SSE 以 `[DONE]` 结尾；强制计量只增加最终 usage 块，显式开启连续计量时另有累计快照。 |
+| `/v1/responses` | 在 `input` 提交完整历史；兼容分段助手文本、嵌套图片 URL 与包装式 function tool。冲突字段返回 400；SSE 按真实状态发送 `response.completed`、`response.incomplete` 或 `response.failed`。PD Router 按无状态接口使用，省略 `previous_response_id`（或传 null）。 |
+| `/v1/messages`、`/v1/messages/count_tokens` | Messages 保留 Anthropic 工具、SSE 与原用量字段；计数只发往 P。总输入为未命中、缓存读、缓存创建之和。 |
+
+媒体按固定 Router 的协议处理：三路支持图片，P/D 共用规范化后的输入；内联 JPEG/PNG 超过
+4 MiB 时尝试压缩，视频在此部署入口返回 400。模型不存在返回相应协议的 404；上游路由不可用返回 502。
+P 的内部 1-token 请求按长度结束；D 使用客户端的 stop 和输出预算。Chat 复用 P 返回的精确 token IDs，
+Responses 和 Messages 复用相同请求内容，沿用 Mooncake 的 KV 交接和 P 实测缓存计量。
 
 ## 7. 验收、压测和计分
 

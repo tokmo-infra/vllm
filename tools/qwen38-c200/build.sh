@@ -68,15 +68,18 @@ cp -- "$wheel" "$ctx/qwen38-build/wheels/$wheel_name"
 (
     cd -- "$ctx"
     manifest() {
-        sed -n 's|^+++ b/||p' "$patch_dir/common.patch" "$patch_dir/$1.patch" |
+        sed -n 's|^+++ b/||p' "$patch_dir/common.patch" \
+            "$patch_dir/api-protocol.patch" "$patch_dir/$1.patch" |
             LC_ALL=C sort -u | while IFS= read -r file; do
                 "${checksum[@]}" "$file"
             done > "qwen38-build/$1.sha256"
     }
     git apply "$patch_dir/common.patch"
+    git apply "$patch_dir/api-protocol.patch"
     git apply "$patch_dir/prefill.patch"
     manifest prefill
-    sed -n 's|^+++ b/||p' "$patch_dir/prefill.patch" | while IFS= read -r file; do
+    sed -n 's|^+++ b/||p' "$patch_dir/api-protocol.patch" "$patch_dir/prefill.patch" |
+        LC_ALL=C sort -u | while IFS= read -r file; do
         mkdir -p "qwen38-build/prefill/$(dirname -- "$file")"
         cp -- "$file" "qwen38-build/prefill/$file"
     done
