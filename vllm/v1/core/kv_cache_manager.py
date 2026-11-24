@@ -250,7 +250,11 @@ class KVCacheManager:
 
     def prefix_cache_lookup_enabled(self, request: Request) -> bool:
         """Whether a local prefix cache lookup may be run for this request."""
-        return self.enable_caching and request.prefix_cache_hit_limit != 0
+        return (
+            self.enable_caching
+            and request.prefix_cache_hit_limit != 0
+            and getattr(request, "k31_cache_read_limit", None) != 0
+        )
 
     def get_num_cached_tokens(self, request: Request) -> int:
         """How many of a request's tokens are already in the prefix cache.

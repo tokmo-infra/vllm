@@ -131,7 +131,12 @@ def _build_anthropic_usage(
                 kwargs["cache_creation_input_tokens"] = cache_creation
                 # Positive writes require per-tier counters from the cache.
                 # A measured zero determines both tiers without an estimate.
-                if kimi_k31 and cache_creation == 0:
+                if kimi_k31 and details.k31_cache_writes is not None:
+                    short, long = details.k31_cache_writes
+                    kwargs["cache_creation"] = AnthropicCacheCreation(
+                        ephemeral_5m_input_tokens=short, ephemeral_1h_input_tokens=long
+                    )
+                elif kimi_k31 and cache_creation == 0:
                     kwargs["cache_creation"] = AnthropicCacheCreation(
                         ephemeral_5m_input_tokens=0, ephemeral_1h_input_tokens=0
                     )

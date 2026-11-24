@@ -14,6 +14,7 @@ from vllm.exceptions import GenerationError, RetryableRequestError, VLLMValidati
 from vllm.logger import init_logger
 from vllm.logprobs import PromptLogprobs, SampleLogprobs
 from vllm.lora.request import LoRARequest
+from vllm.v1.core.kimi_cache_lease import K31CachePlan
 from vllm.v1.metrics.stats import RequestSpecDecodeMetrics, RequestStateStats
 
 logger = init_logger(__name__)
@@ -181,6 +182,8 @@ class RequestOutput:
         num_cached_tokens: int | None = None,
         num_cache_creation_tokens: int | None = None,
         *,
+        k31_cache_plan: K31CachePlan | None = None,
+        k31_cache_writes: tuple[int, int] | None = None,
         prompt_token_id_logprobs: np.ndarray | None = None,
         kv_transfer_params: dict[str, Any] | None = None,
         ec_transfer_params: dict[str, Any] | None = None,
@@ -204,6 +207,8 @@ class RequestOutput:
         self.encoder_prompt = encoder_prompt
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
+        self.k31_cache_plan = k31_cache_plan
+        self.k31_cache_writes = k31_cache_writes
         self.num_cache_creation_tokens = num_cache_creation_tokens
         self.kv_transfer_params = kv_transfer_params
         self.ec_transfer_params = ec_transfer_params
@@ -211,6 +216,8 @@ class RequestOutput:
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""
         self.finished |= next_output.finished
+        if next_output.k31_cache_plan is not None:
+            self.k31_cache_plan = next_output.k31_cache_plan
         self.kv_transfer_params = next_output.kv_transfer_params
         self.ec_transfer_params = next_output.ec_transfer_params
 

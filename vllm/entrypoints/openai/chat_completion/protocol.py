@@ -38,6 +38,7 @@ from vllm.entrypoints.generate.base.protocol import (
     validate_structural_tag_response_format,
     validate_structured_outputs_structural_tag,
 )
+from vllm.entrypoints.openai.kimi_k31 import is_k31_model_name
 from vllm.entrypoints.serve.engine.protocol import OpenAIBaseModel, UsageInfo
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
@@ -786,7 +787,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if prompt_logprobs is None and self.echo:
             prompt_logprobs = self.top_logprobs
 
-        extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
+        extra_args: dict[str, Any] = dict(self.vllm_xargs or {})
+        if is_k31_model_name(self.model):
+            options = (self.model_extra or {}).get("prompt_cache_options")
+            extra_args["k31_requested_cache_ttl"] = (
+                options.get("ttl", "5m") if isinstance(options, dict) else "5m"
+            )
+        else:
+            extra_args.pop("k31_requested_cache_ttl", None)
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params

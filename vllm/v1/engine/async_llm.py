@@ -802,6 +802,8 @@ class AsyncLLM(EngineClient):
 
             # The output_handler task pushes items into the queue.
             # This task pulls from the queue and yields to caller.
+            k31_written: tuple[int, int, int] | None = None
+            k31_limit = 0
             finished = False
             while not finished:
                 # Note: drain queue without await if possible (avoids
@@ -813,6 +815,28 @@ class AsyncLLM(EngineClient):
                 assert isinstance(out, RequestOutput)
                 finished = out.finished
                 if out is not STREAM_FINISHED:
+                    if out.k31_cache_plan is not None:
+                        if k31_written is None:
+                            k31_limit = out.k31_cache_plan.read_limit
+                            k31_written = await out.k31_cache_plan.publish(
+                                out.num_cached_tokens or 0,
+                                out.num_cache_creation_tokens or 0,
+                            )
+                        out.num_cache_creation_tokens, short, long = k31_written
+                        out.k31_cache_writes = (short, long)
+                        if finished:
+                            transfer = (sampling_params.extra_args or {}).get(
+                                "kv_transfer_params"
+                            )
+                            if transfer and transfer.get("do_remote_decode"):
+                                # Mooncake passes KV out of band and can finish
+                                # a successful prefill without a reply payload.
+                                out.kv_transfer_params = {
+                                    **(out.kv_transfer_params or {}),
+                                    "k31_cache_read_limit": k31_limit,
+                                    "k31_cache_writes": [short, long],
+                                }
+                        out.k31_cache_plan = None
                     yield out
 
         # If the request is disconnected by the client, generate()

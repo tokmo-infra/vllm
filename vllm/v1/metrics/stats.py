@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.logger import init_logger
+from vllm.v1.core.kimi_cache_lease import K31CachePlan
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
@@ -323,6 +324,7 @@ class PrefillStats:
     num_local_cached_tokens: int = 0
     num_external_cached_tokens: int = 0
     num_cache_creation_tokens: int = 0
+    k31_cache_plan: K31CachePlan | None = None
 
     def set(
         self,

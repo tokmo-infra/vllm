@@ -635,7 +635,12 @@ class ResponsesRequest(OpenAIBaseModel):
         if isinstance(stop, str):
             stop = [stop]
 
-        extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
+        extra_args: dict[str, Any] = dict(self.vllm_xargs or {})
+        if is_k31_model_name(self.model):
+            options = self.prompt_cache_options
+            extra_args["k31_requested_cache_ttl"] = getattr(options, "ttl", "5m")
+        else:
+            extra_args.pop("k31_requested_cache_ttl", None)
         if self.kv_transfer_params:
             extra_args["kv_transfer_params"] = self.kv_transfer_params
         if self.ec_transfer_params:

@@ -242,6 +242,7 @@ class Request:
         self._block_hasher: Callable[[Request], list[BlockHash]] | None = block_hasher
         self.update_block_hashes()
 
+        self.k31_cache_read_limit: int | None = None
         self.prefix_cache_hit_limit = self.get_prefix_cache_hit_limit()
 
         # Used for streaming
@@ -352,7 +353,12 @@ class Request:
     def get_max_cache_hit_length(self, bound: int | None = None) -> int:
         """Longest prefix cache hit allowed, optionally tightened by bound."""
         # The last token is always recomputed to produce logits.
-        limits = (self.num_tokens - 1, self.prefix_cache_hit_limit, bound)
+        limits = (
+            self.num_tokens - 1,
+            self.prefix_cache_hit_limit,
+            getattr(self, "k31_cache_read_limit", None),
+            bound,
+        )
         return min(limit for limit in limits if limit is not None)
 
     @property
