@@ -1303,31 +1303,6 @@ class EngineCore:
         req = Request.from_engine_core_request(
             request, self.request_block_hasher, frontend_hashes
         )
-        if (
-            req.sampling_params
-            and (extra := req.sampling_params.extra_args)
-            and "k31_requested_cache_ttl" in extra
-        ):
-            transfer = req.kv_transfer_params or {}
-            if transfer.get("do_remote_prefill"):
-                limit = transfer.get("k31_cache_read_limit")
-                if type(limit) is int and limit >= 0:
-                    req.k31_cache_read_limit = limit
-            elif self.prefix_hash_config is not None:
-                from vllm.v1.core.kimi_cache_lease import (
-                    leases_enabled,
-                    prepare_k31_cache,
-                    ttl_seconds,
-                )
-
-                if leases_enabled() and req.prefill_stats is not None:
-                    plan = prepare_k31_cache(
-                        req.block_hashes,
-                        self.prefix_hash_config.hash_block_size,
-                        ttl_seconds(extra["k31_requested_cache_ttl"]),
-                    )
-                    req.k31_cache_read_limit = plan.read_limit
-                    req.prefill_stats.k31_cache_plan = plan
         if req.use_structured_output:
             # Note on thread safety: no race condition.
             # `grammar_init` is only invoked in input processing thread. For

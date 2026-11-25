@@ -273,17 +273,6 @@ class MooncakeStoreScheduler:
             self._hash_block_size if self.enable_partial_hash_hits else self._block_size
         )
 
-    @staticmethod
-    def _readable_tokens(request: Request) -> int:
-        limit = getattr(request, "k31_cache_read_limit", None)
-        return request.num_tokens if limit is None else min(limit, request.num_tokens)
-
-    def _readable_hashes(self, request: Request):
-        limit = getattr(request, "k31_cache_read_limit", None)
-        if limit is None or limit >= request.num_tokens:
-            return request.block_hashes
-        return request.block_hashes[: limit // self._hash_block_size]
-
     def start_lookup_prefetch(self, request: Request) -> None:
         """Start an async lookup as soon as the request is added, so it can
         complete while the request waits to be scheduled."""
@@ -291,14 +280,12 @@ class MooncakeStoreScheduler:
             not self.enable_lookup
             or not self.lookup_async
             or request.skip_reading_external_kv
-            or self._readable_tokens(request) < self._lookup_align()
+            or request.num_tokens < self._lookup_align()
             or not request.block_hashes
         ):
             return
         self.client.prefetch(
-            request.request_id,
-            self._readable_tokens(request),
-            self._readable_hashes(request),
+            request.request_id, request.num_tokens, request.block_hashes
         )
 
     def get_num_new_matched_tokens(
@@ -323,13 +310,13 @@ class MooncakeStoreScheduler:
         if self.retention_config is not None:
             self._release_proposed_read(self.load_specs.pop(request.request_id, None))
 
-        if self._readable_tokens(request) < self._lookup_align():
+        if request.num_tokens < self._lookup_align():
             return 0, False
 
         lookup_result = self.client.lookup(
             request.request_id,
-            self._readable_tokens(request),
-            self._readable_hashes(request),
+            request.num_tokens,
+            request.block_hashes,
             non_block=self.lookup_async,
         )
         if lookup_result is None:

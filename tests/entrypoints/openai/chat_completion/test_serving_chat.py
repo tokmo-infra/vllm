@@ -1025,22 +1025,6 @@ def test_k31_chat_cache_options(ttl):
     )
     validate_k31_request(request, None)
     assert request.model_dump()["prompt_cache_options"]["ttl"] == ttl
-    assert (request.to_sampling_params(16, {}).extra_args or {}).get(
-        "k31_requested_cache_ttl"
-    ) == ttl
-
-
-@pytest.mark.parametrize("fields", [{}, {"prompt_cache_options": {"mode": "implicit"}}])
-def test_k31_no_ttl_uses_capacity_cache(fields):
-    request = ChatCompletionRequest(
-        model="kimi-k3.1-pro",
-        messages=[{"role": "user", "content": "Hello"}],
-        vllm_xargs={"k31_requested_cache_ttl": "5m"},
-        **fields,
-    )
-    assert "k31_requested_cache_ttl" not in (
-        request.to_sampling_params(16, {}).extra_args or {}
-    )
 
 
 @pytest.mark.asyncio

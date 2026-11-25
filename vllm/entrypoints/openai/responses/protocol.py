@@ -231,22 +231,19 @@ class PromptCacheOptions(OpenAIBaseModel):
     """OpenAI prompt_cache_options; defined here because openai>=2.25 lacks it"""
 
     mode: Literal["implicit", "explicit"] = "implicit"
-    ttl: Literal["30m"] | None = Field(default="30m", exclude_if=lambda v: v is None)
+    ttl: Literal["30m"] = "30m"
     comparison_response_id: str | None = None
 
 
 class PromptCacheOptionsParam(PromptCacheOptions):
     """Request-side variant; prewarm is request-only in OpenAI's schema."""
 
-    ttl: Literal["30m"] = "30m"
     prewarm: bool | None = None
 
-    def to_response(self, *, explicit_ttl_only: bool = False) -> PromptCacheOptions:
+    def to_response(self) -> PromptCacheOptions:
         return PromptCacheOptions(
             mode=self.mode,
-            ttl=self.ttl
-            if not explicit_ttl_only or "ttl" in self.model_fields_set
-            else None,
+            ttl=self.ttl,
             comparison_response_id=self.comparison_response_id,
         )
 
@@ -638,16 +635,7 @@ class ResponsesRequest(OpenAIBaseModel):
         if isinstance(stop, str):
             stop = [stop]
 
-        extra_args: dict[str, Any] = dict(self.vllm_xargs or {})
-        extra_args.pop("k31_requested_cache_ttl", None)
-        options = self.prompt_cache_options
-        if (
-            is_k31_model_name(self.model)
-            and options is not None
-            and "ttl" in options.model_fields_set
-            and options.ttl is not None
-        ):
-            extra_args["k31_requested_cache_ttl"] = options.ttl
+        extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
         if self.kv_transfer_params:
             extra_args["kv_transfer_params"] = self.kv_transfer_params
         if self.ec_transfer_params:
@@ -1070,9 +1058,7 @@ class ResponsesResponse(OpenAIBaseModel):
             prompt=request.prompt,
             prompt_cache_key=request.prompt_cache_key,
             prompt_cache_options=(
-                request.prompt_cache_options.to_response(
-                    explicit_ttl_only=is_k31_model_name(request.model)
-                )
+                request.prompt_cache_options.to_response()
                 if request.prompt_cache_options is not None
                 else None
             ),

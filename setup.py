@@ -1715,7 +1715,6 @@ setup(
     rust_extensions=rust_extensions,
     install_requires=get_requirements(),
     extras_require={
-        "k31-cache": ["redis >= 5"],
         # AMD Zen CPU optimizations via zentorch
         "zen": ["zentorch==2.14.0.2"],
         "bench": ["pandas", "matplotlib", "seaborn", "datasets", "scipy", "plotly"],

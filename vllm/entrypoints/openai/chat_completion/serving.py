@@ -105,7 +105,6 @@ def _make_prompt_tokens_details(
     num_cached_tokens: int | None,
     num_cache_creation_tokens: int | None,
     mm_token_counts: dict[str, int] | None,
-    k31_cache_writes: tuple[int, int] | None = None,
 ) -> PromptTokenUsageInfo | None:
     """Build `prompt_tokens_details` from cached + multimodal token counts."""
     if not enable_prompt_tokens_details:
@@ -119,7 +118,6 @@ def _make_prompt_tokens_details(
     return PromptTokenUsageInfo(
         cached_tokens=num_cached_tokens,
         created_cache_tokens=num_cache_creation_tokens,
-        k31_cache_writes=k31_cache_writes,
         multimodal_tokens=mm_token_counts or None,
     )
 
@@ -588,7 +586,6 @@ class OpenAIServingChat(GenerateBaseServing):
         num_prompt_tokens = 0
         num_cached_tokens = None
         num_cache_creation_tokens = None
-        k31_cache_writes = None
 
         previous_texts = [""] * num_choices
 
@@ -642,7 +639,6 @@ class OpenAIServingChat(GenerateBaseServing):
                 if first_iteration:
                     num_cached_tokens = res.num_cached_tokens
                     num_cache_creation_tokens = res.num_cache_creation_tokens
-                    k31_cache_writes = res.k31_cache_writes
                     # Send first response for each request.n (index) with
                     # the role
                     role = self.get_chat_request_role(request)
@@ -696,7 +692,6 @@ class OpenAIServingChat(GenerateBaseServing):
                                     num_cached_tokens,
                                     num_cache_creation_tokens,
                                     mm_token_counts,
-                                    k31_cache_writes,
                                 ),
                             )
 
@@ -938,7 +933,6 @@ class OpenAIServingChat(GenerateBaseServing):
                     num_cached_tokens,
                     num_cache_creation_tokens,
                     mm_token_counts,
-                    k31_cache_writes,
                 )
 
                 # In streaming, metrics ride on this final usage chunk, which is
@@ -1166,7 +1160,6 @@ class OpenAIServingChat(GenerateBaseServing):
             final_res.num_cached_tokens,
             final_res.num_cache_creation_tokens,
             mm_token_counts,
-            final_res.k31_cache_writes,
         )
 
         request_metadata.final_usage_info = usage

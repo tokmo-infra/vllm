@@ -4,7 +4,7 @@
 
 from typing import TYPE_CHECKING, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from vllm.exceptions import VLLMValidationError
 
@@ -29,13 +29,9 @@ def is_k31_model_name(name: str | None) -> bool:
 
 class K31PromptCacheOptions(BaseModel):
     mode: Literal["implicit"] = "implicit"
-    ttl: Literal["5m", "1h"] | None = Field(
-        default=None, exclude_if=lambda v: v is None
-    )
+    ttl: Literal["5m", "1h"] = "5m"
 
-    def to_response(
-        self, *, explicit_ttl_only: bool = False
-    ) -> "K31PromptCacheOptions":
+    def to_response(self) -> "K31PromptCacheOptions":
         return self
 
 

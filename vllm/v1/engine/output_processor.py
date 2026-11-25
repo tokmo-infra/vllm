@@ -31,7 +31,6 @@ from vllm.tracing import (
 )
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.gc_utils import gc_untrack
-from vllm.v1.core.kimi_cache_lease import K31CachePlan
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
@@ -232,8 +231,6 @@ class RequestState:
         self.is_prefilling = True
         self.queue = queue
         self.num_cached_tokens = 0
-        self.k31_cache_plan: K31CachePlan | None = None
-        self.k31_cache_writes: tuple[int, int] | None = None
         self.num_cache_creation_tokens = 0
         self.remote_prefill_cached_tokens = remote_prefill_cached_tokens
         self.remote_prefill_cache_creation_tokens = remote_prefill_cache_creation_tokens
@@ -364,17 +361,6 @@ class RequestState:
         if state.stats is not None and sampling_params is not None:
             state.stats.is_watermarked = bool(sampling_params.watermarking)
             state.stats.is_watermark_skipped = sampling_params._watermarking_skipped
-        if remote_prefill_cache_creation_tokens is not None:
-            assert sampling_params is not None and sampling_params.extra_args
-            transfer = sampling_params.extra_args["kv_transfer_params"]
-            tiers = transfer.get("k31_cache_writes")
-            if (
-                isinstance(tiers, (tuple, list))
-                and len(tiers) == 2
-                and all(type(v) is int and v >= 0 for v in tiers)
-                and sum(tiers) <= remote_prefill_cache_creation_tokens
-            ):
-                state.k31_cache_writes = (tiers[0], tiers[1])
         return state
 
     def make_request_output(
@@ -495,8 +481,6 @@ class RequestState:
             ec_transfer_params=ec_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
             num_cache_creation_tokens=self.num_cache_creation_tokens,
-            k31_cache_plan=self.k31_cache_plan,
-            k31_cache_writes=self.k31_cache_writes,
             metrics=self.stats,
         )
 
@@ -817,9 +801,6 @@ class OutputProcessor:
 
             if req_state.is_prefilling:
                 if engine_core_output.prefill_stats is not None:
-                    req_state.k31_cache_plan = (
-                        engine_core_output.prefill_stats.k31_cache_plan
-                    )
                     req_state.num_cached_tokens = (
                         engine_core_output.prefill_stats.num_cached_tokens
                     )

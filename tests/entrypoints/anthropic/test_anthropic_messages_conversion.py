@@ -819,26 +819,6 @@ class TestBuildAnthropicUsage:
         assert result.cache_read_input_tokens == 0
         assert result.cache_creation_input_tokens == 0
 
-    def test_k31_reports_the_prefill_tiers_for_actual_writes(self):
-        usage = UsageInfo(
-            prompt_tokens=8195,
-            completion_tokens=2,
-            prompt_tokens_details=PromptTokenUsageInfo(
-                cached_tokens=4096,
-                created_cache_tokens=4096,
-                k31_cache_writes=(0, 4096),
-            ),
-        )
-        wire = _build_anthropic_usage(usage, kimi_k31=True).model_dump(
-            exclude_none=True
-        )
-        assert wire["input_tokens"] == 3
-        assert wire["cache_creation_input_tokens"] == 4096
-        assert wire["cache_creation"] == {
-            "ephemeral_5m_input_tokens": 0,
-            "ephemeral_1h_input_tokens": 4096,
-        }
-
     @pytest.mark.parametrize("writes", [None, 0, 32])
     def test_k31_uses_measured_usage_for_native_fields(self, writes):
         usage = UsageInfo(
@@ -1772,20 +1752,6 @@ def test_k31_messages_forwards_cache_ttl_to_chat(ttl):
         "mode": "implicit",
         "ttl": ttl,
     }
-
-
-@pytest.mark.parametrize("fields", [{}, {"cache_control": {"type": "ephemeral"}}])
-def test_k31_messages_without_ttl_use_capacity_cache(fields):
-    request = AnthropicMessagesRequest(
-        model="kimi-k3.1-pro",
-        max_tokens=32,
-        messages=[{"role": "user", "content": "hello"}],
-        **fields,
-    )
-    chat = _convert(request)
-    assert "k31_requested_cache_ttl" not in (
-        chat.to_sampling_params(32, {}).extra_args or {}
-    )
 
 
 def test_other_models_ignore_top_level_cache_control():

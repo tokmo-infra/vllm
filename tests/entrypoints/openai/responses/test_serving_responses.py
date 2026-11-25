@@ -262,20 +262,11 @@ def test_prompt_cache_options_rejects_unknown_ttl() -> None:
 
 
 @pytest.mark.parametrize(
-    "options,ttl", [({}, None), ({"ttl": "5m"}, "5m"), ({"ttl": "1h"}, "1h")]
+    "options,ttl", [({}, "5m"), ({"ttl": "5m"}, "5m"), ({"ttl": "1h"}, "1h")]
 )
 def test_k31_responses_cache_options(options, ttl):
     result = _echoed_response(model="kimi-k3.1-pro", prompt_cache_options=options)
-    expected = {"mode": "implicit"}
-    if ttl:
-        expected["ttl"] = ttl
-    assert result["prompt_cache_options"] == expected
-    request = ResponsesRequest(
-        model="kimi-k3.1-pro", input="hi", prompt_cache_options=options
-    )
-    assert (request.to_sampling_params(16).extra_args or {}).get(
-        "k31_requested_cache_ttl"
-    ) == ttl
+    assert result["prompt_cache_options"] == {"mode": "implicit", "ttl": ttl}
 
 
 @pytest.mark.parametrize(
@@ -283,7 +274,7 @@ def test_k31_responses_cache_options(options, ttl):
 )
 def test_k31_responses_preserves_existing_cache_options(options, mode):
     result = _echoed_response(model="kimi-k3.1-pro", prompt_cache_options=options)
-    assert result["prompt_cache_options"].get("ttl") == options.get("ttl")
+    assert result["prompt_cache_options"]["ttl"] == "30m"
     assert result["prompt_cache_options"]["mode"] == mode
 
 

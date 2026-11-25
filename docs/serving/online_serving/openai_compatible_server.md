@@ -190,26 +190,9 @@ K3.1 Chat and Responses accept
 Responses also accepts the existing `30m` option. Chat and Messages pass
 through additional TTL strings, including `2h`. For Messages, use
 `cache_control={"type":"ephemeral","ttl":"1h"}`.
-Without an explicit TTL, this deployment reuses retained prefixes until
-capacity eviction (LRU), even after five minutes of inactivity. Such requests
-do not read or renew timed leases. With an explicit TTL, the first write
-starts a separate logical lifetime. Configure a shared
-Redis namespace on the prefills with `VLLM_K31_CACHE_LEASE_NAMESPACE` and
-`VLLM_K31_CACHE_LEASE_URL_FILE`. The file contains a Redis connection URL.
-Use a deployment-specific namespace, TLS and a service credential. Install
-the optional `k31-cache` extra in the serving image. Existing request
-cache salts and multimodal identities remain part of the block fingerprints.
-
-The first successful full-block publication chooses the tier. Reading a live
-prefix renews its original tier, including extensions. Expired prefixes must
-be recomputed in both GPU and Mooncake caches. Messages reports measured
-writes in `usage.cache_creation.ephemeral_5m_input_tokens` and
-`ephemeral_1h_input_tokens`. Short prompts skip the metadata service.
-If the service is unavailable, the prefill computes the prompt and omits
-unconfirmed writes from billing. Deploy the matching PD Router so decode
-workers receive the prefill's permitted read length and measured write tiers.
-Messages also reports measured reasoning in
-`usage.output_tokens_details.thinking_tokens`.
+The cache backend controls actual retention. Messages includes measured
+reasoning tokens in `usage.output_tokens_details.thinking_tokens`; a measured
+zero cache write also yields zero for both `usage.cache_creation` tiers.
 
 #### Extra parameters
 
