@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.model_executor.models.interfaces import requires_raw_input_tokens
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import (
@@ -162,6 +163,11 @@ class DefaultModelState(ModelState):
         model_inputs = {}
         if self.supports_mm_inputs or self.prompt_embeds_state is not None:
             model_inputs["inputs_embeds"] = self.dummy_inputs_embeds(num_tokens)
+            # Capture the same calling convention that execute_model uses for
+            # real batches and idle EP peers. Some models need both tensors;
+            # for the rest, the embedding buffer replaces the token-ID input.
+            if not requires_raw_input_tokens(self.model):
+                model_inputs["input_ids"] = None
         if self.rope_state is not None:
             model_inputs["positions"] = self.rope_state.get_positions(num_tokens)
         return model_inputs

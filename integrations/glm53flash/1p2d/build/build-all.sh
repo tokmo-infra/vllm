@@ -65,6 +65,8 @@ if [[ "$mode" == source ]]; then
   args=()
   if [[ -n ${GLM_BUILD_BASE_OCI:-} ]]; then
     args+=(--build-context "glm_pytorch_buildbase=oci-layout://$GLM_BUILD_BASE_OCI" --build-arg BUILD_BASE_IMAGE=glm_pytorch_buildbase)
+  else
+    args+=(--build-arg BUILD_BASE_IMAGE=docker.io/pytorch/manylinux2_28-builder:cuda13.0-78e737ad29420ffc4800e677c51e2a852caf8359@sha256:c8d8dba2124931732d1b073dec1d8999cd4d6c5ff7c5e77232137e77d9f00f6a)
   fi
   "${build[@]}" "${args[@]}" -f "$work/vllm/docker/Dockerfile.glm53-source" --target glm53flash-source \
     --build-context "build_helpers=$here" --build-context "flashinfer_wheels=$work/flashinfer-wheels" \
@@ -85,10 +87,14 @@ mkdir -p "$ctx/flashinfer/experimental" "$ctx/b12x"
 cp -a "$work/flashinfer-b12x/flashinfer/experimental/b12x" "$ctx/flashinfer/experimental/"
 cp "$work/flashinfer-b12x/_flashinfer_filelock.py" "$ctx/"
 cp "$here/b12x/__init__.py" "$ctx/b12x/"
-(
-  cd "$root"; sha256sum -c "$pin_dir/runtime.sha256" >/dev/null
-  awk '{print $2}' "$pin_dir/runtime.sha256" | tar -cf - -T -
-) | tar -xf - -C "$ctx"
+while read -r digest file; do
+  source_file="$root/$file"
+  if [[ -f "$here/compat-baseline/$file" ]]; then
+    source_file="$here/compat-baseline/$file"
+  fi
+  printf '%s  %s\n' "$digest" "$source_file" | sha256sum -c --status -
+  install -D -m 0644 "$source_file" "$ctx/$file"
+done < "$pin_dir/runtime.sha256"
 (
   cd "$ctx"
   # Keep the repository sources lintable while reproducing the deployed files.

@@ -61,6 +61,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     get_mamba_prefill_checkpoint_position,
     is_mamba_prefill_checkpoint_valid,
+    iter_layer_specs,
 )
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import (
@@ -389,21 +390,21 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
-        # TODO: Support models with multiple Mamba specs that require different
-        # prefill checkpoint alignments instead of selecting the first one.
-        self.mamba_prefill_checkpoint_alignment = next(
-            (
-                group.kv_cache_spec.prefill_checkpoint_alignment
-                for group in kv_cache_config.kv_cache_groups
-                if isinstance(group.kv_cache_spec, MambaSpec)
-            ),
-            None,
-        )
-        self.mamba_has_prefill_checkpoint_blocks = self.has_mamba_layers and all(
-            not isinstance(group.kv_cache_spec, MambaSpec)
-            or group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
+        # Worker and manager export into physical Mamba pages, not the
+        # attention page from cache_config. A split may be elided only if
+        # *every* participating layout can export the exact same boundary.
+        mamba_specs = [
+            spec
             for group in kv_cache_config.kv_cache_groups
+            for spec in iter_layer_specs(group.kv_cache_spec)
+            if isinstance(spec, MambaSpec)
+        ]
+        self.mamba_has_prefill_checkpoint_blocks = bool(mamba_specs) and all(
+            spec.num_prefill_checkpoint_blocks > 0 for spec in mamba_specs
         )
+        self.mamba_checkpoint_layouts = tuple(dict.fromkeys(
+            (spec.block_size, spec.prefill_checkpoint_alignment) for spec in mamba_specs
+        ))
         # Fine-grained hits reuse the prompt's hash-aligned Mamba checkpoint.
         # Split there only if the backend cannot save it within the final chunk.
         self.mamba_partial_cache_hit = (
@@ -514,13 +515,16 @@ class Scheduler(SchedulerInterface):
         use_internal_checkpoint = (
             self.mamba_has_prefill_checkpoint_blocks
             and end >= prefill_end
-            and is_mamba_prefill_checkpoint_valid(
-                query_start=start,
-                query_end=end,
-                checkpoint_position=checkpoint_position,
-                hash_block_size=self.hash_block_size,
-                mamba_block_size=block_size,
-                checkpoint_alignment=self.mamba_prefill_checkpoint_alignment,
+            and all(
+                is_mamba_prefill_checkpoint_valid(
+                    query_start=start,
+                    query_end=end,
+                    checkpoint_position=checkpoint_position,
+                    hash_block_size=self.hash_block_size,
+                    mamba_block_size=page_size,
+                    checkpoint_alignment=alignment,
+                )
+                for page_size, alignment in self.mamba_checkpoint_layouts
             )
         )
         if use_internal_checkpoint:

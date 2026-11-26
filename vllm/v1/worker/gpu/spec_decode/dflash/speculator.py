@@ -115,7 +115,11 @@ class DFlashSpeculator(DraftModelSpeculator):
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
-        # The draft's attention differs from the target's in causality.
+        if self.speculative_config.method == "dflash":
+            from vllm.v1.worker.gpu.spec_decode.dflash.utils import dflash_attention_view
+
+            return dflash_attention_view(self.vllm_config, self.requires_non_causal)
+        # Other subclasses (e.g. DSpark) own a separate model loader.
         config = copy.copy(super().attn_vllm_config)
         config.attention_config = replace(
             self.vllm_config.attention_config,

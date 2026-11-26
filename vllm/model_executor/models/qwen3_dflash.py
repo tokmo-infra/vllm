@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import io
+from dataclasses import replace
 from collections.abc import Iterable
 
 import regex as re
@@ -37,7 +38,8 @@ from vllm.multimodal.inputs import NestedTensors
 from vllm.platforms import current_platform
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.transformers_utils.repo_utils import get_hf_file_bytes
-from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backend import AttentionType, MultipleOf
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec, SlidingWindowSpec
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
@@ -180,6 +182,35 @@ def _resolve_layer_attention(
     return sliding_window, _dflash_layer_causal(config, layer_idx)
 
 
+class DFlashCacheAttention(Attention):
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        spec = super().get_kv_cache_spec(vllm_config)
+        if isinstance(spec, (FullAttentionSpec, SlidingWindowSpec)):
+            spec = replace(spec, draft_context=True)
+        unit = vllm_config.cache_config.prefix_match_unit
+        if not unit or not isinstance(spec, SlidingWindowSpec):
+            return spec
+        if not (vllm_config.cache_config.enable_prefix_caching
+                or vllm_config.kv_transfer_config is not None):
+            return spec
+        # SWA managers index completed pages. One logical page per hash
+        # keeps a short draft window from inflating the target's hit stride.
+        # Block-outermost layouts cannot assume virtual kernel-page splitting.
+        factor = vllm_config.parallel_config.decode_context_parallel_size if spec.dcp_sharded else 1
+        if unit % factor:
+            return spec
+        local_unit = unit // factor
+        sizes = self.attn_backend.get_supported_kernel_block_sizes(spec)
+        if not any(local_unit % s.base == 0 if isinstance(s, MultipleOf)
+                   else local_unit == s for s in sizes):
+            return spec  # standard cross-group validation reports incompatibility
+        candidate = replace(spec, block_size=local_unit, page_size_padded=None)
+        if spec.page_size_padded is not None:
+            candidate = replace(candidate, page_size_padded=max(
+                spec.page_size_padded, candidate.unpadded_page_size_bytes))
+        return candidate
+
+
 class DFlashQwen3Attention(nn.Module):
     """Attention for DFlash speculative decoding.
 
@@ -257,7 +288,7 @@ class DFlashQwen3Attention(nn.Module):
         )
 
         self.sliding_window = sliding_window
-        self.attn = Attention(
+        self.attn = DFlashCacheAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,

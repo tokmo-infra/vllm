@@ -347,7 +347,7 @@ class MooncakeStoreCoordinator:
             if num_prompt_tokens is None
             else replay_boundaries(
                 num_prompt_tokens,
-                self.lcm_block_size,
+                mask_alignment,
                 use_eagle=bool(self.eagle_group_ids),
             )
         )
@@ -365,7 +365,7 @@ class MooncakeStoreCoordinator:
             mask = manager_cls.reachable_block_mask(
                 start_block=start_chunk,
                 end_block=end_chunk,
-                alignment_tokens=self.lcm_block_size,
+                alignment_tokens=mask_alignment,
                 kv_cache_spec=spec,
                 use_eagle=use_eagle,
                 retention_interval=retention_interval,

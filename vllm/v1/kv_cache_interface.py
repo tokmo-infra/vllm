@@ -593,6 +593,9 @@ class FullAttentionSpec(AttentionSpec):
     """
     attention_chunk_size: int | None = None
 
+    # Read from the per-layer spec before merge, like the sliding-window tag.
+    draft_context: bool = field(default=False, compare=False, repr=False)
+
     non_causal: bool = False
     """
     Whether the layer attends non-causally (e.g. Prefix LM). Carried on the
@@ -858,6 +861,8 @@ class ChunkedLocalAttentionSpec(AttentionSpec):
 @dataclass(frozen=True, kw_only=True)
 class SlidingWindowSpec(AttentionSpec):
     sliding_window: int
+    # Per-layer scheduling metadata; not a property of the physical KV layout.
+    draft_context: bool = field(default=False, compare=False, repr=False)
     # The trailing edge of the window is extended by ``extra_retained_tokens``
     # so that those extra trailing tokens' blocks are retained (but not
     # attended). This is needed for multi-module spec decoding which can

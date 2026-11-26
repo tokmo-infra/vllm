@@ -63,7 +63,7 @@ def _validate_prefix_cache_retention_interval(
 
 
 def replay_boundaries(
-    num_prompt_tokens: int, scheduler_block_size: int, use_eagle: bool
+    num_prompt_tokens: int, alignment_tokens: int, use_eagle: bool
 ) -> tuple[int, ...]:
     """Positions a later request replaying a prompt can resume at.
 
@@ -75,12 +75,12 @@ def replay_boundaries(
     at ``num_tokens - 1`` (its last token is recomputed for logits), a
     longer sibling matches the final aligned block. They differ only on a
     block-aligned prompt, where retaining just the higher one collapses the
-    resend's hit to 0. The alignment is the scheduler block size, not the
-    finer hash granularity, which would over-estimate the reach.
+    resend's hit to 0. Use the reader's hit alignment: the scheduler block
+    for physical-page hits, or a hash unit for verified partial hits.
     """
     if not use_eagle:
         return (num_prompt_tokens - 1,)
-    block = scheduler_block_size
+    block = alignment_tokens
     resend = (num_prompt_tokens - 1) // block * block
     extension = num_prompt_tokens // block * block
     return tuple(sorted({max(resend - block, 0), max(extension - block, 0)}))
@@ -90,6 +90,10 @@ class KVCacheCoordinator(ABC):
     """Coordinate the KV cache of different KV cache groups."""
 
     enable_partial_hash_hits = False
+
+    @property
+    def _cache_hit_alignment_tokens(self) -> int:
+        return self.scheduler_block_size
 
     def __init__(
         self,
@@ -363,7 +367,7 @@ class KVCacheCoordinator(ABC):
         """
         boundaries = replay_boundaries(
             request.num_prompt_tokens,
-            self.scheduler_block_size,
+            self._cache_hit_alignment_tokens,
             use_eagle=bool(self.eagle_group_ids),
         )
         for group_id, manager in enumerate(self.single_type_managers):

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import copy
+
 import torch.nn as nn
 
 from vllm.config import VllmConfig, replace
@@ -13,33 +15,40 @@ from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
 from vllm.v1.worker.gpu.spec_decode.utils import get_pp_safe_draft_load_config
 
 
+def dflash_attention_view(vllm_config: VllmConfig, non_causal: bool) -> VllmConfig:
+    """One cache ABI for draft layer creation and its metadata builders.
+
+    Keep the resolved physical page size and the shared layer registry. Avoid
+    revalidating the outer target config (e.g. hybrid MLA + GQA), or inheriting
+    target-only KV precision exceptions into the external draft model.
+    """
+    spec = vllm_config.speculative_config
+    assert spec is not None
+    view = copy.copy(vllm_config)
+    view.attention_config = replace(
+        vllm_config.attention_config,
+        use_non_causal=non_causal,
+        backend=spec.attention_backend,
+    )
+    if spec.kv_cache_dtype is not None:
+        view.cache_config = copy.copy(vllm_config.cache_config)
+        view.cache_config.cache_dtype = spec.kv_cache_dtype
+        view.cache_config.kv_cache_dtype_skip_layers = []
+    return view
+
+
 def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
     from vllm.compilation.backends import set_model_tag
-    from vllm.model_executor.models.qwen3_dflash import (
-        dflash_has_any_non_causal,
-    )
+    from vllm.model_executor.models.qwen3_dflash import dflash_has_any_non_causal
 
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     draft_model_config = speculative_config.draft_model_config
-    # Select an attention backend that supports the drafter's attention: mixing
-    # a non-causal layer onto a causal-only backend would fail.
-    draft_vllm_config = replace(
-        vllm_config,
-        attention_config=replace(
-            vllm_config.attention_config,
-            use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),
-            backend=speculative_config.attention_backend,
-        ),
-        cache_config=(
-            replace(
-                vllm_config.cache_config,
-                cache_dtype=speculative_config.kv_cache_dtype,
-            )
-            if speculative_config.kv_cache_dtype is not None
-            else vllm_config.cache_config
-        ),
-        load_config=get_pp_safe_draft_load_config(get_draft_load_config(vllm_config)),
+    draft_vllm_config = dflash_attention_view(
+        vllm_config, dflash_has_any_non_causal(draft_model_config.hf_config)
+    )
+    draft_vllm_config.load_config = get_pp_safe_draft_load_config(
+        get_draft_load_config(vllm_config)
     )
     with set_model_tag("dflash_head"):
         dflash_model = get_model(

@@ -2067,6 +2067,15 @@ def _annotate_eagle_groups(
         return
 
     for group in kv_cache_groups:
+        # DFlash attention registers its ownership on each original layer.
+        # A group may combine layers, and a drafter can span multiple groups.
+        # Keep the replay proof for each group carrying any draft layer,
+        # without unnecessarily dropping a hash unit on target-only groups.
+        if spec_config.method == "dflash" and any(
+            getattr(kv_cache_spec.get(name), "draft_context", False)
+            for name in group.layer_names
+        ):
+            group.is_eagle_group = True
         if any(
             getattr(spec, "non_causal_multi_token_decode", False)
             for spec in iter_layer_specs(group.kv_cache_spec)
