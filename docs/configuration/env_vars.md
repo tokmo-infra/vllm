@@ -10,3 +10,16 @@ vLLM uses the following environment variables to configure the system:
 ```python
 --8<-- "vllm/envs.py:env-vars-definition"
 ```
+
+## DeepSeek V4.1 frontend token cache
+
+With the Python frontend and `--tokenizer-mode deepseek_v41`, set
+`VLLM_DSV41_TOKENIZER_CACHE_GIB` to the retained CPU segment budget in GiB
+per API process. The default is zero. Eight API processes with a budget of
+12 GiB each may retain 96 GiB in addition to normal process memory.
+Requests with the same cache salt can reuse text between tokenizer special
+tokens. Requests needing offsets or multimodal handling use the native path.
+The per-process `vllm:tokenizer_cache_tokens_total` metric distinguishes
+encoded, reused and special tokens. For cold measurements, point
+`VLLM_DSV41_TOKENIZER_CACHE_EPOCH_FILE` at a readable file and replace its
+contents between drained runs.

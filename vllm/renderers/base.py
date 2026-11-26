@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Generic, cast, overload
 
 from typing_extensions import TypeVar
 
+from vllm import envs
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import (
     EmbedsInput,
@@ -122,6 +123,17 @@ class BaseRenderer(ABC, Generic[_T]):
             tokenizer = copy.copy(tokenizer)
             self._prepare_tokenizer(tokenizer)
         self.tokenizer = tokenizer
+        self._dsv41_native_cache = None
+        if (
+            tokenizer is not None
+            and self.model_config.tokenizer_mode == "deepseek_v41"
+            and envs.VLLM_DSV41_TOKENIZER_CACHE_GIB > 0
+        ):
+            from vllm.tokenizers.dsv41_native_cache import NativeCache
+
+            self._dsv41_native_cache = NativeCache(
+                tokenizer, envs.VLLM_DSV41_TOKENIZER_CACHE_GIB, self.api_process_rank
+            )
 
         # Background multimodal warmup task (a future returned by
         # _mm_executor) so it overlaps engine-core initialization while
@@ -164,6 +176,13 @@ class BaseRenderer(ABC, Generic[_T]):
         self._tokenize_prompt_async = make_async(
             self._tokenize_prompt, executor=self._executor
         )
+        if self._dsv41_native_cache is not None:
+            from vllm.tokenizers.dsv41_native_cache import timed_tokenize_async
+
+            self._tokenize_prompt_async = timed_tokenize_async(self, self._executor)
+            self.render_chat_async = self._dsv41_native_cache.track_render(  # type: ignore[method-assign]
+                self.render_chat_async
+            )
         self._async_tokenizer_decode = make_async(self._decode, executor=self._executor)
 
         self.mm_processor: BaseMultiModalProcessor | None = None
@@ -897,6 +916,20 @@ class BaseRenderer(ABC, Generic[_T]):
             *(self.tokenize_prompt_async(prompt, params) for prompt in prompts)
         )
 
+    def _with_tokenizer_cache_salt(
+        self, prompts: list[DictPrompt], extras: dict[str, Any] | None
+    ) -> list[DictPrompt]:
+        # Only the decoder-only DS4.1 cache needs the namespace before encoding.
+        # Copy salted text inputs because completion prompts can be caller-owned.
+        if self._dsv41_native_cache is None or not extras or "cache_salt" not in extras:
+            return prompts
+        return [
+            cast(DictPrompt, {**prompt, "cache_salt": extras["cache_salt"]})
+            if "prompt" in prompt
+            else prompt
+            for prompt in prompts
+        ]
+
     # Step 3: Add extra keys to the prompts
     def _apply_prompt_extras(
         self,
@@ -1355,6 +1388,7 @@ class BaseRenderer(ABC, Generic[_T]):
             tok_params = self.default_cmpl_tok_params
 
         dict_prompts = self.render_prompts(prompts)
+        dict_prompts = self._with_tokenizer_cache_salt(dict_prompts, prompt_extras)
         tok_prompts = self.tokenize_prompts(dict_prompts, tok_params)
 
         self._apply_prompt_extras(tok_prompts, prompt_extras)
@@ -1380,6 +1414,7 @@ class BaseRenderer(ABC, Generic[_T]):
             tok_params = self.default_cmpl_tok_params
 
         dict_prompts = await self.render_prompts_async(prompts)
+        dict_prompts = self._with_tokenizer_cache_salt(dict_prompts, prompt_extras)
         tok_prompts = await self.tokenize_prompts_async(dict_prompts, tok_params)
 
         self._apply_prompt_extras(tok_prompts, prompt_extras)
@@ -1418,6 +1453,7 @@ class BaseRenderer(ABC, Generic[_T]):
             out_conversations.append(conv)
             dict_prompts.append(prompt)
 
+        dict_prompts = self._with_tokenizer_cache_salt(dict_prompts, prompt_extras)
         tok_prompts = self.tokenize_prompts(dict_prompts, tok_params)
 
         prompt_extras = dict(prompt_extras or {})
@@ -1458,6 +1494,7 @@ class BaseRenderer(ABC, Generic[_T]):
             out_conversations.append(conv)
             dict_prompts.append(prompt)
 
+        dict_prompts = self._with_tokenizer_cache_salt(dict_prompts, prompt_extras)
         tok_prompts = await self.tokenize_prompts_async(dict_prompts, tok_params)
 
         prompt_extras = dict(prompt_extras or {})

@@ -1066,6 +1066,7 @@ def tokenize_prompt(
     params: TokenizeParams,
     *,
     want_offsets: bool = False,
+    segment_cache=None,
 ) -> HfTokensPrompt:
     """Tokenize text, preserving an optional mask for truncated echoes."""
     # The mask identifies truncated text inputs even when no tokens were added.
@@ -1077,6 +1078,12 @@ def tokenize_prompt(
     kwargs = params.get_encode_kwargs()
     if want_offsets:
         kwargs["return_offsets_mapping"] = True
+    if segment_cache is not None:
+        ids = segment_cache.try_encode(
+            prompt, kwargs, want_offsets or want_special_tokens_mask
+        )
+        if ids is not None:
+            return cast(HfTokensPrompt, BaseRenderer._build_tokens_prompt(ids, prompt))
     if want_special_tokens_mask:
         encoding = encode_with_special_tokens_mask(
             tokenizer, prompt["prompt"], **kwargs
@@ -1147,6 +1154,7 @@ class BaseHfRenderer(BaseRenderer[_T]):
             prompt,
             params,
             want_offsets=self._wants_offsets(prompt, params),
+            segment_cache=self._dsv41_native_cache,
         )
 
     def _detokenize_prompt(self, prompt: TokensPrompt) -> TokensPrompt:

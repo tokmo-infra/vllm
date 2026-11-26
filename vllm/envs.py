@@ -31,6 +31,8 @@ if TYPE_CHECKING:
     S3_SECRET_ACCESS_KEY: str | None = None
     S3_ENDPOINT_URL: str | None = None
     VLLM_MODEL_REDIRECT_PATH: str | None = None
+    VLLM_DSV41_TOKENIZER_CACHE_GIB: float = 0.0
+    VLLM_DSV41_TOKENIZER_CACHE_EPOCH_FILE: str = ""
     VLLM_CACHE_ROOT: str = os.path.expanduser("~/.cache/vllm")
     VLLM_CONFIG_ROOT: str = os.path.expanduser("~/.config/vllm")
     VLLM_USAGE_STATS_SERVER: str = "https://stats.vllm.ai"
@@ -728,6 +730,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         )
     ),
     # ================== Runtime Env Vars ==================
+    # CPU text-segment LRU per DeepSeek V4.1 API process (0 disables it).
+    "VLLM_DSV41_TOKENIZER_CACHE_GIB": lambda: float(
+        os.getenv("VLLM_DSV41_TOKENIZER_CACHE_GIB", "0")
+    ),
+    # Optional epoch file for cold-cache measurements.
+    "VLLM_DSV41_TOKENIZER_CACHE_EPOCH_FILE": lambda: os.getenv(
+        "VLLM_DSV41_TOKENIZER_CACHE_EPOCH_FILE", ""
+    ),
     # Root directory for vLLM cache files
     # Defaults to `~/.cache/vllm` unless `XDG_CACHE_HOME` is set
     "VLLM_CACHE_ROOT": lambda: os.path.expanduser(
@@ -2520,6 +2530,8 @@ def compile_factors() -> dict[str, object]:
     Start with every known vLLM env var; drop entries in `ignored_factors`;
     hash everything else. This keeps the cache key aligned across workers."""
     ignored_factors: set[str] = {
+        "VLLM_DSV41_TOKENIZER_CACHE_GIB",
+        "VLLM_DSV41_TOKENIZER_CACHE_EPOCH_FILE",
         "MAX_JOBS",
         "VLLM_PP_TRANSPORT",
         "VLLM_TRITON_JIT_WARMUP_NUM_THREADS",
