@@ -39,6 +39,7 @@ use crate::request::{ChatContent, ChatContentPart, ChatMessage, ChatRequest};
 
 mod audio;
 mod expand;
+mod glm5_next;
 mod image;
 mod input;
 mod item;
@@ -133,7 +134,11 @@ impl MultimodalModelContext {
     /// Resolve a static model processor spec for one loaded model.
     fn resolve_model_spec(&self) -> Option<&'static dyn ModelProcessorSpec> {
         static REGISTRY: LazyLock<ModelRegistry> = LazyLock::new(ModelRegistry::new);
-        REGISTRY.lookup(&self.metadata())
+        let metadata = self.metadata();
+        if glm5_next::Glm53FlashSpec.matches(&metadata) {
+            return Some(&glm5_next::Glm53FlashSpec);
+        }
+        REGISTRY.lookup(&metadata)
     }
 
     /// Build a vision preprocessor for one loaded model and modality.
@@ -223,6 +228,8 @@ struct ResolvedPlaceholder {
     marker_token_id: u32,
     /// The model-declared embed token ID marked in `is_embed` masks.
     embed_token_id: u32,
+    /// Marker already wrapped in template tokens, including them in the engine span.
+    boundaries: Option<(u32, u32)>,
 }
 
 impl ResolvedPlaceholder {
@@ -242,7 +249,16 @@ impl ResolvedPlaceholder {
         })?;
         let embed_token_id = raw.placeholder_token_id_for(&metadata, modality)? as u32;
 
+        let boundaries = if raw.name() == "glm53_flash" && modality == Modality::Video {
+            Some((
+                metadata.token_id("<|begin_of_video|>")? as u32,
+                metadata.token_id("<|end_of_video|>")? as u32,
+            ))
+        } else {
+            None
+        };
         Ok(Self {
+            boundaries,
             token,
             marker_token_id,
             embed_token_id,
@@ -402,6 +418,26 @@ impl MultimodalModelInfo {
         video_preprocessor_config: PreProcessorConfig,
         limit_mm_per_prompt: MmLimitPerPrompt,
     ) -> Result<Option<Self>> {
+        let mut limit_mm_per_prompt = limit_mm_per_prompt;
+        if glm5_next::Glm53FlashSpec.matches(&context.metadata()) {
+            // Config can impose a tighter limit, but cannot enlarge the model's limit.
+            let limits = glm5_next::Glm53FlashSpec.modality_limits(&context.metadata())?;
+            if let Some(&cap) = limits.get(&Modality::Video) {
+                let configured = limit_mm_per_prompt.get(&MmModality::Video).and_then(MmLimitSpec::count);
+                limit_mm_per_prompt.insert(MmModality::Video, MmLimitSpec::Count(configured.unwrap_or(cap).min(cap)));
+            }
+        }
+        let temporal = video_preprocessor_config.temporal_patch_size.unwrap_or(2);
+        let video_fps = video_preprocessor_config
+            .extra
+            .get("fps")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(2.0);
+        let video_cap = video_preprocessor_config
+            .extra
+            .get("max_frames")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(2048) as usize;
         let (image, video) = Self::resolve_vision_lanes(
             &context,
             preprocessor_config.clone(),
@@ -418,10 +454,12 @@ impl MultimodalModelInfo {
             return Ok(None);
         }
 
-        let media_connector = Arc::new(MediaConnector::new(
-            reqwest_0_13::Client::new(),
-            MediaConnectorConfig::default(),
-        )?);
+        let mut media_connector =
+            MediaConnector::new(reqwest_0_13::Client::new(), MediaConnectorConfig::default())?;
+        if video.as_ref().is_some_and(|lane| lane.spec.raw.name() == "glm53_flash") {
+            media_connector = media_connector.with_glm_video(temporal, video_fps, video_cap);
+        }
+        let media_connector = Arc::new(media_connector);
 
         let placeholder_token_ids = [
             image.as_ref().map(|support| support.placeholder.marker_token_id),

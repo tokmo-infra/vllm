@@ -1071,46 +1071,15 @@ class ModelConfig:
     def _resolve_mm_device_do_normalize(
         self, mm_device_do_normalize: bool | None
     ) -> bool:
-        if mm_device_do_normalize is None:
-            if envs.VLLM_USE_RUST_FRONTEND:
-                logger.debug(
-                    "VLLM_USE_RUST_FRONTEND is set. "
-                    "Rust frontend does not currently support mm_device_do_normalize, "
-                    "forcing mm_device_do_normalize = False."
-                )
-                mm_device_do_normalize = False
-            else:
-                mm_device_do_normalize = (
-                    self._model_info.supports_mm_device_do_normalize
-                )
-                logger.debug(
-                    "mm_device_do_normalize is %s by default.",
-                    "enabled" if mm_device_do_normalize else "disabled",
-                )
-        else:
-            if mm_device_do_normalize and envs.VLLM_USE_RUST_FRONTEND:
-                logger.warning(
-                    "VLLM_USE_RUST_FRONTEND is set. "
-                    "Rust frontend does not currently support mm_device_do_normalize, "
-                    "forcing mm_device_do_normalize = False."
-                )
-                mm_device_do_normalize = False
-
-            if (
-                mm_device_do_normalize
-                and not self._model_info.supports_mm_device_do_normalize
-            ):
-                logger.warning(
-                    "Model does not support mm_device_do_normalize, "
-                    "forcing mm_device_do_normalize = False."
-                )
-                mm_device_do_normalize = False
-
-            logger.debug(
-                "mm_device_do_normalize is %s.",
-                "enabled" if mm_device_do_normalize else "disabled",
+        supported = self._model_info.supports_mm_device_do_normalize
+        if envs.VLLM_USE_RUST_FRONTEND:
+            supported = supported and self.hf_config.model_type in (
+                "glm5_next", "glm53_flash",
             )
-
+        if mm_device_do_normalize and not supported:
+            logger.warning("Device media normalization unavailable for this model/frontend.")
+        mm_device_do_normalize = supported and mm_device_do_normalize is not False
+        logger.debug("Device media normalization: %s", mm_device_do_normalize)
         return mm_device_do_normalize
 
     def _get_transformers_backend_cls(self) -> str:

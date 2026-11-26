@@ -30,6 +30,7 @@ use crate::utils::{resolve_request_context, unix_timestamp};
 pub(crate) fn build_router(state: Arc<RenderState>) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(|State(s): State<Arc<RenderState>>| async move { super::metrics::render(s.text.tokenizer().cache_stats()) }))
         .route("/ping", get(health).post(health))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions/render", post(render_chat))

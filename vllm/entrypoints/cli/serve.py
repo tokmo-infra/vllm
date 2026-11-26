@@ -353,6 +353,10 @@ def run_multi_api_server(args: argparse.Namespace):
             # Start rust front-end process.
             api_server_manager = RustFrontendProcessManager(
                 binary_path=rust_frontend_path,
+                mm_device_do_normalize=bool(
+                    vllm_config.model_config.multimodal_config
+                    and vllm_config.model_config.multimodal_config.mm_device_do_normalize
+                ),
                 sock=sock,
                 grpc_sock=grpc_sock,
                 args=args,

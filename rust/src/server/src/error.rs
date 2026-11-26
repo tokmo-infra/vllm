@@ -20,6 +20,8 @@ pub enum ApiError {
     },
     /// The requested model name does not match the single configured model.
     ModelNotFound { model: String },
+    InvalidFunctionTool { message: String },
+    NotFound { message: String },
     /// The request body could not be parsed as valid JSON.
     JsonParseError { message: String },
     /// The requested operation conflicts with current server state.
@@ -32,8 +34,8 @@ impl ApiError {
     /// Return the HTTP status code associated with this API error.
     pub fn status_code(&self) -> StatusCode {
         match self {
-            Self::InvalidRequest { .. } => StatusCode::BAD_REQUEST,
-            Self::ModelNotFound { .. } => StatusCode::NOT_FOUND,
+            Self::InvalidRequest { .. } | Self::InvalidFunctionTool { .. } => StatusCode::BAD_REQUEST,
+            Self::ModelNotFound { .. } | Self::NotFound { .. } => StatusCode::NOT_FOUND,
             Self::Conflict { .. } => StatusCode::CONFLICT,
             Self::ServerError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::JsonParseError { .. } => StatusCode::BAD_REQUEST,
@@ -50,12 +52,19 @@ impl ApiError {
                 param: param.map(|p| p.to_string()),
                 code: Some("invalid_request_error".to_string()),
             },
+            Self::InvalidFunctionTool { message } => ErrorDetail {
+                message: message.clone(),
+                error_type: "invalid_request_error".into(),
+                param: Some("tools".into()),
+                code: Some("invalid_function_tool".into()),
+            },
             Self::ModelNotFound { model } => ErrorDetail {
                 message: format!("The model `{model}` does not exist."),
                 error_type: "invalid_request_error".to_string(),
                 param: Some("model".to_string()),
                 code: Some("model_not_found".to_string()),
             },
+            Self::NotFound { message } => ErrorDetail { message: message.clone(), error_type: "invalid_request_error".into(), param: None, code: Some("not_found".into()) },
             Self::ServerError { message } => ErrorDetail {
                 message: message.clone(),
                 error_type: "server_error".to_string(),

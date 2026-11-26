@@ -143,6 +143,8 @@ fn load_response_template(
 }
 
 impl ChatBackend for HfChatBackend {
+    fn hf_model_type(&self) -> Option<&str> { Some(&self.model_type) }
+
     fn chat_renderer(&self) -> DynChatRenderer {
         self.chat_renderer.clone()
     }

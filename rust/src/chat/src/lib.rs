@@ -355,6 +355,8 @@ impl ChatLlm {
         self.processor.prepare_media(media.into(), token_ids).await
     }
 
+    pub fn hf_model_type(&self) -> Option<&str> { self.processor.backend.hf_model_type() }
+
     /// Effective tool-call parser name for this model, if parsing is enabled.
     pub fn tool_call_parser_name(&self) -> Option<&str> {
         self.processor.tool_call_parser.resolve_tool_name(self.model_id())
@@ -370,11 +372,13 @@ impl ChatLlm {
         let (text_request, output_processor) =
             self.processor.prepare(request, self.text.request_processor()).await?;
         let request_id = text_request.request_id.clone();
-        let decoded_stream = self.text.generate(text_request).await?.map_err(Error::from).boxed();
+        let prepared = self.text.request_processor().prepare(text_request)?;
+        let sampling = prepared.effective_sampling();
+        let decoded_stream = self.text.generate_prepared(prepared).await?.map_err(Error::from).boxed();
 
         let structured_stream = output_processor.process(decoded_stream)?;
 
-        Ok(ChatEventStream::new(request_id, structured_stream))
+        Ok(ChatEventStream::new(request_id, sampling, structured_stream))
     }
 
     /// Abort in-flight requests by their external (user-supplied) request ids.

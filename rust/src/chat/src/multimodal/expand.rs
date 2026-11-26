@@ -19,6 +19,7 @@ struct ExpansionLane<'a> {
     modality: Modality,
     marker_token_id: u32,
     embed_token_id: u32,
+    boundaries: Option<(u32, u32)>,
     placeholder_token: String,
     replacements: VecDeque<&'a PromptReplacement>,
 }
@@ -33,6 +34,7 @@ impl<'a> ExpansionLane<'a> {
             modality: media.modality,
             marker_token_id: media.placeholder.marker_token_id,
             embed_token_id: media.placeholder.embed_token_id,
+            boundaries: media.placeholder.boundaries,
             placeholder_token: media.placeholder.token.clone(),
             replacements: media.replacements.iter().collect(),
         })
@@ -84,7 +86,7 @@ pub(super) fn expand_prompt_token_ids(
     let mut expanded = Vec::with_capacity(expanded_len);
     let mut ranges = HashMap::<Modality, Vec<PlaceholderRange>>::new();
 
-    for &token in prompt_token_ids.iter() {
+    for (pos, &token) in prompt_token_ids.iter().enumerate() {
         let lane = lanes
             .iter_mut()
             .find(|lane| lane.marker_token_id == token && !lane.replacements.is_empty());
@@ -103,7 +105,15 @@ pub(super) fn expand_prompt_token_ids(
         }
 
         let replacement_len = replacement.tokens.len();
-        let structural_prefix = replacement.structural_prefix;
+        let mut structural_prefix = replacement.structural_prefix;
+        let mut structural_suffix = 0;
+        if let Some((begin, end)) = lane.boundaries {
+            if expanded.last() != Some(&begin) || prompt_token_ids.get(pos + 1) != Some(&end) {
+                bail_multimodal!("video marker must be surrounded by its model's begin/end tokens");
+            }
+            structural_prefix += 1;
+            structural_suffix = 1;
+        }
         if structural_prefix > expanded.len() {
             bail_multimodal!(
                 "placeholder token `{}` declares a structural prefix of {} token(s), but only {} token(s) precede it",
@@ -116,7 +126,7 @@ pub(super) fn expand_prompt_token_ids(
         // replacement block lands at in the expanded prompt (mirroring
         // vLLM's `_apply_token_matches_with_placeholders` splice-time pad).
         let pad_count = replacement.alignment_pad.map_or(0, |pad| pad.count_at(expanded.len()));
-        let range_len = structural_prefix + pad_count + replacement_len;
+        let range_len = structural_prefix + pad_count + replacement_len + structural_suffix;
         let is_embed = {
             let mut mask = Vec::with_capacity(range_len);
             mask.extend(std::iter::repeat_n(false, structural_prefix));
@@ -129,6 +139,7 @@ pub(super) fn expand_prompt_token_ids(
             mask.extend(
                 replacement.tokens.iter().map(|&token| token as u32 == lane.embed_token_id),
             );
+            mask.extend(std::iter::repeat_n(false, structural_suffix));
             WireTensor::from_bool(vec![range_len], mask).map_err(Error::Multimodal)?
         };
 
@@ -184,6 +195,7 @@ mod tests {
         PreparedMedia {
             modality,
             placeholder: ResolvedPlaceholder {
+                boundaries: None,
                 token: placeholder_token.to_string(),
                 marker_token_id,
                 embed_token_id,
@@ -297,6 +309,23 @@ mod tests {
             &ranges[0],
             &[false, true, false, true, false, false, true, false],
         );
+    }
+
+    #[test]
+    fn glm_video_span_includes_existing_boundaries_once() {
+        let mut media = qwen3_video_prepared(vec![PromptReplacement::sequence(
+            Modality::Video,
+            "<|video_pad|>",
+            vec![3, 17, 4],
+        )]);
+        media.placeholder.embed_token_id = 17;
+        media.placeholder.boundaries = Some((10, 11));
+        let mut ids = vec![99, 10, QWEN3_VIDEO_PAD_ID, 11, 98];
+        let r = expand_prompt_token_ids(&mut ids, &[media]).unwrap();
+        assert_eq!(ids, vec![99, 10, 3, 17, 4, 11, 98]);
+        let span = &r[&Modality::Video][0];
+        assert_eq!((span.offset, span.length), (1, 5));
+        assert_bool_mask(span, &[false, false, true, false, false]);
     }
 
     #[test]

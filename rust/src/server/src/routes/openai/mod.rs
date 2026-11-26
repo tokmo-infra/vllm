@@ -4,6 +4,7 @@
 pub mod chat_completions;
 mod completions;
 mod models;
+pub(super) mod responses;
 pub(crate) mod utils;
 
 pub use chat_completions::chat_completions;

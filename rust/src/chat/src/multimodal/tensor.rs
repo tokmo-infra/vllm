@@ -39,7 +39,20 @@ pub(super) fn collect_tensors(
         ..
     } = preprocessed;
 
-    let primary_value = KwargValue::from_f32_array(encoder_input, float_dtype)?;
+    use llm_multimodal::encoder_inputs::EncoderTensor;
+    let primary_value = match encoder_input {
+        EncoderTensor::Float(array) => KwargValue::from_f32_array(array, float_dtype)?,
+        EncoderTensor::Bytes(array) => {
+            let shape = array.shape().to_vec();
+            let data = if array.is_standard_layout() {
+                let len = array.len();
+                let (raw, offset) = array.into_raw_vec_and_offset();
+                let start = offset.unwrap_or(0);
+                if start == 0 && raw.len() == len { raw } else { raw[start..start+len].to_vec() }
+            } else { array.into_iter().collect() };
+            KwargValue::Tensor { wire: WireTensor::from_raw(TensorDtype::U8, shape, data) }
+        }
+    };
 
     let mut tensors = HashMap::new();
     tensors.insert(primary_key.to_string(), primary_value);

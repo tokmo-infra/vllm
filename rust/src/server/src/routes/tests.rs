@@ -5640,7 +5640,7 @@ async fn tool_calls_are_mapped_to_tool_call_sse_chunks() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn named_tool_choice_uses_stop_finish_reason() {
+async fn named_tool_choice_uses_tool_calls_finish_reason() {
     for stream in [false, true] {
         let (app, engine_task) = test_app_with_backend_and_stream_output_specs(
             Arc::new(FakeChatBackend::with_model_id("Qwen/Qwen3-0.6B")),
@@ -5690,8 +5690,8 @@ async fn named_tool_choice_uses_stop_finish_reason() {
 
         assert!(text.contains("\"tool_calls\":"), "{text}");
         assert!(text.contains("\"name\":\"get_weather\""), "{text}");
-        assert!(text.contains("\"finish_reason\":\"stop\""), "{text}");
-        assert!(!text.contains("\"finish_reason\":\"tool_calls\""), "{text}");
+        assert!(!text.contains("\"finish_reason\":\"stop\""), "{text}");
+        assert!(text.contains("\"finish_reason\":\"tool_calls\""), "{text}");
     }
 }
 

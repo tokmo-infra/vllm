@@ -35,6 +35,10 @@ pub(super) fn build_batched_items(
     for (index, (hash, uuid)) in izip!(hashes, uuids).enumerate() {
         let mut data = MmKwargsItem::new();
         for (key, tensor) in &tensors {
+            if spec.raw.name() == "glm53_flash" && key == "patches_per_image" {
+                // The count tensor still supplies each item's flat pixel range below.
+                continue;
+            }
             let keep_on_cpu = spec.keep_on_cpu_keys.contains(key);
             let (value, field) = match spec.field_layout_for(key) {
                 Some(FieldLayout::Batched) => (

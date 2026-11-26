@@ -16,7 +16,7 @@ pub mod test_utils;
 mod tiktoken;
 
 pub use error::{Result, TokenizerError};
-pub use hf::HuggingFaceTokenizer;
+pub use hf::{EncodeCacheStats, HuggingFaceTokenizer};
 pub use incremental::{DecodedText, IncrementalDecoder, TokenAnchor, TokenAttribution};
 pub use tekken::TekkenTokenizer;
 pub use tiktoken::TiktokenTokenizer;
@@ -24,6 +24,14 @@ pub use tiktoken::TiktokenTokenizer;
 pub trait Tokenizer: Send + Sync {
     /// Encode one prompt string into token IDs.
     fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>>;
+
+    /// Cache-aware encode; stateless backends have no entries to isolate.
+    fn encode_scoped(&self, text: &str, add_special_tokens: bool, _salt: Option<&str>) -> Result<Vec<u32>> {
+        self.encode(text, add_special_tokens)
+    }
+
+    /// Snapshot of this tokenizer's own cache; coarse-grained, only on scrape.
+    fn cache_stats(&self) -> Option<EncodeCacheStats> { None }
 
     /// Equivalent to `encode(text, false)`, except that every added,
     /// special, and control-token matcher is bypassed.

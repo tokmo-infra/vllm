@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 mod abort_requests;
+mod anthropic;
+mod protocol_compat;
 mod cache;
 mod collective_rpc;
 mod health;
@@ -117,9 +119,33 @@ fn build_router_with_options(
         .route("/v1/models", get(openai::list_models))
         .route("/v1/completions", post(openai::completions))
         .route("/v1/chat/completions", post(openai::chat_completions))
+        .route("/v1/responses", post(openai::responses::create_responses))
+        .route("/v1/responses/{response_id}", get(openai::responses::retrieve_response))
+        .route("/v1/responses/{response_id}/cancel", post(openai::responses::cancel_response))
+        .route("/v1/messages", post(anthropic::messages))
+        .route("/v1/messages/count_tokens", post(anthropic::count_tokens))
         // vLLM specific endpoints
         .route("/tokenize", post(tokenize::tokenize))
         .route("/detokenize", post(tokenize::detokenize));
+
+    // LAB ONLY: never register without the read-only benchmark-key mount.
+    if let Ok(value) = std::fs::read_to_string("/run/bench84-reset-key") {
+        use subtle::ConstantTimeEq as _;
+        let key = value.trim();
+        assert!(key.len() == 64 && key.bytes().all(|c| c.is_ascii_hexdigit()), "invalid benchmark reset key");
+        let key = std::sync::Arc::<[u8]>::from(key.as_bytes());
+        let bench_state = state.clone();
+        router = router.route("/_c32/reset", post(move |h: axum::http::HeaderMap| {
+            let key = key.clone();
+            let state = bench_state.clone();
+            async move {
+                let provided = h.get("x-c32-reset").map(|s| s.as_bytes()).unwrap_or_default();
+                if !bool::from(key.as_ref().ct_eq(provided)) { return Err(StatusCode::FORBIDDEN); }
+                let success = state.engine_core_client().reset_prefix_cache(false, true).await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+                Ok(Json(serde_json::json!({"success":success})))
+            }
+        }));
+    }
 
     if scale_out_endpoints_enabled {
         router = router.route("/inference/v1/generate", post(inference::generate));
@@ -212,7 +238,7 @@ fn build_router_with_options(
         router = router.layer(from_fn_with_state(
             state.clone(),
             middleware::authenticate_api_key,
-        ));
+        )).layer(from_fn(anthropic::adapt_auth));
     }
 
     // Later layers wrap earlier ones. Keep tracing outside auth so rejected

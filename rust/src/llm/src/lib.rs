@@ -101,6 +101,9 @@ impl Llm {
         req.sampling_params.stream_interval =
             (stream_interval > NonZeroU32::MIN).then_some(stream_interval);
 
+        let remote_cached = remote_prefill_usage(
+            req.sampling_params.extra_args.as_ref().and_then(|args| args.get("kv_transfer_params")),
+        );
         let prepared = req.prepare(self.randomize_request_id)?;
         let prompt_token_ids = prepared.prompt_token_ids().into();
         let external_request_id = prepared
@@ -133,6 +136,7 @@ impl Llm {
 
         Ok(GenerateOutputStream::new(
             prompt_token_ids,
+            remote_cached,
             stream,
             request_metrics,
             guard,
@@ -164,5 +168,30 @@ impl Llm {
     pub async fn shutdown(self) -> Result<()> {
         self.client.shutdown().await?;
         Ok(())
+    }
+}
+
+// P reports actual historical reuse. D also sees tokens received from P as
+// an external cache hit, which is a transport metric, not billable reuse.
+fn remote_prefill_usage(kv: Option<&serde_json::Value>) -> Option<usize> {
+    let kv = kv?;
+    if kv.get("do_remote_prefill")?.as_bool()? {
+        usize::try_from(kv.get("remote_prefill_cached_tokens")?.as_u64()?).ok()
+    } else { None }
+}
+
+#[cfg(test)]
+mod pd_usage_tests {
+    use super::remote_prefill_usage;
+    use serde_json::json;
+    #[test]
+    fn remote_usage_preserves_cold_zero_and_only_applies_on_consumer() {
+        for n in [0, 768] {
+            assert_eq!(remote_prefill_usage(Some(&json!({"do_remote_prefill":true,"remote_prefill_cached_tokens":n}))),Some(n));
+            assert_eq!(remote_prefill_usage(Some(&json!({"do_remote_prefill":false,"remote_prefill_cached_tokens":n}))),None);
+        }
+        for v in [json!(true),json!(-1),json!("0"),json!(null)] {
+            assert_eq!(remote_prefill_usage(Some(&json!({"do_remote_prefill":true,"remote_prefill_cached_tokens":v}))),None);
+        }
     }
 }

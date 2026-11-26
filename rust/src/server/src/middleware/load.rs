@@ -25,6 +25,8 @@ const TRACKED_HANDLERS: &[&str] = &[
     "/v1/messages",
     "/v1/messages/count_tokens",
     "/v1/chat/completions",
+    "/v1/responses",
+    "/v1/messages",
     "/v1/completions",
     "/v1/audio/transcriptions",
     "/v1/audio/translations",

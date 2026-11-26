@@ -32,17 +32,21 @@ pub struct CollectedAssistantMessage {
 
 /// Per-request stream of chat events.
 pub struct ChatEventStream {
+    sampling: vllm_text::EffectiveSampling,
     request_id: String,
     inner: Pin<Box<dyn Stream<Item = Result<ChatEvent>> + Send>>,
 }
 
 impl ChatEventStream {
-    pub(crate) fn new(request_id: String, inner: impl crate::output::ChatEventStream) -> Self {
+    pub(crate) fn new(request_id: String, sampling: vllm_text::EffectiveSampling, inner: impl crate::output::ChatEventStream) -> Self {
         Self {
             request_id,
             inner: Box::pin(inner),
+            sampling,
         }
     }
+
+    pub fn sampling(&self) -> vllm_text::EffectiveSampling { self.sampling }
 
     /// Return the request ID associated with this stream.
     pub fn request_id(&self) -> &str {
@@ -146,6 +150,7 @@ mod tests {
     async fn collect_message_requires_terminal_done_event() {
         let stream = ChatEventStream::new(
             "chat-missing-done".to_string(),
+            vllm_text::EffectiveSampling { temperature: 1.0, top_p: 1.0, max_tokens: 16, presence_penalty: 0.0, frequency_penalty: 0.0 },
             stream::iter([Ok(ChatEvent::Start {
                 prompt_token_ids: vec![].into(),
                 prompt_logprobs: None,
@@ -164,6 +169,7 @@ mod tests {
     async fn collect_message_retains_prompt_and_sample_logprobs() {
         let stream = ChatEventStream::new(
             "chat-logprobs".to_string(),
+            vllm_text::EffectiveSampling { temperature: 1.0, top_p: 1.0, max_tokens: 16, presence_penalty: 0.0, frequency_penalty: 0.0 },
             stream::iter(vec![
                 Ok(ChatEvent::Start {
                     prompt_token_ids: vec![10, 11].into(),
@@ -199,6 +205,7 @@ mod tests {
                         prompt_token_count: 2,
                         output_token_count: 1,
                         cached_token_count: 0,
+                        cache_creation_token_count: 0,
                     }),
                     finish_reason: FinishReason::stop_eos(),
                     kv_transfer_params: None,
@@ -240,6 +247,7 @@ mod tests {
                     prompt_token_count: 2,
                     output_token_count: 1,
                     cached_token_count: 0,
+                    cache_creation_token_count: 0,
                 }),
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,

@@ -26,6 +26,9 @@ pub struct NewChatOutputProcessorOptions<'a> {
 
 /// Minimal prompt-processing backend needed by `vllm-chat`.
 pub trait ChatBackend: Send + Sync {
+    /// Effective Hugging Face model_type, independent of served name or LoRA alias.
+    fn hf_model_type(&self) -> Option<&str> { None }
+
     /// Return the renderer used for chat-prompt construction.
     fn chat_renderer(&self) -> DynChatRenderer;
 

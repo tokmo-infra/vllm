@@ -434,6 +434,16 @@ async fn generate_merges_outputs_by_stream_interval() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn collect_output_aggregates_raw_tokens_logprobs_and_terminal_metadata() {
+    check_collected_usage(None, 1).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pd_consumer_reports_producer_cache_hits_even_when_zero() {
+    check_collected_usage(Some(0), 0).await;
+    check_collected_usage(Some(2), 2).await;
+}
+
+async fn check_collected_usage(remote: Option<usize>, expected_cached: usize) {
     init_tracing();
     let ipc = IpcNamespace::new().unwrap();
     let handshake_address = ipc.handshake_endpoint();
@@ -500,7 +510,13 @@ async fn collect_output_aggregates_raw_tokens_logprobs_and_terminal_metadata() {
     );
 
     let llm = connect_async_llm_with_ipc(handshake_address, 7, "test-model", &ipc).await;
-    let stream = llm.generate(sample_generate_request("req-collect", 4)).await.unwrap();
+    let mut request = sample_generate_request("req-collect", 4);
+    if let Some(cached) = remote {
+        request.sampling_params.extra_args.get_or_insert_with(Default::default).insert(
+            "kv_transfer_params".into(), serde_json::json!({"do_remote_prefill":true,"remote_prefill_cached_tokens":cached})
+        );
+    }
+    let stream = llm.generate(request).await.unwrap();
     let internal_id = stream.request_id().to_string();
     let collected = stream.collect_output().await.unwrap();
 
@@ -511,7 +527,7 @@ async fn collect_output_aggregates_raw_tokens_logprobs_and_terminal_metadata() {
     assert_eq!(collected.prompt_token_ids, vec![11, 22]);
     assert_eq!(collected.token_ids, vec![33, 44]);
     assert_eq!(collected.finish_reason, FinishReason::stop_eos());
-    assert_eq!(collected.usage.cached_token_count, 1);
+    assert_eq!(collected.usage.cached_token_count, expected_cached);
     assert_eq!(collected.prompt_logprobs, Some(prompt_logprobs()));
     assert_eq!(
         collected.logprobs.as_ref().map(|lp| lp.positions.len()),
@@ -542,6 +558,7 @@ async fn collect_output_rejects_partial_sampling_mask() {
         logprobs: None,
         finish_reason: Some(FinishReason::Length),
         cached_token_count: 0,
+        cache_creation_token_count: 0,
         kv_transfer_params: None,
         ec_transfer_params: None,
         sampling_mask: Some(SamplingMask {

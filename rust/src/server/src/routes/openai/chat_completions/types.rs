@@ -402,6 +402,8 @@ pub(super) struct ChatCompletionMessage {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
     pub reasoning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 /// Mirrors the Python vLLM `ChatCompletionStreamResponse` class.
@@ -447,6 +449,7 @@ pub(super) struct ChatMessageDelta {
     pub content: Option<String>,
     pub tool_calls: Option<Vec<ToolCallDelta>>,
     pub reasoning: Option<String>,
+    pub reasoning_content: Option<String>,
 }
 
 /// Schema-level validation for cross-field dependencies

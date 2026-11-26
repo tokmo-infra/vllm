@@ -35,6 +35,8 @@ pub enum Error {
     MmLimitExceeded { modality: String, limit: usize },
     #[error("invalid inline multimodal features: {message}")]
     InvalidPreprocessedMultimodal { message: String },
+    #[error("invalid media input: {0}")]
+    InvalidMedia(&'static str),
     #[error("multimodal preprocessing error: {0}")]
     Multimodal(#[message] String),
     #[error("{kind} parsing is not available for model `{model_id}`")]
@@ -126,6 +128,7 @@ impl Error {
             | Self::UnsupportedMultimodalContent(_)
             | Self::UnsupportedModality { .. }
             | Self::InvalidPreprocessedMultimodal { .. }
+            | Self::InvalidMedia(_)
             | Self::MmLimitExceeded { .. } => true,
 
             _ => false,
@@ -135,13 +138,24 @@ impl Error {
 
 impl From<llm_multimodal::MediaConnectorError> for Error {
     fn from(error: llm_multimodal::MediaConnectorError) -> Self {
-        Self::Multimodal(error.to_report_string())
+        use llm_multimodal::MediaConnectorError as M;
+        match error {
+            M::Image(_) => Self::InvalidMedia("unreadable image"),
+            M::InvalidVideo(_) => Self::InvalidMedia("unreadable video"),
+            M::Base64Decode(_) | M::DataUrl(_) => Self::InvalidMedia("invalid inline encoding"),
+            M::InvalidUrl(_) | M::UnsupportedScheme(_) | M::DisallowedDomain(_) | M::DisallowedLocalPath(_) => Self::InvalidMedia("invalid or disallowed media URL"),
+            M::PayloadTooLarge { .. } => Self::InvalidMedia("media payload exceeds the size limit"),
+            other => Self::Multimodal(other.to_report_string()),
+        }
     }
 }
 
 impl From<llm_multimodal::MultiModalError> for Error {
     fn from(error: llm_multimodal::MultiModalError) -> Self {
-        Self::Multimodal(error.to_report_string())
+        match error {
+            llm_multimodal::MultiModalError::Media(media) => media.into(),
+            other => Self::Multimodal(other.to_report_string()),
+        }
     }
 }
 

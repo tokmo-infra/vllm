@@ -212,7 +212,7 @@ mod tests {
         ));
 
         let preprocessed = PreprocessedEncoderInputs {
-            encoder_input: ArrayD::zeros(vec![1, 128, 4]),
+            encoder_input: ArrayD::zeros(vec![1, 128, 4]).into(),
             feature_token_counts: vec![1],
             item_sizes: vec![(128, 4)],
             model_specific: HashMap::from([

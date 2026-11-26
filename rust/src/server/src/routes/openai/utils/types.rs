@@ -282,7 +282,7 @@ fn default_function_tool_type() -> String {
 }
 
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Function {
     pub name: String,
     pub description: Option<String>,
@@ -293,6 +293,25 @@ pub struct Function {
     /// Whether the schema is loaded on demand via tool search (vLLM extension,
     /// mirroring the OpenAI Responses and Anthropic Messages field).
     pub defer_loading: Option<bool>,
+}
+
+impl From<Function> for vllm_chat::ChatTool {
+    fn from(function: Function) -> Self {
+        let Function {
+            name,
+            description,
+            parameters,
+            strict,
+            defer_loading,
+        } = function;
+        Self {
+            name,
+            description,
+            parameters,
+            strict,
+            defer_loading,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -328,7 +347,7 @@ pub struct FunctionCallDelta {
 }
 
 /// Tool choice value for simple string options.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolChoiceValue {
     Auto,
@@ -361,13 +380,13 @@ impl Default for ToolChoice {
 }
 
 /// Function choice specification for `ToolChoice::Function`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct FunctionChoice {
     pub name: String,
 }
 
 /// Tool reference for `ToolChoice::AllowedTools`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum ToolReference {
@@ -565,7 +584,7 @@ impl Usage {
             completion_tokens: Some(completion_tokens),
             prompt_tokens_details: cached_tokens
                 .filter(|&c| c > 0)
-                .map(|c| PromptTokenUsageInfo { cached_tokens: c }),
+                .map(|c| PromptTokenUsageInfo { cached_tokens: c, created_cache_tokens: None }),
             completion_tokens_details: CompletionTokenUsageInfo { reasoning_tokens },
         }
     }
@@ -575,12 +594,16 @@ impl Usage {
         enable_prompt_tokens_details: bool,
     ) -> Self {
         let usage = usage.into();
-        Self::from_counts(
+        let mut result = Self::from_counts(
             usage.prompt_token_count,
             usage.output_token_count,
-            enable_prompt_tokens_details.then_some(usage.cached_token_count),
+            None,
             usage.reasoning_tokens,
-        )
+        );
+        if enable_prompt_tokens_details {
+            result.prompt_tokens_details = Some(PromptTokenUsageInfo { cached_tokens: usage.cached_token_count, created_cache_tokens: Some(usage.cache_creation_token_count) });
+        }
+        result
     }
 }
 
@@ -588,6 +611,8 @@ impl Usage {
 #[derive(Debug, Clone, Serialize)]
 pub struct PromptTokenUsageInfo {
     pub cached_tokens: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_cache_tokens: Option<usize>,
 }
 
 /// Mirrors the Python vLLM `CompletionTokenUsageInfo` class.
@@ -610,6 +635,7 @@ mod usage_tests {
                 prompt_token_count: 5,
                 output_token_count: 2,
                 cached_token_count: 3,
+                cache_creation_token_count: 0,
             },
             false,
         );
@@ -626,6 +652,7 @@ mod usage_tests {
                 prompt_token_count: 5,
                 output_token_count: 2,
                 cached_token_count: 3,
+                cache_creation_token_count: 0,
             },
             true,
         );
@@ -644,6 +671,7 @@ mod usage_tests {
                     prompt_token_count: 5,
                     output_token_count: 4,
                     cached_token_count: 0,
+                    cache_creation_token_count: 0,
                 },
                 reasoning_tokens: 3,
             },
@@ -663,6 +691,7 @@ mod usage_tests {
                     prompt_token_count: 5,
                     output_token_count: 0,
                     cached_token_count: 0,
+                    cache_creation_token_count: 0,
                 },
                 reasoning_tokens: 0,
             },
@@ -680,6 +709,7 @@ mod usage_tests {
                 prompt_token_count: 5,
                 output_token_count: 2,
                 cached_token_count: 0,
+                cache_creation_token_count: 0,
             },
             false,
         );

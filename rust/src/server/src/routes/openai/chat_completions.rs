@@ -67,10 +67,11 @@ pub async fn chat_completions(
     let requested_model = body.model.as_deref().filter(|model| !model.is_empty());
     let lora_resolution = state.resolve_model_with_loras(requested_model).await;
 
-    let prepared = match prepare_chat_request(body, &lora_resolution, request_context) {
+    let mut prepared = match prepare_chat_request(body, &lora_resolution, request_context) {
         Ok(prepared) => prepared,
         Err(error) => return error.into_response(),
     };
+    prepared.options.glm_reasoning_alias = state.chat.hf_model_type() == Some("glm5_next");
     let request_span = tracing::info_span!(
         "chat_completions",
         request_id = %prepared.request_id,
@@ -139,10 +140,10 @@ async fn collect_chat_completion(
         output_top_logprobs,
         include_prompt_logprobs,
         include_reasoning,
+        glm_reasoning_alias,
         echo,
         return_token_ids,
         return_tokens_as_token_ids,
-        is_named_tool_choice,
     }: ResponseOptions,
 ) -> Result<ChatCompletionResponse, ApiError> {
     let collected = stream.collect_message().await.map_err(|error| {
@@ -170,7 +171,7 @@ async fn collect_chat_completion(
     // tokens through per-token metadata.
     let include_output_metadata = include_reasoning || reasoning.is_none();
     let finish_reason =
-        chat_finish_reason_to_openai(&finish_reason, saw_tool_calls && !is_named_tool_choice)?
+        chat_finish_reason_to_openai(&finish_reason, saw_tool_calls)?
             .to_string();
     let tool_calls = message
         .tool_calls()
@@ -228,6 +229,7 @@ async fn collect_chat_completion(
                     None => Some(message.text()).filter(|t| !t.is_empty()),
                 },
                 tool_calls,
+                reasoning_content: if include_reasoning && glm_reasoning_alias { reasoning.clone() } else { None },
                 reasoning: if include_reasoning { reasoning } else { None },
             },
             logprobs,
@@ -254,6 +256,7 @@ async fn chat_completion_chunk_stream(
     ApiServerOptions {
         enable_log_requests,
         enable_prompt_tokens_details,
+        enable_force_include_usage,
         ..
     }: ApiServerOptions,
     ResponseOptions {
@@ -264,10 +267,10 @@ async fn chat_completion_chunk_stream(
         // Ignored: chat streaming prompt logprobs are rejected for Python parity.
         include_prompt_logprobs: _,
         include_reasoning,
+        glm_reasoning_alias,
         echo,
         return_token_ids,
         return_tokens_as_token_ids,
-        is_named_tool_choice,
     }: ResponseOptions,
     mut y: TryYielder<ChatCompletionStreamResponse, ApiError>,
 ) -> Result<(), ApiError> {
@@ -289,6 +292,9 @@ async fn chat_completion_chunk_stream(
     macro_rules! yield_chunk {
         ($chunk:expr) => {{
             let mut chunk = $chunk;
+            if glm_reasoning_alias {
+                for choice in &mut chunk.choices { choice.delta.reasoning_content.clone_from(&choice.delta.reasoning); }
+            }
             if include_continuous_usage {
                 chunk.usage = Some(continuous_usage.to_usage());
             }
@@ -459,7 +465,7 @@ async fn chat_completion_chunk_stream(
                 match final_chunk(
                     &envelope,
                     finish_reason,
-                    saw_tool_calls && !is_named_tool_choice,
+                    saw_tool_calls,
                 ) {
                     Ok(chunk) => yield_chunk!(chunk),
                     Err(error) => {
@@ -471,7 +477,7 @@ async fn chat_completion_chunk_stream(
                     }
                 }
 
-                if include_usage {
+                if include_usage || enable_force_include_usage {
                     y.yield_ok(usage_chunk(
                         &envelope,
                         Usage::from_token_usage(final_usage, enable_prompt_tokens_details),
@@ -605,6 +611,7 @@ impl PendingChatChunk {
             content: self.delta.content.take(),
             tool_calls: self.delta.tool_calls.take(),
             reasoning: self.delta.reasoning.take(),
+            reasoning_content: None,
         }
     }
 }
@@ -843,6 +850,7 @@ mod tests {
             prompt_token_count: prompt_tokens,
             output_token_count: output_tokens,
             cached_token_count: cached_tokens,
+            cache_creation_token_count: 0,
         }
         .into()
     }
@@ -1465,6 +1473,7 @@ mod tests {
                         prompt_token_count: 3,
                         output_token_count: 3,
                         cached_token_count: 0,
+                        cache_creation_token_count: 0,
                     },
                     reasoning_tokens: 2,
                 },
@@ -1536,6 +1545,7 @@ mod tests {
                         prompt_token_count: 1,
                         output_token_count: 2,
                         cached_token_count: 0,
+                        cache_creation_token_count: 0,
                     },
                     reasoning_tokens: 2,
                 },

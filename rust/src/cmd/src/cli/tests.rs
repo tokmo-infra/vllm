@@ -199,6 +199,7 @@ fn serve_args_forward_python_flags_with_separator() {
                         chat_template_content_format: Auto,
                         enable_log_requests: false,
                         enable_prompt_tokens_details: false,
+                        enable_force_include_usage: false,
                         enable_request_id_headers: false,
                         enable_scale_out: false,
                         sse_keep_alive_interval: 0,
@@ -594,6 +595,7 @@ fn serve_passes_enable_prompt_tokens_details_into_config() {
         "serve",
         "Qwen/Qwen3-0.6B",
         "--enable-prompt-tokens-details",
+        "--enable-force-include-usage",
     ])
     .unwrap();
 
@@ -602,6 +604,7 @@ fn serve_passes_enable_prompt_tokens_details_into_config() {
     };
     let config = args.to_frontend_config("tcp://127.0.0.1:62100".to_string());
     assert!(config.api_server_options.enable_prompt_tokens_details);
+    assert!(config.api_server_options.enable_force_include_usage);
 }
 
 #[test]
@@ -1067,6 +1070,7 @@ fn frontend_args_accept_json() {
                         chat_template_content_format: Auto,
                         enable_log_requests: false,
                         enable_prompt_tokens_details: false,
+                        enable_force_include_usage: false,
                         enable_request_id_headers: false,
                         enable_scale_out: false,
                         sse_keep_alive_interval: 0,
@@ -1738,6 +1742,7 @@ fn serve_args_accept_handshake_aliases() {
                         chat_template_content_format: Auto,
                         enable_log_requests: false,
                         enable_prompt_tokens_details: false,
+                        enable_force_include_usage: false,
                         enable_request_id_headers: false,
                         enable_scale_out: false,
                         sse_keep_alive_interval: 0,
@@ -1895,6 +1900,7 @@ fn serve_frontend_config_uses_dp_address_as_advertised_host() {
             api_server_options: ApiServerOptions {
                 enable_log_requests: false,
                 enable_prompt_tokens_details: false,
+                enable_force_include_usage: false,
                 enable_request_id_headers: false,
                 enable_scale_out: false,
                 sse_keep_alive_interval: None,
@@ -1989,6 +1995,7 @@ fn serve_frontend_config_keeps_tcp_transport_for_non_local_only_topology() {
             api_server_options: ApiServerOptions {
                 enable_log_requests: false,
                 enable_prompt_tokens_details: false,
+                enable_force_include_usage: false,
                 enable_request_id_headers: false,
                 enable_scale_out: false,
                 sse_keep_alive_interval: None,
@@ -2127,6 +2134,7 @@ fn frontend_config_uses_external_coordinator_when_coordinator_address_is_present
             api_server_options: ApiServerOptions {
                 enable_log_requests: false,
                 enable_prompt_tokens_details: false,
+                enable_force_include_usage: false,
                 enable_request_id_headers: false,
                 enable_scale_out: false,
                 sse_keep_alive_interval: None,

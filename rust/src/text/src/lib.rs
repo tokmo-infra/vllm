@@ -15,7 +15,8 @@ pub use backend::{
 pub use error::{Error, LogprobsError, Result, SamplingParamsError, TokenIdsError};
 use futures::Stream;
 pub use lower::{
-    PreparedTextRequest, lower_sampling_params, lower_text_request, resolve_max_tokens,
+    EffectiveSampling, PreparedTextRequest, lower_sampling_params, lower_text_request,
+    resolve_max_tokens,
 };
 pub use output::{
     CollectedTextOutput, DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs,
@@ -89,10 +90,11 @@ impl TextRequestProcessor {
         add_special_tokens: bool,
         prompt_truncation: Option<PromptTruncation>,
         max_output_tokens: Option<u32>,
+        cache_salt: Option<&str>,
     ) -> Result<Vec<u32>> {
         let tokenizer = self.backend.tokenizer();
         let mut prompt_token_ids = match prompt {
-            Prompt::Text(text) => tokenizer.encode(&text, add_special_tokens)?,
+            Prompt::Text(text) => tokenizer.encode_scoped(&text, add_special_tokens, cache_salt)?,
             // Pre-tokenized prompts are the main completions-side escape hatch that lets benchmark
             // and infra workloads bypass chat rendering and tokenizer overhead entirely.
             Prompt::TokenIds(token_ids) => token_ids,
@@ -117,6 +119,7 @@ impl TextRequestProcessor {
             request.add_special_tokens,
             request.prompt_truncation.take(),
             request.sampling_params.max_tokens,
+            request.cache_salt.as_deref(),
         )?;
         request.prompt = Prompt::TokenIds(prompt_token_ids);
         match &request.prompt {
@@ -133,6 +136,7 @@ impl TextRequestProcessor {
             request.add_special_tokens,
             request.prompt_truncation,
             request.sampling_params.max_tokens,
+            request.cache_salt.as_deref(),
         )
     }
 
@@ -149,6 +153,7 @@ impl TextRequestProcessor {
             request.add_special_tokens,
             request.prompt_truncation,
             request.sampling_params.max_tokens,
+            request.cache_salt.as_deref(),
         )?;
         let tokenizer = self.backend.tokenizer();
         let sampling_hints = self.backend.sampling_hints()?;
@@ -236,14 +241,26 @@ impl TextLlm {
     /// Tokenize if needed, lower to a generate request, and return the raw
     /// token stream.
     pub async fn generate_raw(&self, request: TextRequest) -> Result<GenerateOutputStream> {
-        let (_, raw_stream) = self.generate_inner(request).await?;
-        Ok(raw_stream)
+        let prepared = self.processor.prepare(request)?;
+        Ok(self.llm.generate(prepared.generate_request).await?)
     }
 
     /// Tokenize if needed, lower to a generate request, and stream
     /// incrementally decoded text.
     pub async fn generate(&self, request: TextRequest) -> Result<impl TextOutputStream> {
-        let (text_request, raw_stream) = self.generate_inner(request).await?;
+        let prepared = self.processor.prepare(request)?;
+        self.generate_prepared(prepared).await
+    }
+
+    /// Stream incrementally decoded text for one already prepared request.
+    pub async fn generate_prepared(
+        &self,
+        PreparedTextRequest {
+            text_request,
+            generate_request,
+        }: PreparedTextRequest,
+    ) -> Result<impl TextOutputStream> {
+        let raw_stream = self.llm.generate(generate_request).await?;
         let tokenizer = self.processor.tokenizer();
         let decoded_stream = output::decoded_text_event_stream(
             text_request.request_id,
@@ -254,19 +271,6 @@ impl TextLlm {
         );
 
         Ok(decoded_stream)
-    }
-
-    async fn generate_inner(
-        &self,
-        request: TextRequest,
-    ) -> Result<(TextRequest, GenerateOutputStream)> {
-        let PreparedTextRequest {
-            text_request,
-            generate_request,
-        } = self.processor.prepare(request)?;
-
-        let raw_stream = self.llm.generate(generate_request).await?;
-        Ok((text_request, raw_stream))
     }
 
     /// Abort in-flight requests by their external (user-supplied) request ids.

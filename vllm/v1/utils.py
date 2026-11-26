@@ -297,6 +297,7 @@ class RustFrontendProcessManager:
         data_parallel_size: int,
         stats_update_address: str | None = None,
         grpc_sock: Any | None = None,
+        mm_device_do_normalize: bool = False,
     ):
         import os
         import subprocess
@@ -372,7 +373,10 @@ class RustFrontendProcessManager:
         logger.info("Launching Rust frontend: %s", " ".join(cmd[:-1] + [redacted_json]))
         self._listeners = [input_listener, output_listener]
         try:
-            self._proc = subprocess.Popen(cmd, pass_fds=inherited_fds)
+            self._proc = subprocess.Popen(
+                cmd, pass_fds=inherited_fds,
+                env={**os.environ, "VLLM_RS_GLM_DEVICE_NORM": str(int(mm_device_do_normalize))},
+            )
         except BaseException:
             for listener in self._listeners:
                 listener.cleanup()

@@ -22,6 +22,8 @@ use crate::hf::added_tokens::load_tokenizer_json_with_extra_tokens;
 use crate::{Result, Tokenizer};
 
 mod added_tokens;
+mod encode_cache;
+use encode_cache::{CacheConfig, CacheMode, EncodeCache};
 
 static EMPTY_HF_ADDED_VOCABULARY: LazyLock<AddedVocabulary> = LazyLock::new(AddedVocabulary::new);
 
@@ -147,9 +149,22 @@ fn encode_fastokens_ordinary(
 /// unsupported tokenizer features or file formats).
 pub struct HuggingFaceTokenizer {
     backend: Backend,
+    encode_cache: Option<EncodeCache>,
     special_token_ids: Arc<[u32]>,
     added_vocab: Box<[(String, u32)]>,
     vocab_size: usize,
+}
+
+/// Process-local observations for the opt-in exact encode cache.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EncodeCacheStats {
+    pub l1_hits: u64,
+    pub shared_hits: u64,
+    pub misses: u64,
+    pub reused_tokens: u64,
+    pub encoded_tokens: u64,
+    pub special_tokens: u64,
+    pub l1_bytes: usize,
 }
 
 impl HuggingFaceTokenizer {
@@ -178,6 +193,7 @@ impl HuggingFaceTokenizer {
         let vocab_size = tokenizer.get_vocab_size(true);
         Self {
             backend: Backend::Hf(Box::new(tokenizer)),
+            encode_cache: None,
             special_token_ids,
             added_vocab,
             vocab_size,
@@ -216,6 +232,7 @@ impl HuggingFaceTokenizer {
         };
         Self {
             backend,
+            encode_cache: None,
             special_token_ids,
             added_vocab,
             vocab_size,
@@ -224,20 +241,39 @@ impl HuggingFaceTokenizer {
 
     /// Load from `tokenizer.json` with `fastokens`.
     pub fn new_fastokens(path: &Path) -> Result<Self> {
+        Self::new_fastokens_with_cache(path, CacheConfig::from_env())
+    }
+
+    fn new_fastokens_with_cache(path: &Path, config: Option<CacheConfig>) -> Result<Self> {
         info!(path = %path.display(), "loading tokenizer with fastokens");
         let tokenizer_json = load_tokenizer_json_with_extra_tokens(path)?;
+        let encode_cache = config.and_then(|c| c.build(&tokenizer_json, CacheMode::FastokensWhole));
         let t = FastokensTokenizer::from_json(tokenizer_json)
             .map_err(|error| tokenizer_error!("failed to load tokenizer: {}", error.as_report()))?;
-        Ok(Self::from_fastokens_backend(t))
+        let mut result = Self::from_fastokens_backend(t);
+        result.encode_cache = encode_cache;
+        Ok(result)
     }
 
     /// Load from `tokenizer.json` with Hugging Face `tokenizers`.
     pub fn new_hf(path: &Path) -> Result<Self> {
+        Self::new_hf_with_cache(path, CacheConfig::from_env())
+    }
+
+    fn new_hf_with_cache(path: &Path, config: Option<CacheConfig>) -> Result<Self> {
         info!(path = %path.display(), "loading tokenizer with huggingface tokenizers");
         let tokenizer_json = load_tokenizer_json_with_extra_tokens(path)?;
+        let encode_cache = config.and_then(|c| c.build(&tokenizer_json, CacheMode::HuggingFaceWhole));
         let t = serde_json::from_value::<HfTokenizer>(tokenizer_json)
             .map_err(|error| tokenizer_error!("failed to load tokenizer: {}", error.as_report()))?;
-        Ok(Self::from_hf_backend(t))
+        let mut result = Self::from_hf_backend(t);
+        result.encode_cache = encode_cache;
+        Ok(result)
+    }
+
+    /// Read this tokenizer instance's local and shared lookup counters.
+    pub fn encode_cache_stats(&self) -> Option<EncodeCacheStats> {
+        self.encode_cache.as_ref().map(EncodeCache::stats)
     }
 
     /// Load from `tokenizer.json` via fastokens or HuggingFace tokenizers.
@@ -257,17 +293,37 @@ impl HuggingFaceTokenizer {
 }
 
 impl Tokenizer for HuggingFaceTokenizer {
+    fn cache_stats(&self) -> Option<EncodeCacheStats> { self.encode_cache_stats() }
+
     fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
+        self.encode_scoped(text, add_special_tokens, None)
+    }
+
+    fn encode_scoped(&self, text: &str, add_special_tokens: bool, salt: Option<&str>) -> Result<Vec<u32>> {
         match &self.backend {
             Backend::Hf(t) => {
-                let encoding = t
-                    .encode(text, add_special_tokens)
-                    .map_err(|error| tokenizer_error!("encoding failed: {}", error.as_report()))?;
-                Ok(encoding.get_ids().to_vec())
+                let native = || {
+                    let encoding = t
+                        .encode(text, add_special_tokens)
+                        .map_err(|error| tokenizer_error!("encoding failed: {}", error.as_report()))?;
+                    Ok(encoding.get_ids().to_vec())
+                };
+                if !add_special_tokens && let Some(cache) = &self.encode_cache {
+                    cache.encode_whole(salt, text, native)
+                } else {
+                    native()
+                }
             }
-            Backend::Fastokens(t) | Backend::FastokensByteLevel(t) => t
-                .encode_with_special_tokens(text, add_special_tokens)
-                .map_err(|error| tokenizer_error!("encoding failed: {}", error.as_report())),
+            Backend::Fastokens(t) | Backend::FastokensByteLevel(t) => {
+                if !add_special_tokens
+                    && let Some(cache) = &self.encode_cache
+                    && let Ok(ids) = cache.encode(t, salt, text)
+                {
+                    return Ok(ids);
+                }
+                t.encode_with_special_tokens(text, add_special_tokens)
+                    .map_err(|error| tokenizer_error!("encoding failed: {}", error.as_report()))
+            }
         }
     }
 

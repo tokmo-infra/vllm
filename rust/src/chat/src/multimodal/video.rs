@@ -52,7 +52,13 @@ impl MultimodalModelInfo {
         let mut items = Vec::with_capacity(clips.len());
 
         for (clip, uuid) in izip!(&clips, uuids) {
-            let preprocessed = self.preprocess_video_clip(support, Arc::clone(clip)).await?;
+            let mut preprocessed = self.preprocess_video_clip(support, Arc::clone(clip)).await?;
+            if let Some(seconds) = &clip.grid_seconds {
+                preprocessed.model_specific.insert(
+                    "glm_grid_seconds".into(),
+                    llm_multimodal::ModelSpecificValue::int_1d(seconds.clone()),
+                );
+            }
             let mut clip_replacements =
                 support.spec.prompt_replacements_for(&self.context, &preprocessed)?;
             if clip_replacements.len() != 1 {
@@ -62,6 +68,11 @@ impl MultimodalModelInfo {
                 );
             }
             replacements.push(clip_replacements.pop().unwrap());
+            if support.spec.raw.name() == "glm53_flash" {
+                // The engine accepts pixel_values_videos and video_grid_thw; all other
+                // fields in this processor are local prompt/packing metadata.
+                preprocessed.model_specific.retain(|k, _| k == "video_grid_thw");
+            }
             items.push(build_video_item(
                 support,
                 preprocessed,
@@ -276,7 +287,7 @@ mod tests {
         let info = qwen3_vl_info();
         // One clip flattened to 6 patches with 4 features each.
         let preprocessed = PreprocessedEncoderInputs {
-            encoder_input: ArrayD::zeros(vec![6, 4]),
+            encoder_input: ArrayD::zeros(vec![6, 4]).into(),
             feature_token_counts: vec![6],
             item_sizes: vec![(32, 32)],
             model_specific: HashMap::from([
